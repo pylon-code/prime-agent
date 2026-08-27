@@ -9,9 +9,9 @@ This repository is Pylon's long-lived Prime Agent fork. It follows Prime upstrea
 - The local `upstream` remote must be fetch-only. Never push to a Prime Intellect remote.
 - Do not hard-reset, force-push, or wholesale rebase `pylon` onto upstream.
 
-The daily `Pylon upstream sync` workflow fast-forwards `main`, then opens a draft merge pull request into `pylon`. Clean candidates run through the trusted `pylon` CI definition with no secrets or persisted Git credentials. A conflict opens or updates one blocker issue and requires a human resolution branch from `pylon`; the workflow never resolves conflicts automatically.
+The daily `Pylon upstream sync` workflow fast-forwards `main`, prepares a clean merge candidate, and runs it through the trusted `pylon` CI definition with no secrets or persisted Git credentials. With a narrowly scoped `PYLON_SYNC_PR_TOKEN`, it opens a draft merge pull request. Without that token, it opens or updates one candidate-ready issue with the exact PR link. A conflict opens or updates one blocker issue and requires a human resolution branch from `pylon`; the workflow never resolves conflicts automatically.
 
-Sync and manual conflict-resolution pull requests must use merge commits so `pylon` retains ancestry from the exact upstream commit. The mirror push must use the built-in `GITHUB_TOKEN`: replacing it with a PAT or app token would allow an upstream-owned push workflow to execute when `main` advances.
+Sync and manual conflict-resolution pull requests must use merge commits so `pylon` retains ancestry from the exact upstream commit. The mirror and candidate branch pushes must use the built-in `GITHUB_TOKEN`: replacing it with a PAT or app token would allow an upstream-owned push workflow to execute when `main` advances. A separate PR-only app token may be used only by `gh pr create`; never expose it to Git credentials or candidate verification.
 
 ## Upstream overlap decisions
 

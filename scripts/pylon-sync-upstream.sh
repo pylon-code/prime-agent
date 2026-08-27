@@ -4,6 +4,7 @@ set -euo pipefail
 repo="${GITHUB_REPOSITORY:-pylon-code/prime-agent}"
 expected_repo="pylon-code/prime-agent"
 blocker_title="Prime upstream sync blocked"
+candidate_title="Prime upstream sync candidate ready"
 
 emit_output() {
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
@@ -57,6 +58,47 @@ close_blocker() {
   rm -f "$body_file"
 }
 
+find_candidate_issue() {
+  gh issue list \
+    --repo "$repo" \
+    --state open \
+    --search "$candidate_title in:title" \
+    --json number,title \
+    --jq "map(select(.title == \"$candidate_title\")) | .[0].number // empty"
+}
+
+report_candidate() {
+  local details="$1"
+  local body_file
+  local issue_number
+  body_file="$(mktemp)"
+  printf '%s\n' "$details" > "$body_file"
+  issue_number="$(find_candidate_issue)"
+
+  if [[ -n "$issue_number" ]]; then
+    gh issue comment "$issue_number" --repo "$repo" --body-file "$body_file"
+  else
+    gh issue create --repo "$repo" --title "$candidate_title" --body-file "$body_file"
+  fi
+  rm -f "$body_file"
+}
+
+close_candidate_issue() {
+  local pr_url="$1"
+  local issue_number
+  local body_file
+  issue_number="$(find_candidate_issue)"
+  if [[ -z "$issue_number" ]]; then
+    return
+  fi
+
+  body_file="$(mktemp)"
+  printf 'A pull request now owns this candidate: %s\n' "$pr_url" > "$body_file"
+  gh issue comment "$issue_number" --repo "$repo" --body-file "$body_file"
+  gh issue close "$issue_number" --repo "$repo"
+  rm -f "$body_file"
+}
+
 git config user.name "pylon-upstream-sync[bot]"
 git config user.email "pylon-upstream-sync[bot]@users.noreply.github.com"
 git remote add upstream https://github.com/PrimeIntellect-ai/prime-agent.git 2>/dev/null || \
@@ -95,12 +137,13 @@ open_pr="$(gh pr list \
   --base pylon \
   --state open \
   --limit 100 \
-  --json number,headRefName,headRefOid,headRepositoryOwner,url,labels \
-  --jq 'map(select(.headRepositoryOwner.login == "pylon-code" and (.headRefName | startswith("automation/prime-upstream-")) and any(.labels[]?; .name == "pylon-upstream-sync"))) | if length > 0 then "\(.[0].number)\t\(.[0].url)\t\(.[0].headRefOid)" else "" end')"
+  --json number,headRefName,headRefOid,headRepositoryOwner,url \
+  --jq 'map(select(.headRepositoryOwner.login == "pylon-code" and (.headRefName | startswith("automation/prime-upstream-")))) | if length > 0 then "\(.[0].number)\t\(.[0].url)\t\(.[0].headRefOid)" else "" end')"
 if [[ -n "$open_pr" ]]; then
   IFS=$'\t' read -r open_number open_url open_sha <<< "$open_pr"
   emit_output candidate_sha "$open_sha"
   emit_output pr_url "$open_url"
+  close_candidate_issue "$open_url" || echo "Could not close the candidate-ready issue." >&2
   echo "Upstream sync pull request #$open_number is already open: $open_url"
   echo "The mirror branch was updated; the next run after that PR settles will collect later commits."
   exit 0
@@ -148,19 +191,33 @@ cat > "$body_file" <<EOF
 Created by the daily Pylon upstream synchronization workflow.
 EOF
 
-pr_url="$(gh pr create \
-  --repo "$repo" \
-  --base pylon \
-  --head "$branch" \
-  --draft \
-  --label pylon-upstream-sync \
-  --title "chore: sync Prime upstream through $short_sha" \
-  --body-file "$body_file")"
+candidate_sha="$(git rev-parse HEAD)"
+if [[ -n "${PYLON_SYNC_PR_TOKEN:-}" ]]; then
+  pr_url="$(GH_TOKEN="$PYLON_SYNC_PR_TOKEN" gh pr create \
+    --repo "$repo" \
+    --base pylon \
+    --head "$branch" \
+    --draft \
+    --label pylon-upstream-sync \
+    --title "chore: sync Prime upstream through $short_sha" \
+    --body-file "$body_file")"
+  close_candidate_issue "$pr_url" || echo "Could not close the candidate-ready issue." >&2
+  echo "Created draft pull request $pr_url"
+else
+  pr_url="$server_url/$repo/compare/pylon...$branch?expand=1"
+  report_candidate "A clean Prime upstream candidate is ready for human review.
+
+- Candidate branch: \`$branch\`
+- Candidate commit: \`$candidate_sha\`
+- Open the pull request: $pr_url
+- Trusted candidate CI: $verification_url
+
+The Pylon organization currently prevents the built-in GitHub Actions token from creating pull requests. Open the draft PR manually, or configure a narrowly scoped Pylon GitHub App token as \`PYLON_SYNC_PR_TOKEN\`. Never use that token for the mirror push."
+  echo "Candidate branch is ready; a maintainer must open the draft pull request: $pr_url"
+fi
 rm -f "$body_file"
 
-candidate_sha="$(git rev-parse HEAD)"
 emit_output candidate_sha "$candidate_sha"
 emit_output pr_url "$pr_url"
-close_blocker "A clean synchronization pull request is available: $pr_url" ||
+close_blocker "A clean synchronization candidate is available: $pr_url" ||
   echo "Could not close the previous sync blocker." >&2
-echo "Created draft pull request $pr_url"
