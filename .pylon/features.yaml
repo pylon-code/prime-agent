@@ -17,6 +17,7 @@ decisions:
     decision: retain
     pylon_refs:
       - https://github.com/pylon-code/pylon/issues/114
+      - https://github.com/pylon-code/pylon/issues/126
       - https://github.com/pylon-code/pylon/pull/116
     fork_change: none
     upstream_support: Prime extensions can register a todo tool, but the daemon has no native managed-plan event.
@@ -56,6 +57,7 @@ decisions:
     decision: redesign
     pylon_refs:
       - https://github.com/pylon-code/pylon/issues/114
+      - https://github.com/pylon-code/pylon/issues/126
     fork_change: possible-capability
     upstream_support: Prime exposes subagent lifecycle separately from root plan state.
     revisit_when:
