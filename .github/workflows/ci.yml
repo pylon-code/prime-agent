@@ -1,13 +1,20 @@
 name: CI
 
 on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: Exact candidate commit to verify from a trusted Pylon workflow
+        required: false
+        type: string
   push:
-    branches: [main]
+    branches: [pylon]
   pull_request:
-    branches: [main]
+    branches: [pylon]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ inputs.checkout_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -16,13 +23,26 @@ permissions:
 jobs:
   trust:
     name: Contributor trust
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     outputs:
-      allowed: ${{ github.event_name == 'push' || steps.vouch.outputs.vouched == 'true' }}
+      allowed: ${{ github.event_name == 'workflow_call' || github.event_name == 'push' || steps.sync.outputs.allowed == 'true' || steps.vouch.outputs.vouched == 'true' }}
     steps:
+      - name: Recognize the internal upstream sync pull request
+        id: sync
+        if: github.event_name == 'pull_request'
+        env:
+          HAS_SYNC_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'pylon-upstream-sync') }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [ "$HAS_SYNC_LABEL" = true ] && [ "$HEAD_REPOSITORY" = "pylon-code/prime-agent" ] && [[ "$HEAD_REF" == automation/prime-upstream-* ]]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check pull request author
         id: vouch
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.sync.outputs.allowed != 'true'
         uses: mitchellh/vouch/action/check-user@d66fa29a64600490892131ad87597c30c91fcac4 # v1
         with:
           user: ${{ github.event.pull_request.user.login }}
@@ -40,6 +60,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
           persist-credentials: false
 
       - name: Setup Node.js
@@ -52,7 +73,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
-          sudo ln -s $(which fdfind) /usr/local/bin/fd
+          sudo ln -s "$(which fdfind)" /usr/local/bin/fd
 
       - name: Install dependencies
         run: npm ci
@@ -113,6 +134,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
           persist-credentials: false
 
       - name: Setup Node.js
@@ -125,7 +147,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
-          sudo ln -s $(which fdfind) /usr/local/bin/fd
+          sudo ln -s "$(which fdfind)" /usr/local/bin/fd
 
       - name: Install dependencies
         run: npm ci

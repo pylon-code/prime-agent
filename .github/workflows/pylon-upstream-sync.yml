@@ -1,0 +1,47 @@
+name: Pylon upstream sync
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pylon-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Mirror and prepare merge
+    if: github.repository == 'pylon-code/prime-agent' && github.ref == 'refs/heads/pylon'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      candidate_sha: ${{ steps.sync.outputs.candidate_sha }}
+      pr_url: ${{ steps.sync.outputs.pr_url }}
+    steps:
+      - name: Checkout Pylon product branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: pylon
+          fetch-depth: 0
+
+      - name: Mirror Prime and open a draft merge pull request
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/pylon-sync-upstream.sh
+
+  verify:
+    name: Verify candidate with trusted fork CI
+    needs: sync
+    if: needs.sync.outputs.candidate_sha != ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      checkout_ref: ${{ needs.sync.outputs.candidate_sha }}

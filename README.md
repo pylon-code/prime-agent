@@ -12,6 +12,8 @@
 Prime Agent: A Self-Improving RLM Harness
 </h3>
 
+> This is Pylon's long-lived Prime Agent fork. It synchronizes with [Prime upstream](https://github.com/PrimeIntellect-ai/prime-agent) daily while preserving Pylon integrations that upstream does not yet provide. See [PYLON.md](PYLON.md) for branch, synchronization, and overlap policy.
+
 <p align="center">
   <a href="packages/coding-agent/docs/index.md">Documentation</a> &bull;
   <a href="https://github.com/PrimeIntellect-ai/verifiers">Verifiers</a> &bull;
