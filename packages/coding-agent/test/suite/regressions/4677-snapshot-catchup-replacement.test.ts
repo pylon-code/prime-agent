@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -149,6 +149,58 @@ function workerHarness(result: DaemonAttachResult, transcript: SnapshotTranscrip
 }
 
 describe("ENG-4677 snapshot catch-up replacement", () => {
+	it("assigns supervisor-owned UUIDs to mixed-version full snapshots with the same cursor and count", async () => {
+		const root = tempDirectory();
+		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			descriptorDir: join(root, "state"),
+		});
+		const large = "x".repeat(400 * 1024);
+		const firstMessages = [
+			{ role: "user", content: { nested: `before-${large}` }, timestamp: 1 },
+			{ role: "user", content: { nested: `before-2-${large}` }, timestamp: 2 },
+		] as unknown as AgentMessage[];
+		const secondMessages = [
+			{ role: "user", content: { nested: "after" }, timestamp: 1 },
+			{ role: "user", content: { nested: "after-2" }, timestamp: 2 },
+		] as unknown as AgentMessage[];
+		const withoutStream = (messages: AgentMessage[]): DaemonAttachResult => {
+			const result = streamedResult("legacy", messages.length, 7);
+			const { snapshotStream: _snapshotStream, ...full } = result;
+			full.snapshot = { ...full.snapshot, messages };
+			return full;
+		};
+		const firstResult = withoutStream(firstMessages);
+		const secondResult = withoutStream(secondMessages);
+		const worker = workerHarness(
+			firstResult,
+			new SnapshotTranscriptCache({
+				activeSessionId,
+				snapshotId: "placeholder",
+				cacheRoot: root,
+			}),
+		);
+		worker.transcriptCaches.clear();
+		worker.snapshotCache.clear();
+		worker.snapshotGenerations.clear();
+		const internals = supervisor as unknown as {
+			getOrCreateTranscriptCache(worker: object, result: DaemonAttachResult): Promise<SnapshotTranscriptCache>;
+		};
+
+		const first = await internals.getOrCreateTranscriptCache(worker, firstResult);
+		const firstId = first.snapshotId;
+		const firstChunkCount = first.chunkCount;
+		const second = await internals.getOrCreateTranscriptCache(worker, secondResult);
+
+		expect(firstId).not.toBe(second.snapshotId);
+		expect(firstId).toMatch(/^snapshot-[0-9a-f-]+$/);
+		expect(second.snapshotId).toMatch(/^snapshot-[0-9a-f-]+$/);
+		expect(firstChunkCount).toBe(2);
+		expect(second.chunkCount).toBe(1);
+		expect(Buffer.concat([...second]).toString("utf8")).toContain('"nested":"after"');
+		second.dispose();
+	});
+
 	it("lets an incomplete retained snapshot finish after a newer generation begins", async () => {
 		const root = tempDirectory();
 		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
@@ -377,7 +429,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 		});
 		firstTranscript.appendEncodedChunk(Buffer.from("orphaned transcript chunk"));
 		expect(firstTranscript.fileBacked).toBe(true);
-		const cacheDirectory = join(root, firstSnapshotId);
+		const cacheDirectory = join(root, readdirSync(root).find((entry) => entry.startsWith(firstSnapshotId))!);
 		expect(existsSync(cacheDirectory)).toBe(true);
 		const waiter = firstTranscript.waitForChunk(1);
 		void waiter.catch(() => undefined);

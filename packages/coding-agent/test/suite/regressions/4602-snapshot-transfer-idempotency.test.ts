@@ -16,7 +16,10 @@ import {
 	type DaemonWorkerFrameHeader,
 	isDaemonWorkerFrameHeader,
 } from "../../../src/modes/daemon/daemon-worker-protocol.js";
-import { SnapshotTranscriptCache } from "../../../src/modes/daemon/snapshot-transcript-cache.js";
+import {
+	SnapshotTranscriptCache,
+	type SnapshotTranscriptChunkSource,
+} from "../../../src/modes/daemon/snapshot-transcript-cache.js";
 import { type PrivateFrame, PrivateFrameDecoder } from "../../../src/modes/session-worker/private-framing.js";
 
 const activeSessionId = "active-4602";
@@ -63,7 +66,7 @@ function summary(): SessionSummary {
 	};
 }
 
-function streamedResult(messages: AgentMessage[]): DaemonAttachResult {
+function streamedResult(messages: AgentMessage[], resultSnapshotId = snapshotId): DaemonAttachResult {
 	return {
 		protocol: DAEMON_PROTOCOL_INFO,
 		activeSessionId,
@@ -82,7 +85,7 @@ function streamedResult(messages: AgentMessage[]): DaemonAttachResult {
 		},
 		lastEventSequence: 1,
 		lastEventCursor: { generation: "generation-4602", sequence: 1 },
-		snapshotStream: { id: snapshotId, messageCount: messages.length, targetChunkBytes: 512 * 1024 },
+		snapshotStream: { id: resultSnapshotId, messageCount: messages.length, targetChunkBytes: 512 * 1024 },
 		client: { id: "worker", capabilities: ["chunked_snapshot"] },
 	};
 }
@@ -231,6 +234,92 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(unhandled).not.toHaveBeenCalled();
 	});
 
+	it("uses a fresh transfer identity when transcript bytes change at the same event cursor", async () => {
+		const daemon = new AgentDaemon("/tmp/eng-4602-transfer-identity.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const state = {
+			activeSessionId,
+			clients: new Set<DaemonSocketClient>(),
+			pendingAttaches: 0,
+			eventGeneration: "generation-4602",
+			lastEventSequence: 1,
+			runtime: { metadata: { kind: "top-level", createdAt: 1 } },
+		} as unknown as ActiveSessionState;
+		const socket = new PassThrough();
+		const client = {
+			id: "supervisor",
+			socket: socket as unknown as Socket,
+			transport: "private-framed",
+			attachedActiveSessionIds: new Set<string>(),
+			detachInput: () => {},
+			supportsExtensionUi: false,
+			capabilities: new Set<string>(),
+		} as DaemonSocketClient;
+		const firstMessage = { role: "user", content: "before", timestamp: 1 } as const;
+		const secondMessage = { role: "user", content: "after", timestamp: 1 } as const;
+		const createAttachResult = vi
+			.fn<() => DaemonAttachResult>()
+			.mockReturnValueOnce(streamedResult([firstMessage]))
+			.mockReturnValueOnce(streamedResult([secondMessage]));
+		const streamWorkerSnapshot = vi.fn(
+			async (
+				_client: DaemonSocketClient,
+				_result: DaemonAttachResult,
+				_transcript: SnapshotTranscriptChunkSource,
+			) => {},
+		);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAttachResult: typeof createAttachResult;
+			streamWorkerSnapshot: typeof streamWorkerSnapshot;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(activeSessionId, state);
+		internals.createAttachResult = createAttachResult;
+		internals.streamWorkerSnapshot = streamWorkerSnapshot;
+		const attach = {
+			type: "attach",
+			activeSessionId,
+			capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+		} as const;
+
+		const firstResponse = (await internals.handleCommand(client, attach)) as {
+			success: true;
+			data: DaemonAttachResult;
+		};
+		const secondResponse = (await internals.handleCommand(client, attach)) as {
+			success: true;
+			data: DaemonAttachResult;
+		};
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		expect(firstResponse.data.lastEventCursor).toEqual(secondResponse.data.lastEventCursor);
+		expect(firstResponse.data.snapshotStream?.id).not.toBe(secondResponse.data.snapshotStream?.id);
+		expect(streamWorkerSnapshot).toHaveBeenCalledTimes(2);
+		const transcriptContents = await Promise.all(
+			streamWorkerSnapshot.mock.calls.map(async ([, , transcript]) => {
+				const contents: unknown[] = [];
+				for await (const chunk of transcript) {
+					const wireChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.concat(chunk);
+					const decoded = JSON.parse(wireChunk.toString("utf8")) as Extract<
+						DaemonOutbound,
+						{ type: "session_snapshot_chunk" }
+					>;
+					contents.push(
+						...decoded.messages.map((message) => (message.role === "user" ? message.content : undefined)),
+					);
+				}
+				return contents;
+			}),
+		);
+		expect(transcriptContents).toEqual([["before"], ["after"]]);
+		socket.destroy();
+	});
+
 	it("fails one worker snapshot without dropping another session on the supervisor channel", async () => {
 		const daemon = new AgentDaemon("/tmp/eng-4602-stream.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
@@ -292,6 +381,122 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		socket.destroy();
 	});
 
+	it.each([
+		{
+			name: "non-monotonic first chunk",
+			corrupt: (frames: ReturnType<typeof snapshotFrames>) => ({ ...frames.chunk, index: 1 }),
+		},
+		{
+			name: "wrong fresh chunk snapshot id",
+			corrupt: (frames: ReturnType<typeof snapshotFrames>) => ({
+				...frames.chunk,
+				snapshotId: "payload-mismatch",
+			}),
+		},
+	] as const)("rejects a $name without closing the worker channel", ({ corrupt }) => {
+		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-fresh-chunk.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/eng-4602-supervisor-fresh-chunk-state",
+		});
+		const { close, worker } = workerHarness();
+		const internals = supervisor as unknown as {
+			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		const frames = snapshotFrames([{ role: "user", content: "stable", timestamp: 1 }]);
+		internals.handleWorkerFrame(worker, frame(frames.begin));
+		const corruptFrame = frame(corrupt(frames) as DaemonOutbound);
+		if (corruptFrame.header.kind !== "outbound") throw new Error("expected outbound frame");
+		corruptFrame.header.snapshotId = snapshotId;
+
+		internals.handleWorkerFrame(worker, corruptFrame);
+
+		expect(close).not.toHaveBeenCalled();
+		expect(worker.client).toBeDefined();
+		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
+		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
+	});
+
+	it.each([
+		{
+			name: "chunk count",
+			corrupt: (end: ReturnType<typeof snapshotFrames>["end"]) => ({ ...end, chunkCount: 2 }),
+		},
+		{
+			name: "event sequence",
+			corrupt: (end: ReturnType<typeof snapshotFrames>["end"]) => ({ ...end, lastEventSequence: 2 }),
+		},
+		{
+			name: "event cursor",
+			corrupt: (end: ReturnType<typeof snapshotFrames>["end"]) => ({
+				...end,
+				lastEventCursor: { generation: "other", sequence: 1 },
+			}),
+		},
+	] as const)("validates a fresh generation's $name before publishing completion", ({ corrupt }) => {
+		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-fresh-end.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/eng-4602-supervisor-fresh-end-state",
+		});
+		const { close, worker } = workerHarness();
+		const internals = supervisor as unknown as {
+			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		const frames = snapshotFrames([{ role: "user", content: "stable", timestamp: 1 }]);
+		internals.handleWorkerFrame(worker, frame(frames.begin));
+		internals.handleWorkerFrame(worker, frame(frames.chunk));
+		const transcript = worker.transcriptCaches.get(activeSessionId);
+		if (!transcript) throw new Error("missing staged transcript");
+
+		internals.handleWorkerFrame(worker, frame(corrupt(frames.end) as DaemonOutbound));
+
+		expect(transcript.complete).toBe(false);
+		expect(close).not.toHaveBeenCalled();
+		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
+		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
+	});
+
+	it.each([
+		{
+			name: "session identity",
+			corrupt: (begin: ReturnType<typeof snapshotFrames>["begin"]) => ({
+				...begin,
+				snapshot: {
+					...begin.snapshot,
+					state: { ...begin.snapshot.state, sessionId: "wrong-session" },
+				},
+			}),
+		},
+		{
+			name: "event progress",
+			corrupt: (begin: ReturnType<typeof snapshotFrames>["begin"]) => ({
+				...begin,
+				snapshot: {
+					...begin.snapshot,
+					lastEventCursor: { generation: "generation-4602", sequence: 2 },
+				},
+			}),
+		},
+	] as const)("rejects invalid snapshot begin $name and ignores its late frames", ({ corrupt }) => {
+		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-invalid-begin.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/eng-4602-supervisor-invalid-begin-state",
+		});
+		const { close, worker } = workerHarness();
+		const internals = supervisor as unknown as {
+			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		const frames = snapshotFrames([{ role: "user", content: "stable", timestamp: 1 }]);
+
+		internals.handleWorkerFrame(worker, frame(corrupt(frames.begin) as DaemonOutbound));
+		internals.handleWorkerFrame(worker, frame(frames.chunk));
+		internals.handleWorkerFrame(worker, frame(frames.end));
+
+		expect(close).not.toHaveBeenCalled();
+		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
+		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
+		expect(worker.snapshotGenerations.has(activeSessionId)).toBe(false);
+	});
+
 	it("keeps a multi-session worker connected after a scoped snapshot failure frame", () => {
 		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-failure.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
@@ -333,12 +538,48 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(worker.snapshotGenerations.has(activeSessionId)).toBe(false);
 	});
 
+	it("invalidates only the snapshot load associated with a stale generation", () => {
+		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-overlap.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/eng-4602-supervisor-overlap-state",
+		});
+		const staleKey = `${activeSessionId}:chunked`;
+		const freshKey = `${activeSessionId}:full`;
+		const worker = {
+			...workerHarness().worker,
+			snapshotLoads: new Map([
+				[staleKey, Promise.resolve(streamedResult([], "snapshot-stale"))],
+				[freshKey, Promise.resolve(streamedResult([], "snapshot-fresh"))],
+			]),
+			snapshotLoadSnapshotIds: new Map([
+				[staleKey, "snapshot-stale"],
+				[freshKey, "snapshot-fresh"],
+			]),
+		};
+		const internals = supervisor as unknown as {
+			failWorkerSnapshotCache(
+				worker: object,
+				activeSessionId: string,
+				error: Error,
+				closeWorkerChannel: boolean,
+				expectedSnapshotId: string,
+			): void;
+		};
+
+		internals.failWorkerSnapshotCache(worker, activeSessionId, new Error("stale"), false, "snapshot-stale");
+
+		expect(worker.snapshotLoads.has(staleKey)).toBe(false);
+		expect(worker.snapshotLoads.has(freshKey)).toBe(true);
+		expect(worker.snapshotLoadSnapshotIds.has(staleKey)).toBe(false);
+		expect(worker.snapshotLoadSnapshotIds.get(freshKey)).toBe("snapshot-fresh");
+	});
+
 	it("quarantines a completed duplicate until transcript validation", async () => {
 		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			descriptorDir: "/tmp/eng-4602-supervisor-state",
 		});
-		const { close, worker } = workerHarness();
+		const { close, request, worker } = workerHarness();
 		const client = socketClient("public", new PassThrough());
 		const streamSnapshot = vi.fn(async () => {});
 		const internals = supervisor as unknown as {
@@ -346,6 +587,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			workers: Map<string, WorkerHarness>;
 			syncWorkerExtensionUi: ReturnType<typeof vi.fn>;
 			streamSnapshot: typeof streamSnapshot;
+			forwardToWorker(worker: WorkerHarness, command: DaemonCommand): Promise<unknown>;
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		};
 		internals.clients.add(client);
@@ -398,6 +640,21 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(streamSnapshot).toHaveBeenCalledOnce();
 		expect(close).not.toHaveBeenCalled();
 		streamSnapshot.mockClear();
+		const replacementSnapshotId = "snapshot-4602-recovered";
+		request.mockImplementation(async (command: { type: string }) => {
+			if (command.type === "attach") {
+				return {
+					type: "response",
+					command: "attach",
+					success: true,
+					data: streamedResult([], replacementSnapshotId),
+				};
+			}
+			if (command.type === "prompt") {
+				return { type: "response", command: "prompt", success: true };
+			}
+			throw new Error(`unexpected worker request: ${command.type}`);
+		});
 
 		internals.handleWorkerFrame(worker, frame(frames.begin, "replacement"));
 		internals.handleWorkerFrame(
@@ -410,11 +667,23 @@ describe("ENG-4602 snapshot transfer containment", () => {
 				"replacement",
 			),
 		);
+		await new Promise<void>((resolve) => setImmediate(resolve));
 
+		expect(close).not.toHaveBeenCalled();
+		expect(worker.client).toBeDefined();
+		expect(worker.descriptor.lifecycle).toBe("ready");
 		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
 		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
+		expect(request.mock.calls.some(([command]) => command.type === "attach")).toBe(false);
 		expect(streamSnapshot).not.toHaveBeenCalled();
-		expect(close).toHaveBeenCalledOnce();
+		await expect(
+			internals.forwardToWorker(worker, {
+				id: "prompt-after-snapshot-mismatch",
+				type: "prompt",
+				activeSessionId,
+				message: "still alive",
+			}),
+		).resolves.toMatchObject({ id: "prompt-after-snapshot-mismatch", success: true });
 	});
 
 	it("holds catch-up behind duplicate validation and rejects it on mismatch", async () => {
@@ -473,11 +742,13 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		);
 		await failedCatchup;
 
-		expect(request).not.toHaveBeenCalled();
+		expect(request.mock.calls.some(([command]) => command.type === "attach")).toBe(false);
 		expect(streamSnapshot).not.toHaveBeenCalled();
 		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
 		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
-		expect(close).toHaveBeenCalledOnce();
+		expect(worker.client).toBeDefined();
+		expect(worker.descriptor.lifecycle).toBe("ready");
+		expect(close).not.toHaveBeenCalled();
 	});
 
 	it("rejects a quarantined catch-up before intentional worker stop", async () => {
@@ -574,7 +845,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(worker.snapshotGenerations.size).toBe(0);
 	});
 
-	it("rejects same-ID reentrant begins and mismatched duplicate metadata", async () => {
+	it("retires same-ID generation faults without recovering the worker", async () => {
 		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-invalid.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			descriptorDir: "/tmp/eng-4602-supervisor-invalid-state",
@@ -599,27 +870,29 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		internals.handleWorkerFrame(reentrant.worker, frame(frames.begin));
 		internals.handleWorkerFrame(reentrant.worker, frame(frames.begin));
 		await new Promise<void>((resolve) => setImmediate(resolve));
-		expect(reentrant.close).toHaveBeenCalledOnce();
+		expect(reentrant.close).not.toHaveBeenCalled();
 		expect(reentrant.worker.transcriptCaches.has(activeSessionId)).toBe(false);
-		expect(reentrant.worker.client).toBeUndefined();
-		expect(reentrant.worker.descriptor.lifecycle).toBe("recovering");
-		expect(recoverWorker).toHaveBeenCalledWith(reentrant.worker);
+		expect(reentrant.worker.client).toBeDefined();
+		expect(reentrant.worker.descriptor.lifecycle).toBe("ready");
+		expect(recoverWorker).not.toHaveBeenCalled();
 
 		const completed = workerHarness();
 		for (const message of [frames.begin, frames.chunk, frames.end]) {
 			internals.handleWorkerFrame(completed.worker, frame(message));
 		}
 		internals.handleWorkerFrame(completed.worker, frame({ ...frames.begin, messageCount: 2 }));
-		expect(completed.close).toHaveBeenCalledOnce();
+		expect(completed.close).not.toHaveBeenCalled();
 		expect(completed.worker.transcriptCaches.has(activeSessionId)).toBe(false);
+		expect(completed.worker.client).toBeDefined();
 
 		const mismatchedEnd = workerHarness();
 		for (const message of [frames.begin, frames.chunk, frames.end, frames.begin, frames.chunk]) {
 			internals.handleWorkerFrame(mismatchedEnd.worker, frame(message));
 		}
 		internals.handleWorkerFrame(mismatchedEnd.worker, frame({ ...frames.end, lastEventSequence: 2 }));
-		expect(mismatchedEnd.close).toHaveBeenCalledOnce();
+		expect(mismatchedEnd.close).not.toHaveBeenCalled();
 		expect(mismatchedEnd.worker.transcriptCaches.has(activeSessionId)).toBe(false);
+		expect(mismatchedEnd.worker.client).toBeDefined();
 
 		const replaced = workerHarness();
 		internals.handleWorkerFrame(replaced.worker, frame(frames.begin));
@@ -628,7 +901,146 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(replaced.worker.transcriptCaches.get(activeSessionId)?.snapshotId).toBe("snapshot-4602-new");
 	});
 
-	it("fails one public snapshot without dropping another session on the shared client", async () => {
+	it("emits one terminal failure without a supervisor-side retry loop", async () => {
+		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-bounded-retry.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/eng-4602-supervisor-bounded-retry-state",
+		});
+		const firstSnapshotId = "snapshot-4602-failed-first";
+		const retrySnapshotId = "snapshot-4602-failed-retry";
+		const firstError = new Error("first generation failed");
+		const retryError = new Error("retry generation failed");
+		const transcripts = [
+			new SnapshotTranscriptCache({ activeSessionId, snapshotId: firstSnapshotId, cacheRoot: "/tmp" }),
+			new SnapshotTranscriptCache({ activeSessionId, snapshotId: retrySnapshotId, cacheRoot: "/tmp" }),
+		];
+		transcripts[0]!.markFailed(firstError);
+		transcripts[1]!.markFailed(retryError);
+		const results = [streamedResult([], firstSnapshotId), streamedResult([], retrySnapshotId)];
+		const socket = new PassThrough();
+		socket.resume();
+		const client = socketClient("bounded-retry", socket);
+		const { worker } = workerHarness();
+		const records: DaemonOutbound[] = [];
+		let attachIndex = 0;
+		const attachClient = vi.fn(async () => {
+			const index = attachIndex++;
+			const transcript = transcripts[index];
+			const result = results[index];
+			if (!transcript || !result) throw new Error("snapshot retry was not bounded");
+			return { result, worker, transcript, releaseTranscript: transcript.retain() };
+		});
+		const internals = supervisor as unknown as {
+			clients: Set<DaemonSocketClient>;
+			attachClient: typeof attachClient;
+			writeSnapshotRecord(client: DaemonSocketClient, message: DaemonOutbound): Promise<boolean>;
+			queueCatchup(client: DaemonSocketClient, activeSessionId: string, purpose: "replacement" | "resync"): void;
+			catchUpClient(client: DaemonSocketClient): Promise<void>;
+		};
+		internals.clients.add(client);
+		internals.attachClient = attachClient;
+		internals.writeSnapshotRecord = async (_client, message) => {
+			records.push(message);
+			return true;
+		};
+
+		internals.queueCatchup(client, activeSessionId, "replacement");
+		await internals.catchUpClient(client);
+
+		expect(attachClient).toHaveBeenCalledOnce();
+		expect(records.map((record) => record.type)).toEqual(["session_snapshot_begin", "session_snapshot_failed"]);
+		expect(records[1]).toEqual({
+			type: "session_snapshot_failed",
+			activeSessionId,
+			snapshotId: firstSnapshotId,
+			error: firstError.message,
+		});
+		socket.destroy();
+		for (const transcript of transcripts) transcript.dispose();
+	});
+
+	it("expires an incomplete worker generation and settles cache and public waiters", async () => {
+		vi.useFakeTimers();
+		try {
+			const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-deadline.sock", {
+				defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+				descriptorDir: "/tmp/eng-4602-supervisor-deadline-state",
+			});
+			const { worker } = workerHarness();
+			const client = socketClient("deadline", new PassThrough());
+			const records: DaemonOutbound[] = [];
+			const internals = supervisor as unknown as {
+				clients: Set<DaemonSocketClient>;
+				writeSnapshotRecord(client: DaemonSocketClient, message: DaemonOutbound): Promise<boolean>;
+				handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+			};
+			internals.clients.add(client);
+			internals.writeSnapshotRecord = async (_client, message) => {
+				records.push(message);
+				return true;
+			};
+			const frames = snapshotFrames([{ role: "user", content: "never completes", timestamp: 1 }]);
+			internals.handleWorkerFrame(worker, frame(frames.begin, "replacement"));
+			const transcript = worker.transcriptCaches.get(activeSessionId);
+			if (!transcript) throw new Error("snapshot deadline transcript was not created");
+			const waiter = expect(transcript.waitForChunk(0)).rejects.toThrow("timed out before completion");
+
+			await vi.advanceTimersByTimeAsync(30_000);
+			await waiter;
+			await Promise.resolve();
+
+			expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
+			expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
+			expect(worker.snapshotGenerations.has(activeSessionId)).toBe(false);
+			expect(records.filter((record) => record.type === "session_snapshot_failed")).toHaveLength(1);
+			client.socket.destroy();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("settles a detached stream before a same-session reattach can revive zombie work", async () => {
+		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-epoch.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/eng-4602-supervisor-epoch-state",
+		});
+		const { worker } = workerHarness();
+		const client = socketClient("epoch", new PassThrough());
+		const transcript = new SnapshotTranscriptCache({ activeSessionId, snapshotId, cacheRoot: "/tmp" });
+		const records: DaemonOutbound[] = [];
+		const internals = supervisor as unknown as {
+			advanceAttachmentEpoch(client: DaemonSocketClient, activeSessionId: string): number;
+			detachClient(client: DaemonSocketClient, activeSessionId: string): void;
+			writeSnapshotRecord(client: DaemonSocketClient, message: DaemonOutbound): Promise<boolean>;
+			writeSnapshotBuffer(client: DaemonSocketClient, buffer: Uint8Array): Promise<boolean>;
+			streamSnapshot(
+				client: DaemonSocketClient,
+				worker: WorkerHarness,
+				result: DaemonAttachResult,
+				transcript: SnapshotTranscriptCache,
+			): Promise<void>;
+		};
+		internals.writeSnapshotRecord = async (_client, message) => {
+			records.push(message);
+			return true;
+		};
+		internals.writeSnapshotBuffer = async () => true;
+		internals.advanceAttachmentEpoch(client, activeSessionId);
+		const streaming = internals.streamSnapshot(client, worker, streamedResult([]), transcript);
+		await Promise.resolve();
+		expect(records.map((record) => record.type)).toEqual(["session_snapshot_begin"]);
+
+		internals.detachClient(client, activeSessionId);
+		client.attachedActiveSessionIds.add(activeSessionId);
+		internals.advanceAttachmentEpoch(client, activeSessionId);
+		await streaming;
+
+		expect(records.map((record) => record.type)).toEqual(["session_snapshot_begin"]);
+		transcript.dispose();
+		client.socket.destroy();
+	});
+
+	it("retries one public cache-read failure without dropping another session on the shared client", async () => {
 		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-public.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			descriptorDir: "/tmp/eng-4602-supervisor-public-state",

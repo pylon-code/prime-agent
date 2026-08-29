@@ -274,6 +274,12 @@ describe("daemon protocol helpers", () => {
 		expect(isDaemonMutatingCommand({ type: "get_prompt_lifecycles" })).toBe(false);
 	});
 
+	it("negotiates immutable worker snapshots without changing legacy client defaults", () => {
+		expect(DAEMON_DEFAULT_CLIENT_CAPABILITIES).not.toContain("immutable_snapshot_transfer_v1");
+		expect(DAEMON_SUPPORTED_CLIENT_CAPABILITIES).toContain("immutable_snapshot_transfer_v1");
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("immutable_snapshot_transfer_v1");
+	});
+
 	it("removes correlated provenance from legacy daemon events", () => {
 		const event: DaemonOutbound = {
 			type: "session_event",

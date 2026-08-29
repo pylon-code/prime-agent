@@ -12,6 +12,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { readFile, stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -117,7 +119,7 @@ import { createAgentConnectionToolDefinition } from "../agent-connection/tool-de
 import type { AgentConnectionHeartbeat, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
-import { encodePrivateFrame, PrivateFrameDecoder } from "../session-worker/private-framing.js";
+import { encodePrivateFrameParts, PrivateFrameDecoder } from "../session-worker/private-framing.js";
 import {
 	type ActiveSessionState,
 	AmbiguousActiveSessionError,
@@ -206,9 +208,12 @@ import {
 } from "./rlm-subagent-display.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import {
-	createSnapshotTranscriptChunks,
+	createImmutableSnapshotMessages,
+	prepareSnapshotTranscriptPayload,
 	SNAPSHOT_TARGET_CHUNK_BYTES,
 	type SnapshotTranscriptChunkSource,
+	type SnapshotTranscriptPayloadCache,
+	type SnapshotTranscriptWireChunk,
 } from "./snapshot-transcript-cache.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
@@ -236,8 +241,13 @@ export { defaultDaemonSocketPath } from "./daemon-socket.js";
 
 const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
+const WORKER_SNAPSHOT_PREPARATION_TIMEOUT_MS = 30_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
+
+function createSnapshotTransferId(): string {
+	return `snapshot-${randomUUID()}`;
+}
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -486,6 +496,14 @@ export class AgentDaemon {
 	private socketIdentity?: DaemonSocketIdentity;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
+	private readonly snapshotPayloadGenerations = new Map<
+		string,
+		{
+			key: string;
+			messages: readonly AgentMessage[];
+			promise: Promise<SnapshotTranscriptPayloadCache>;
+		}
+	>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
 	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
 	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
@@ -2697,12 +2715,9 @@ export class AgentDaemon {
 			try {
 				await this.closeSession(state, "shutdown", true, false);
 			} catch (error) {
-				// A pre-removal close failure must not strand a resident child outside its
-				// parent's ownership map or disconnect its event forwarder.
 				if (
 					this.sessions.get(state.activeSessionId) === state &&
-					this.sessions.get(parentActiveSessionId) === parentState &&
-					parentState.runtime.session.registerRlmChildSession(childId, state.runtime.session, unsubscribeChild)
+					this.sessions.get(parentActiveSessionId) === parentState
 				) {
 					throw error;
 				}
@@ -3874,14 +3889,14 @@ export class AgentDaemon {
 					});
 				}
 				if (streamsSnapshot) {
-					const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+					const snapshotId = createSnapshotTransferId();
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
-						transcript = createSnapshotTranscriptChunks({
+						transcript = await this.prepareWorkerSnapshotTranscript({
 							activeSessionId: state.activeSessionId,
 							snapshotId,
+							generationKey: this.snapshotPayloadGenerationKey(result),
 							messages: result.snapshot.messages,
-							targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
 							signal: snapshotSignal,
 						});
 					} catch (error) {
@@ -5139,11 +5154,12 @@ export class AgentDaemon {
 		}
 		session = state.runtime.session;
 		const connectionState = this.createConnectionState(state);
+		const messages = createImmutableSnapshotMessages(session.messages);
 		return {
 			activeSessionId: state.activeSessionId,
 			summary: summaryForActiveSession(state),
 			state: connectionState,
-			messages: session.messages,
+			messages,
 			// Omit duplicate heavy payloads from attach. The client can derive render
 			// context from messages + state, and fetch the full session tree lazily
 			// when the tree/branch selector opens.
@@ -5158,6 +5174,66 @@ export class AgentDaemon {
 				? { promptLifecycles: session.getPromptLifecycles?.() ?? { records: [], expired: [] } }
 				: {}),
 		};
+	}
+
+	private async prepareWorkerSnapshotTranscript(options: {
+		activeSessionId: string;
+		snapshotId: string;
+		generationKey: string;
+		messages: readonly AgentMessage[];
+		signal?: AbortSignal;
+	}): Promise<SnapshotTranscriptChunkSource> {
+		options.signal?.throwIfAborted();
+		while (true) {
+			const existing = this.snapshotPayloadGenerations.get(options.activeSessionId);
+			if (
+				existing &&
+				existing.key === options.generationKey &&
+				isDeepStrictEqual(existing.messages, options.messages)
+			) {
+				const payload = await existing.promise;
+				options.signal?.throwIfAborted();
+				return payload.createTransfer(options.activeSessionId, options.snapshotId);
+			}
+			if (existing) {
+				const stalePayload = await existing.promise.catch(() => undefined);
+				if (this.snapshotPayloadGenerations.get(options.activeSessionId) === existing) {
+					this.snapshotPayloadGenerations.delete(options.activeSessionId);
+					stalePayload?.dispose();
+				}
+				continue;
+			}
+			const generation = {
+				key: options.generationKey,
+				messages: options.messages,
+				promise: prepareSnapshotTranscriptPayload({
+					messages: options.messages,
+					targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
+					signal: AbortSignal.timeout(WORKER_SNAPSHOT_PREPARATION_TIMEOUT_MS),
+				}),
+			};
+			this.snapshotPayloadGenerations.set(options.activeSessionId, generation);
+			try {
+				const payload = await generation.promise;
+				options.signal?.throwIfAborted();
+				return payload.createTransfer(options.activeSessionId, options.snapshotId);
+			} catch (error) {
+				if (this.snapshotPayloadGenerations.get(options.activeSessionId) === generation) {
+					this.snapshotPayloadGenerations.delete(options.activeSessionId);
+				}
+				throw error;
+			}
+		}
+	}
+
+	private snapshotPayloadGenerationKey(result: DaemonAttachResult): string {
+		const cursor = result.lastEventCursor;
+		return [
+			result.snapshot.state.sessionId,
+			cursor?.generation ?? "legacy",
+			cursor?.sequence ?? result.lastEventSequence,
+			result.snapshot.messages.length,
+		].join(":");
 	}
 
 	private async streamWorkerSnapshot(
@@ -5336,7 +5412,7 @@ export class AgentDaemon {
 
 	private async writeWorkerSnapshotBuffer(
 		client: DaemonSocketClient,
-		buffer: Buffer,
+		buffer: SnapshotTranscriptWireChunk,
 		message: DaemonOutbound,
 		purpose: "attach" | "replacement" | "catchup",
 		signal?: AbortSignal,
@@ -6560,6 +6636,14 @@ export class AgentDaemon {
 		}
 		state.clients.clear();
 		this.acpMcpOwners.delete(state.activeSessionId);
+		const snapshotPayload = this.snapshotPayloadGenerations.get(state.activeSessionId);
+		this.snapshotPayloadGenerations.delete(state.activeSessionId);
+		if (snapshotPayload) {
+			void snapshotPayload.promise.then(
+				(payload) => payload.dispose(),
+				() => undefined,
+			);
+		}
 		this.sessions.delete(state.activeSessionId);
 		if (isEmptyDraftSession) {
 			const sessionFile = state.runtime.session.sessionFile;
@@ -6680,7 +6764,7 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		message: Extract<DaemonOutbound, { type: "session_replaced" }>,
 	): void {
-		const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+		const snapshotId = createSnapshotTransferId();
 		// Mark before the registry read so later events queue behind this snapshot.
 		const snapshotSignal = markClientSnapshotStreaming(client, state.activeSessionId);
 		void this.prepareReplacementSnapshot(client, state, message, snapshotId, snapshotSignal).catch((error) => {
@@ -6717,11 +6801,11 @@ export class AgentDaemon {
 			}
 			return;
 		}
-		const transcript = createSnapshotTranscriptChunks({
+		const transcript = await this.prepareWorkerSnapshotTranscript({
 			activeSessionId: state.activeSessionId,
 			snapshotId,
+			generationKey: this.snapshotPayloadGenerationKey(result),
 			messages: result.snapshot.messages,
-			targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
 			signal: snapshotSignal,
 		});
 		this.write(client, { ...message, messages: [], snapshotFollows: true });
@@ -6880,15 +6964,15 @@ export class AgentDaemon {
 							),
 						});
 					}
-					const snapshotId = `${activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+					const snapshotId = createSnapshotTransferId();
 					const snapshotSignal = markClientSnapshotStreaming(client, activeSessionId);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
-						transcript = createSnapshotTranscriptChunks({
+						transcript = await this.prepareWorkerSnapshotTranscript({
 							activeSessionId,
 							snapshotId,
+							generationKey: this.snapshotPayloadGenerationKey(result),
 							messages: result.snapshot.messages,
-							targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
 							signal: snapshotSignal,
 						});
 					} catch (error) {
@@ -7007,17 +7091,16 @@ export class AgentDaemon {
 
 	private writeSerialized(
 		client: DaemonSocketClient,
-		line: string | Buffer,
+		line: string | Buffer | readonly Buffer[],
 		message: DaemonOutbound,
 		payloadEncoding: "jsonl" | "assistant-delta" = "jsonl",
 		snapshotPurpose?: "attach" | "replacement" | "catchup",
 	): boolean {
-		if (client.socket.destroyed) {
-			return false;
-		}
-		const wireData =
+		if (client.socket.destroyed) return false;
+		const payloadParts = typeof line === "string" ? [Buffer.from(line)] : Buffer.isBuffer(line) ? [line] : [...line];
+		const wireParts =
 			client.transport === "private-framed"
-				? encodePrivateFrame<DaemonWorkerFrameHeader>(
+				? encodePrivateFrameParts<DaemonWorkerFrameHeader>(
 						{
 							kind: "outbound",
 							outboundType: message.type,
@@ -7030,13 +7113,17 @@ export class AgentDaemon {
 							payloadEncoding,
 							...(snapshotPurpose ? { snapshotPurpose } : {}),
 						},
-						typeof line === "string" ? Buffer.from(line) : line,
+						payloadParts,
 					)
-				: line;
-		const accepted = client.socket.write(wireData);
-		if (!accepted) {
-			client.backpressured = true;
+				: payloadParts;
+		let accepted = true;
+		if (wireParts.length > 1) client.socket.cork?.();
+		try {
+			for (const part of wireParts) accepted = client.socket.write(part) && accepted;
+		} finally {
+			if (wireParts.length > 1) client.socket.uncork?.();
 		}
+		if (!accepted) client.backpressured = true;
 		return accepted;
 	}
 

@@ -29,6 +29,23 @@ function isObjectHeader(value: unknown): value is object {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function encodePrivateFrameParts<THeader extends object>(
+	header: THeader,
+	payloadParts: readonly Uint8Array[],
+	limits: PrivateFrameLimits = DEFAULT_PRIVATE_FRAME_LIMITS,
+): Buffer[] {
+	const headerBuffer = Buffer.from(JSON.stringify(header), "utf8");
+	const payloadLength = payloadParts.reduce((total, part) => total + part.length, 0);
+	assertFrameLength("header length", headerBuffer.length, limits.maxHeaderBytes);
+	assertFrameLength("payload length", payloadLength, limits.maxPayloadBytes);
+	if (headerBuffer.length === 0) throw new Error("Private frame header cannot be empty");
+	const prefix = Buffer.allocUnsafe(FRAME_PREFIX_BYTES + headerBuffer.length);
+	prefix.writeUInt32BE(headerBuffer.length, 0);
+	prefix.writeUInt32BE(payloadLength, 4);
+	headerBuffer.copy(prefix, FRAME_PREFIX_BYTES);
+	return [prefix, ...payloadParts.map((part) => (Buffer.isBuffer(part) ? part : Buffer.from(part)))];
+}
+
 export function encodePrivateFrame<THeader extends object>(
 	header: THeader,
 	payload: Uint8Array = Buffer.alloc(0),

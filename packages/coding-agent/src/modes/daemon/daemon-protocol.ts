@@ -75,8 +75,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds capability-gated correlated prompt lifecycle and event provenance.
-export const DAEMON_SCHEMA_REVISION = 24;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-24-2c8fb17d3895";
+// Revision 25 negotiates immutable snapshot transfer identities with session workers.
+export const DAEMON_SCHEMA_REVISION = 25;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-25-2c8fb17d3895";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -94,6 +95,7 @@ export type DaemonClientCapability =
 	| "extension_ui"
 	| "slim_attach"
 	| "chunked_snapshot"
+	| "immutable_snapshot_transfer_v1"
 	| "client_owned_sessions"
 	| "correlated_prompt_lifecycle_v1";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
@@ -147,6 +149,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"extension_ui",
 	"slim_attach",
 	"chunked_snapshot",
+	"immutable_snapshot_transfer_v1",
 	"client_owned_sessions",
 	"correlated_prompt_lifecycle_v1",
 ];

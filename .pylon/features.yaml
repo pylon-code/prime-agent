@@ -170,3 +170,21 @@ decisions:
     upstream_support: "Prime PR #1886 repairs protocol fixtures regressed by the #1839 merge commit, but is not yet on main."
     revisit_when:
       - "Prime merges PR #1886 and the exact fix reaches the mirrored main branch."
+
+  snapshot-recovery-integrity:
+    area: runtime-reliability
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/11
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/issues/1229
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1845
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1756
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1864
+    fork_change: immutable-snapshot-transfer-and-isolated-retry
+    upstream_support: Prime now provides one RLM child projection, recovery-aware session reuse, and ownership checks for in-flight opens, but still reuses the event cursor as snapshot transfer identity, serializes selected message objects lazily, and closes a healthy worker on an isolated duplicate-transfer mismatch.
+    revisit_when:
+      - Prime gives each transfer immutable bytes and a unique identity while preserving the event cursor as ordering metadata.
+      - Prime retries an isolated bad snapshot generation without closing the resident worker control channel.

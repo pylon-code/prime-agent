@@ -1,9 +1,10 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { AgentDaemon, markClientSnapshotStreaming } from "../../../src/modes/daemon/daemon-mode.js";
@@ -111,6 +112,46 @@ describe("ENG-4601 worker snapshot cache", () => {
 			'{"type":"session_snapshot_chunk","activeSessionId":"active-\\"\\\\","snapshotId":"snapshot-\\n","index":0,"messages":[{"role":"user","content":"line1\\n\\"quoted\\"\\\\tail","timestamp":1}]}\n',
 		]);
 		expect([...createSnapshotTranscriptChunks({ activeSessionId, snapshotId, messages: [] })]).toEqual([]);
+	});
+
+	it("freezes nested transcript bytes when the selected message later mutates", () => {
+		const cacheRoot = tempDirectory();
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "selected" }],
+			api: "openai-responses",
+			provider: "openai",
+			model: "gpt-4o-mini",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		};
+		const chunks = createSnapshotTranscriptChunks({
+			activeSessionId,
+			snapshotId,
+			messages: [message],
+			cacheRoot,
+			memoryCacheBytes: 1,
+		});
+		const cacheDirectory = join(cacheRoot, readdirSync(cacheRoot)[0]!);
+		expect(existsSync(cacheDirectory)).toBe(true);
+
+		const selected = message.content[0];
+		if (selected?.type !== "text") throw new Error("expected text content");
+		selected.text = "mutated";
+
+		const frozenBytes = Buffer.concat([...chunks]).toString("utf8");
+		expect(frozenBytes).toContain('"text":"selected"');
+		expect(frozenBytes).not.toContain('"text":"mutated"');
+		chunks.dispose?.();
+		expect(existsSync(cacheDirectory)).toBe(false);
 	});
 
 	it.each([1, 2])(
@@ -222,16 +263,15 @@ describe("ENG-4601 worker snapshot cache", () => {
 			return true;
 		};
 
+		const abortedTranscript = createSnapshotTranscriptChunks({
+			activeSessionId,
+			snapshotId,
+			messages: messages("aborted"),
+			signal,
+		});
 		internals.detachClientFromSession(client, state);
 		await Promise.all([
-			internals.streamWorkerSnapshot(
-				client,
-				streamedResult(2),
-				createSnapshotTranscriptChunks({ activeSessionId, snapshotId, messages: messages("aborted"), signal }),
-				"attach",
-				signal,
-				true,
-			),
+			internals.streamWorkerSnapshot(client, streamedResult(2), abortedTranscript, "attach", signal, true),
 			internals.streamWorkerSnapshot(
 				client,
 				streamedResult(2, 1, siblingActiveSessionId, siblingSnapshotId),
