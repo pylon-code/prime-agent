@@ -1,5 +1,9 @@
 # Development Rules
 
+## Pylon fork policy
+
+On the `pylon` branch and branches based on it, read and follow `PYLON.md` before making changes. `main` is an exact Prime upstream mirror; all Pylon product work targets `pylon`. When upstream and Pylon overlap, preserve Pylon behavior until `.pylon/features.yaml` records a reviewed `adopt`, `hybridize`, `retain`, or `redesign` decision.
+
 ## Conversational Style
 
 - No fluff or cheerful filler text
@@ -71,9 +75,10 @@ When closing issues via commit:
 
 ## PR Workflow
 
-- Analyze PRs without pulling locally first
-- If the user approves: create a feature branch, pull PR, rebase on main, apply adjustments, commit, merge into main, push, close PR, and leave a comment in the user's tone
-- We work in feature branches until everything is according to the user's requirements. Never merge PRs by yourself.
+- Analyze PRs without pulling locally first.
+- For Pylon product work, branch from the latest `origin/pylon`, apply adjustments, commit only your files, push the task branch, and open a pull request against `pylon`.
+- Never commit or merge Pylon changes into `main`; it is the exact Prime upstream mirror.
+- We work in feature branches until everything meets the user's requirements. Never merge pull requests by yourself.
 
 ## Testing Prime Agent Interactive Mode with tmux
 

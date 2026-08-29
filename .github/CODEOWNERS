@@ -1,0 +1,6 @@
+# Pylon fork governance and synchronization
+/.github/workflows/ @rynfar
+/scripts/pylon-sync-upstream.sh @rynfar
+/AGENTS.md @rynfar
+/PYLON.md @rynfar
+/.pylon/ @rynfar

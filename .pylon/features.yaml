@@ -1,0 +1,117 @@
+schema: 1
+fork:
+  repository: https://github.com/pylon-code/prime-agent
+  upstream_repository: https://github.com/PrimeIntellect-ai/prime-agent
+  upstream_branch: main
+  mirror_branch: main
+  product_branch: pylon
+  tracking_issue: https://github.com/pylon-code/prime-agent/issues/1
+  reviewed_upstream_commit: bc0fa7606abb3b7af0f765319518d255e6ae553d
+  reviewed_at: 2026-08-27
+
+decisions:
+  managed-plan-daemon:
+    area: progress
+    state: shipped
+    owner: pylon-server
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+      - https://github.com/pylon-code/pylon/issues/126
+      - https://github.com/pylon-code/pylon/pull/116
+    fork_change: none
+    upstream_support: Prime extensions can register a todo tool, but the daemon has no native managed-plan event.
+    revisit_when:
+      - Prime ships a negotiated structured plan event or equivalent managed tool-result contract.
+      - Pylon behavioral evaluation shows the full-snapshot model is too noisy or unreliable.
+
+  managed-plan-acp:
+    area: progress
+    state: gap
+    owner: pylon-prime-integration
+    decision: redesign
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+    fork_change: candidate
+    upstream_support: ACP does not expose a trustworthy Pylon-managed structured plan result.
+    revisit_when:
+      - Prime adds authenticated extension provenance and structured ACP tool-result metadata.
+      - A standard ACP plan protocol becomes available.
+
+  mobile-plan-rendering:
+    area: progress
+    state: gap
+    owner: pylon-client
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+    fork_change: none
+    upstream_support: not applicable
+    revisit_when:
+      - Pylon mobile and web share a provider-neutral plan renderer.
+
+  delegated-work-progress:
+    area: progress
+    state: design
+    owner: pylon-client-runtime
+    decision: redesign
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+      - https://github.com/pylon-code/pylon/issues/126
+    fork_change: possible-capability
+    upstream_support: Prime exposes subagent lifecycle separately from root plan state.
+    revisit_when:
+      - Root progress can summarize delegated phases without creating one plan row per worker.
+      - Prime exposes a stable aggregate delegated-work status where Pylon lacks one.
+
+  background-process-lifecycle:
+    area: autonomous-work
+    state: gap
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+    fork_change: candidate
+    upstream_support: Prime has native background execution, but Pylon lacks complete public lifecycle and ownership mapping.
+    revisit_when:
+      - Prime publishes list, correlation, cancellation, and terminal lifecycle events.
+
+  heartbeat-projection:
+    area: autonomous-work
+    state: blocked
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+    fork_change: none-yet
+    upstream_support: Prime exposes heartbeat list, management, and change APIs.
+    blocker: Pylon needs canonical autonomous occurrence, turn, checkpoint, and active-run ownership.
+    revisit_when:
+      - The provider-neutral autonomous-work ownership model is implemented.
+      - Prime changes heartbeat dispatch or lifecycle APIs.
+
+  scheduled-prompts:
+    area: autonomous-work
+    state: blocked
+    owner: shared
+    decision: redesign
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+    fork_change: candidate
+    upstream_support: Prime exposes scheduled prompt APIs, but not all Pylon run ownership and history guarantees.
+    blocker: Pylon needs canonical occurrence identity, restart adoption, cancellation, outcomes, limits, and checkpoint ownership.
+    revisit_when:
+      - The provider-neutral autonomous-work ownership model is implemented.
+      - Prime publishes stronger scheduled-run lifecycle APIs.
+
+  pylon-read-context:
+    area: agent-context
+    state: gap
+    owner: pylon-server
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+    fork_change: none
+    upstream_support: not applicable
+    revisit_when:
+      - Pylon ships scoped read-only context and checkpoint MCP capabilities.

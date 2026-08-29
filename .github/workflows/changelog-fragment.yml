@@ -3,7 +3,7 @@ name: Changelog fragment
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
-    branches: [main]
+    branches: [pylon]
 
 permissions:
   pull-requests: read
