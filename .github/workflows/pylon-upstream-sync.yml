@@ -10,6 +10,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: write
   issues: write
   pull-requests: read
@@ -30,15 +31,14 @@ jobs:
           ref: pylon
           fetch-depth: 0
 
-      - name: Mirror Prime and open a draft merge pull request
+      - name: Mirror Prime and prepare a review candidate
         id: sync
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PYLON_SYNC_PR_TOKEN: ${{ secrets.PYLON_SYNC_PR_TOKEN }}
         run: scripts/pylon-sync-upstream.sh
 
   verify:
-    name: Verify candidate with trusted fork CI
+    name: Verify candidate ${{ needs.sync.outputs.candidate_sha }} with trusted fork CI
     needs: sync
     if: needs.sync.outputs.candidate_sha != ''
     permissions:
