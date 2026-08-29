@@ -118,6 +118,10 @@ class ResumeDaemonClient {
 		}
 	}
 
+	supportsServerCapability(): boolean {
+		return false;
+	}
+
 	close(): void {}
 }
 

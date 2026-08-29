@@ -104,6 +104,19 @@ describe("ActionStore selection", () => {
 		expect(selectBatch(store, mode)).toEqual([followUp]);
 	});
 
+	it("snapshots only pre-hook actions for rollback-safe recovery", () => {
+		const store = new ActionStore();
+		const selected = turn("selected");
+		const preparing = turn("preparing");
+		const queued = turn("queued");
+		for (const action of [selected, preparing, queued]) store.enqueue(action);
+		expect(store.selectFirst()).toBe(selected);
+		expect(store.selectFirst()).toBe(preparing);
+		transitionSessionAction(preparing, { state: "preparing" });
+
+		expect(store.snapshotActions()).toEqual([selected, queued]);
+	});
+
 	it("does not let an executing /compact see itself as a queued successor", () => {
 		const store = new ActionStore();
 		const compact = command("/compact");

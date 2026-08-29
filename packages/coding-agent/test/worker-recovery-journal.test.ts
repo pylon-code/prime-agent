@@ -28,6 +28,19 @@ describe("WorkerRecoveryJournal", () => {
 			sessionFile: "/tmp/session-1.jsonl",
 			busy: true,
 			operation: "prompt_accepted",
+			promptLifecycles: {
+				records: [
+					{
+						correlationId: "correlation-1",
+						phase: "delivered",
+						kind: "model_prompt",
+						revision: 3,
+						deliveryCrossed: true,
+					},
+				],
+				expired: [],
+				pendingUsage: [],
+			},
 		});
 		journal.record({
 			activeSessionId: "active-2",
@@ -38,10 +51,54 @@ describe("WorkerRecoveryJournal", () => {
 
 		expect(WorkerRecoveryJournal.readLatest(path)).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ activeSessionId: "active-1", busy: true, operation: "prompt_accepted" }),
+				expect.objectContaining({
+					activeSessionId: "active-1",
+					busy: true,
+					operation: "prompt_accepted",
+					promptLifecycles: {
+						records: [expect.objectContaining({ correlationId: "correlation-1", deliveryCrossed: true })],
+						expired: [],
+						pendingUsage: [],
+					},
+				}),
 				expect.objectContaining({ activeSessionId: "active-2", busy: false, operation: "ready" }),
 			]),
 		);
+	});
+
+	it("accepts legacy records and ignores malformed lifecycle recovery state", () => {
+		const path = createPath();
+		appendFileSync(
+			path,
+			`${JSON.stringify({
+				version: 1,
+				activeSessionId: "legacy-active",
+				sessionId: "legacy-session",
+				busy: true,
+				operation: "prompt_accepted",
+				recordedAt: "2026-01-01T00:00:00.000Z",
+			})}\n`,
+		);
+		appendFileSync(
+			path,
+			`${JSON.stringify({
+				version: 2,
+				activeSessionId: "invalid-active",
+				sessionId: "invalid-session",
+				busy: true,
+				operation: "prompt_accepted",
+				promptLifecycles: {
+					records: [{ correlationId: "bad", phase: "delivered", revision: 3 }],
+					expired: [],
+					pendingUsage: [],
+				},
+				recordedAt: "2026-01-01T00:00:00.000Z",
+			})}\n`,
+		);
+
+		expect(WorkerRecoveryJournal.readLatest(path)).toEqual([
+			expect.objectContaining({ version: 1, activeSessionId: "legacy-active" }),
+		]);
 	});
 
 	it("compacts stable checkpoints and ignores a truncated final record", () => {

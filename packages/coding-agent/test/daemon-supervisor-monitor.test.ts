@@ -3401,6 +3401,194 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(catchUpClient).not.toHaveBeenCalled();
 	});
 
+	it("shapes correlated worker events separately for capable and legacy clients", () => {
+		const activeSessionId = "active-correlated";
+		const capableWrites: string[] = [];
+		const legacyWrites: string[] = [];
+		const makeClient = (id: string, writes: string[], capable: boolean) =>
+			({
+				id,
+				socket: {
+					destroyed: false,
+					write: vi.fn((value: unknown) => {
+						writes.push(String(value));
+						return true;
+					}),
+				},
+				attachedActiveSessionIds: new Set([activeSessionId]),
+				catchupActiveSessionIds: new Set<string>(),
+				backpressured: false,
+				supportsExtensionUi: false,
+				capabilities: new Set(capable ? ["correlated_prompt_lifecycle_v1"] : []),
+			}) as unknown as DaemonSocketClient;
+		const capable = makeClient("capable", capableWrites, true);
+		const legacy = makeClient("legacy", legacyWrites, false);
+		const worker = {
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotLoads: new Map(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients: new Set([capable, legacy]),
+			streamReconstructor: { observe: vi.fn() },
+			invalidateWorkerSnapshot: vi.fn(),
+		}) as {
+			handleWorkerFrame(residentWorker: typeof worker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		const event = {
+			type: "session_event",
+			activeSessionId,
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
+				promptCorrelationId: "correlation-1",
+			},
+			attribution: { scope: "prompt", correlationId: "correlation-1" },
+		};
+
+		supervisor.handleWorkerFrame(worker, {
+			header: { kind: "outbound", outboundType: "session_event", activeSessionId },
+			payload: Buffer.from(`${JSON.stringify(event)}\n`),
+		});
+		expect(JSON.parse(capableWrites[0]!)).toMatchObject({
+			attribution: { scope: "prompt", correlationId: "correlation-1" },
+			event: { promptCorrelationId: "correlation-1" },
+		});
+		expect(JSON.parse(legacyWrites[0]!)).toEqual({
+			type: "session_event",
+			activeSessionId,
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
+			},
+		});
+
+		supervisor.handleWorkerFrame(worker, {
+			header: { kind: "outbound", outboundType: "prompt_lifecycle", activeSessionId },
+			payload: Buffer.from(
+				`${JSON.stringify({
+					type: "prompt_lifecycle",
+					activeSessionId,
+					lifecycle: {
+						correlationId: "correlation-1",
+						phase: "completed",
+						kind: "model_prompt",
+						revision: 4,
+						deliveryCrossed: true,
+					},
+				})}\n`,
+			),
+		});
+		expect(capableWrites).toHaveLength(2);
+		expect(legacyWrites).toHaveLength(1);
+	});
+
+	it("invalidates lifecycle snapshot loads without retiring transcript data", () => {
+		const activeSessionId = "active-lifecycle-load";
+		const transcript = { id: "transcript" };
+		const worker = {
+			snapshotCache: new Map([[activeSessionId, {}]]),
+			snapshotLoads: new Map([
+				[`${activeSessionId}:chunked`, Promise.resolve({})],
+				[`${activeSessionId}:full`, Promise.resolve({})],
+			]),
+			transcriptCaches: new Map([[activeSessionId, transcript]]),
+		};
+		const retireWorkerSnapshotCache = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			retireWorkerSnapshotCache,
+		}) as {
+			invalidateWorkerSnapshot(
+				residentWorker: typeof worker,
+				activeId: string,
+				transcriptChanged: boolean,
+				invalidateLoad: boolean,
+			): void;
+		};
+
+		supervisor.invalidateWorkerSnapshot(worker, activeSessionId, false, true);
+		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
+		expect(worker.snapshotLoads.size).toBe(0);
+		expect(worker.transcriptCaches.get(activeSessionId)).toBe(transcript);
+		expect(retireWorkerSnapshotCache).not.toHaveBeenCalled();
+	});
+
+	it("fails worker recovery instead of crossing a missing session generation", async () => {
+		const request = vi.fn();
+		const worker = { summaries: new Map(), client: { request } };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			requireAvailableWorkerClient: () => worker.client,
+		}) as {
+			restoreWorkerPromptLifecycles(
+				residentWorker: typeof worker,
+				recovery: ReadonlyMap<string, { sessionId: string; snapshot: unknown }>,
+			): Promise<void>;
+		};
+		const recovery = new Map([
+			[
+				"missing-active",
+				{
+					sessionId: "old-session",
+					snapshot: {
+						formatVersion: 1,
+						actions: [],
+						promptLifecycles: {
+							records: [],
+							expired: [],
+							pendingUsage: [],
+						},
+					},
+				},
+			],
+		]);
+
+		await expect(supervisor.restoreWorkerPromptLifecycles(worker, recovery)).rejects.toThrow(
+			"Replacement worker did not recover lifecycle session missing-active",
+		);
+		expect(request).not.toHaveBeenCalled();
+	});
+
+	it("restores queued correlated actions only into the matching session generation", async () => {
+		const request = vi.fn(async () => ({ success: true }));
+		const worker = {
+			summaries: new Map([["active-1", { sessionId: "session-1" }]]),
+			client: { request },
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			requireAvailableWorkerClient: () => worker.client,
+		}) as {
+			restoreWorkerPromptLifecycles(
+				residentWorker: typeof worker,
+				recovery: ReadonlyMap<string, { sessionId: string; snapshot: unknown }>,
+			): Promise<void>;
+		};
+		const snapshot = {
+			formatVersion: 1,
+			actions: [{ id: "queued-correlation", promptCorrelationId: "correlation-1" }],
+			promptLifecycles: {
+				records: [],
+				expired: [],
+				pendingUsage: [],
+			},
+		};
+
+		await supervisor.restoreWorkerPromptLifecycles(
+			worker,
+			new Map([["active-1", { sessionId: "session-1", snapshot }]]),
+		);
+		expect(request).toHaveBeenCalledWith({
+			type: "restore_actions",
+			activeSessionId: "active-1",
+			snapshot,
+		});
+		await expect(
+			supervisor.restoreWorkerPromptLifecycles(
+				worker,
+				new Map([["active-1", { sessionId: "stale-session", snapshot }]]),
+			),
+		).rejects.toThrow("Replacement worker did not recover lifecycle session active-1");
+	});
+
 	it("subscribes to worker updates with chunked snapshots", async () => {
 		type SubscriptionWorker = {
 			client: { requestWorker: (command: unknown) => Promise<{ success: boolean }> };
@@ -3418,7 +3606,13 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(requestWorker).toHaveBeenCalledWith({
 			type: "worker_subscribe",
 			activeSessionId: "active-1",
-			capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+			capabilities: [
+				"attach_snapshot",
+				"event_sequence",
+				"slim_attach",
+				"chunked_snapshot",
+				"correlated_prompt_lifecycle_v1",
+			],
 			supportsExtensionUi: false,
 		});
 	});
@@ -3547,6 +3741,162 @@ describe("daemon worker supervisor monitoring", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+	it("publishes recovery holds only with the exact restorable queued action state", async () => {
+		type RecoveryWorker = {
+			descriptor: {
+				workerId: string;
+				pid: number;
+				rootActiveSessionId: string;
+				recoveryJournalPath: string;
+				orphanProcessJournalPath?: string;
+			};
+			summaries?: Map<string, { sessionId: string }>;
+			client?: { request: ReturnType<typeof vi.fn> };
+		};
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-recovery-hold-test-"));
+		const journalPath = join(root, "worker.recovery.jsonl");
+		const fingerprint = "a".repeat(64);
+		const usage = {
+			input: 1,
+			output: 2,
+			cacheRead: 3,
+			cacheWrite: 4,
+			totalTokens: 10,
+			cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 },
+		};
+		const customMessage = {
+			role: "custom" as const,
+			customType: "heartbeat_prompt",
+			content: "queued body",
+			display: true,
+			timestamp: 1,
+		};
+		const action = {
+			id: "action-1",
+			source: "internal" as const,
+			delivery: "when_run_idle" as const,
+			wake: "external_resume" as const,
+			queueKey: "heartbeat:job-1",
+			agentMessageId: "agentmsg_followup",
+			promptCorrelationId: "correlation-1",
+			payload: {
+				kind: "turn" as const,
+				text: "queued body",
+				customMessage,
+				records: [
+					{
+						id: "action-1-primary",
+						role: "primary" as const,
+						message: customMessage,
+						ownerActionId: "action-1",
+					},
+				],
+				executionPolicy: {
+					preparation: {
+						initialRefineBarrier: "skip" as const,
+						flushPendingBashBeforeValidation: false,
+						validateModelAndAuth: true,
+						awaitPendingModelSelection: true,
+						preTurnCompaction: "beforeModelSelection" as const,
+						finalRefineBarrier: "always" as const,
+					},
+					runBeforeAgentStart: true,
+					nextTurnContextTiming: "commit" as const,
+					preserveEmptyExtensionPrompt: true,
+					completionIncludesRetryChain: true,
+				},
+				queueVisible: true,
+				acceptedAgentMessage: false,
+				acceptedBeforeCompletion: false,
+			},
+		};
+		const promptLifecycles = {
+			records: [
+				{
+					correlationId: "correlation-1",
+					phase: "queued" as const,
+					kind: "model_prompt" as const,
+					revision: 2,
+					deliveryCrossed: false,
+				},
+			],
+			expired: [{ correlationId: "expired-1", deliveryCrossed: true }],
+			pendingUsage: [{ correlationId: "correlation-1", usage }],
+			requestFingerprints: [{ correlationId: "correlation-1", fingerprint }],
+		};
+		const sessionActions = { formatVersion: 1 as const, actions: [action], promptLifecycles };
+		const journal = new WorkerRecoveryJournal(journalPath);
+		journal.record({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session-1.jsonl",
+			busy: true,
+			operation: "prompt_accepted",
+			promptLifecycles,
+			sessionActions,
+		});
+		const worker: RecoveryWorker = {
+			descriptor: {
+				workerId: "worker-1",
+				pid: process.pid,
+				rootActiveSessionId: "active-1",
+				recoveryJournalPath: journalPath,
+			},
+		};
+		const createRecoverySupervisor = () =>
+			Object.assign(Object.create(DaemonSupervisor.prototype), {
+				catalog: { markInterrupted: vi.fn(async () => undefined) },
+				log: vi.fn(),
+				assertRecoveryAllowed: vi.fn(async () => undefined),
+			}) as {
+				recoverUncertainWorkerOperations(
+					residentWorker: RecoveryWorker,
+					killWorkerProcess: boolean,
+				): Promise<Map<string, { sessionId: string; snapshot: typeof sessionActions }>>;
+				restoreWorkerPromptLifecycles(
+					residentWorker: RecoveryWorker,
+					recovery: ReadonlyMap<string, { sessionId: string; snapshot: typeof sessionActions }>,
+				): Promise<void>;
+				requireAvailableWorkerClient?: (residentWorker: RecoveryWorker) => NonNullable<RecoveryWorker["client"]>;
+			};
+
+		try {
+			const firstSupervisor = createRecoverySupervisor();
+			await firstSupervisor.recoverUncertainWorkerOperations(worker, false);
+			const hold = WorkerRecoveryJournal.readLatest(journalPath);
+			expect(hold).toEqual([
+				expect.objectContaining({
+					version: 3,
+					activeSessionId: "active-1",
+					busy: false,
+					operation: "recovery_hold",
+					sessionActions,
+					sessionActionsHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+				}),
+			]);
+
+			const request = vi.fn(async () => ({ success: true as const }));
+			const restartedWorker: RecoveryWorker = {
+				...worker,
+				summaries: new Map([["active-1", { sessionId: "session-1" }]]),
+				client: { request },
+			};
+			const secondSupervisor = createRecoverySupervisor();
+			secondSupervisor.requireAvailableWorkerClient = (candidate) => candidate.client!;
+			const reopened = await secondSupervisor.recoverUncertainWorkerOperations(restartedWorker, false);
+			expect(reopened.get("active-1")).toEqual({ sessionId: "session-1", snapshot: sessionActions });
+			await secondSupervisor.restoreWorkerPromptLifecycles(restartedWorker, reopened);
+			expect(request).toHaveBeenCalledTimes(1);
+			expect(request).toHaveBeenCalledWith({
+				type: "restore_actions",
+				activeSessionId: "active-1",
+				snapshot: sessionActions,
+			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it.each([
 		{ name: "malformed data", data: undefined, error: /invalid update manifest/ },
 		{

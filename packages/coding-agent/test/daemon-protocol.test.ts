@@ -8,14 +8,17 @@ import {
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
 	DAEMON_COMMAND_COMPATIBILITY,
+	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_OUTBOUND_COMPATIBILITY,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
+	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonCommand,
 	type DaemonOutbound,
+	daemonOutboundForCorrelatedPromptCapability,
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
@@ -251,6 +254,62 @@ describe("daemon protocol helpers", () => {
 			DAEMON_COMMAND_COMPATIBILITY.cancel_prompt_admission,
 		]);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("owned_prompt_cancellation");
+	});
+
+	it("capability-gates correlated submit, cancel, query, and lifecycle events", () => {
+		const expected = {
+			minProtocol: 7,
+			minSchemaRevision: 24,
+			capability: "correlated_prompt_lifecycle_v1",
+		};
+		expect(DAEMON_COMMAND_COMPATIBILITY.submit_correlated_prompt).toEqual(expected);
+		expect(DAEMON_COMMAND_COMPATIBILITY.cancel_correlated_prompt).toEqual(expected);
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_prompt_lifecycles).toEqual(expected);
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.prompt_lifecycle).toEqual(expected);
+		expect(DAEMON_DEFAULT_CLIENT_CAPABILITIES).not.toContain("correlated_prompt_lifecycle_v1");
+		expect(DAEMON_SUPPORTED_CLIENT_CAPABILITIES).toContain("correlated_prompt_lifecycle_v1");
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("correlated_prompt_lifecycle_v1");
+		expect(isDaemonMutatingCommand({ type: "submit_correlated_prompt" })).toBe(true);
+		expect(isDaemonMutatingCommand({ type: "cancel_correlated_prompt" })).toBe(true);
+		expect(isDaemonMutatingCommand({ type: "get_prompt_lifecycles" })).toBe(false);
+	});
+
+	it("removes correlated provenance from legacy daemon events", () => {
+		const event: DaemonOutbound = {
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
+				promptCorrelationId: "correlation-1",
+			},
+			attribution: { scope: "prompt", correlationId: "correlation-1" },
+		};
+		expect(daemonOutboundForCorrelatedPromptCapability(event, true)).toBe(event);
+		expect(daemonOutboundForCorrelatedPromptCapability(event, false)).toEqual({
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
+			},
+		});
+		expect(
+			daemonOutboundForCorrelatedPromptCapability(
+				{
+					type: "prompt_lifecycle",
+					activeSessionId: "active-1",
+					lifecycle: {
+						correlationId: "correlation-1",
+						phase: "owned",
+						kind: "model_prompt",
+						revision: 1,
+						deliveryCrossed: false,
+					},
+				},
+				false,
+			),
+		).toBeUndefined();
 	});
 
 	it("gates honest worker-state reporting at its introducing schema revision", () => {

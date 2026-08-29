@@ -1,3 +1,13 @@
+export type {
+	ExpiredPromptLifecycle,
+	PromptEventAttribution,
+	PromptLifecycleCancellationResult,
+	PromptLifecycleEvent,
+	PromptLifecycleKind,
+	PromptLifecyclePhase,
+	PromptLifecycleSnapshot,
+	PromptLifecycleStateSnapshot,
+} from "../../core/prompt-lifecycle.js";
 export { DaemonAgentConnection } from "./daemon-agent-connection.js";
 export { InProcessAgentConnection } from "./in-process-agent-connection.js";
 export { createAgentConnectionCommands, createAgentConnectionState } from "./snapshot.js";
@@ -10,6 +20,8 @@ export type {
 	AgentConnectionBranchSummaryEntry,
 	AgentConnectionChildUsageAttributionEntry,
 	AgentConnectionCompactionEntry,
+	AgentConnectionCorrelatedPromptOptions,
+	AgentConnectionCorrelatedPromptResult,
 	AgentConnectionCustomEntry,
 	AgentConnectionCustomMessageEntry,
 	AgentConnectionEvent,

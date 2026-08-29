@@ -23,6 +23,10 @@ import {
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
 import {
+	SESSION_ACTION_RECOVERY_FORMAT_VERSION,
+	type SessionActionRecoverySnapshot,
+} from "../../core/agent-session.js";
+import {
 	type AgentSessionRuntimeConfig,
 	type DurableAgentSessionRuntimeConfig,
 	durableAgentSessionRuntimeConfig,
@@ -42,6 +46,7 @@ import {
 	shouldReapOrphanProcess,
 } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
+import { createPromptRequestFingerprint } from "../../core/prompt-lifecycle.js";
 import {
 	canEvictWorker,
 	type IdleEvictionMinutes,
@@ -78,12 +83,14 @@ import {
 	type DaemonOutbound,
 	type DaemonResponse,
 	type DaemonUpdateRestartManifest,
+	daemonOutboundForCorrelatedPromptCapability,
 	failure,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
+	withoutCorrelatedPromptLifecycleSnapshot,
 } from "./daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
 import { matchesSessionIdSuffix } from "./daemon-session-id.js";
@@ -181,6 +188,9 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"prompt",
 	"cancel_prompt_admission",
 	"prompt_and_wait",
+	"submit_correlated_prompt",
+	"cancel_correlated_prompt",
+	"get_prompt_lifecycles",
 	"steer",
 	"follow_up",
 	"restore_next_turn",
@@ -347,6 +357,44 @@ interface SupervisorPromptAdmission {
 	workerActiveSessionId?: string;
 }
 
+interface WorkerSessionRecovery {
+	sessionId: string;
+	snapshot: SessionActionRecoverySnapshot;
+}
+
+interface SupervisorCorrelatedPromptReservation {
+	tail: Promise<void>;
+	pending: number;
+}
+
+interface SupervisorCorrelatedCommandOrder {
+	previous: Promise<void>;
+	release: () => void;
+}
+
+interface SupervisorCorrelatedJournalRun {
+	requestIdentity: string;
+	promise: Promise<DaemonResponse>;
+	resolve: (response: DaemonResponse) => void;
+}
+
+function correlatedCommandRequestIdentity(
+	command: Extract<DaemonCommand, { type: "submit_correlated_prompt" | "cancel_correlated_prompt" }>,
+): string {
+	return JSON.stringify([
+		command.type,
+		command.sessionId,
+		command.correlationId,
+		command.type === "submit_correlated_prompt"
+			? createPromptRequestFingerprint({
+					message: command.message,
+					images: command.images,
+					queueIfBusy: command.queueIfBusy,
+				})
+			: null,
+	]);
+}
+
 interface SupervisorSessionInputPause {
 	owner: DaemonSocketClient;
 	worker: ResidentWorker;
@@ -355,6 +403,10 @@ interface SupervisorSessionInputPause {
 	leaseKey: string;
 	pauseId: string;
 	releaseTask?: Promise<DaemonResponse>;
+}
+
+function isCorrelationRetrySafeMutation(command: DaemonCommand): boolean {
+	return command.type === "submit_correlated_prompt" || command.type === "cancel_correlated_prompt";
 }
 
 function throwIfAdmissionCancelled(admission: SupervisorPromptAdmission | undefined): void {
@@ -629,6 +681,8 @@ export class DaemonSupervisor {
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
 	/** Public admission ids are scoped to the socket that registered them. */
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
+	private readonly correlatedPromptReservations = new Map<string, SupervisorCorrelatedPromptReservation>();
+	private readonly correlatedJournalRuns = new Map<string, SupervisorCorrelatedJournalRun>();
 	private readonly sessionInputPauses = new Map<string, SupervisorSessionInputPause>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
 	private readonly descriptorDir: string;
@@ -1298,6 +1352,41 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private reserveCorrelatedPromptCommand(sessionId: string, correlationId: string): SupervisorCorrelatedCommandOrder {
+		if (sessionId.length === 0) throw new Error("sessionId must not be empty");
+		if (correlationId.length === 0 || correlationId.length > 128) {
+			throw new Error("correlationId must contain between 1 and 128 characters");
+		}
+		// The durable session generation is canonical across selector aliases.
+		// It shares one lane within a generation without colliding with another session.
+		const key = JSON.stringify([sessionId, correlationId]);
+		let reservation = this.correlatedPromptReservations.get(key);
+		if (reservation === undefined) {
+			reservation = { tail: Promise.resolve(), pending: 0 };
+			this.correlatedPromptReservations.set(key, reservation);
+		}
+		const ownedReservation = reservation;
+		const previous = ownedReservation.tail;
+		let releaseTail = () => {};
+		ownedReservation.tail = new Promise<void>((resolve) => {
+			releaseTail = resolve;
+		});
+		ownedReservation.pending += 1;
+		let released = false;
+		return {
+			previous,
+			release: () => {
+				if (released) return;
+				released = true;
+				releaseTail();
+				ownedReservation.pending -= 1;
+				if (ownedReservation.pending === 0 && this.correlatedPromptReservations.get(key) === ownedReservation) {
+					this.correlatedPromptReservations.delete(key);
+				}
+			},
+		};
+	}
+
 	/** Non-async by design: prompt registration completes before handleLine's first await. */
 	private parseCommandAndRegisterPromptAdmission(
 		client: DaemonSocketClient,
@@ -1307,6 +1396,7 @@ export class DaemonSupervisor {
 		envelopeClientId?: string;
 		protocolVersion: number;
 		admission?: SupervisorPromptAdmission;
+		correlatedOrder?: SupervisorCorrelatedCommandOrder;
 	} {
 		const parsed = JSON.parse(line) as unknown;
 		const envelope = isDaemonCommandEnvelope(parsed) ? parsed : undefined;
@@ -1335,11 +1425,23 @@ export class DaemonSupervisor {
 			};
 			admissions.set(key, admission);
 		}
+		let correlatedOrder: SupervisorCorrelatedCommandOrder | undefined;
+		if (command.type === "submit_correlated_prompt" || command.type === "cancel_correlated_prompt") {
+			if (
+				typeof command.activeSessionId !== "string" ||
+				typeof command.sessionId !== "string" ||
+				typeof command.correlationId !== "string"
+			) {
+				throw new Error("Correlated prompt command requires activeSessionId, sessionId, and correlationId");
+			}
+			correlatedOrder = this.reserveCorrelatedPromptCommand(command.sessionId, command.correlationId);
+		}
 		return {
 			command,
 			envelopeClientId: envelope.clientId ?? client.id,
 			protocolVersion: envelope.protocol.version,
 			admission,
+			correlatedOrder,
 		};
 	}
 
@@ -1353,6 +1455,7 @@ export class DaemonSupervisor {
 		}
 		const command = preParsed.command;
 		const parsedAdmission = preParsed.admission;
+		const correlatedOrder = preParsed.correlatedOrder;
 		if (command.type === "cancel_prompt_admission" && this.updateRestartPhase !== undefined) {
 			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
 			return;
@@ -1369,6 +1472,7 @@ export class DaemonSupervisor {
 			await waitForPromptAdmission(this.ready, parsedAdmission?.controller.signal);
 		} catch (error) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			correlatedOrder?.release();
 			this.write(client, failure(command.id, command.type, error));
 			return;
 		}
@@ -1379,6 +1483,7 @@ export class DaemonSupervisor {
 		}
 		this.cancelOwnedWorkerCleanup(client.id);
 		if (!DAEMON_COMMAND_TYPES.has(command.type)) {
+			correlatedOrder?.release();
 			this.write(client, failure(command.id, command.type, `Unknown daemon command: ${command.type}`));
 			return;
 		}
@@ -1386,6 +1491,7 @@ export class DaemonSupervisor {
 			command.type === "get_session_tree" &&
 			preParsed.protocolVersion < DAEMON_COMMAND_COMPATIBILITY.get_session_tree.minProtocol
 		) {
+			correlatedOrder?.release();
 			this.write(
 				client,
 				failure(
@@ -1401,6 +1507,7 @@ export class DaemonSupervisor {
 			await waitForPromptAdmission(this.assertCurrentOwnership(), parsedAdmission?.controller.signal);
 		} catch (error) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			correlatedOrder?.release();
 			this.write(client, failure(command.id, command.type, error));
 			return;
 		}
@@ -1408,16 +1515,31 @@ export class DaemonSupervisor {
 		const mutation = isDaemonMutatingCommand(command);
 		const journalIdentity =
 			envelopeClientId && command.id && mutation ? { clientId: envelopeClientId, commandId: command.id } : undefined;
+		const correlatedRequestIdentity =
+			command.type === "submit_correlated_prompt" || command.type === "cancel_correlated_prompt"
+				? correlatedCommandRequestIdentity(command)
+				: undefined;
 		const existing = journalIdentity
-			? this.commandJournal.lookup(journalIdentity.clientId, journalIdentity.commandId)
+			? this.commandJournal.lookup(journalIdentity.clientId, journalIdentity.commandId, correlatedRequestIdentity)
 			: undefined;
+		if (existing?.status === "conflict") {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			correlatedOrder?.release();
+			this.write(
+				client,
+				failure(command.id, command.type, "Correlated command id was reused with a different request"),
+			);
+			return;
+		}
 		if (existing?.status === "complete") {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			correlatedOrder?.release();
 			this.write(client, existing.response);
 			return;
 		}
-		if (existing?.status === "pending" && journalIdentity) {
+		if (existing?.status === "pending" && journalIdentity && !isCorrelationRetrySafeMutation(command)) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			correlatedOrder?.release();
 			this.write(
 				client,
 				failure(command.id, command.type, "The previous command result is uncertain and was not replayed", {
@@ -1435,18 +1557,35 @@ export class DaemonSupervisor {
 				: phase !== undefined && !(phase === "prepared" && command.type === "shutdown");
 		if (restartRejected && mutation) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			correlatedOrder?.release();
 			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
 			return;
 		}
 		if (journalIdentity) {
-			const admitted = this.commandJournal.begin(journalIdentity.clientId, journalIdentity.commandId, command.type);
+			const admitted = this.commandJournal.begin(
+				journalIdentity.clientId,
+				journalIdentity.commandId,
+				command.type,
+				correlatedRequestIdentity,
+			);
+			if (admitted.status === "conflict") {
+				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+				correlatedOrder?.release();
+				this.write(
+					client,
+					failure(command.id, command.type, "Correlated command id was reused with a different request"),
+				);
+				return;
+			}
 			if (admitted.status === "complete") {
 				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+				correlatedOrder?.release();
 				this.write(client, admitted.response);
 				return;
 			}
-			if (admitted.status === "pending") {
+			if (admitted.status === "pending" && !isCorrelationRetrySafeMutation(command)) {
 				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+				correlatedOrder?.release();
 				this.write(
 					client,
 					failure(command.id, command.type, "The previous command result is uncertain and was not replayed", {
@@ -1458,6 +1597,35 @@ export class DaemonSupervisor {
 			}
 		}
 
+		let correlatedJournalRun: (SupervisorCorrelatedJournalRun & { key: string; settled: boolean }) | undefined;
+		if (
+			journalIdentity &&
+			(command.type === "submit_correlated_prompt" || command.type === "cancel_correlated_prompt")
+		) {
+			const key = `${journalIdentity.clientId} ${journalIdentity.commandId}`;
+			const requestIdentity = correlatedRequestIdentity!;
+			const inFlight = this.correlatedJournalRuns.get(key);
+			if (inFlight) {
+				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+				correlatedOrder?.release();
+				if (inFlight.requestIdentity !== requestIdentity) {
+					this.write(
+						client,
+						failure(command.id, command.type, "Correlated command id was reused with a different request"),
+					);
+					return;
+				}
+				this.write(client, await inFlight.promise);
+				return;
+			}
+			let resolveRun = (_response: DaemonResponse) => {};
+			const promise = new Promise<DaemonResponse>((resolve) => {
+				resolveRun = resolve;
+			});
+			correlatedJournalRun = { key, requestIdentity, promise, resolve: resolveRun, settled: false };
+			this.correlatedJournalRuns.set(key, correlatedJournalRun);
+		}
+
 		if (mutation && !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)) {
 			const idleEvictionFence = this.idleEvictionFence;
 			if (idleEvictionFence) await idleEvictionFence;
@@ -1467,11 +1635,16 @@ export class DaemonSupervisor {
 		// the client retries through the saved-session path instead of mutating state.
 		if (mutation) this.mutationDrain.begin();
 		try {
-			const response = await this.handleCommand(client, command, cancellationAdmission);
+			await correlatedOrder?.previous;
+			const response = await this.handleCommand(client, command, cancellationAdmission, correlatedOrder);
 			if (response) {
 				if (journalIdentity) {
 					await this.assertCurrentOwnership();
 					this.commandJournal.recordResult(journalIdentity.clientId, journalIdentity.commandId, response);
+				}
+				if (correlatedJournalRun) {
+					correlatedJournalRun.settled = true;
+					correlatedJournalRun.resolve(response);
 				}
 				this.write(client, response);
 			}
@@ -1486,8 +1659,23 @@ export class DaemonSupervisor {
 					response = failure(command.id, command.type, ownershipError, serializeDaemonError(ownershipError));
 				}
 			}
+			if (correlatedJournalRun) {
+				correlatedJournalRun.settled = true;
+				correlatedJournalRun.resolve(response);
+			}
 			this.write(client, response);
 		} finally {
+			correlatedOrder?.release();
+			if (correlatedJournalRun) {
+				if (!correlatedJournalRun.settled) {
+					correlatedJournalRun.resolve(
+						failure(command.id, command.type, "Correlated command ended without a result"),
+					);
+				}
+				if (this.correlatedJournalRuns.get(correlatedJournalRun.key) === correlatedJournalRun) {
+					this.correlatedJournalRuns.delete(correlatedJournalRun.key);
+				}
+			}
 			if (mutation) this.mutationDrain.end();
 		}
 	}
@@ -1496,6 +1684,7 @@ export class DaemonSupervisor {
 		client: DaemonSocketClient,
 		command: DaemonCommand,
 		cancellationAdmission?: SupervisorPromptAdmission,
+		correlatedOrder?: SupervisorCorrelatedCommandOrder,
 	): Promise<DaemonResponse | undefined> {
 		switch (command.type) {
 			case "cancel_prompt_admission": {
@@ -2126,6 +2315,14 @@ export class DaemonSupervisor {
 				admission?.controller.signal,
 			);
 			throwIfAdmissionCancelled(admission);
+			if (
+				(command.type === "submit_correlated_prompt" ||
+					command.type === "cancel_correlated_prompt" ||
+					command.type === "get_prompt_lifecycles") &&
+				match.summary.sessionId !== command.sessionId
+			) {
+				throw new Error("Correlated prompt targeted a stale session generation");
+			}
 			const resolvedCommand = {
 				...command,
 				activeSessionId: match.summary.activeSessionId ?? match.summary.id,
@@ -2140,7 +2337,9 @@ export class DaemonSupervisor {
 				(match.summary.activeSessionId ?? match.summary.id) === match.worker.descriptor.rootActiveSessionId;
 			if (!isRootKill) {
 				const forward = async () => {
-					const response = await this.forwardToWorker(match.worker, resolvedCommand);
+					const workerResponse = this.forwardToWorker(match.worker, resolvedCommand);
+					correlatedOrder?.release();
+					const response = await workerResponse;
 					if (admission && response.success) admission.status = "owned";
 					return response;
 				};
@@ -2413,6 +2612,7 @@ export class DaemonSupervisor {
 		command: DaemonCreateCommand,
 		existing?: ResidentWorker,
 		ownerClientId?: string,
+		promptLifecycleRecovery?: ReadonlyMap<string, WorkerSessionRecovery>,
 	): Promise<ResidentWorker> {
 		await this.assertRecoveryAllowed();
 		if (existing && this.isWorkerRecoveryCancelled(existing)) {
@@ -2576,6 +2776,9 @@ export class DaemonSupervisor {
 			worker.descriptor.sessionFile = summary.sessionFile;
 			await this.subscribeWorker(worker, rootActiveSessionId);
 			await this.refreshWorkerSummaries(worker, true);
+			if (promptLifecycleRecovery !== undefined) {
+				await this.restoreWorkerPromptLifecycles(worker, promptLifecycleRecovery);
+			}
 			if (existing && (this.isWorkerRecoveryCancelled(worker) || worker.stopRevision !== recoveryStopRevision)) {
 				throw new Error(`Session worker ${workerId} recovery was cancelled`);
 			}
@@ -2695,8 +2898,21 @@ export class DaemonSupervisor {
 			type: "worker_subscribe",
 			activeSessionId,
 			capabilities: supportsExtensionUi
-				? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
-				: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+				? [
+						"attach_snapshot",
+						"event_sequence",
+						"extension_ui",
+						"slim_attach",
+						"chunked_snapshot",
+						"correlated_prompt_lifecycle_v1",
+					]
+				: [
+						"attach_snapshot",
+						"event_sequence",
+						"slim_attach",
+						"chunked_snapshot",
+						"correlated_prompt_lifecycle_v1",
+					],
 			supportsExtensionUi,
 		});
 		if (!response.success) {
@@ -3125,11 +3341,19 @@ export class DaemonSupervisor {
 					}
 					const safeToKillWorkerProcess =
 						processAlive && processIdentityMatches && worker.descriptor.processStartId !== undefined;
-					await this.recoverUncertainWorkerOperations(worker, safeToKillWorkerProcess);
+					const promptLifecycleRecovery = await this.recoverUncertainWorkerOperations(
+						worker,
+						safeToKillWorkerProcess,
+					);
 					if (this.isWorkerRecoveryCancelled(worker)) {
 						return;
 					}
-					await this.launchWorker(recoveryCommand, worker, worker.descriptor.ownerClientId);
+					await this.launchWorker(
+						recoveryCommand,
+						worker,
+						worker.descriptor.ownerClientId,
+						promptLifecycleRecovery,
+					);
 					return;
 				} catch (error) {
 					if (isSupervisorRecoveryCancelled(error) || this.isWorkerRecoveryCancelled(worker)) {
@@ -3171,7 +3395,29 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private async recoverUncertainWorkerOperations(worker: ResidentWorker, killWorkerProcess = true): Promise<void> {
+	private async restoreWorkerPromptLifecycles(
+		worker: ResidentWorker,
+		recovery: ReadonlyMap<string, WorkerSessionRecovery>,
+	): Promise<void> {
+		const client = this.requireAvailableWorkerClient(worker);
+		for (const [activeSessionId, recovered] of recovery) {
+			const summary = worker.summaries.get(activeSessionId);
+			if (!summary || summary.sessionId !== recovered.sessionId) {
+				throw new Error(`Replacement worker did not recover lifecycle session ${activeSessionId}`);
+			}
+			const response = await client.request({
+				type: "restore_actions",
+				activeSessionId,
+				snapshot: recovered.snapshot,
+			});
+			if (!response.success) throw deserializeDaemonError(response);
+		}
+	}
+
+	private async recoverUncertainWorkerOperations(
+		worker: ResidentWorker,
+		killWorkerProcess = true,
+	): Promise<Map<string, WorkerSessionRecovery>> {
 		await this.assertRecoveryAllowed();
 		if (killWorkerProcess) {
 			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
@@ -3192,9 +3438,25 @@ export class DaemonSupervisor {
 		}
 		const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
 		const latest = journal.getLatest();
+		const promptLifecycles = new Map(
+			latest.flatMap((record) => {
+				const snapshot =
+					record.sessionActions ??
+					(record.promptLifecycles === undefined
+						? undefined
+						: {
+								formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION,
+								actions: [],
+								promptLifecycles: record.promptLifecycles,
+							});
+				return snapshot === undefined
+					? []
+					: [[record.activeSessionId, { sessionId: record.sessionId, snapshot }] as const];
+			}),
+		);
 		const uncertain = latest.filter((record) => record.busy);
 		if (uncertain.length === 0) {
-			return;
+			return promptLifecycles;
 		}
 		const interruptedSessions = new Map<
 			string,
@@ -3233,6 +3495,8 @@ export class DaemonSupervisor {
 				...(record.sessionFile ? { sessionFile: record.sessionFile } : {}),
 				busy: false,
 				operation: "recovery_hold",
+				...(record.promptLifecycles ? { promptLifecycles: record.promptLifecycles } : {}),
+				...(record.sessionActions ? { sessionActions: record.sessionActions } : {}),
 			});
 		}
 		this.log(
@@ -3240,6 +3504,7 @@ export class DaemonSupervisor {
 				.map((record) => record.operation)
 				.join(", ")}`,
 		);
+		return promptLifecycles;
 	}
 
 	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
@@ -3711,8 +3976,14 @@ export class DaemonSupervisor {
 							type: "attach",
 							activeSessionId,
 							capabilities: client.capabilities.has("chunked_snapshot")
-								? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
-								: ["attach_snapshot", "event_sequence", "slim_attach"],
+								? [
+										"attach_snapshot",
+										"event_sequence",
+										"slim_attach",
+										"chunked_snapshot",
+										"correlated_prompt_lifecycle_v1",
+									]
+								: ["attach_snapshot", "event_sequence", "slim_attach", "correlated_prompt_lifecycle_v1"],
 							supportsExtensionUi: false,
 							env: command.env ?? collectDaemonClientEnv(),
 						});
@@ -3794,10 +4065,13 @@ export class DaemonSupervisor {
 					}
 				}
 			}
+			const snapshot = client.capabilities.has("correlated_prompt_lifecycle_v1")
+				? result.snapshot
+				: withoutCorrelatedPromptLifecycleSnapshot(result.snapshot);
 			const publicResult: DaemonAttachResult = {
 				...result,
 				state: result.state ? publicSummary : undefined,
-				snapshot: { ...result.snapshot, summary: publicSummary },
+				snapshot: { ...snapshot, summary: publicSummary },
 				client: { id: client.id, capabilities: [...client.capabilities] },
 			};
 			if (publicResult.state && publicResult.messages) {
@@ -4178,7 +4452,10 @@ export class DaemonSupervisor {
 						messageCount: begin.messageCount,
 						targetChunkBytes: begin.targetChunkBytes,
 					},
-					client: { id: "supervisor", capabilities: ["chunked_snapshot"] },
+					client: {
+						id: "supervisor",
+						capabilities: ["chunked_snapshot", "correlated_prompt_lifecycle_v1"],
+					},
 				};
 				const generations = this.snapshotGenerationsFor(worker, activeSessionId);
 				let generation = generations.get(begin.snapshotId);
@@ -4469,7 +4746,7 @@ export class DaemonSupervisor {
 				this.scheduleCompactCatchup(worker, activeSessionId);
 				return;
 			}
-			if (!isCompactAssistantDelta(compactValue)) {
+			if (!isCompactAssistantDelta(compactValue) || compactValue.activeSessionId !== activeSessionId) {
 				this.scheduleCompactCatchup(worker, activeSessionId);
 				return;
 			}
@@ -4478,13 +4755,19 @@ export class DaemonSupervisor {
 				this.scheduleCompactCatchup(worker, activeSessionId);
 				return;
 			}
+			decodedOutbound = reconstructed;
 			publicPayload = Buffer.from(serializeJsonLine(reconstructed));
 		} else if (
 			sessionEventType === "message_start" ||
 			sessionEventType === "message_end" ||
 			outboundType === "session_replaced" ||
 			outboundType === "session_resynced" ||
-			outboundType === "session_closed"
+			outboundType === "session_closed" ||
+			[...this.clients].some(
+				(client) =>
+					client.attachedActiveSessionIds.has(activeSessionId) &&
+					!client.capabilities.has("correlated_prompt_lifecycle_v1"),
+			)
 		) {
 			try {
 				decodedOutbound = JSON.parse(frame.payload.toString("utf8")) as DaemonOutbound;
@@ -4495,13 +4778,17 @@ export class DaemonSupervisor {
 		}
 		const replacementSnapshotFollows =
 			decodedOutbound?.type === "session_replaced" && decodedOutbound.snapshotFollows === true;
+		const transcriptChanged =
+			outboundType === "session_replaced" ||
+			outboundType === "session_closed" ||
+			isFinalizedTranscriptEvent(sessionEventType);
 		this.invalidateWorkerSnapshot(
 			worker,
 			activeSessionId,
-			outboundType === "session_replaced" ||
-				outboundType === "session_closed" ||
-				isFinalizedTranscriptEvent(sessionEventType),
+			transcriptChanged,
+			transcriptChanged || outboundType === "prompt_lifecycle",
 		);
+		let legacyPayload: Buffer | undefined;
 		for (const client of this.clients) {
 			if (!client.attachedActiveSessionIds.has(activeSessionId)) {
 				continue;
@@ -4512,6 +4799,13 @@ export class DaemonSupervisor {
 			if (outboundType === "extension_ui_request" && !client.supportsExtensionUi) {
 				continue;
 			}
+			const correlatedLifecycleSupported = client.capabilities.has("correlated_prompt_lifecycle_v1");
+			if (!correlatedLifecycleSupported) {
+				if (decodedOutbound === undefined) continue;
+				const legacyOutbound = daemonOutboundForCorrelatedPromptCapability(decodedOutbound, false);
+				if (legacyOutbound === undefined) continue;
+				legacyPayload ??= Buffer.from(serializeJsonLine(legacyOutbound));
+			}
 			if (client.snapshotActiveSessionIds?.has(activeSessionId)) {
 				this.queueCatchup(client, activeSessionId, outboundType === "session_replaced" ? "replacement" : "resync");
 				continue;
@@ -4520,7 +4814,7 @@ export class DaemonSupervisor {
 				this.queueCatchup(client, activeSessionId, outboundType === "session_replaced" ? "replacement" : "resync");
 				continue;
 			}
-			this.writeSerialized(client, publicPayload);
+			this.writeSerialized(client, correlatedLifecycleSupported ? publicPayload : legacyPayload!);
 		}
 		if (outboundType === "session_replaced" || outboundType === "session_closed") {
 			void this.refreshWorkerSummaries(worker).catch(() => undefined);
@@ -4549,13 +4843,18 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private invalidateWorkerSnapshot(worker: ResidentWorker, activeSessionId: string, transcriptChanged = true): void {
+	private invalidateWorkerSnapshot(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		transcriptChanged = true,
+		invalidateLoad = transcriptChanged,
+	): void {
 		worker.snapshotCache.delete(activeSessionId);
-		if (!transcriptChanged) {
-			return;
+		if (invalidateLoad) {
+			worker.snapshotLoads.delete(`${activeSessionId}:chunked`);
+			worker.snapshotLoads.delete(`${activeSessionId}:full`);
 		}
-		worker.snapshotLoads.delete(`${activeSessionId}:chunked`);
-		worker.snapshotLoads.delete(`${activeSessionId}:full`);
+		if (!transcriptChanged) return;
 		const transcript = worker.transcriptCaches.get(activeSessionId);
 		if (transcript) {
 			this.retireWorkerSnapshotCache(worker, activeSessionId, transcript);

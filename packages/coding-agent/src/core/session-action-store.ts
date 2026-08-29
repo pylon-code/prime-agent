@@ -73,6 +73,7 @@ export interface SessionAction<TPayload extends SessionActionPayload = SessionAc
 	lifecycle: ActionLifecycle;
 	queueKey?: string;
 	agentMessageId?: string;
+	promptCorrelationId?: string;
 	suppressAutonomousContinuation?: boolean;
 }
 
@@ -275,7 +276,9 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 	}
 
 	snapshotActions(): readonly TAction[] {
-		return this.queuedActions();
+		return this.actions().filter(
+			(action) => action.lifecycle.state === "queued" || action.lifecycle.state === "selected",
+		);
 	}
 
 	unfinishedActions(policy?: DeliveryPolicy): readonly TAction[] {

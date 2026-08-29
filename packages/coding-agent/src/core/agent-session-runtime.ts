@@ -68,6 +68,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private beforeSessionInvalidate?: () => void;
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
+	private sessionReplacementInProgress = false;
 	private disposePromise?: Promise<void>;
 
 	constructor(
@@ -208,6 +209,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	private bindRuntimeHost(): void {
 		this._session.setSubagentRuntimeHost(this.subagentRuntimeHost ?? this);
+		this._session.setSessionReplacementAdmissionGuard(() => this.sessionReplacementInProgress);
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
@@ -389,6 +391,20 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 	}
 
+	private async withSessionReplacementFence<T>(operation: () => Promise<T>): Promise<T> {
+		if (this.sessionReplacementInProgress) {
+			throw new Error("A session replacement or reload is already in progress");
+		}
+		const release = this.session.acquireSessionReplacementFence();
+		this.sessionReplacementInProgress = true;
+		try {
+			return await operation();
+		} finally {
+			this.sessionReplacementInProgress = false;
+			release();
+		}
+	}
+
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
 		if (this.rebindSession) {
 			await this.rebindSession(this.session);
@@ -402,6 +418,16 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	async switchSession(
+		sessionPath: string,
+		options?: {
+			cwdOverride?: string;
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		},
+	): Promise<{ cancelled: boolean }> {
+		return this.withSessionReplacementFence(() => this.switchSessionUnfenced(sessionPath, options));
+	}
+
+	private async switchSessionUnfenced(
 		sessionPath: string,
 		options?: {
 			cwdOverride?: string;
@@ -450,6 +476,14 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ cancelled: boolean }> {
+		return this.withSessionReplacementFence(() => this.newSessionUnfenced(options));
+	}
+
+	private async newSessionUnfenced(options?: {
+		parentSession?: string;
+		setup?: (sessionManager: SessionManager) => Promise<void>;
+		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+	}): Promise<{ cancelled: boolean }> {
 		const beforeResult = await this.emitBeforeSwitch("new");
 		if (beforeResult.cancelled) {
 			return beforeResult;
@@ -493,6 +527,16 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	async fork(
+		entryId: string,
+		options?: {
+			position?: "before" | "at";
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		},
+	): Promise<{ cancelled: boolean; selectedText?: string }> {
+		return this.withSessionReplacementFence(() => this.forkUnfenced(entryId, options));
+	}
+
+	private async forkUnfenced(
 		entryId: string,
 		options?: {
 			position?: "before" | "at";
@@ -629,6 +673,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		return this.withSessionReplacementFence(() => this.importFromJsonlUnfenced(inputPath, cwdOverride));
+	}
+
+	private async importFromJsonlUnfenced(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
 		const resolvedPath = resolve(inputPath);
 		if (!existsSync(resolvedPath)) {
 			throw new SessionImportFileNotFoundError(resolvedPath);

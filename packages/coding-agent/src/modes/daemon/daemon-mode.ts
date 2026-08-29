@@ -88,6 +88,7 @@ import {
 } from "../../core/cron-jobs.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
+import { createPromptRequestFingerprint, type PromptLifecycleSnapshot } from "../../core/prompt-lifecycle.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
@@ -149,6 +150,7 @@ import {
 	type DaemonSessionSnapshot,
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartSession,
+	daemonOutboundForCorrelatedPromptCapability,
 	failure,
 	isDaemonCommandEnvelope,
 	isDaemonDialogExtensionUiRequest,
@@ -249,6 +251,9 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"prompt",
 	"cancel_prompt_admission",
 	"prompt_and_wait",
+	"submit_correlated_prompt",
+	"cancel_correlated_prompt",
+	"get_prompt_lifecycles",
 	"steer",
 	"follow_up",
 	"restore_next_turn",
@@ -507,6 +512,21 @@ export class AgentDaemon {
 			run: SideQuestionRun;
 			client: DaemonSocketClient;
 			activeSessionId: string;
+		}
+	>();
+	/** Correlated submissions reserved synchronously while their command handler is still entering AgentSession. */
+	private readonly correlatedPromptSubmissions = new Map<
+		string,
+		{
+			activeSessionId: string;
+			sessionId: string;
+			correlationId: string;
+			ownerCommandId: string;
+			requestFingerprint: string;
+			controller: AbortController;
+			result: Promise<PromptLifecycleSnapshot>;
+			resolveResult: (lifecycle: PromptLifecycleSnapshot) => void;
+			rejectResult: (error: unknown) => void;
 		}
 	>();
 	/** Live prompt admissions, keyed by session and caller-generated admission id. */
@@ -3256,6 +3276,10 @@ export class AgentDaemon {
 		return `${activeSessionId}\0${admissionId}`;
 	}
 
+	private correlatedPromptKey(activeSessionId: string, sessionId: string, correlationId: string): string {
+		return `${activeSessionId}\0${sessionId}\0${correlationId}`;
+	}
+
 	/**
 	 * Parse and synchronously register prompt admission before returning a promise.
 	 * This method is intentionally non-async: handleLine invokes it before its first await.
@@ -3264,9 +3288,15 @@ export class AgentDaemon {
 		const wireValue = JSON.parse(line) as unknown;
 		if (isDaemonCommandEnvelope(wireValue) && wireValue.clientId) client.id = wireValue.clientId;
 		const parsed = (isDaemonCommandEnvelope(wireValue) ? { ...wireValue.command, id: wireValue.id } : wireValue) as {
+			id?: unknown;
 			type?: unknown;
 			activeSessionId?: unknown;
+			sessionId?: unknown;
 			admissionId?: unknown;
+			correlationId?: unknown;
+			message?: unknown;
+			images?: unknown;
+			queueIfBusy?: unknown;
 		};
 		if (parsed.type === "prompt" || parsed.type === "prompt_and_wait") {
 			if (parsed.admissionId !== undefined) {
@@ -3283,6 +3313,52 @@ export class AgentDaemon {
 					admissionId: parsed.admissionId,
 					controller: new AbortController(),
 					status: "waiting",
+				});
+			}
+		}
+		if (parsed.type === "submit_correlated_prompt") {
+			if (
+				typeof parsed.id !== "string" ||
+				typeof parsed.activeSessionId !== "string" ||
+				typeof parsed.sessionId !== "string" ||
+				typeof parsed.correlationId !== "string" ||
+				typeof parsed.message !== "string"
+			) {
+				throw new Error(
+					"Correlated prompt submission requires string id, activeSessionId, sessionId, and correlationId",
+				);
+			}
+			if (parsed.correlationId.length === 0 || parsed.correlationId.length > 128) {
+				throw new Error("correlationId must contain between 1 and 128 characters");
+			}
+			const key = this.correlatedPromptKey(parsed.activeSessionId, parsed.sessionId, parsed.correlationId);
+			const requestFingerprint = createPromptRequestFingerprint({
+				message: parsed.message,
+				images: Array.isArray(parsed.images) ? parsed.images : undefined,
+				queueIfBusy: typeof parsed.queueIfBusy === "boolean" ? parsed.queueIfBusy : undefined,
+			});
+			const currentSubmission = this.correlatedPromptSubmissions.get(key);
+			if (currentSubmission && currentSubmission.requestFingerprint !== requestFingerprint) {
+				throw new Error("Prompt correlation id was reused with a different request");
+			}
+			if (!currentSubmission) {
+				let resolveResult = (_lifecycle: PromptLifecycleSnapshot) => {};
+				let rejectResult = (_error: unknown) => {};
+				const result = new Promise<PromptLifecycleSnapshot>((resolve, reject) => {
+					resolveResult = resolve;
+					rejectResult = reject;
+				});
+				void result.catch(() => undefined);
+				this.correlatedPromptSubmissions.set(key, {
+					activeSessionId: parsed.activeSessionId,
+					sessionId: parsed.sessionId,
+					correlationId: parsed.correlationId,
+					ownerCommandId: parsed.id,
+					requestFingerprint,
+					controller: new AbortController(),
+					result,
+					resolveResult,
+					rejectResult,
 				});
 			}
 		}
@@ -3303,7 +3379,9 @@ export class AgentDaemon {
 				supervisorProcessStartId?: unknown;
 				supervisorSocketPath?: unknown;
 				activeSessionId?: unknown;
+				sessionId?: unknown;
 				admissionId?: unknown;
+				correlationId?: unknown;
 				capabilities?: unknown;
 				supportsExtensionUi?: unknown;
 				job?: unknown;
@@ -3316,11 +3394,34 @@ export class AgentDaemon {
 							this.promptAdmissionKey(parsed.activeSessionId, (parsed as { admissionId: string }).admissionId),
 						)
 					: undefined;
+			const parsedCorrelatedSubmission =
+				parsed.type === "submit_correlated_prompt" &&
+				typeof parsed.id === "string" &&
+				typeof parsed.activeSessionId === "string" &&
+				typeof parsed.sessionId === "string" &&
+				typeof parsed.correlationId === "string"
+					? this.correlatedPromptSubmissions.get(
+							this.correlatedPromptKey(parsed.activeSessionId, parsed.sessionId, parsed.correlationId),
+						)
+					: undefined;
 			clearParsedAdmission = () => {
-				if (!parsedAdmission) return;
-				const key = this.promptAdmissionKey(parsedAdmission.activeSessionId, parsedAdmission.admissionId);
-				if (this.promptAdmissions.get(key) === parsedAdmission) {
-					this.promptAdmissions.delete(key);
+				if (parsedAdmission) {
+					const key = this.promptAdmissionKey(parsedAdmission.activeSessionId, parsedAdmission.admissionId);
+					if (this.promptAdmissions.get(key) === parsedAdmission) {
+						this.promptAdmissions.delete(key);
+					}
+				}
+				const correlatedSubmission = parsedCorrelatedSubmission;
+				if (correlatedSubmission && correlatedSubmission.ownerCommandId === parsed.id) {
+					const key = this.correlatedPromptKey(
+						correlatedSubmission.activeSessionId,
+						correlatedSubmission.sessionId,
+						correlatedSubmission.correlationId,
+					);
+					if (this.correlatedPromptSubmissions.get(key) === correlatedSubmission) {
+						this.correlatedPromptSubmissions.delete(key);
+						correlatedSubmission.rejectResult(new Error("Correlated prompt was not admitted"));
+					}
 				}
 			};
 			// Envelope client identity is irrelevant to worker-local prompt admission.
@@ -3933,12 +4034,27 @@ export class AgentDaemon {
 					this.promptAdmissionKey(command.activeSessionId, command.admissionId),
 				);
 				if (!admission) {
+					const lifecycleResult = command.cancelOwned
+						? this.getBoundSessionState(command.activeSessionId).runtime.session.cancelPromptLifecycle?.(
+								command.admissionId,
+							)
+						: undefined;
 					return success(command.id, command.type, {
-						status: "unknown" as const,
+						status:
+							lifecycleResult?.status === "cancelled"
+								? ("cancelled" as const)
+								: lifecycleResult === undefined || lifecycleResult.status === "unknown"
+									? ("unknown" as const)
+									: ("owned" as const),
 					});
 				}
 				if (admission.status === "owned") {
-					if (command.cancelOwned) admission.controller?.abort();
+					if (command.cancelOwned) {
+						admission.controller?.abort();
+						this.getBoundSessionState(command.activeSessionId).runtime.session.cancelPromptLifecycle?.(
+							command.admissionId,
+						);
+					}
 					return success(command.id, command.type, {
 						status: "owned" as const,
 					});
@@ -4049,6 +4165,91 @@ export class AgentDaemon {
 					})
 					.finally(clearAdmission);
 				return undefined;
+			}
+
+			case "submit_correlated_prompt": {
+				onPromptHandlerOwnsAdmission();
+				const key = this.correlatedPromptKey(command.activeSessionId, command.sessionId, command.correlationId);
+				const submission = this.correlatedPromptSubmissions.get(key);
+				if (!submission) throw new Error("Correlated prompt was not registered during command parsing");
+				if (submission.ownerCommandId !== command.id) {
+					const lifecycle = await submission.result;
+					return success(command.id, command.type, { lifecycle, duplicate: true });
+				}
+				try {
+					const state = this.getBoundSessionState(command.activeSessionId);
+					if (state.runtime.session.sessionId !== command.sessionId) {
+						throw new Error("Correlated prompt targeted a stale session generation");
+					}
+					const existing = state.runtime.session.getPromptLifecycle(command.correlationId);
+					if (existing) {
+						if (
+							state.runtime.session.getPromptLifecycleRequestFingerprint(command.correlationId) !==
+							submission.requestFingerprint
+						) {
+							throw new Error("Prompt correlation id was reused with a different request");
+						}
+						submission.resolveResult(existing);
+						return success(command.id, command.type, { lifecycle: existing, duplicate: true });
+					}
+					const busy =
+						state.runtime.session.isStreaming ||
+						state.runtime.session.isCompacting ||
+						state.runtime.session.isRetrying ||
+						state.runtime.session.isBashRunning ||
+						state.runtime.session.unfinishedActionCount > 0;
+					if (busy && command.queueIfBusy !== true) {
+						throw new Error("Agent is busy and queueIfBusy was not enabled");
+					}
+					await state.runtime.session.promptUntilAccepted(command.message, {
+						images: command.images,
+						streamingBehavior: busy ? "followUp" : undefined,
+						queueIfBusy: command.queueIfBusy,
+						source: "interactive",
+						signal: submission.controller.signal,
+						promptCorrelationId: command.correlationId,
+					});
+					const lifecycle = state.runtime.session.getPromptLifecycle(command.correlationId);
+					if (!lifecycle) throw new Error("Correlated prompt was accepted without a lifecycle record");
+					submission.resolveResult(lifecycle);
+					this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+					return success(command.id, command.type, { lifecycle, duplicate: false });
+				} catch (error) {
+					const state = this.sessions.get(command.activeSessionId);
+					const lifecycle = state?.runtime.session.getPromptLifecycle(command.correlationId);
+					if (lifecycle) submission.resolveResult(lifecycle);
+					else submission.rejectResult(error);
+					throw error;
+				} finally {
+					if (this.correlatedPromptSubmissions.get(key) === submission) {
+						this.correlatedPromptSubmissions.delete(key);
+					}
+				}
+			}
+
+			case "cancel_correlated_prompt": {
+				const key = this.correlatedPromptKey(command.activeSessionId, command.sessionId, command.correlationId);
+				const submission = this.correlatedPromptSubmissions.get(key);
+				const state = this.getBoundSessionState(command.activeSessionId);
+				if (state.runtime.session.sessionId !== command.sessionId) {
+					throw new Error("Correlated prompt cancellation targeted a stale session generation");
+				}
+				let result = state.runtime.session.cancelPromptLifecycle(command.correlationId);
+				if (result.status === "cancelled") submission?.controller.abort();
+				if (result.status === "unknown" && submission) {
+					submission.controller.abort();
+					await submission.result.catch(() => undefined);
+					result = state.runtime.session.cancelPromptLifecycle(command.correlationId);
+				}
+				return success(command.id, command.type, result);
+			}
+
+			case "get_prompt_lifecycles": {
+				const state = this.getBoundSessionState(command.activeSessionId);
+				if (state.runtime.session.sessionId !== command.sessionId) {
+					throw new Error("Prompt lifecycle query targeted a stale session generation");
+				}
+				return success(command.id, command.type, state.runtime.session.getPromptLifecycles());
 			}
 
 			case "steer": {
@@ -4873,7 +5074,8 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		command: Extract<DaemonCommand, { type: "attach" }>,
 	): Promise<DaemonAttachResult> {
-		const snapshot = await this.createSessionSnapshot(state);
+		const capabilities = daemonClientCapabilitiesForSession(client, state.activeSessionId);
+		const snapshot = await this.createSessionSnapshot(state, capabilities.has("correlated_prompt_lifecycle_v1"));
 		const replay =
 			command.resumeCursor?.activeSessionId && command.resumeCursor.activeSessionId !== state.activeSessionId
 				? {
@@ -4892,7 +5094,6 @@ export class AgentDaemon {
 				: createDaemonReplayInfo(command.resumeCursor, state.lastEventSequence, state.eventGeneration);
 		// Slim clients read summary/messages from the snapshot; duplicating them at
 		// the top level would serialize the full history twice more per attach.
-		const capabilities = daemonClientCapabilitiesForSession(client, state.activeSessionId);
 		const slim = capabilities.has("slim_attach");
 		return {
 			protocol: DAEMON_PROTOCOL_INFO,
@@ -4912,7 +5113,10 @@ export class AgentDaemon {
 		};
 	}
 
-	private async createSessionSnapshot(state: ActiveSessionState): Promise<DaemonSessionSnapshot> {
+	private async createSessionSnapshot(
+		state: ActiveSessionState,
+		includePromptLifecycles: boolean,
+	): Promise<DaemonSessionSnapshot> {
 		const metadata = state.runtime.metadata;
 		const parent =
 			metadata.parentActiveSessionId || metadata.parentSessionId || metadata.rlmParentNodeId || metadata.rlmChildId
@@ -4950,6 +5154,9 @@ export class AgentDaemon {
 			},
 			...(parent ? { parent } : {}),
 			children,
+			...(includePromptLifecycles
+				? { promptLifecycles: session.getPromptLifecycles?.() ?? { records: [], expired: [] } }
+				: {}),
 		};
 	}
 
@@ -6390,7 +6597,9 @@ export class AgentDaemon {
 	}
 
 	private broadcastToSession(state: ActiveSessionState, message: DaemonOutbound): void {
-		if (message.type === "session_event") {
+		if (message.type === "prompt_lifecycle") {
+			this.recordWorkerRecoveryState(state, "prompt_lifecycle");
+		} else if (message.type === "session_event") {
 			const eventType = message.event.type;
 			// A finished turn/compaction is the cue to refresh status.
 			if (eventType === "turn_end" || eventType === "compaction_end") {
@@ -6412,21 +6621,29 @@ export class AgentDaemon {
 		this.stampRlmChildActiveSessionId(message);
 		const sequencedMessage = this.addSessionEventMeta(state, message);
 		let serialized: string | undefined;
+		let legacySerialized: string | undefined;
 		for (const client of state.clients) {
-			if (!shouldSendDaemonOutboundToClient(client, sequencedMessage)) {
+			const correlatedLifecycleSupported = daemonClientCapabilitiesForSession(client, state.activeSessionId).has(
+				"correlated_prompt_lifecycle_v1",
+			);
+			const clientMessage = daemonOutboundForCorrelatedPromptCapability(
+				sequencedMessage,
+				correlatedLifecycleSupported,
+			);
+			if (clientMessage === undefined || !shouldSendDaemonOutboundToClient(client, clientMessage)) {
 				continue;
 			}
-			if (sequencedMessage.type === "session_closed") {
+			if (clientMessage.type === "session_closed") {
 				client.catchupActiveSessionIds?.delete(state.activeSessionId);
 				client.catchupPurposes?.delete(state.activeSessionId);
-				this.write(client, sequencedMessage);
+				this.write(client, clientMessage);
 				continue;
 			}
 			if (client.snapshotActiveSessionIds?.has(state.activeSessionId)) {
 				this.queueClientCatchup(
 					client,
 					state.activeSessionId,
-					sequencedMessage.type === "session_replaced" ? "replacement" : "resync",
+					clientMessage.type === "session_replaced" ? "replacement" : "resync",
 				);
 				continue;
 			}
@@ -6434,23 +6651,26 @@ export class AgentDaemon {
 				this.queueClientCatchup(
 					client,
 					state.activeSessionId,
-					sequencedMessage.type === "session_replaced" ? "replacement" : "resync",
+					clientMessage.type === "session_replaced" ? "replacement" : "resync",
 				);
 				continue;
 			}
 			if (
-				sequencedMessage.type === "session_replaced" &&
+				clientMessage.type === "session_replaced" &&
 				client.transport === "private-framed" &&
 				daemonClientCapabilitiesForSession(client, state.activeSessionId).has("chunked_snapshot")
 			) {
-				this.beginReplacementSnapshot(client, state, sequencedMessage);
+				this.beginReplacementSnapshot(client, state, clientMessage);
 				continue;
 			}
 			if (client.transport === "private-framed") {
-				this.write(client, sequencedMessage);
+				this.write(client, clientMessage);
+			} else if (correlatedLifecycleSupported) {
+				serialized ??= serializeJsonLine(clientMessage);
+				this.writeSerialized(client, serialized, clientMessage);
 			} else {
-				serialized ??= serializeJsonLine(sequencedMessage);
-				this.writeSerialized(client, serialized, sequencedMessage);
+				legacySerialized ??= serializeJsonLine(clientMessage);
+				this.writeSerialized(client, legacySerialized, clientMessage);
 			}
 		}
 	}
@@ -6552,6 +6772,8 @@ export class AgentDaemon {
 				...(session.sessionFile ? { sessionFile: session.sessionFile } : {}),
 				busy,
 				operation,
+				promptLifecycles: session.getPromptLifecycleRecoverySnapshot(),
+				sessionActions: session.getSessionActionRecoverySnapshot(),
 			});
 		} catch (error) {
 			this.log(`could not checkpoint worker operation state: ${String(error)}`);
@@ -7044,6 +7266,7 @@ type SequencedDaemonOutbound = Extract<
 function isSequencedSessionOutbound(message: DaemonOutbound): message is SequencedDaemonOutbound {
 	return (
 		message.type === "session_event" ||
+		message.type === "prompt_lifecycle" ||
 		message.type === "session_status" ||
 		message.type === "session_replaced" ||
 		message.type === "session_resynced" ||
@@ -7054,6 +7277,12 @@ function isSequencedSessionOutbound(message: DaemonOutbound): message is Sequenc
 }
 
 export function shouldSendDaemonOutboundToClient(client: DaemonSocketClient, message: DaemonOutbound): boolean {
+	if (
+		message.type === "prompt_lifecycle" &&
+		!daemonClientCapabilitiesForSession(client, message.activeSessionId).has("correlated_prompt_lifecycle_v1")
+	) {
+		return false;
+	}
 	return (
 		message.type !== "extension_ui_request" ||
 		!isDaemonDialogExtensionUiRequest(message.method) ||

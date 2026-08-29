@@ -187,6 +187,18 @@ import {
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
+import {
+	createPromptRequestFingerprint,
+	isPromptLifecycleTerminal,
+	type PromptLifecycleCancellationResult,
+	type PromptLifecycleEvent,
+	type PromptLifecycleKind,
+	type PromptLifecyclePhase,
+	type PromptLifecycleRecoveryStateSnapshot,
+	type PromptLifecycleSnapshot,
+	type PromptLifecycleStateSnapshot,
+	PromptLifecycleStore,
+} from "./prompt-lifecycle.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
 	type AutoRefineReason,
@@ -309,7 +321,7 @@ export interface RlmChildAgentSnapshot {
 
 export type CompactionReason = "manual" | "threshold" | "overflow" | "requested";
 
-export type AgentSessionEvent =
+type AgentSessionEventBody =
 	| AgentEvent
 	| {
 			type: "ipython_sent_agent_message";
@@ -375,8 +387,10 @@ export type AgentSessionEvent =
 			runId?: string;
 	  }
 	| { type: "refine_complete"; result: RefinementResult }
-	| { type: "refine_failed"; error: string };
+	| { type: "refine_failed"; error: string }
+	| PromptLifecycleEvent;
 
+export type AgentSessionEvent = AgentSessionEventBody & { promptCorrelationId?: string | null };
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
 type UserBashEndDetails = {
@@ -513,6 +527,7 @@ export interface PromptOptions {
 	skipInputHandlers?: boolean;
 	signal?: AbortSignal;
 	admissionCommitted?: () => void;
+	promptCorrelationId?: string;
 	agentMessageId?: string;
 	content?: (TextContent | ImageContent)[];
 	customMessage?: CustomMessage;
@@ -677,12 +692,14 @@ export interface SessionActionRecoveryAction {
 	payload: SessionActionRecoveryPayload;
 	queueKey?: string;
 	agentMessageId?: string;
+	promptCorrelationId?: string;
 	suppressAutonomousContinuation?: boolean;
 }
 
 export interface SessionActionRecoverySnapshot {
 	formatVersion: typeof SESSION_ACTION_RECOVERY_FORMAT_VERSION;
 	actions: SessionActionRecoveryAction[];
+	promptLifecycles?: PromptLifecycleRecoveryStateSnapshot;
 }
 
 function cloneCustomMessage(message: CustomMessage): CustomMessage {
@@ -1051,6 +1068,11 @@ export class AgentSession {
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
+	private readonly _promptLifecycles = new PromptLifecycleStore();
+	private readonly _pendingCorrelatedPromptAdmissions = new Map<string, AbortController>();
+	private readonly _promptEventContext = new AsyncLocalStorage<string>();
+	private _sessionReplacementFenced = false;
+	private _sessionReplacementAdmissionGuard: (() => boolean) | undefined;
 	private _sessionInputPump: Promise<void> = Promise.resolve();
 	private _sessionInputPumpRequested = false;
 	// Invalidates preparation when a branch pause starts and finishes before its next await resumes.
@@ -1485,10 +1507,55 @@ export class AgentSession {
 		this.agent.shouldStopAfterTurn = (context) => this._shouldStopAfterTurn(context);
 	}
 
+	private _beginPromptLifecycle(
+		correlationId: string,
+		kind: PromptLifecycleKind,
+		requestFingerprint?: string,
+	): PromptLifecycleSnapshot {
+		if (this._sessionReplacementFenced || this._sessionReplacementAdmissionGuard?.()) {
+			throw new Error("A session replacement or reload is already in progress");
+		}
+		const snapshot = this._promptLifecycles.begin(correlationId, kind, requestFingerprint);
+		this._emit({ type: "prompt_lifecycle", promptCorrelationId: correlationId, ...snapshot });
+		return snapshot;
+	}
+
+	private _transitionPromptLifecycle(
+		correlationId: string,
+		phase: Exclude<PromptLifecyclePhase, "owned">,
+	): PromptLifecycleSnapshot {
+		const current = this._promptLifecycles.get(correlationId);
+		const snapshot = this._promptLifecycles.transition(correlationId, phase);
+		if (snapshot !== current) {
+			this._emit({ type: "prompt_lifecycle", promptCorrelationId: correlationId, ...snapshot });
+		}
+		return snapshot;
+	}
+
+	private _settlePromptLifecycle(
+		correlationId: string | undefined,
+		phase: "completed" | "cancelled" | "failed",
+	): void {
+		if (correlationId === undefined) return;
+		const current = this._promptLifecycles.get(correlationId);
+		if (!current || isPromptLifecycleTerminal(current.phase)) return;
+		this._transitionPromptLifecycle(correlationId, phase);
+	}
+
 	private _emit(event: AgentSessionEvent): void {
+		const contextualCorrelationId = this._promptEventContext.getStore();
+		const contextualLifecycle =
+			contextualCorrelationId === undefined ? undefined : this._promptLifecycles.get(contextualCorrelationId);
+		const promptCorrelationId =
+			event.promptCorrelationId ??
+			(contextualLifecycle?.deliveryCrossed === true && !isPromptLifecycleTerminal(contextualLifecycle.phase)
+				? contextualLifecycle.correlationId
+				: null);
+		const correlatedEvent =
+			event.promptCorrelationId === undefined ? ({ ...event, promptCorrelationId } as AgentSessionEvent) : event;
 		for (const l of this._eventListeners) {
 			try {
-				l(event);
+				l(correlatedEvent);
 			} catch {
 				// A failing observer must not prevent other subscribers from
 				// receiving lifecycle and persistence events.
@@ -1724,6 +1791,7 @@ export class AgentSession {
 			}
 		}
 		for (const action of actions) {
+			this._settlePromptLifecycle(action.promptCorrelationId, "cancelled");
 			const ticket = this._actionStore.ticketFor(action);
 			if (
 				action.payload.kind === "turn" &&
@@ -3459,6 +3527,9 @@ export class AgentSession {
 						: undefined;
 				if (record) record.started = true;
 				if (record?.role === "primary") {
+					if (action.promptCorrelationId !== undefined) {
+						this._transitionPromptLifecycle(action.promptCorrelationId, "delivered");
+					}
 					this._actionStore.ticketFor(action).settleDelivered({ status: "delivered" });
 					this._settleAgentMessage(action.agentMessageId, "delivery");
 				}
@@ -3591,6 +3662,10 @@ export class AgentSession {
 
 		this._addLoginGuidanceToAuthError(event);
 
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			const correlationId = this._promptEventContext.getStore();
+			if (correlationId !== undefined) this._promptLifecycles.addUsage(correlationId, event.message.usage);
+		}
 		this._emit(event);
 
 		if (event.type === "message_end") {
@@ -3830,6 +3905,99 @@ export class AgentSession {
 			if (index !== -1) {
 				this._eventListeners.splice(index, 1);
 			}
+		};
+	}
+
+	getPromptLifecycles(): PromptLifecycleStateSnapshot {
+		return this._promptLifecycles.snapshot();
+	}
+
+	getPromptLifecycleRecoverySnapshot(): PromptLifecycleRecoveryStateSnapshot {
+		return this._promptLifecycles.recoverySnapshot();
+	}
+
+	getPromptLifecycle(correlationId: string): PromptLifecycleSnapshot | undefined {
+		return this._promptLifecycles.get(correlationId);
+	}
+
+	getPromptLifecycleRequestFingerprint(correlationId: string): string | undefined {
+		return this._promptLifecycles.getRequestFingerprint(correlationId);
+	}
+
+	get currentPromptCorrelationId(): string | null {
+		const correlationId = this._promptEventContext.getStore();
+		if (correlationId === undefined) return null;
+		const lifecycle = this._promptLifecycles.get(correlationId);
+		return lifecycle?.deliveryCrossed === true && !isPromptLifecycleTerminal(lifecycle.phase) ? correlationId : null;
+	}
+
+	get hasNonterminalPromptLifecycle(): boolean {
+		return this._promptLifecycles.snapshot().records.some((lifecycle) => !isPromptLifecycleTerminal(lifecycle.phase));
+	}
+
+	setSessionReplacementAdmissionGuard(guard: (() => boolean) | undefined): void {
+		this._sessionReplacementAdmissionGuard = guard;
+	}
+
+	acquireSessionReplacementFence(): () => void {
+		if (this._sessionReplacementFenced || this._sessionReplacementAdmissionGuard?.()) {
+			throw new Error("A session replacement or reload is already in progress");
+		}
+		if (this.hasNonterminalPromptLifecycle) {
+			throw new Error("A correlated prompt is still active and prevents session replacement or reload");
+		}
+		this._sessionReplacementFenced = true;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this._sessionReplacementFenced = false;
+		};
+	}
+
+	cancelPromptLifecycle(correlationId: string): PromptLifecycleCancellationResult {
+		const lifecycle = this._promptLifecycles.get(correlationId);
+		if (!lifecycle) {
+			const expired = this._promptLifecycles.getExpired(correlationId);
+			return expired
+				? { status: "expired", ownershipCrossed: true, deliveryCrossed: expired.deliveryCrossed }
+				: { status: "unknown", ownershipCrossed: "unknown", deliveryCrossed: "unknown" };
+		}
+		if (lifecycle.phase === "cancelled") {
+			return { status: "cancelled", ownershipCrossed: true, deliveryCrossed: false, lifecycle };
+		}
+		if (isPromptLifecycleTerminal(lifecycle.phase) || lifecycle.deliveryCrossed) {
+			return {
+				status: "too_late",
+				ownershipCrossed: true,
+				deliveryCrossed: lifecycle.deliveryCrossed,
+				lifecycle,
+			};
+		}
+		const cancelled = this._cancelSessionActions(
+			(action) => action.promptCorrelationId === correlationId,
+			new Error("Correlated prompt was cancelled before delivery."),
+		);
+		if (cancelled.length > 0) {
+			this._emitQueueUpdate();
+			this._scheduleSessionInputPump();
+			const terminal = this._promptLifecycles.get(correlationId);
+			if (!terminal) throw new Error("Cancelled prompt lifecycle was not retained");
+			return { status: "cancelled", ownershipCrossed: true, deliveryCrossed: false, lifecycle: terminal };
+		}
+		const pending = this._pendingCorrelatedPromptAdmissions.get(correlationId);
+		if (pending !== undefined) {
+			pending.abort();
+			this._settlePromptLifecycle(correlationId, "cancelled");
+			const terminal = this._promptLifecycles.get(correlationId);
+			if (!terminal) throw new Error("Cancelled prompt lifecycle was not retained");
+			return { status: "cancelled", ownershipCrossed: true, deliveryCrossed: false, lifecycle: terminal };
+		}
+		return {
+			status: "too_late",
+			ownershipCrossed: true,
+			deliveryCrossed: lifecycle.deliveryCrossed,
+			lifecycle,
 		};
 	}
 
@@ -4837,50 +5005,120 @@ export class AgentSession {
 			this._assertSessionActionAdmissionAvailable();
 		}
 		const admissionEpoch = this._sessionInputPumpEpoch;
-		const commitFence = this.isStreaming
-			? undefined
-			: await this._acquireDirectTurnAdmissionFence(options?.signal).catch((error: unknown) => {
-					throwIfPromptAdmissionCancelled(options?.signal);
-					throw error;
-				});
+		const promptCorrelationId = options?.promptCorrelationId;
+		const isInternalPrompt = options?.internalPrompt === true;
+		const expandPromptTemplates = isInternalPrompt ? false : (options?.expandPromptTemplates ?? true);
+		const parseSessionCommands = !isInternalPrompt && !options?.skipPrePromptWork;
+		const inputSource =
+			!isInternalPrompt && !options?.skipInputHandlers ? (options?.source ?? "interactive") : undefined;
+		const sessionCommandWillRun = parseSessionCommands && parseSessionSlashCommand(text) !== undefined;
+		const extensionCommandWillRun =
+			expandPromptTemplates &&
+			text.startsWith("/") &&
+			this._extensionRunner.getCommand(parseSlashCommand(text)?.name ?? "") !== undefined;
+		const inputHandlerWillRun =
+			inputSource !== undefined &&
+			this._extensionRunner.hasHandlers("input") &&
+			!sessionCommandWillRun &&
+			!extensionCommandWillRun;
+		let correlatedAdmissionController: AbortController | undefined;
+		if (promptCorrelationId !== undefined) {
+			const kind: PromptLifecycleKind = isInternalPrompt
+				? "injected_prompt"
+				: sessionCommandWillRun
+					? "session_command"
+					: extensionCommandWillRun
+						? "extension_command"
+						: inputHandlerWillRun
+							? "input_handler"
+							: "model_prompt";
+			this._beginPromptLifecycle(
+				promptCorrelationId,
+				kind,
+				createPromptRequestFingerprint({
+					message: text,
+					images: options?.images,
+					queueIfBusy: options?.queueIfBusy,
+				}),
+			);
+			correlatedAdmissionController = new AbortController();
+			this._pendingCorrelatedPromptAdmissions.set(promptCorrelationId, correlatedAdmissionController);
+		}
+		const promptSignal = correlatedAdmissionController
+			? options?.signal
+				? AbortSignal.any([options.signal, correlatedAdmissionController.signal])
+				: correlatedAdmissionController.signal
+			: options?.signal;
+		let commitFence: { owner: symbol; release(): void } | undefined;
+		try {
+			commitFence = this.isStreaming ? undefined : await this._acquireDirectTurnAdmissionFence(promptSignal);
+		} catch (error) {
+			if (
+				promptCorrelationId !== undefined &&
+				this._pendingCorrelatedPromptAdmissions.get(promptCorrelationId) === correlatedAdmissionController
+			) {
+				this._pendingCorrelatedPromptAdmissions.delete(promptCorrelationId);
+			}
+			this._settlePromptLifecycle(promptCorrelationId, promptSignal?.aborted === true ? "cancelled" : "failed");
+			throwIfPromptAdmissionCancelled(promptSignal);
+			throw error;
+		}
 		const reportPreflight = oncePreflight(options?.preflightResult);
 		const run = async () => {
 			try {
-				throwIfPromptAdmissionCancelled(options?.signal);
+				throwIfPromptAdmissionCancelled(promptSignal);
 				if (!resumeSuspendedInput && admissionEpoch !== this._sessionInputPumpEpoch) {
 					throw new Error("Session input was invalidated before admission");
 				}
 				options?.admissionCommitted?.();
-				const isInternalPrompt = options?.internalPrompt === true;
-				const expandPromptTemplates = isInternalPrompt ? false : (options?.expandPromptTemplates ?? true);
-				const normalizationResult = this._normalizeSubmission(text, options?.images, {
-					parseSessionCommands: !isInternalPrompt && !options?.skipPrePromptWork,
-					extensionCommands: expandPromptTemplates ? "execute" : "ignore",
-					inputSource:
-						!isInternalPrompt && !options?.skipInputHandlers ? (options?.source ?? "interactive") : undefined,
-					expandSkills: expandPromptTemplates,
-					expandPromptTemplates,
-				});
+				if (promptCorrelationId !== undefined && (inputHandlerWillRun || extensionCommandWillRun)) {
+					this._transitionPromptLifecycle(promptCorrelationId, "delivered");
+				}
+				const normalizeSubmission = () =>
+					this._normalizeSubmission(text, options?.images, {
+						parseSessionCommands,
+						extensionCommands: expandPromptTemplates ? "execute" : "ignore",
+						inputSource,
+						expandSkills: expandPromptTemplates,
+						expandPromptTemplates,
+					});
+				const normalizationResult = promptCorrelationId
+					? this._promptEventContext.run(promptCorrelationId, normalizeSubmission)
+					: normalizeSubmission();
 				const normalized = normalizationResult instanceof Promise ? await normalizationResult : normalizationResult;
 				// Async input handlers ran between the admission check above and
 				// admission itself; re-check so content invalidated during that
 				// await (e.g. a cron job cancelled or updated) is not admitted.
 				if (normalizationResult instanceof Promise) options?.admissionCommitted?.();
+				throwIfPromptAdmissionCancelled(promptSignal);
 				if (normalized.kind === "extensionCommand") {
+					if (promptCorrelationId !== undefined) {
+						this._transitionPromptLifecycle(promptCorrelationId, "delivered");
+					}
 					commitFence?.release();
 					reportPreflight(true);
 					void normalized.completion.then(
-						() => this._settleAgentMessage(options?.agentMessageId, "completion"),
-						(error) => this._settleAgentMessage(options?.agentMessageId, "completion", error),
+						() => {
+							this._settleAgentMessage(options?.agentMessageId, "completion");
+							this._settlePromptLifecycle(promptCorrelationId, "completed");
+						},
+						(error) => {
+							this._settleAgentMessage(options?.agentMessageId, "completion", error);
+							this._settlePromptLifecycle(promptCorrelationId, "failed");
+						},
 					);
 					void normalized.completion.catch(() => undefined);
 					if (!options?.returnAfterAccepted) await normalized.completion.catch(() => undefined);
 					return;
 				}
 				if (normalized.kind === "handled") {
+					if (promptCorrelationId !== undefined) {
+						this._transitionPromptLifecycle(promptCorrelationId, "delivered");
+					}
 					commitFence?.release();
 					reportPreflight(true);
 					this._settleAgentMessage(options?.agentMessageId, "completion");
+					this._settlePromptLifecycle(promptCorrelationId, "completed");
 					return;
 				}
 
@@ -4896,6 +5134,7 @@ export class AgentSession {
 						schedule,
 						{
 							agentMessageId: options?.agentMessageId,
+							promptCorrelationId,
 							source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
 						},
 					);
@@ -4903,8 +5142,17 @@ export class AgentSession {
 						immediatelyEligible: !wasBusy && this._canStartSessionActionImmediately(),
 					});
 					commitFence?.release();
+					if (promptCorrelationId !== undefined && result.accepted && result.disposition === "queued") {
+						const lifecycle = this._promptLifecycles.get(promptCorrelationId);
+						if (lifecycle?.phase === "owned") {
+							this._transitionPromptLifecycle(promptCorrelationId, "queued");
+						}
+					}
 					reportPreflight(result.accepted, result.disposition === "queued");
-					if (!result.accepted || !result.ticket) return;
+					if (!result.accepted || !result.ticket) {
+						this._settlePromptLifecycle(promptCorrelationId, "failed");
+						return;
+					}
 					if (options?.returnAfterAccepted) {
 						if (result.disposition === "starts_when_admitted") await result.ticket.delivered;
 						return;
@@ -4941,6 +5189,7 @@ export class AgentSession {
 				const acceptedAgentMessage = options?.skipPrePromptWork === true && options.returnAfterAccepted === true;
 				const action = this._createPreparedTurnAction(schedule, normalized.text, normalized.images, {
 					agentMessageId: options?.agentMessageId,
+					promptCorrelationId,
 					queueKey: options?.followUpQueueKey,
 					content,
 					message: primaryMessage,
@@ -4970,10 +5219,17 @@ export class AgentSession {
 				commitFence?.release();
 				if (!result.accepted || !result.ticket) {
 					if (prefixMessages) this._pendingNextTurnMessages.unshift(...prefixMessages);
+					this._settlePromptLifecycle(promptCorrelationId, "failed");
 					reportPreflight(false, false);
 					return;
 				}
 				if (result.disposition === "queued") {
+					if (promptCorrelationId !== undefined) {
+						const lifecycle = this._promptLifecycles.get(promptCorrelationId);
+						if (lifecycle?.phase === "owned") {
+							this._transitionPromptLifecycle(promptCorrelationId, "queued");
+						}
+					}
 					reportPreflight(true, true);
 				} else {
 					void result.ticket.delivered.then(
@@ -5020,10 +5276,22 @@ export class AgentSession {
 				await result.ticket.completed;
 				await this.waitForSessionInputIdle();
 			} catch (error) {
+				const lifecycle =
+					promptCorrelationId === undefined ? undefined : this._promptLifecycles.get(promptCorrelationId);
+				this._settlePromptLifecycle(
+					promptCorrelationId,
+					promptSignal?.aborted === true && lifecycle?.deliveryCrossed !== true ? "cancelled" : "failed",
+				);
 				reportPreflight(false);
 				throw error;
 			} finally {
 				commitFence?.release();
+				if (
+					promptCorrelationId !== undefined &&
+					this._pendingCorrelatedPromptAdmissions.get(promptCorrelationId) === correlatedAdmissionController
+				) {
+					this._pendingCorrelatedPromptAdmissions.delete(promptCorrelationId);
+				}
 			}
 		};
 		return commitFence ? this._sessionActionCommitContext.run(commitFence.owner, run) : run();
@@ -5154,6 +5422,11 @@ export class AgentSession {
 		if (snapshot.formatVersion !== SESSION_ACTION_RECOVERY_FORMAT_VERSION) {
 			throw new Error(`Unsupported session action recovery format version: ${snapshot.formatVersion}`);
 		}
+		const restoredPromptLifecycles =
+			snapshot.promptLifecycles === undefined ? this._promptLifecycles : new PromptLifecycleStore();
+		if (snapshot.promptLifecycles !== undefined) {
+			restoredPromptLifecycles.restore(snapshot.promptLifecycles);
+		}
 		const actionIds = new Set(this._actionStore.ownedActions().map((action) => action.id));
 		const actions = snapshot.actions.map((recovered): QueuedSessionAction => {
 			if (actionIds.has(recovered.id)) throw new Error(`Duplicate session action id: ${recovered.id}`);
@@ -5228,9 +5501,27 @@ export class AgentSession {
 				lifecycle: { state: "queued" },
 				...(recovered.queueKey ? { queueKey: recovered.queueKey } : {}),
 				...(recovered.agentMessageId ? { agentMessageId: recovered.agentMessageId } : {}),
+				...(recovered.promptCorrelationId ? { promptCorrelationId: recovered.promptCorrelationId } : {}),
 				...(recovered.suppressAutonomousContinuation ? { suppressAutonomousContinuation: true } : {}),
 			};
 		});
+		for (const action of actions) {
+			if (action.promptCorrelationId !== undefined) {
+				const restoredLifecycle = restoredPromptLifecycles.get(action.promptCorrelationId);
+				if (restoredLifecycle?.phase !== "queued" || restoredLifecycle.deliveryCrossed) {
+					throw new Error(`Recovered session action has incompatible prompt lifecycle: ${action.id}`);
+				}
+			}
+		}
+		if (this._disposed || this._disposing) {
+			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
+		}
+		if (this._sessionInputAdmissionPauses.size > 0) {
+			throw new Error("Cannot admit a session action while session input admission is paused.");
+		}
+		if (snapshot.promptLifecycles !== undefined) {
+			this._promptLifecycles.restore(snapshot.promptLifecycles);
+		}
 		for (const action of actions) {
 			const durableTerminalNotice = this._isRlmTerminalNoticeAction(action);
 			if (durableTerminalNotice) this._durableRlmTerminalNoticeActionIds.add(action.id);
@@ -5238,7 +5529,18 @@ export class AgentSession {
 				this._admitSessionInput(action, { restore: true });
 			} catch (error) {
 				if (durableTerminalNotice) this._durableRlmTerminalNoticeActionIds.delete(action.id);
+				this._settlePromptLifecycle(action.promptCorrelationId, "failed");
 				throw error;
+			}
+		}
+		if (snapshot.promptLifecycles !== undefined) {
+			const restoredCorrelations = new Set(
+				actions.flatMap((action) => (action.promptCorrelationId === undefined ? [] : [action.promptCorrelationId])),
+			);
+			for (const lifecycle of this._promptLifecycles.snapshot().records) {
+				if (!isPromptLifecycleTerminal(lifecycle.phase) && !restoredCorrelations.has(lifecycle.correlationId)) {
+					this._settlePromptLifecycle(lifecycle.correlationId, "failed");
+				}
 			}
 		}
 		return actions.length;
@@ -5441,6 +5743,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		options: {
 			agentMessageId?: string;
+			promptCorrelationId?: string;
 			queueKey?: string;
 			content?: (TextContent | ImageContent)[];
 			message?: QueuedAgentMessage;
@@ -5496,6 +5799,7 @@ export class AgentSession {
 			lifecycle: { state: "queued" },
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
+			promptCorrelationId: options.promptCorrelationId,
 			suppressAutonomousContinuation: options.suppressAutonomousContinuation,
 		};
 	}
@@ -5507,6 +5811,7 @@ export class AgentSession {
 		schedule: SessionInputSchedule,
 		options: {
 			agentMessageId?: string;
+			promptCorrelationId?: string;
 			source?: InputSource | "internal";
 		} = {},
 	): QueuedSessionAction {
@@ -5518,6 +5823,7 @@ export class AgentSession {
 			payload: { kind: "session_command", text, command, images },
 			lifecycle: { state: "queued" },
 			agentMessageId: options.agentMessageId,
+			promptCorrelationId: options.promptCorrelationId,
 		};
 	}
 
@@ -5726,16 +6032,20 @@ export class AgentSession {
 				const first = preselected ?? this._actionStore.selectFirst();
 				if (!first) return;
 				if (first.payload.kind === "session_command") {
-					await this._executeSelectedSessionCommand(first, epoch);
+					const executeSessionCommand = () => this._executeSelectedSessionCommand(first, epoch);
+					await (first.promptCorrelationId
+						? this._promptEventContext.run(first.promptCorrelationId, executeSessionCommand)
+						: executeSessionCommand());
 					return;
 				}
 
 				const mode = first.delivery === "next_turn_boundary" ? this.steeringMode : this.followUpMode;
 				const actions: QueuedSessionAction[] = [first];
-				while (!preselected && mode === "all") {
+				while (!preselected && mode === "all" && first.promptCorrelationId === undefined) {
 					const next = this._actionStore.queuedActions(first.delivery)[0];
 					if (
 						!next ||
+						next.promptCorrelationId !== undefined ||
 						next.payload.kind !== "turn" ||
 						!turnExecutionPoliciesEqual(first.payload.executionPolicy, next.payload.executionPolicy)
 					) {
@@ -5752,7 +6062,10 @@ export class AgentSession {
 				this._notifySessionInputCheckpointChange();
 				this._emitQueueUpdate();
 				try {
-					await this._startPreparedTurnActions(actions, epoch);
+					const startPreparedTurnActions = () => this._startPreparedTurnActions(actions, epoch);
+					await (first.promptCorrelationId
+						? this._promptEventContext.run(first.promptCorrelationId, startPreparedTurnActions)
+						: startPreparedTurnActions());
 					for (const action of actions) {
 						if (action.lifecycle.state === "committing") {
 							const primary = primaryDeliveryRecord(action);
@@ -5766,6 +6079,7 @@ export class AgentSession {
 						}
 						if (action.lifecycle.state === "running") {
 							transitionSessionAction(action, { state: "completed" });
+							this._settlePromptLifecycle(action.promptCorrelationId, "completed");
 							this._actionStore.ticketFor(action).settleCompleted();
 							this._settleAgentMessage(action.agentMessageId, "completion");
 						}
@@ -5809,6 +6123,7 @@ export class AgentSession {
 								error: terminalError,
 							});
 						}
+						this._settlePromptLifecycle(action.promptCorrelationId, "failed");
 						const ticket = this._actionStore.ticketFor(action);
 						if (undelivered.includes(action)) {
 							ticket.rejectDelivered(terminalError);
@@ -5871,11 +6186,15 @@ export class AgentSession {
 				this._notifySessionInputCheckpointChange();
 				this._emitQueueUpdate();
 				try {
+					if (action.promptCorrelationId !== undefined) {
+						this._transitionPromptLifecycle(action.promptCorrelationId, "delivered");
+					}
 					this._appendDurableSessionCommandMessage(input.text, input.command, false);
 					this._actionStore.ticketFor(action).settleDelivered({ status: "not_applicable" });
 					this._settleAgentMessage(action.agentMessageId, "delivery");
 					await this._executeQueuedSessionCommand(action);
 					transitionSessionAction(action, { state: "completed" });
+					this._settlePromptLifecycle(action.promptCorrelationId, "completed");
 					this._actionStore.ticketFor(action).settleCompleted();
 					this._settleAgentMessage(action.agentMessageId, "completion");
 				} catch (error) {
@@ -5884,6 +6203,7 @@ export class AgentSession {
 						state: "failed",
 						error: commandError,
 					});
+					this._settlePromptLifecycle(action.promptCorrelationId, "failed");
 					const ticket = this._actionStore.ticketFor(action);
 					ticket.rejectDelivered(commandError);
 					ticket.settleCompleted(commandError);
@@ -6553,6 +6873,7 @@ export class AgentSession {
 	getSessionActionRecoverySnapshot(): SessionActionRecoverySnapshot {
 		return {
 			formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION,
+			promptLifecycles: this._promptLifecycles.recoverySnapshot(),
 			actions: this._actionStore.snapshotActions().map((action) => ({
 				id: action.id,
 				source: action.source,
@@ -6560,6 +6881,7 @@ export class AgentSession {
 				wake: action.wake,
 				...(action.queueKey ? { queueKey: action.queueKey } : {}),
 				...(action.agentMessageId ? { agentMessageId: action.agentMessageId } : {}),
+				...(action.promptCorrelationId ? { promptCorrelationId: action.promptCorrelationId } : {}),
 				...(action.suppressAutonomousContinuation ? { suppressAutonomousContinuation: true } : {}),
 				payload:
 					action.payload.kind === "turn"
@@ -9204,6 +9526,15 @@ export class AgentSession {
 	}
 
 	async reload(): Promise<void> {
+		const release = this.acquireSessionReplacementFence();
+		try {
+			await this.reloadUnfenced();
+		} finally {
+			release();
+		}
+	}
+
+	private async reloadUnfenced(): Promise<void> {
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, {
 			type: "session_shutdown",

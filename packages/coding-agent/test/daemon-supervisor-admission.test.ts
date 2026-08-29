@@ -28,6 +28,7 @@ interface SupervisorHarness {
 	handleLine(client: DaemonSocketClient, line: string): Promise<void>;
 	clients: Set<DaemonSocketClient>;
 	promptAdmissions: Map<DaemonSocketClient, Map<string, AdmissionRecord>>;
+	correlatedPromptReservations: Map<string, unknown>;
 }
 
 function client(id: string): DaemonSocketClient {
@@ -80,6 +81,8 @@ function createHarness(
 		detachingInputPauseSessions: new WeakMap(),
 		protocolClientIds: new WeakMap(),
 		promptAdmissions: new Map(),
+		correlatedPromptReservations: new Map(),
+		correlatedJournalRuns: new Map(),
 		sessionInputPauses: new Map(),
 		mutationDrain: new MutationDrainLatch(),
 		commandJournal: options.commandJournal ?? {
@@ -133,6 +136,175 @@ describe("daemon supervisor prompt admission ownership", () => {
 		workerLookup.reject(new Error("worker lookup stopped"));
 		await pendingPrompt;
 		expect(admissionFor(supervisor, owner)).toBeUndefined();
+	});
+
+	it("reserves correlated submissions before worker lookup without generic admission ids", async () => {
+		const workerLookup = deferred<unknown>();
+		const forwarded = deferred<DaemonResponse>();
+		const forwardToWorker = vi.fn((_worker: unknown, _command: DaemonCommand) => forwarded.promise);
+		const supervisor = createHarness({
+			findWorker: vi.fn(() => workerLookup.promise),
+			forwardToWorker,
+		});
+		const owner = client("connection-owner");
+		const prompt = {
+			id: "submit-1",
+			type: "submit_correlated_prompt",
+			activeSessionId: "session-1",
+			sessionId: "durable-session-1",
+			correlationId: "correlation-1",
+			message: "hello",
+			queueIfBusy: true,
+		} satisfies DaemonCommand;
+
+		const pending = supervisor.handleLine(owner, commandLine(prompt));
+		expect(admissionFor(supervisor, owner)).toBeUndefined();
+		expect(supervisor.correlatedPromptReservations.size).toBe(1);
+		workerLookup.resolve({
+			worker: { descriptor: { lifecycle: "ready", rootActiveSessionId: "session-1" } },
+			summary: { id: "session-1", activeSessionId: "worker-session-1", sessionId: "durable-session-1" },
+		});
+		await waitFor(() => forwardToWorker.mock.calls.length === 1);
+		expect(forwardToWorker.mock.calls[0]?.[1]).toMatchObject({
+			type: "submit_correlated_prompt",
+			correlationId: "correlation-1",
+			activeSessionId: "worker-session-1",
+		});
+		forwarded.resolve(success("submit-1", "submit_correlated_prompt", {}));
+		await pending;
+		expect(supervisor.correlatedPromptReservations.size).toBe(0);
+	});
+
+	it("does not serialize the same correlation id across session generations", async () => {
+		const firstLookup = deferred<unknown>();
+		const forwardToWorker = vi.fn(async (_worker: unknown, command: DaemonCommand) =>
+			success(command.id, command.type, {}),
+		);
+		const supervisor = createHarness({
+			findWorker: vi.fn((_client: DaemonSocketClient, activeSessionId: string) =>
+				activeSessionId === "session-1"
+					? firstLookup.promise
+					: Promise.resolve({
+							worker: { descriptor: { lifecycle: "ready", rootActiveSessionId: "session-2" } },
+							summary: {
+								id: "session-2",
+								activeSessionId: "worker-session-2",
+								sessionId: "durable-session-2",
+							},
+						}),
+			),
+			forwardToWorker,
+		});
+		const first = supervisor.handleLine(
+			client("first"),
+			commandLine({
+				id: "submit-1",
+				type: "submit_correlated_prompt",
+				activeSessionId: "session-1",
+				sessionId: "durable-session-1",
+				correlationId: "shared-correlation",
+				message: "first",
+			}),
+		);
+		const second = supervisor.handleLine(
+			client("second"),
+			commandLine({
+				id: "submit-2",
+				type: "submit_correlated_prompt",
+				activeSessionId: "session-2",
+				sessionId: "durable-session-2",
+				correlationId: "shared-correlation",
+				message: "second",
+			}),
+		);
+
+		await waitFor(() => forwardToWorker.mock.calls.length === 1);
+		expect(forwardToWorker.mock.calls[0]?.[1]).toMatchObject({ activeSessionId: "worker-session-2" });
+		await second;
+		firstLookup.resolve({
+			worker: { descriptor: { lifecycle: "ready", rootActiveSessionId: "session-1" } },
+			summary: { id: "session-1", activeSessionId: "worker-session-1", sessionId: "durable-session-1" },
+		});
+		await first;
+	});
+
+	it("rejects stale correlated generations before forwarding to a worker", async () => {
+		const forwardToWorker = vi.fn(async (_worker: unknown, command: DaemonCommand) =>
+			success(command.id, command.type, {}),
+		);
+		const supervisor = createHarness({
+			findWorker: vi.fn(async () => ({
+				worker: { descriptor: { lifecycle: "ready", rootActiveSessionId: "session-1" } },
+				summary: { id: "session-1", activeSessionId: "worker-session-1", sessionId: "current-session" },
+			})),
+			forwardToWorker,
+		});
+		await supervisor.handleLine(
+			client("stale-client"),
+			commandLine({
+				id: "submit-stale",
+				type: "submit_correlated_prompt",
+				activeSessionId: "session-1",
+				sessionId: "stale-session",
+				correlationId: "correlation-1",
+				message: "hello",
+			}),
+		);
+
+		expect(forwardToWorker).not.toHaveBeenCalled();
+		expect((supervisor as unknown as { write: ReturnType<typeof vi.fn> }).write.mock.calls.at(-1)?.[1]).toMatchObject(
+			{
+				success: false,
+				error: "Correlated prompt targeted a stale session generation",
+			},
+		);
+	});
+
+	it("orders cross-client correlated cancellation after the matching submit", async () => {
+		const submitResult = deferred<DaemonResponse>();
+		const cancelResult = deferred<DaemonResponse>();
+		const forwardToWorker = vi.fn((_worker: unknown, command: DaemonCommand) =>
+			command.type === "submit_correlated_prompt" ? submitResult.promise : cancelResult.promise,
+		);
+		const supervisor = createHarness({
+			findWorker: vi.fn(async () => ({
+				worker: { descriptor: { lifecycle: "ready", rootActiveSessionId: "session-1" } },
+				summary: { id: "session-1", activeSessionId: "worker-session-1", sessionId: "durable-session-1" },
+			})),
+			forwardToWorker,
+		});
+		const submitter = client("submitter");
+		const canceller = client("canceller");
+		const submit = supervisor.handleLine(
+			submitter,
+			commandLine({
+				id: "submit-1",
+				type: "submit_correlated_prompt",
+				activeSessionId: "session-1",
+				sessionId: "durable-session-1",
+				correlationId: "correlation-1",
+				message: "hello",
+				queueIfBusy: true,
+			}),
+		);
+		const cancel = supervisor.handleLine(
+			canceller,
+			commandLine({
+				id: "cancel-1",
+				type: "cancel_correlated_prompt",
+				activeSessionId: "session-alias",
+				sessionId: "durable-session-1",
+				correlationId: "correlation-1",
+			}),
+		);
+
+		await waitFor(() => forwardToWorker.mock.calls.length === 2);
+		expect(forwardToWorker.mock.calls[0]?.[1]).toMatchObject({ type: "submit_correlated_prompt" });
+		expect(forwardToWorker.mock.calls[1]?.[1]).toMatchObject({ type: "cancel_correlated_prompt" });
+		cancelResult.resolve(success("cancel-1", "cancel_correlated_prompt", { status: "cancelled" }));
+		await cancel;
+		submitResult.resolve(success("submit-1", "submit_correlated_prompt", {}));
+		await submit;
 	});
 
 	it("cleans up restart-fenced prompt admissions so the same id can retry", async () => {
@@ -198,7 +370,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 			commandJournal,
 			findWorker: vi.fn(async () => ({
 				worker: { descriptor: { lifecycle: "ready", rootActiveSessionId: "session-1" } },
-				summary: { id: "session-1", activeSessionId: "session-1" },
+				summary: { id: "session-1", activeSessionId: "session-1", sessionId: "durable-session-1" },
 			})),
 			forwardToWorker: vi.fn(() => forward.promise),
 		});
@@ -211,12 +383,105 @@ describe("daemon supervisor prompt admission ownership", () => {
 
 		const first = supervisor.handleLine(owner, JSON.stringify(command));
 		const second = supervisor.handleLine(owner, JSON.stringify(command));
-		await waitFor(() => commandJournal.begin.mock.calls.length === 2);
+		await waitFor(
+			() =>
+				commandJournal.begin.mock.calls.length === 2 &&
+				(supervisor as unknown as { forwardToWorker: ReturnType<typeof vi.fn> }).forwardToWorker.mock.calls
+					.length === 1,
+		);
 		expect(
 			(supervisor as unknown as { forwardToWorker: ReturnType<typeof vi.fn> }).forwardToWorker,
 		).toHaveBeenCalledOnce();
 		forward.resolve({ type: "response", command: "prompt", success: true });
 		await Promise.all([first, second]);
+	});
+
+	it.each([
+		{
+			id: "submit-retry",
+			type: "submit_correlated_prompt" as const,
+			activeSessionId: "session-1",
+			sessionId: "durable-session-1",
+			correlationId: "correlation-1",
+			message: "hello",
+			queueIfBusy: true,
+		},
+		{
+			id: "cancel-retry",
+			type: "cancel_correlated_prompt" as const,
+			activeSessionId: "session-1",
+			sessionId: "durable-session-1",
+			correlationId: "correlation-1",
+		},
+	])("redrives an uncertain correlated $type through lifecycle idempotency", async (command) => {
+		const commandJournal = {
+			lookup: vi.fn(() => ({ status: "pending" as const })),
+			begin: vi.fn(() => ({ status: "pending" as const })),
+			recordResult: vi.fn(),
+			acknowledge: vi.fn(),
+		};
+		const forwardToWorker = vi.fn(async () => success(command.id, command.type, {}));
+		const supervisor = createHarness({
+			commandJournal,
+			findWorker: vi.fn(async () => ({
+				worker: { descriptor: { lifecycle: "ready", rootActiveSessionId: "session-1" } },
+				summary: { id: "session-1", activeSessionId: "session-1", sessionId: "durable-session-1" },
+			})),
+			forwardToWorker,
+		});
+
+		await supervisor.handleLine(client("owner"), commandLine(command));
+		expect(forwardToWorker).toHaveBeenCalledOnce();
+		expect(commandJournal.recordResult).toHaveBeenCalledOnce();
+	});
+
+	it("coalesces concurrent journal redrive for the same correlated command id", async () => {
+		const forwarded = deferred<DaemonResponse>();
+		const commandJournal = {
+			lookup: vi.fn(() => ({ status: "pending" as const })),
+			begin: vi.fn(() => ({ status: "pending" as const })),
+			recordResult: vi.fn(),
+			acknowledge: vi.fn(),
+		};
+		const forwardToWorker = vi.fn(() => forwarded.promise);
+		const supervisor = createHarness({
+			commandJournal,
+			findWorker: vi.fn(async () => ({
+				worker: { descriptor: { lifecycle: "ready", rootActiveSessionId: "session-1" } },
+				summary: { id: "session-1", activeSessionId: "session-1", sessionId: "durable-session-1" },
+			})),
+			forwardToWorker,
+		});
+		const owner = client("owner");
+		const command = {
+			id: "submit-retry",
+			type: "submit_correlated_prompt" as const,
+			activeSessionId: "session-1",
+			sessionId: "durable-session-1",
+			correlationId: "correlation-1",
+			message: "hello",
+			queueIfBusy: true,
+		};
+
+		const first = supervisor.handleLine(owner, commandLine(command, "stable-client"));
+		const retry = supervisor.handleLine(owner, commandLine(command, "stable-client"));
+		const conflictingRetry = supervisor.handleLine(
+			owner,
+			commandLine({ ...command, message: "different" }, "stable-client"),
+		);
+		await waitFor(() => forwardToWorker.mock.calls.length === 1);
+		await conflictingRetry;
+		const write = (supervisor as unknown as { write: ReturnType<typeof vi.fn> }).write;
+		expect(write.mock.calls.at(-1)?.[1]).toMatchObject({
+			success: false,
+			error: "Correlated command id was reused with a different request",
+		});
+		forwarded.resolve(success(command.id, command.type, { duplicate: false }));
+		await Promise.all([first, retry]);
+
+		expect(forwardToWorker).toHaveBeenCalledOnce();
+		expect(commandJournal.recordResult).toHaveBeenCalledOnce();
+		expect(write).toHaveBeenCalledTimes(3);
 	});
 
 	it("lets the originating connection cancel before worker lookup starts", async () => {

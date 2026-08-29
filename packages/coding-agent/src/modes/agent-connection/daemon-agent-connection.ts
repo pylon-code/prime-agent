@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
 import { appendRotatingLog, getAgentLogPath, getDaemonLogPath } from "../../config.js";
@@ -16,6 +17,17 @@ import type {
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
+import {
+	createPromptRequestFingerprint,
+	isPromptEventAttribution,
+	isPromptLifecycleSnapshot,
+	isPromptLifecycleStateSnapshot,
+	isPromptLifecycleSuccessor,
+	isPromptLifecycleTerminal,
+	type PromptLifecycleCancellationResult,
+	type PromptLifecycleSnapshot,
+	type PromptLifecycleStateSnapshot,
+} from "../../core/prompt-lifecycle.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { SessionAlreadyActiveError } from "../../core/session-lease.js";
@@ -48,6 +60,8 @@ import {
 import type {
 	AgentConnection,
 	AgentConnectionBeforeSessionInvalidateListener,
+	AgentConnectionCorrelatedPromptOptions,
+	AgentConnectionCorrelatedPromptResult,
 	AgentConnectionEvent,
 	AgentConnectionEventListener,
 	AgentConnectionExecuteBashOptions,
@@ -93,6 +107,8 @@ import { AgentConnectionPromptAdmissionError } from "./types.js";
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 type DaemonSnapshotBegin = Extract<DaemonOutbound, { type: "session_snapshot_begin" }>;
+type DaemonSnapshotPurpose = NonNullable<DaemonSnapshotBegin["purpose"]>;
+type DaemonSessionReplaced = Extract<DaemonOutbound, { type: "session_replaced" }>;
 
 interface DaemonSnapshotAssembly {
 	begin?: DaemonSnapshotBegin;
@@ -103,6 +119,33 @@ interface DaemonSnapshotAssembly {
 	timeout: ReturnType<typeof setTimeout>;
 }
 
+interface CorrelatedPromptRoute {
+	activeSessionId: string;
+	sessionId: string;
+	requestFingerprint: string;
+	pending: boolean;
+}
+
+interface PendingChunkedReplacement {
+	header: DaemonSessionReplaced;
+	snapshotId?: string;
+	queuedMessages: DaemonOutbound[];
+}
+
+interface StagedEventProgress {
+	lastEventCursor: DaemonEventCursor | undefined;
+	lastEventSequence: number | undefined;
+	retiredEventGenerations: Set<string>;
+}
+
+interface StagedSnapshotCommit extends StagedEventProgress {
+	activeSessionId: string;
+	attachedSessionId: string;
+	attachedSessionFile: string | undefined;
+	latestSnapshot: AgentConnectionSnapshot;
+	childRosterSequence: number | undefined;
+}
+
 export const DAEMON_REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 export const DAEMON_RECONNECT_TIMEOUT_MS = 60_000;
@@ -111,6 +154,8 @@ const MAX_IGNORED_SNAPSHOT_IDS = 128;
 const UPDATE_RECONNECT_TIMEOUT_MS = 120000;
 const UPDATE_RECONNECT_RETRY_MS = 100;
 const MAX_COMPLETED_SNAPSHOTS = 128;
+const PROMPT_LIFECYCLE_TERMINAL_RETENTION = 256;
+const PROMPT_LIFECYCLE_TOMBSTONE_RETENTION = 256;
 const OWNED_SESSION_DISPOSE_RECONNECT_WAIT_MS = 10_000;
 const updateTransportReconnects = new WeakMap<DaemonClient, Promise<void>>();
 
@@ -124,6 +169,35 @@ function formatErrorSentence(error: unknown): string {
 		return "Unknown daemon error.";
 	}
 	return /[.!?]$/.test(message) ? message : `${message}.`;
+}
+
+function isPromptLifecycleCancellationResult(
+	value: unknown,
+	correlationId: string,
+): value is PromptLifecycleCancellationResult {
+	if (typeof value !== "object" || value === null || !("status" in value)) return false;
+	const result = value as Record<string, unknown>;
+	if (result.status === "unknown") {
+		return result.ownershipCrossed === "unknown" && result.deliveryCrossed === "unknown";
+	}
+	if (result.status === "expired") {
+		return result.ownershipCrossed === true && typeof result.deliveryCrossed === "boolean";
+	}
+	if (result.status !== "cancelled" && result.status !== "too_late") return false;
+	if (
+		result.ownershipCrossed !== true ||
+		typeof result.deliveryCrossed !== "boolean" ||
+		!isPromptLifecycleSnapshot(result.lifecycle)
+	) {
+		return false;
+	}
+	return (
+		result.lifecycle.correlationId === correlationId &&
+		result.lifecycle.deliveryCrossed === result.deliveryCrossed &&
+		(result.status === "cancelled"
+			? result.lifecycle.phase === "cancelled" && result.deliveryCrossed === false
+			: result.lifecycle.phase !== "cancelled" && (result.deliveryCrossed || result.lifecycle.phase === "failed"))
+	);
 }
 
 function reconnectDaemonTransportAfterUpdate(client: DaemonClient): Promise<void> {
@@ -218,8 +292,12 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly unsubscribeDaemonClose: () => void;
 	private readonly clientId = `daemon-agent-connection:${randomUUID()}`;
 	private readonly sessionInputPauses = new Map<string, Promise<AgentConnectionSessionInputPause>>();
+	private readonly correlatedPromptRoutes = new Map<string, CorrelatedPromptRoute>();
 	private sessionInputPauseGeneration = 0;
 	private ownedSessionPromotionTail = Promise.resolve();
+	private replacementMessageTail: Promise<void> | undefined;
+	private pendingChunkedReplacement: PendingChunkedReplacement | undefined;
+	private replacementReconciliationFailed = false;
 	private lastEventCursor: DaemonEventCursor | undefined;
 	private readonly retiredEventGenerations = new Set<string>();
 	private lastEventSequence: number | undefined;
@@ -244,6 +322,50 @@ export class DaemonAgentConnection implements AgentConnection {
 	private disposing = false;
 	private disposed = false;
 
+	private dispatchDaemonMessage(message: DaemonOutbound): void {
+		if (this.replacementReconciliationFailed) return;
+		if (this.pendingChunkedReplacement && !isSnapshotTransferMessage(message)) {
+			this.pendingChunkedReplacement.queuedMessages.push(message);
+			return;
+		}
+		const fencesReplacement =
+			message.type === "session_replaced" && !message.snapshotFollows && this.supportsCorrelatedPromptLifecycle();
+		const previous = this.replacementMessageTail;
+		const handling = previous
+			? previous.then(() => {
+					if (!this.replacementReconciliationFailed) return this.handleDaemonMessage(message);
+				})
+			: this.handleDaemonMessage(message);
+		const settled = handling.catch((error: unknown) => {
+			try {
+				appendRotatingLog(
+					getAgentLogPath(),
+					`[${new Date().toISOString()}] daemon-message: ignored ${message.type} failure: ${String(error)}`,
+				);
+			} catch {
+				// Logging failure must not turn an isolated message error into a connection failure.
+			}
+			if (fencesReplacement) this.failClosedReplacementReconciliation();
+		});
+		if (!previous && !fencesReplacement) return;
+		this.replacementMessageTail = settled;
+		void settled.finally(() => {
+			if (this.replacementMessageTail === settled) this.replacementMessageTail = undefined;
+		});
+	}
+
+	private failClosedReplacementReconciliation(): void {
+		this.replacementReconciliationFailed = true;
+		this.pendingChunkedReplacement = undefined;
+		this.latestSnapshotIsFresh = false;
+		if (this.terminalCloseEmitted) return;
+		this.terminalCloseEmitted = true;
+		void this.emit({
+			type: "closed",
+			error: "Daemon replacement lifecycle state could not be reconciled.",
+		});
+	}
+
 	constructor(
 		private readonly client: DaemonClient,
 		private activeSessionId: string,
@@ -253,16 +375,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.client.enableRequestRecovery();
 		}
 		this.unsubscribeDaemonMessages = this.client.onMessage((message) => {
-			void this.handleDaemonMessage(message).catch((error: unknown) => {
-				try {
-					appendRotatingLog(
-						getAgentLogPath(),
-						`[${new Date().toISOString()}] daemon-message: ignored ${message.type} failure: ${String(error)}`,
-					);
-				} catch {
-					// Logging failure must not turn an isolated message error into a connection failure.
-				}
-			});
+			this.dispatchDaemonMessage(message);
 		});
 		this.captureDaemonLogPath();
 		this.unsubscribeDaemonClose = this.client.onClose((error) => {
@@ -317,10 +430,18 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async attach(): Promise<void> {
+		await this.attachSession(this.activeSessionId, this.lastEventCursor, false);
+	}
+
+	private async attachSession(
+		requestedActiveSessionId: string,
+		resumeCursor: DaemonEventCursor | undefined,
+		resetEventProgress: boolean,
+	): Promise<void> {
 		const supportsExtensionUi = this.options.supportsExtensionUi !== false;
 		const result = await this.requestData<SessionSummary | DaemonAttachResult>({
 			type: "attach",
-			activeSessionId: this.activeSessionId,
+			activeSessionId: requestedActiveSessionId,
 			supportsExtensionUi,
 			clientId: this.clientId,
 			capabilities: [
@@ -329,6 +450,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				...(supportsExtensionUi ? (["extension_ui"] as const) : []),
 				"slim_attach",
 				"chunked_snapshot",
+				...(this.supportsCorrelatedPromptLifecycle() ? (["correlated_prompt_lifecycle_v1"] as const) : []),
 				...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
 			],
 			env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
@@ -340,43 +462,52 @@ export class DaemonAgentConnection implements AgentConnection {
 				: {}),
 			telemetryDisabled: this.options.telemetryDisabled,
 			resumeCursor:
-				this.lastEventCursor === undefined
+				resumeCursor === undefined
 					? undefined
 					: {
-							activeSessionId: this.activeSessionId,
-							...this.lastEventCursor,
+							activeSessionId: requestedActiveSessionId,
+							...resumeCursor,
 						},
 		});
-		this.activeSessionId = getAttachActiveSessionId(result);
-		const summary = "snapshot" in result ? result.snapshot.summary : result;
-		this.attachedSessionId = summary.sessionId;
-		this.attachedSessionFile =
-			summary.sessionFile ?? ("snapshot" in result ? result.snapshot.state.sessionFile : undefined);
-		this.captureDaemonLogPath();
-		this.updateReconnectFailed = false;
-		this.terminalCloseEmitted = false;
-		const attachCursor = getAttachLastEventCursor(result);
-		if (attachCursor) {
-			this.observeEventCursor(attachCursor);
-		}
-		this.lastEventSequence = maxEventSequence(this.lastEventSequence, getAttachLastEventSequence(result));
+		if (this.disposed) throw new Error("Daemon connection disposed during attach");
+		const nextActiveSessionId = getAttachActiveSessionId(result);
 		if ("snapshot" in result) {
 			const snapshot = result.snapshotStream
 				? await this.waitForSnapshot(result.snapshotStream.id)
 				: result.snapshot;
-			this.latestSnapshot = mapDaemonSessionSnapshot(snapshot, result.replay);
-			if (Array.isArray(snapshot.children)) this.childRosterSequence = snapshot.lastEventSequence;
-			if (this.lastEventSequence !== undefined) {
-				this.latestSnapshot.lastEventSequence = this.lastEventSequence;
+			let staged: StagedSnapshotCommit;
+			try {
+				validateDaemonSnapshotIdentity(result.snapshot, nextActiveSessionId);
+				mapDaemonSessionSnapshot(result.snapshot, undefined, this.supportsCorrelatedPromptLifecycle());
+				staged = this.stageSnapshotCommit(snapshot, {
+					purpose: "attach",
+					envelopeActiveSessionId: nextActiveSessionId,
+					expectedState: result.snapshot.state,
+					replay: result.replay,
+					resetEventProgress,
+					progress: [
+						{ cursor: getAttachLastEventCursor(result), sequence: getAttachLastEventSequence(result) },
+						{ cursor: snapshot.lastEventCursor, sequence: snapshot.lastEventSequence },
+					],
+				});
+			} catch (error) {
+				if (this.supportsCorrelatedPromptLifecycle()) {
+					await this.emit({ type: "correlated_prompt_protocol_violation" });
+				}
+				throw error;
 			}
-			if (this.lastEventCursor) {
-				this.latestSnapshot.lastEventCursor = this.lastEventCursor;
-			}
-			this.latestSnapshotIsFresh = true;
+			this.commitStagedSnapshot(staged);
 		} else {
+			validateSummaryIdentity(result, nextActiveSessionId);
+			this.activeSessionId = nextActiveSessionId;
+			this.attachedSessionId = result.sessionId;
+			this.attachedSessionFile = result.sessionFile;
 			this.latestSnapshot = undefined;
 			this.latestSnapshotIsFresh = false;
 		}
+		this.captureDaemonLogPath();
+		this.updateReconnectFailed = false;
+		this.terminalCloseEmitted = false;
 	}
 
 	subscribe(listener: AgentConnectionEventListener): () => void {
@@ -409,7 +540,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		// getSessionTree() fetches it lazily via get_session_tree on first use.
 		const snapshotCursor = this.lastEventCursor;
 		const snapshotSequence = this.lastEventSequence;
-		const [state, messagesData, sessionContextData] = await Promise.all([
+		const [state, messagesData, sessionContextData, promptLifecycles] = await Promise.all([
 			this.requestData<AgentConnectionState>({
 				type: "get_connection_state",
 				activeSessionId: this.activeSessionId,
@@ -422,16 +553,26 @@ export class DaemonAgentConnection implements AgentConnection {
 				type: "get_session_context",
 				activeSessionId: this.activeSessionId,
 			}),
+			this.supportsCorrelatedPromptLifecycle() ? this.getPromptLifecycles() : Promise.resolve(undefined),
 		]);
-		const children = this.latestSnapshot?.children;
-		const streamingMessage = this.latestSnapshot?.streamingMessage;
-		this.latestSnapshot = {
+		const observedSnapshot = this.latestSnapshot;
+		const sameGeneration = observedSnapshot?.state.sessionId === state.sessionId;
+		const children = sameGeneration ? observedSnapshot.children : undefined;
+		const streamingMessage = sameGeneration ? observedSnapshot.streamingMessage : undefined;
+		const reconciledPromptLifecycles = promptLifecycles
+			? mergePromptLifecycleStates(promptLifecycles, sameGeneration ? observedSnapshot.promptLifecycles : undefined)
+			: undefined;
+		const nextSnapshot: AgentConnectionSnapshot = {
 			state,
 			messages: messagesData.messages,
 			sessionContext: sessionContextData.context,
 			...(children ? { children } : {}),
 			...(streamingMessage ? { streamingMessage } : {}),
+			...(reconciledPromptLifecycles ? { promptLifecycles: reconciledPromptLifecycles } : {}),
 		};
+		const generationChanged = this.attachedSessionId !== undefined && this.attachedSessionId !== state.sessionId;
+		this.prunePromptRoutes(reconciledPromptLifecycles, this.activeSessionId, state.sessionId, generationChanged);
+		this.latestSnapshot = nextSnapshot;
 		if (snapshotSequence !== undefined) {
 			this.latestSnapshot.lastEventSequence = snapshotSequence;
 		}
@@ -502,6 +643,147 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	supportsAcpMcpServers(): boolean {
 		return this.client.supportsServerCapability("acp_mcp_servers");
+	}
+
+	supportsCorrelatedPromptLifecycle(): boolean {
+		return this.client.supportsServerCapability("correlated_prompt_lifecycle_v1");
+	}
+
+	async getPromptLifecycles(): Promise<PromptLifecycleStateSnapshot> {
+		return this.getPromptLifecyclesFor(this.activeSessionId, this.attachedSessionId);
+	}
+
+	private async getPromptLifecyclesFor(
+		activeSessionId: string,
+		sessionId: string | undefined,
+	): Promise<PromptLifecycleStateSnapshot> {
+		if (!this.supportsCorrelatedPromptLifecycle()) {
+			throw new DaemonCapabilityUnavailableError("get_prompt_lifecycles", "correlated_prompt_lifecycle_v1");
+		}
+		if (!sessionId) throw new Error("Prompt lifecycle query requires an attached session generation");
+		const snapshot = await this.requestData<PromptLifecycleStateSnapshot>({
+			type: "get_prompt_lifecycles",
+			activeSessionId,
+			sessionId,
+		});
+		if (!isPromptLifecycleStateSnapshot(snapshot)) {
+			throw new Error("Daemon returned invalid prompt lifecycle state");
+		}
+		return snapshot;
+	}
+
+	async submitCorrelatedPrompt(
+		message: string,
+		options: AgentConnectionCorrelatedPromptOptions,
+	): Promise<AgentConnectionCorrelatedPromptResult> {
+		if (!this.supportsCorrelatedPromptLifecycle()) {
+			throw new DaemonCapabilityUnavailableError("submit_correlated_prompt", "correlated_prompt_lifecycle_v1");
+		}
+		if (options.signal?.aborted) {
+			throw new AgentConnectionPromptAdmissionError("Prompt admission was cancelled.", "cancelled");
+		}
+		const sessionId = this.attachedSessionId;
+		if (!sessionId) throw new Error("Correlated prompt submission requires an attached session generation");
+		const requestFingerprint = createPromptRequestFingerprint({
+			message,
+			images: options.images,
+			queueIfBusy: options.queueIfBusy,
+		});
+		const existingRoute = this.correlatedPromptRoutes.get(options.correlationId);
+		if (
+			existingRoute &&
+			(existingRoute.activeSessionId !== this.activeSessionId ||
+				existingRoute.sessionId !== sessionId ||
+				existingRoute.requestFingerprint !== requestFingerprint)
+		) {
+			throw new Error("Prompt correlation id is reserved for another session generation or request");
+		}
+		const route =
+			existingRoute ??
+			({
+				activeSessionId: this.activeSessionId,
+				sessionId,
+				requestFingerprint,
+				pending: true,
+			} satisfies CorrelatedPromptRoute);
+		if (!existingRoute) this.correlatedPromptRoutes.set(options.correlationId, route);
+		const onAbort = () => {
+			void this.cancelPromptLifecycle(options.correlationId).catch(() => undefined);
+		};
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			const result = await this.requestData<AgentConnectionCorrelatedPromptResult>(
+				{
+					type: "submit_correlated_prompt",
+					activeSessionId: this.activeSessionId,
+					sessionId,
+					correlationId: options.correlationId,
+					message,
+					images: options.images,
+					queueIfBusy: options.queueIfBusy,
+				},
+				DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
+			);
+			if (
+				typeof result !== "object" ||
+				result === null ||
+				typeof result.duplicate !== "boolean" ||
+				!isPromptLifecycleSnapshot(result.lifecycle) ||
+				result.lifecycle.correlationId !== options.correlationId
+			) {
+				throw new Error("Daemon returned an invalid correlated prompt result");
+			}
+			const lifecycle = this.observePromptLifecycleResponse(result.lifecycle);
+			route.pending = false;
+			if (options.signal?.aborted) {
+				const cancellation = await this.cancelPromptLifecycle(options.correlationId);
+				if (cancellation.status === "cancelled") {
+					throw new AgentConnectionPromptAdmissionError("Prompt admission was cancelled.", "cancelled");
+				}
+				if (cancellation.status === "unknown") {
+					throw new Error("Correlated prompt cancellation could not be reconciled after reconnect");
+				}
+			}
+			return { ...result, lifecycle };
+		} catch (error) {
+			if (!existingRoute && route.pending && error instanceof Error && this.definitiveRequestErrors.has(error)) {
+				this.correlatedPromptRoutes.delete(options.correlationId);
+			}
+			throw error;
+		} finally {
+			options.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+
+	async cancelPromptLifecycle(correlationId: string): Promise<PromptLifecycleCancellationResult> {
+		if (!this.supportsCorrelatedPromptLifecycle()) {
+			throw new DaemonCapabilityUnavailableError("cancel_correlated_prompt", "correlated_prompt_lifecycle_v1");
+		}
+		const cachedLifecycle = this.latestSnapshot?.promptLifecycles;
+		const cachedInAttachedGeneration =
+			this.attachedSessionId !== undefined && this.latestSnapshot?.state.sessionId === this.attachedSessionId;
+		const currentGenerationProvesCorrelation =
+			cachedInAttachedGeneration &&
+			(cachedLifecycle?.records.some((record) => record.correlationId === correlationId) === true ||
+				cachedLifecycle?.expired.some((tombstone) => tombstone.correlationId === correlationId) === true);
+		const route =
+			this.correlatedPromptRoutes.get(correlationId) ??
+			(this.attachedSessionId && currentGenerationProvesCorrelation
+				? { activeSessionId: this.activeSessionId, sessionId: this.attachedSessionId }
+				: undefined);
+		if (!route) {
+			return { status: "unknown", ownershipCrossed: "unknown", deliveryCrossed: "unknown" };
+		}
+		const result = await this.requestData<PromptLifecycleCancellationResult>({
+			type: "cancel_correlated_prompt",
+			activeSessionId: route.activeSessionId,
+			sessionId: route.sessionId,
+			correlationId,
+		});
+		if (!isPromptLifecycleCancellationResult(result, correlationId)) {
+			throw new Error("Daemon returned an invalid correlated prompt cancellation result");
+		}
+		return result;
 	}
 
 	async replaceAcpMcpServers(servers: readonly AcpMcpServerConfig[], ownerId: string): Promise<void> {
@@ -887,6 +1169,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (signal?.aborted) {
 			throw new AgentConnectionPromptAdmissionError("Prompt admission was cancelled.", "cancelled");
 		}
+		const admissionId = signal ? `prompt-admission:${randomUUID()}` : undefined;
 		if (!signal) {
 			await this.requestData<unknown>(
 				{
@@ -897,12 +1180,13 @@ export class DaemonAgentConnection implements AgentConnection {
 					streamingBehavior: options?.streamingBehavior,
 					queueIfBusy: options?.queueIfBusy,
 					source: options?.source,
+					admissionId,
 				},
 				DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
 			);
 			return;
 		}
-		const admissionId = `prompt-admission:${randomUUID()}`;
+		if (admissionId === undefined) throw new Error("Prompt admission id was not created for cancellable input");
 		let resolveAbort = () => {};
 		const aborted = new Promise<"abort">((resolve) => {
 			resolveAbort = () => resolve("abort");
@@ -1255,19 +1539,6 @@ export class DaemonAgentConnection implements AgentConnection {
 		sourceActiveSessionId: string,
 		targetActiveSessionId: string,
 	): Promise<{ cancelled: false }> {
-		const previousState = {
-			lastEventCursor: this.lastEventCursor,
-			lastEventSequence: this.lastEventSequence,
-			latestSnapshot: this.latestSnapshot,
-			latestSnapshotIsFresh: this.latestSnapshotIsFresh,
-			retiredEventGenerations: new Set(this.retiredEventGenerations),
-		};
-		this.activeSessionId = targetActiveSessionId;
-		this.lastEventCursor = undefined;
-		this.lastEventSequence = undefined;
-		this.latestSnapshot = undefined;
-		this.latestSnapshotIsFresh = false;
-		this.retiredEventGenerations.clear();
 		this.pendingReattachActiveSessionIds.add(targetActiveSessionId);
 		let reattached = false;
 		try {
@@ -1284,6 +1555,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
 					"slim_attach",
 					"chunked_snapshot",
+					...(this.supportsCorrelatedPromptLifecycle() ? (["correlated_prompt_lifecycle_v1"] as const) : []),
 					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
 				],
 				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
@@ -1291,37 +1563,38 @@ export class DaemonAgentConnection implements AgentConnection {
 				telemetryDisabled: this.options.telemetryDisabled,
 			});
 			reattached = true;
-			this.activeSessionId = result.activeSessionId;
-			this.activeSideQuestionIds.clear();
-			if (result.snapshotStream) {
-				try {
-					await this.waitForSnapshot(result.snapshotStream.id);
-				} catch (snapshotError) {
-					await this.snapshotRecoveryPromises.get(result.snapshotStream.id);
-					if (!this.latestSnapshotIsFresh) {
-						throw snapshotError;
-					}
-				}
-			} else {
-				this.applyReplacementSnapshot(result.snapshot, result.replay);
-				await this.emit({
-					type: "session_replaced",
-					state: result.snapshot.state,
-					messages: result.snapshot.messages,
-				});
+			if (result.activeSessionId !== targetActiveSessionId) {
+				throw new Error("Daemon returned an invalid session snapshot");
 			}
+			const snapshot = result.snapshotStream
+				? await this.waitForSnapshot(result.snapshotStream.id)
+				: result.snapshot;
+			validateDaemonSnapshotIdentity(result.snapshot, result.activeSessionId);
+			mapDaemonSessionSnapshot(result.snapshot, undefined, this.supportsCorrelatedPromptLifecycle());
+			const staged = this.stageSnapshotCommit(snapshot, {
+				purpose: "replacement",
+				envelopeActiveSessionId: result.activeSessionId,
+				expectedState: result.snapshot.state,
+				replay: result.replay,
+				progress: [
+					{ cursor: result.lastEventCursor, sequence: result.lastEventSequence },
+					{ cursor: snapshot.lastEventCursor, sequence: snapshot.lastEventSequence },
+				],
+			});
+			this.activeSideQuestionIds.clear();
+			this.commitStagedSnapshot(staged);
+			await this.emit({
+				type: "session_replaced",
+				state: snapshot.state,
+				messages: snapshot.messages,
+			});
 			return { cancelled: false };
 		} catch (error) {
-			if (!reattached) {
-				this.activeSessionId = sourceActiveSessionId;
-				this.lastEventCursor = previousState.lastEventCursor;
-				this.lastEventSequence = previousState.lastEventSequence;
-				this.latestSnapshot = previousState.latestSnapshot;
-				this.latestSnapshotIsFresh = previousState.latestSnapshotIsFresh;
-				this.retiredEventGenerations.clear();
-				for (const generation of previousState.retiredEventGenerations) {
-					this.retiredEventGenerations.add(generation);
+			if (reattached) {
+				if (this.supportsCorrelatedPromptLifecycle()) {
+					await this.emit({ type: "correlated_prompt_protocol_violation" });
 				}
+				this.failClosedReplacementReconciliation();
 			}
 			throw error;
 		} finally {
@@ -1449,12 +1722,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		await Promise.allSettled([...this.activeSideQuestionIds].map((id) => this.abortSideQuestion(id)));
 		this.unsubscribeDaemonMessages();
 		this.unsubscribeDaemonClose();
+		const pendingActiveSessionId = [...this.pendingReattachActiveSessionIds].at(-1);
+		const serverRoutedActiveSessionId = pendingActiveSessionId ?? this.activeSessionId;
 		if (this.options.ownedSession) {
-			await this.requestOk({ type: "complete_owned_session", activeSessionId: this.activeSessionId }).catch(
+			await this.requestOk({ type: "complete_owned_session", activeSessionId: serverRoutedActiveSessionId }).catch(
 				() => undefined,
 			);
 		} else {
-			await this.requestOk({ type: "detach", activeSessionId: this.activeSessionId }).catch(() => undefined);
+			await this.requestOk({ type: "detach", activeSessionId: serverRoutedActiveSessionId }).catch(() => undefined);
 		}
 		if (this.options.closeClientOnDispose) {
 			this.client.close();
@@ -1570,6 +1845,17 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (message.type === "session_snapshot_begin") {
+			const pendingReplacement = this.pendingChunkedReplacement;
+			if (pendingReplacement) {
+				if (
+					message.purpose !== "replacement" ||
+					(pendingReplacement.snapshotId !== undefined && pendingReplacement.snapshotId !== message.snapshotId)
+				) {
+					this.failClosedReplacementReconciliation();
+					return;
+				}
+				pendingReplacement.snapshotId = message.snapshotId;
+			}
 			const assembly = this.getSnapshotAssembly(message.snapshotId);
 			assembly.begin = message;
 			return;
@@ -1586,8 +1872,10 @@ export class DaemonAgentConnection implements AgentConnection {
 			const assembly = this.getSnapshotAssembly(message.snapshotId);
 			const purpose = assembly.begin?.purpose ?? "attach";
 			const snapshotError = new Error(message.error);
+			const pendingReattach = this.pendingReattachActiveSessionIds.has(message.activeSessionId);
+			const quarantinesReplacement = purpose === "replacement" && this.supportsCorrelatedPromptLifecycle();
 			const recoveryPromise =
-				purpose === "replacement" || purpose === "resync"
+				!pendingReattach && !quarantinesReplacement && (purpose === "replacement" || purpose === "resync")
 					? this.recoverFailedSnapshot(purpose, snapshotError)
 					: undefined;
 			if (recoveryPromise) {
@@ -1595,21 +1883,33 @@ export class DaemonAgentConnection implements AgentConnection {
 			}
 			this.rejectSnapshotAssembly(message.snapshotId, assembly, snapshotError);
 			this.ignoreSnapshotId(message.snapshotId);
+			if (quarantinesReplacement) this.failClosedReplacementReconciliation();
 			if (recoveryPromise) {
 				try {
 					await recoveryPromise;
 				} finally {
 					this.snapshotRecoveryPromises.delete(message.snapshotId);
 				}
+				if (!this.terminalCloseEmitted) this.releaseChunkedReplacementFence();
 			}
 			return;
 		}
 		if (this.isStaleSequencedMessage(message)) {
 			return;
 		}
-		this.observeDaemonEventSequence(message);
-
 		if (message.type === "session_event") {
+			if (
+				this.supportsCorrelatedPromptLifecycle() &&
+				(!isPromptEventAttribution(message.attribution) ||
+					message.event.promptCorrelationId === undefined ||
+					(message.attribution.scope === "session" && message.event.promptCorrelationId !== null) ||
+					(message.attribution.scope === "prompt" &&
+						message.event.promptCorrelationId !== message.attribution.correlationId))
+			) {
+				await this.emit({ type: "correlated_prompt_protocol_violation" });
+				return;
+			}
+			this.observeDaemonEventSequence(message);
 			if (message.event.type !== "refine_complete" && message.event.type !== "refine_failed") {
 				this.observeStreamingMessage(message.event);
 			}
@@ -1618,9 +1918,111 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.observeRlmChildUpdate(message.event.child);
 			}
 			this.latestSnapshotIsFresh = false;
-			await this.emit({ type: "session_event", event: message.event });
+			await this.emit({ type: "session_event", event: message.event, attribution: message.attribution });
 			return;
 		}
+		if (message.type === "prompt_lifecycle") {
+			if (!this.supportsCorrelatedPromptLifecycle()) return;
+			if (!isPromptLifecycleSnapshot(message.lifecycle)) {
+				await this.emit({ type: "correlated_prompt_protocol_violation" });
+				return;
+			}
+			if (this.latestSnapshot) {
+				let next: PromptLifecycleStateSnapshot | undefined;
+				try {
+					next = advancePromptLifecycleState(this.latestSnapshot.promptLifecycles, message.lifecycle);
+				} catch {
+					await this.emit({ type: "correlated_prompt_protocol_violation" });
+					return;
+				}
+				if (!next) {
+					this.prunePromptRoutes(
+						this.latestSnapshot.promptLifecycles,
+						message.activeSessionId,
+						this.latestSnapshot.state.sessionId,
+						false,
+					);
+					return;
+				}
+				this.observeDaemonEventSequence(message);
+				this.commitPromptLifecycleState(next, true);
+			} else {
+				this.observeDaemonEventSequence(message);
+			}
+			await this.emit({ type: "prompt_lifecycle", lifecycle: message.lifecycle });
+			return;
+		}
+		if (message.type === "session_resynced") {
+			let staged: StagedSnapshotCommit;
+			try {
+				staged = this.stageSnapshotCommit(message.snapshot, {
+					purpose: "resync",
+					envelopeActiveSessionId: message.activeSessionId,
+					expectedSessionId: this.attachedSessionId,
+					progress: [
+						{ cursor: message.snapshot.lastEventCursor, sequence: message.snapshot.lastEventSequence },
+						{ cursor: getDaemonMessageCursor(message), sequence: getDaemonMessageSequence(message) },
+					],
+				});
+			} catch {
+				if (this.supportsCorrelatedPromptLifecycle()) {
+					await this.emit({ type: "correlated_prompt_protocol_violation" });
+				}
+				return;
+			}
+			this.commitStagedSnapshot(staged);
+			await this.emit({ type: "session_resynced", snapshot: staged.latestSnapshot });
+			return;
+		}
+		if (message.type === "session_replaced") {
+			try {
+				validateConnectionStateIdentity(message.state, message.activeSessionId);
+			} catch {
+				if (this.supportsCorrelatedPromptLifecycle()) {
+					await this.emit({ type: "correlated_prompt_protocol_violation" });
+				}
+				this.failClosedReplacementReconciliation();
+				return;
+			}
+			if (message.snapshotFollows) {
+				if (this.pendingChunkedReplacement) {
+					throw new Error("Daemon returned an invalid replacement snapshot header");
+				}
+				this.pendingChunkedReplacement = { header: message, queuedMessages: [] };
+				return;
+			}
+			const promptLifecycles = this.supportsCorrelatedPromptLifecycle()
+				? await this.getPromptLifecyclesFor(message.activeSessionId, message.state.sessionId)
+				: undefined;
+			const reconciledPromptLifecycles =
+				promptLifecycles && this.latestSnapshot?.state.sessionId === message.state.sessionId
+					? reconcilePromptLifecycleSnapshot(promptLifecycles, this.latestSnapshot.promptLifecycles)
+					: promptLifecycles;
+			const latestSnapshot: AgentConnectionSnapshot = {
+				state: message.state,
+				messages: message.messages,
+				...(reconciledPromptLifecycles ? { promptLifecycles: reconciledPromptLifecycles } : {}),
+			};
+			const staged = this.stageMappedSnapshotCommit(latestSnapshot, {
+				activeSessionId: message.activeSessionId,
+				attachedSessionId: message.state.sessionId,
+				attachedSessionFile: message.state.sessionFile,
+				progress: [{ cursor: getDaemonMessageCursor(message), sequence: getDaemonMessageSequence(message) }],
+			});
+			this.commitStagedSnapshot(staged);
+			await this.emit({ type: "session_replaced", state: message.state, messages: message.messages });
+			return;
+		}
+
+		if (
+			(message.type === "extension_ui_request" || message.type === "extension_error") &&
+			this.supportsCorrelatedPromptLifecycle() &&
+			!isPromptEventAttribution(message.attribution)
+		) {
+			await this.emit({ type: "correlated_prompt_protocol_violation" });
+			return;
+		}
+		this.observeDaemonEventSequence(message);
 		if (message.type === "side_question_event") {
 			this.observeSideQuestionEvent(message.event);
 			await this.emit({ type: "side_question_event", event: message.event });
@@ -1637,46 +2039,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			await this.emit({ type: "session_status", recap: message.recap });
 			return;
 		}
-		if (message.type === "session_resynced") {
-			this.attachedSessionId = message.snapshot.state.sessionId;
-			this.attachedSessionFile = message.snapshot.state.sessionFile;
-			this.latestSnapshot = mapDaemonSessionSnapshot(message.snapshot);
-			if (Array.isArray(message.snapshot.children)) {
-				this.childRosterSequence = message.snapshot.lastEventSequence;
-			}
-			if (this.lastEventSequence !== undefined) {
-				this.latestSnapshot.lastEventSequence = this.lastEventSequence;
-			}
-			if (this.lastEventCursor) {
-				this.latestSnapshot.lastEventCursor = this.lastEventCursor;
-			}
-			this.latestSnapshotIsFresh = true;
-			await this.emit({ type: "session_resynced", snapshot: this.latestSnapshot });
-			return;
-		}
-		if (message.type === "session_replaced") {
-			this.attachedSessionId = message.state.sessionId;
-			this.attachedSessionFile = message.state.sessionFile;
-			if (message.snapshotFollows) {
-				this.latestSnapshotIsFresh = false;
-				return;
-			}
-			const latestSnapshot: AgentConnectionSnapshot = {
-				state: message.state,
-				messages: message.messages,
-			};
-			if (this.lastEventSequence !== undefined) {
-				latestSnapshot.lastEventSequence = this.lastEventSequence;
-			}
-			if (this.lastEventCursor) {
-				latestSnapshot.lastEventCursor = this.lastEventCursor;
-			}
-			this.latestSnapshot = latestSnapshot;
-			this.childRosterSequence = undefined;
-			this.latestSnapshotIsFresh = true;
-			await this.emit({ type: "session_replaced", state: message.state, messages: message.messages });
-			return;
-		}
+
 		if (message.type === "extension_ui_request") {
 			await this.emit({
 				type: "extension_ui_request",
@@ -1684,6 +2047,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					id: message.id,
 					method: message.method,
 					payload: message.payload,
+					attribution: message.attribution,
 				},
 			});
 			return;
@@ -1694,6 +2058,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				extensionPath: message.extensionPath,
 				event: message.event,
 				error: message.error,
+				attribution: message.attribution,
 			});
 			return;
 		}
@@ -1820,11 +2185,12 @@ export class DaemonAgentConnection implements AgentConnection {
 					if (this.disposed) {
 						return;
 					}
-					this.activeSessionId = restored.activeSessionId;
-					this.lastEventSequence = undefined;
-					this.lastEventCursor = undefined;
-					this.retiredEventGenerations.clear();
-					await this.attach();
+					this.pendingReattachActiveSessionIds.add(restored.activeSessionId);
+					try {
+						await this.attachSession(restored.activeSessionId, undefined, true);
+					} finally {
+						this.pendingReattachActiveSessionIds.delete(restored.activeSessionId);
+					}
 					if (this.disposed) {
 						return;
 					}
@@ -1865,6 +2231,13 @@ export class DaemonAgentConnection implements AgentConnection {
 				current.reject(new Error(`Timed out waiting for snapshot ${snapshotId}`));
 				this.snapshotAssemblies.delete(snapshotId);
 				this.ignoreSnapshotId(snapshotId);
+				if (
+					this.pendingChunkedReplacement ||
+					(current.begin?.purpose === "replacement" &&
+						!this.pendingReattachActiveSessionIds.has(current.begin.activeSessionId))
+				) {
+					this.failClosedReplacementReconciliation();
+				}
 			}
 		}, this.options.snapshotTimeoutMs ?? DAEMON_SNAPSHOT_TIMEOUT_MS);
 		timeout.unref();
@@ -1909,11 +2282,28 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
+	private async rejectInvalidSnapshotAssembly(
+		snapshotId: string,
+		assembly: DaemonSnapshotAssembly,
+		error: Error,
+		activeSessionId: string,
+	): Promise<void> {
+		this.rejectSnapshotAssembly(snapshotId, assembly, error);
+		this.snapshotAssemblies.delete(snapshotId);
+		this.ignoreSnapshotId(snapshotId);
+		if (
+			this.pendingChunkedReplacement ||
+			(assembly.begin?.purpose === "replacement" && !this.pendingReattachActiveSessionIds.has(activeSessionId))
+		) {
+			this.failClosedReplacementReconciliation();
+		}
+		if (this.supportsCorrelatedPromptLifecycle()) {
+			await this.emit({ type: "correlated_prompt_protocol_violation" });
+		}
+	}
+
 	private async recoverFailedSnapshot(purpose: "replacement" | "resync", snapshotError: Error): Promise<void> {
 		this.latestSnapshotIsFresh = false;
-		if (purpose === "replacement") {
-			this.latestSnapshot = undefined;
-		}
 		try {
 			const snapshot = await this.getInitialSnapshot();
 			if (this.disposed) {
@@ -1954,16 +2344,111 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
-	private applyReplacementSnapshot(snapshot: DaemonSessionSnapshot, replay?: DaemonReplayInfo): void {
-		if (snapshot.lastEventCursor) {
-			this.observeEventCursor(snapshot.lastEventCursor);
+	private stageSnapshotCommit(
+		snapshot: DaemonSessionSnapshot,
+		options: {
+			purpose: DaemonSnapshotPurpose;
+			envelopeActiveSessionId: string;
+			expectedSessionId?: string;
+			expectedState?: AgentConnectionState;
+			replay?: DaemonReplayInfo;
+			resetEventProgress?: boolean;
+			progress: Array<{ cursor: DaemonEventCursor | undefined; sequence: number | undefined }>;
+		},
+	): StagedSnapshotCommit {
+		const latestSnapshot = reconcileDaemonSessionSnapshot(snapshot, {
+			purpose: options.purpose,
+			envelopeActiveSessionId: options.envelopeActiveSessionId,
+			expectedSessionId: options.expectedSessionId,
+			expectedState: options.expectedState,
+			cachedSnapshot: this.latestSnapshot,
+			replay: options.replay,
+			includePromptLifecycles: this.supportsCorrelatedPromptLifecycle(),
+		});
+		return this.stageMappedSnapshotCommit(latestSnapshot, {
+			activeSessionId: options.envelopeActiveSessionId,
+			attachedSessionId: snapshot.state.sessionId,
+			attachedSessionFile: snapshot.state.sessionFile,
+			progress: options.progress,
+			allowStaleProgress:
+				options.purpose === "attach" && this.latestSnapshot?.state.sessionId === snapshot.state.sessionId,
+			resetEventProgress: options.resetEventProgress,
+			childRosterSequence: Array.isArray(snapshot.children) ? snapshot.lastEventSequence : undefined,
+		});
+	}
+
+	private stageMappedSnapshotCommit(
+		latestSnapshot: AgentConnectionSnapshot,
+		options: {
+			activeSessionId: string;
+			attachedSessionId: string;
+			attachedSessionFile: string | undefined;
+			progress: Array<{ cursor: DaemonEventCursor | undefined; sequence: number | undefined }>;
+			allowStaleProgress?: boolean;
+			resetEventProgress?: boolean;
+			childRosterSequence?: number;
+		},
+	): StagedSnapshotCommit {
+		const progress = stageEventProgress(
+			options.resetEventProgress ? undefined : this.lastEventCursor,
+			options.resetEventProgress ? undefined : this.lastEventSequence,
+			options.resetEventProgress ? new Set<string>() : this.retiredEventGenerations,
+			options.progress,
+			options.allowStaleProgress,
+		);
+		const committedSnapshot = {
+			...latestSnapshot,
+			...(latestSnapshot.promptLifecycles
+				? { promptLifecycles: retainPromptLifecycleState(latestSnapshot.promptLifecycles) }
+				: {}),
+		};
+		if (progress.lastEventSequence !== undefined) {
+			committedSnapshot.lastEventSequence = progress.lastEventSequence;
 		}
-		this.lastEventSequence = maxEventSequence(this.lastEventSequence, snapshot.lastEventSequence);
-		this.attachedSessionId = snapshot.state.sessionId;
-		this.attachedSessionFile = snapshot.state.sessionFile;
-		this.latestSnapshot = mapDaemonSessionSnapshot(snapshot, replay);
-		this.childRosterSequence = Array.isArray(snapshot.children) ? snapshot.lastEventSequence : undefined;
+		if (progress.lastEventCursor) {
+			committedSnapshot.lastEventCursor = progress.lastEventCursor;
+		}
+		return {
+			...progress,
+			activeSessionId: options.activeSessionId,
+			attachedSessionId: options.attachedSessionId,
+			attachedSessionFile: options.attachedSessionFile,
+			latestSnapshot: committedSnapshot,
+			childRosterSequence: options.childRosterSequence,
+		};
+	}
+
+	private commitStagedSnapshot(staged: StagedSnapshotCommit): void {
+		const generationChanged =
+			this.attachedSessionId !== undefined &&
+			(this.activeSessionId !== staged.activeSessionId || this.attachedSessionId !== staged.attachedSessionId);
+		this.prunePromptRoutes(
+			staged.latestSnapshot.promptLifecycles,
+			staged.activeSessionId,
+			staged.attachedSessionId,
+			generationChanged,
+		);
+		this.activeSessionId = staged.activeSessionId;
+		this.attachedSessionId = staged.attachedSessionId;
+		this.attachedSessionFile = staged.attachedSessionFile;
+		this.lastEventCursor = staged.lastEventCursor;
+		this.lastEventSequence = staged.lastEventSequence;
+		this.retiredEventGenerations.clear();
+		for (const generation of staged.retiredEventGenerations) {
+			this.retiredEventGenerations.add(generation);
+		}
+		this.latestSnapshot = staged.latestSnapshot;
+		this.childRosterSequence = staged.childRosterSequence;
 		this.latestSnapshotIsFresh = true;
+	}
+
+	private releaseChunkedReplacementFence(): void {
+		const pending = this.pendingChunkedReplacement;
+		if (!pending) return;
+		this.pendingChunkedReplacement = undefined;
+		for (const message of pending.queuedMessages) {
+			this.dispatchDaemonMessage(message);
+		}
 	}
 
 	private async completeSnapshotAssembly(
@@ -1971,20 +2456,22 @@ export class DaemonAgentConnection implements AgentConnection {
 	): Promise<void> {
 		const assembly = this.getSnapshotAssembly(message.snapshotId);
 		if (!assembly.begin) {
-			this.rejectSnapshotAssembly(
+			await this.rejectInvalidSnapshotAssembly(
 				message.snapshotId,
 				assembly,
 				new Error(`Snapshot ${message.snapshotId} ended before it began`),
+				message.activeSessionId,
 			);
 			return;
 		}
 		if (assembly.chunks.size !== message.chunkCount) {
-			this.rejectSnapshotAssembly(
+			await this.rejectInvalidSnapshotAssembly(
 				message.snapshotId,
 				assembly,
 				new Error(
 					`Snapshot ${message.snapshotId} ended with ${assembly.chunks.size} of ${message.chunkCount} chunks`,
 				),
+				message.activeSessionId,
 			);
 			return;
 		}
@@ -1992,22 +2479,24 @@ export class DaemonAgentConnection implements AgentConnection {
 		for (let index = 0; index < message.chunkCount; index++) {
 			const chunk = assembly.chunks.get(index);
 			if (!chunk) {
-				this.rejectSnapshotAssembly(
+				await this.rejectInvalidSnapshotAssembly(
 					message.snapshotId,
 					assembly,
 					new Error(`Snapshot ${message.snapshotId} is missing chunk ${index}`),
+					message.activeSessionId,
 				);
 				return;
 			}
 			messages.push(...chunk);
 		}
 		if (messages.length !== assembly.begin.messageCount) {
-			this.rejectSnapshotAssembly(
+			await this.rejectInvalidSnapshotAssembly(
 				message.snapshotId,
 				assembly,
 				new Error(
 					`Snapshot ${message.snapshotId} contained ${messages.length} of ${assembly.begin.messageCount} messages`,
 				),
+				message.activeSessionId,
 			);
 			return;
 		}
@@ -2017,34 +2506,125 @@ export class DaemonAgentConnection implements AgentConnection {
 			lastEventSequence: message.lastEventSequence,
 			lastEventCursor: message.lastEventCursor,
 		};
-		if (message.lastEventCursor) {
-			this.observeEventCursor(message.lastEventCursor);
-		}
-		this.lastEventSequence = maxEventSequence(this.lastEventSequence, message.lastEventSequence);
-		this.attachedSessionId = snapshot.state.sessionId;
-		this.attachedSessionFile = snapshot.state.sessionFile;
-		this.latestSnapshot = mapDaemonSessionSnapshot(snapshot);
-		this.latestSnapshotIsFresh = true;
-		assembly.resolve(snapshot);
 		const purpose = assembly.begin.purpose ?? "attach";
-		clearTimeout(assembly.timeout);
-		if (purpose !== "attach") {
-			this.snapshotAssemblies.delete(message.snapshotId);
-			if (this.pendingReattachActiveSessionIds.has(message.activeSessionId)) {
+		const pendingReattach = this.pendingReattachActiveSessionIds.has(message.activeSessionId);
+		if (purpose === "attach" || pendingReattach) {
+			assembly.resolve(snapshot);
+			clearTimeout(assembly.timeout);
+			if (pendingReattach) {
+				this.snapshotAssemblies.delete(message.snapshotId);
 				this.completedSnapshots.set(message.snapshotId, snapshot);
 				while (this.completedSnapshots.size > MAX_COMPLETED_SNAPSHOTS) {
 					const oldest = this.completedSnapshots.keys().next().value;
-					if (oldest === undefined) {
-						break;
-					}
+					if (oldest === undefined) break;
 					this.completedSnapshots.delete(oldest);
 				}
 			}
+			return;
 		}
-		if (purpose === "replacement") {
-			await this.emit({ type: "session_replaced", state: snapshot.state, messages });
-		} else if (purpose === "resync") {
-			await this.emit({ type: "session_resynced", snapshot: this.latestSnapshot });
+		const pendingReplacement = purpose === "replacement" ? this.pendingChunkedReplacement : undefined;
+		try {
+			if (pendingReplacement?.snapshotId !== undefined && pendingReplacement.snapshotId !== message.snapshotId) {
+				throw new Error("Daemon returned an invalid replacement snapshot");
+			}
+			const staged = this.stageSnapshotCommit(snapshot, {
+				purpose,
+				envelopeActiveSessionId: message.activeSessionId,
+				expectedSessionId: purpose === "resync" ? this.attachedSessionId : undefined,
+				expectedState: pendingReplacement?.header.state,
+				progress: [
+					...(pendingReplacement
+						? [
+								{
+									cursor: getDaemonMessageCursor(pendingReplacement.header),
+									sequence: getDaemonMessageSequence(pendingReplacement.header),
+								},
+							]
+						: []),
+					{ cursor: message.lastEventCursor, sequence: message.lastEventSequence },
+				],
+			});
+			this.commitStagedSnapshot(staged);
+			assembly.resolve(snapshot);
+			clearTimeout(assembly.timeout);
+			this.snapshotAssemblies.delete(message.snapshotId);
+			if (purpose === "replacement") {
+				await this.emit({ type: "session_replaced", state: snapshot.state, messages });
+			} else {
+				await this.emit({ type: "session_resynced", snapshot: staged.latestSnapshot });
+			}
+			if (pendingReplacement) this.releaseChunkedReplacementFence();
+		} catch {
+			await this.rejectInvalidSnapshotAssembly(
+				message.snapshotId,
+				assembly,
+				new Error("Daemon returned an invalid session snapshot"),
+				message.activeSessionId,
+			);
+		}
+	}
+
+	private observePromptLifecycleResponse(lifecycle: PromptLifecycleSnapshot): PromptLifecycleSnapshot {
+		if (!this.latestSnapshot) return lifecycle;
+		const current = this.latestSnapshot.promptLifecycles ?? { records: [], expired: [] };
+		const cached = current.records.find((record) => record.correlationId === lifecycle.correlationId);
+		if (cached) {
+			if (isDeepStrictEqual(cached, lifecycle)) return cached;
+			if (isLegalPromptLifecycleForward(lifecycle, cached)) return cached;
+			if (!isLegalPromptLifecycleForward(cached, lifecycle)) {
+				throw new Error("Daemon prompt lifecycle response could not be reconciled");
+			}
+			this.commitPromptLifecycleState(
+				{
+					records: [
+						...current.records.filter((record) => record.correlationId !== lifecycle.correlationId),
+						lifecycle,
+					],
+					expired: current.expired,
+				},
+				false,
+			);
+			return lifecycle;
+		}
+		if (current.expired.some((tombstone) => tombstone.correlationId === lifecycle.correlationId)) {
+			throw new Error("Daemon prompt lifecycle response could not be reconciled");
+		}
+		this.commitPromptLifecycleState({ records: [...current.records, lifecycle], expired: current.expired }, false);
+		return lifecycle;
+	}
+
+	private commitPromptLifecycleState(promptLifecycles: PromptLifecycleStateSnapshot, syncProgress: boolean): void {
+		if (!this.latestSnapshot) return;
+		const retained = retainPromptLifecycleState(promptLifecycles);
+		this.prunePromptRoutes(retained, this.activeSessionId, this.latestSnapshot.state.sessionId, false);
+		this.latestSnapshot = {
+			...this.latestSnapshot,
+			promptLifecycles: retained,
+			...(syncProgress && this.lastEventSequence !== undefined ? { lastEventSequence: this.lastEventSequence } : {}),
+			...(syncProgress && this.lastEventCursor !== undefined ? { lastEventCursor: this.lastEventCursor } : {}),
+		};
+	}
+
+	private prunePromptRoutes(
+		next: PromptLifecycleStateSnapshot | undefined,
+		activeSessionId: string,
+		sessionId: string,
+		removeRetiredGenerations: boolean,
+	): void {
+		if (!next) return;
+		const retainedIds = new Set([
+			...next.records.map((record) => record.correlationId),
+			...next.expired.map((tombstone) => tombstone.correlationId),
+		]);
+		for (const [correlationId, route] of this.correlatedPromptRoutes) {
+			const matchesGeneration = route.activeSessionId === activeSessionId && route.sessionId === sessionId;
+			if (matchesGeneration && retainedIds.has(correlationId)) {
+				route.pending = false;
+				continue;
+			}
+			if (!route.pending && (matchesGeneration || removeRetiredGenerations)) {
+				this.correlatedPromptRoutes.delete(correlationId);
+			}
 		}
 	}
 
@@ -2076,10 +2656,11 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private isMessageForActiveSession(message: DaemonOutbound): boolean {
-		if (!("activeSessionId" in message)) {
+		if (!("activeSessionId" in message) || typeof message.activeSessionId !== "string") {
 			return false;
 		}
-		return message.activeSessionId === this.activeSessionId;
+		if (message.activeSessionId === this.activeSessionId) return true;
+		return isSnapshotTransferMessage(message) && this.pendingReattachActiveSessionIds.has(message.activeSessionId);
 	}
 
 	private isStaleSequencedMessage(message: DaemonOutbound): boolean {
@@ -2184,7 +2765,210 @@ function maxEventSequence(current: number | undefined, observed: number | undefi
 	return Math.max(current, observed);
 }
 
-function mapDaemonSessionSnapshot(snapshot: DaemonSessionSnapshot, replay?: DaemonReplayInfo): AgentConnectionSnapshot {
+function validateSummaryIdentity(summary: SessionSummary, activeSessionId: string): void {
+	if (
+		summary.id !== activeSessionId ||
+		(summary.activeSessionId !== undefined && summary.activeSessionId !== activeSessionId)
+	) {
+		throw new Error("Daemon returned an invalid session snapshot");
+	}
+}
+
+function validateConnectionStateIdentity(state: AgentConnectionState, activeSessionId: string): void {
+	if (state.activeSessionId !== activeSessionId || !state.sessionId) {
+		throw new Error("Daemon returned an invalid session snapshot");
+	}
+}
+
+function validateDaemonSnapshotIdentity(
+	snapshot: DaemonSessionSnapshot,
+	activeSessionId: string,
+	expectedSessionId?: string,
+	expectedState?: AgentConnectionState,
+): void {
+	validateSummaryIdentity(snapshot.summary, activeSessionId);
+	validateConnectionStateIdentity(snapshot.state, activeSessionId);
+	if (
+		snapshot.activeSessionId !== activeSessionId ||
+		snapshot.summary.sessionId !== snapshot.state.sessionId ||
+		(expectedSessionId !== undefined && snapshot.state.sessionId !== expectedSessionId) ||
+		(expectedState !== undefined && !isDeepStrictEqual(snapshot.state, expectedState)) ||
+		(snapshot.summary.sessionFile !== undefined &&
+			snapshot.state.sessionFile !== undefined &&
+			snapshot.summary.sessionFile !== snapshot.state.sessionFile)
+	) {
+		throw new Error("Daemon returned an invalid session snapshot");
+	}
+}
+
+function isLegalPromptLifecycleForward(current: PromptLifecycleSnapshot, next: PromptLifecycleSnapshot): boolean {
+	if (
+		current.correlationId !== next.correlationId ||
+		current.kind !== next.kind ||
+		next.revision <= current.revision ||
+		(current.deliveryCrossed && !next.deliveryCrossed) ||
+		isPromptLifecycleTerminal(current.phase)
+	) {
+		return false;
+	}
+	const reachable =
+		current.phase === "owned"
+			? new Set(["queued", "delivered", "completed", "cancelled", "failed"])
+			: current.phase === "queued"
+				? new Set(["delivered", "completed", "cancelled", "failed"])
+				: new Set(["completed", "failed"]);
+	return reachable.has(next.phase);
+}
+
+function retainPromptLifecycleState(snapshot: PromptLifecycleStateSnapshot): PromptLifecycleStateSnapshot {
+	const nonterminal = snapshot.records.filter((record) => !isPromptLifecycleTerminal(record.phase));
+	const terminal = snapshot.records
+		.filter((record) => isPromptLifecycleTerminal(record.phase))
+		.sort((left, right) => left.revision - right.revision);
+	const retainedTerminal = terminal.slice(-PROMPT_LIFECYCLE_TERMINAL_RETENTION);
+	const evictedTerminal = terminal.slice(0, -PROMPT_LIFECYCLE_TERMINAL_RETENTION).map((record) => ({
+		correlationId: record.correlationId,
+		deliveryCrossed: record.deliveryCrossed,
+	}));
+	return {
+		records: [...nonterminal, ...retainedTerminal].sort((left, right) => left.revision - right.revision),
+		expired: [...snapshot.expired, ...evictedTerminal].slice(-PROMPT_LIFECYCLE_TOMBSTONE_RETENTION),
+	};
+}
+
+function advancePromptLifecycleState(
+	current: PromptLifecycleStateSnapshot | undefined,
+	next: PromptLifecycleSnapshot,
+): PromptLifecycleStateSnapshot | undefined {
+	const state = current ?? { records: [], expired: [] };
+	const previous = state.records.find((record) => record.correlationId === next.correlationId);
+	if (previous && isDeepStrictEqual(previous, next)) return undefined;
+	if (
+		state.expired.some((tombstone) => tombstone.correlationId === next.correlationId) ||
+		(previous !== undefined && !isPromptLifecycleSuccessor(previous, next))
+	) {
+		throw new Error("Daemon prompt lifecycle state could not be reconciled");
+	}
+	return {
+		records: [...state.records.filter((record) => record.correlationId !== next.correlationId), next],
+		expired: state.expired,
+	};
+}
+
+function reconcilePromptLifecycleSnapshot(
+	candidate: PromptLifecycleStateSnapshot,
+	cached: PromptLifecycleStateSnapshot | undefined,
+): PromptLifecycleStateSnapshot {
+	if (cached === undefined) return candidate;
+	const candidateRecords = new Map(candidate.records.map((record) => [record.correlationId, record]));
+	const candidateExpired = new Map(candidate.expired.map((tombstone) => [tombstone.correlationId, tombstone]));
+	for (const current of cached.records) {
+		const next = candidateRecords.get(current.correlationId);
+		if (next) {
+			if (isDeepStrictEqual(current, next)) continue;
+			if (next.revision === current.revision || !isLegalPromptLifecycleForward(current, next)) {
+				throw new Error("Daemon snapshot prompt lifecycle state could not be reconciled");
+			}
+			continue;
+		}
+		const tombstone = candidateExpired.get(current.correlationId);
+		if (
+			!isPromptLifecycleTerminal(current.phase) ||
+			(tombstone !== undefined && tombstone.deliveryCrossed !== current.deliveryCrossed)
+		) {
+			throw new Error("Daemon snapshot prompt lifecycle state could not be reconciled");
+		}
+	}
+	for (const current of cached.expired) {
+		if (candidateRecords.has(current.correlationId)) {
+			throw new Error("Daemon snapshot prompt lifecycle state could not be reconciled");
+		}
+		const tombstone = candidateExpired.get(current.correlationId);
+		if (tombstone && tombstone.deliveryCrossed !== current.deliveryCrossed) {
+			throw new Error("Daemon snapshot prompt lifecycle state could not be reconciled");
+		}
+	}
+	return candidate;
+}
+
+function mergePromptLifecycleStates(
+	loaded: PromptLifecycleStateSnapshot,
+	observed: PromptLifecycleStateSnapshot | undefined,
+): PromptLifecycleStateSnapshot {
+	if (observed === undefined) return retainPromptLifecycleState(loaded);
+	try {
+		return retainPromptLifecycleState(reconcilePromptLifecycleSnapshot(loaded, observed));
+	} catch {
+		const records = new Map(loaded.records.map((record) => [record.correlationId, record]));
+		const expired = new Map(loaded.expired.map((tombstone) => [tombstone.correlationId, tombstone]));
+		for (const current of observed.records) {
+			const candidate = records.get(current.correlationId);
+			if (candidate) {
+				if (isDeepStrictEqual(candidate, current)) continue;
+				if (!isLegalPromptLifecycleForward(candidate, current)) {
+					throw new Error("Daemon snapshot prompt lifecycle state could not be reconciled");
+				}
+				records.set(current.correlationId, current);
+				continue;
+			}
+			const tombstone = expired.get(current.correlationId);
+			if (
+				!isPromptLifecycleTerminal(current.phase) ||
+				(tombstone !== undefined && tombstone.deliveryCrossed !== current.deliveryCrossed)
+			) {
+				throw new Error("Daemon snapshot prompt lifecycle state could not be reconciled");
+			}
+		}
+		for (const current of observed.expired) {
+			const candidate = expired.get(current.correlationId);
+			if (
+				records.has(current.correlationId) ||
+				(candidate && candidate.deliveryCrossed !== current.deliveryCrossed)
+			) {
+				throw new Error("Daemon snapshot prompt lifecycle state could not be reconciled");
+			}
+		}
+		return retainPromptLifecycleState({ records: [...records.values()], expired: [...expired.values()] });
+	}
+}
+
+function reconcileDaemonSessionSnapshot(
+	snapshot: DaemonSessionSnapshot,
+	options: {
+		purpose: DaemonSnapshotPurpose;
+		envelopeActiveSessionId: string;
+		expectedSessionId?: string;
+		expectedState?: AgentConnectionState;
+		cachedSnapshot: AgentConnectionSnapshot | undefined;
+		replay?: DaemonReplayInfo;
+		includePromptLifecycles: boolean;
+	},
+): AgentConnectionSnapshot {
+	validateDaemonSnapshotIdentity(
+		snapshot,
+		options.envelopeActiveSessionId,
+		options.purpose === "resync" ? options.expectedSessionId : undefined,
+		options.purpose === "replacement" || options.purpose === "attach" ? options.expectedState : undefined,
+	);
+	const mapped = mapDaemonSessionSnapshot(snapshot, options.replay, options.includePromptLifecycles);
+	if (options.includePromptLifecycles && mapped.promptLifecycles) {
+		const reconciled =
+			options.cachedSnapshot?.state.sessionId === snapshot.state.sessionId
+				? reconcilePromptLifecycleSnapshot(mapped.promptLifecycles, options.cachedSnapshot.promptLifecycles)
+				: mapped.promptLifecycles;
+		mapped.promptLifecycles = retainPromptLifecycleState(reconciled);
+	}
+	return mapped;
+}
+
+function mapDaemonSessionSnapshot(
+	snapshot: DaemonSessionSnapshot,
+	replay?: DaemonReplayInfo,
+	includePromptLifecycles = false,
+): AgentConnectionSnapshot {
+	if (includePromptLifecycles && !isPromptLifecycleStateSnapshot(snapshot.promptLifecycles)) {
+		throw new Error("Daemon snapshot is missing valid prompt lifecycle state");
+	}
 	const connectionSnapshot: AgentConnectionSnapshot = {
 		state: snapshot.state,
 		messages: snapshot.messages,
@@ -2204,10 +2988,62 @@ function mapDaemonSessionSnapshot(snapshot: DaemonSessionSnapshot, replay?: Daem
 	if (snapshot.children) {
 		connectionSnapshot.children = snapshot.children;
 	}
+	if (includePromptLifecycles && snapshot.promptLifecycles) {
+		connectionSnapshot.promptLifecycles = snapshot.promptLifecycles;
+	}
 	if (replay) {
 		connectionSnapshot.replay = replay;
 	}
 	return connectionSnapshot;
+}
+
+function stageEventProgress(
+	lastEventCursor: DaemonEventCursor | undefined,
+	lastEventSequence: number | undefined,
+	retiredEventGenerations: ReadonlySet<string>,
+	observations: Array<{ cursor: DaemonEventCursor | undefined; sequence: number | undefined }>,
+	allowStaleObservations = false,
+): StagedEventProgress {
+	let cursor = lastEventCursor;
+	let sequence = lastEventSequence;
+	const retired = new Set(retiredEventGenerations);
+	for (const observation of observations) {
+		if (observation.cursor) {
+			if (observation.sequence !== undefined && observation.sequence !== observation.cursor.sequence) {
+				throw new Error("Daemon returned an invalid session snapshot cursor");
+			}
+			if (
+				retired.has(observation.cursor.generation) ||
+				(cursor?.generation === observation.cursor.generation && observation.cursor.sequence < cursor.sequence)
+			) {
+				if (allowStaleObservations) continue;
+				throw new Error("Daemon returned an invalid session snapshot cursor");
+			}
+			if (cursor && cursor.generation !== observation.cursor.generation) {
+				retired.add(cursor.generation);
+			}
+			if (
+				!cursor ||
+				cursor.generation !== observation.cursor.generation ||
+				observation.cursor.sequence > cursor.sequence
+			) {
+				cursor = observation.cursor;
+			}
+			sequence = cursor.sequence;
+			continue;
+		}
+		sequence = maxEventSequence(sequence, observation.sequence);
+	}
+	return { lastEventCursor: cursor, lastEventSequence: sequence, retiredEventGenerations: retired };
+}
+
+function isSnapshotTransferMessage(message: DaemonOutbound): boolean {
+	return (
+		message.type === "session_snapshot_begin" ||
+		message.type === "session_snapshot_chunk" ||
+		message.type === "session_snapshot_end" ||
+		message.type === "session_snapshot_failed"
+	);
 }
 
 function getDaemonMessageSequence(message: DaemonOutbound): number | undefined {

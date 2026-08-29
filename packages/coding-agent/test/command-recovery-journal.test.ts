@@ -25,6 +25,26 @@ describe("CommandRecoveryJournal", () => {
 		expect(journal.begin("client-a", "command-a", "prompt")).toEqual({ status: "pending" });
 	});
 
+	it("rejects a changed durable request identity before pending or completed redrive", () => {
+		const path = createPath();
+		const journal = new CommandRecoveryJournal(path);
+		expect(journal.begin("client-a", "correlated", "submit_correlated_prompt", "request-a")).toEqual({
+			status: "new",
+		});
+		expect(journal.begin("client-a", "correlated", "submit_correlated_prompt", "request-b")).toEqual({
+			status: "conflict",
+		});
+		journal.recordResult("client-a", "correlated", {
+			id: "correlated",
+			type: "response",
+			command: "submit_correlated_prompt",
+			success: true,
+		});
+		const restored = new CommandRecoveryJournal(path);
+		expect(restored.lookup("client-a", "correlated", "request-b")).toEqual({ status: "conflict" });
+		expect(restored.lookup("client-a", "correlated", "request-a")).toMatchObject({ status: "complete" });
+	});
+
 	it("looks up prior commands without inserting new receipts", () => {
 		const journal = new CommandRecoveryJournal(createPath());
 		expect(journal.lookup("client-a", "missing")).toBeUndefined();

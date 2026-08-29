@@ -60,10 +60,24 @@ export async function bindActiveSessionState(
 	state.unsubscribe?.();
 	state.runtime.setSubagentRuntimeHost(callbacks.subagentRuntimeHost);
 	state.unsubscribe = session.subscribe((event) => {
+		if (event.type === "prompt_lifecycle") {
+			const { type: _type, promptCorrelationId: _promptCorrelationId, ...lifecycle } = event;
+			callbacks.broadcast(state, {
+				type: "prompt_lifecycle",
+				activeSessionId: state.activeSessionId,
+				lifecycle,
+			});
+			return;
+		}
+		const correlationId = event.promptCorrelationId;
 		callbacks.broadcast(state, {
 			type: "session_event",
 			activeSessionId: state.activeSessionId,
 			event: slimSessionEventForWire(event),
+			attribution:
+				correlationId === null || correlationId === undefined
+					? { scope: "session" }
+					: { scope: "prompt", correlationId },
 		});
 	});
 
@@ -91,15 +105,23 @@ export async function bindActiveSessionState(
 				extensionPath: error.extensionPath,
 				event: error.event,
 				error: error.error,
+				attribution: currentPromptAttribution(state),
 			});
 		},
 	});
 }
 
+function currentPromptAttribution(state: ActiveSessionState) {
+	const correlationId = state.runtime.session.currentPromptCorrelationId;
+	return correlationId === null ? { scope: "session" as const } : { scope: "prompt" as const, correlationId };
+}
+
 function createCommandContextActions(state: ActiveSessionState): ExtensionCommandContextActions {
 	return {
 		waitForIdle: () => state.runtime.session.waitForIdle(),
-		newSession: async (options) => state.runtime.newSession(options),
+		newSession: async (options) => {
+			return state.runtime.newSession(options);
+		},
 		fork: async (entryId, options) => {
 			const result = await state.runtime.fork(entryId, options);
 			return { cancelled: result.cancelled };
@@ -113,7 +135,9 @@ function createCommandContextActions(state: ActiveSessionState): ExtensionComman
 			});
 			return { cancelled: result.cancelled };
 		},
-		switchSession: async (sessionPath, options) => state.runtime.switchSession(sessionPath, options),
+		switchSession: async (sessionPath, options) => {
+			return state.runtime.switchSession(sessionPath, options);
+		},
 		reload: async () => {
 			// Reload re-evaluates extension modules, which capture client env
 			// (e.g. herdr pane identity) synchronously at load.
@@ -134,6 +158,7 @@ function createExtensionUIContext(
 			id,
 			method,
 			payload,
+			attribution: currentPromptAttribution(state),
 		});
 		return id;
 	};
