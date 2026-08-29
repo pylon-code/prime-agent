@@ -133,3 +133,19 @@ decisions:
     revisit_when:
       - Prime adopts deterministic catalog fixtures or repo-owned structural invariants.
       - Prime stops regenerating vendor pricing before tests and releases.
+
+  kernel-protocol-test-fixtures:
+    area: runtime-reliability
+    state: adopted-ahead-of-upstream
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/4
+      - https://github.com/pylon-code/prime-agent/pull/5
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1839
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1886
+    fork_change: exact-upstream-pr-1886
+    upstream_support: "Prime PR #1886 repairs protocol fixtures regressed by the #1839 merge commit, but is not yet on main."
+    revisit_when:
+      - "Prime merges PR #1886 and the exact fix reaches the mirrored main branch."
