@@ -511,6 +511,42 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(worker.snapshotGenerations.has(activeSessionId)).toBe(false);
 	});
 
+	it("uses routed chunk metadata without reparsing a large canonical payload", () => {
+		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-routed-chunk.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+		});
+		const { worker } = workerHarness();
+		registerWorker(supervisor, worker);
+		const messages: AgentMessage[] = [{ role: "user", content: "x".repeat(1024 * 1024), timestamp: 1 }];
+		const frames = snapshotFrames(messages);
+		const internals = supervisor as unknown as {
+			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		internals.handleWorkerFrame(worker, frame(frames.begin));
+		const payload = Buffer.from(`${JSON.stringify(frames.chunk)}\n`);
+		const parse = vi.spyOn(JSON, "parse");
+		try {
+			internals.handleWorkerFrame(worker, {
+				header: {
+					kind: "outbound",
+					outboundType: "session_snapshot_chunk",
+					activeSessionId,
+					snapshotId,
+					payloadEncoding: "jsonl",
+					snapshotChunkIndex: 0,
+					snapshotChunkMessageCount: 1,
+				},
+				payload,
+			});
+			expect(parse).not.toHaveBeenCalled();
+		} finally {
+			parse.mockRestore();
+		}
+		expect(worker.transcriptCaches.get(activeSessionId)?.chunkCount).toBe(1);
+		internals.handleWorkerFrame(worker, frame(frames.end));
+		worker.transcriptCaches.get(activeSessionId)?.dispose();
+	});
+
 	it("keeps a multi-session worker connected after a scoped snapshot failure frame", () => {
 		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-failure.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
@@ -921,6 +957,49 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		internals.handleWorkerFrame(replaced.worker, frame({ ...frames.begin, snapshotId: "snapshot-4602-new" }));
 		expect(replaced.close).not.toHaveBeenCalled();
 		expect(replaced.worker.transcriptCaches.get(activeSessionId)?.snapshotId).toBe("snapshot-4602-new");
+	});
+
+	it("emits one supervisor pre-begin catch-up failure without a self-requeue", async () => {
+		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-pre-begin.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/eng-4602-supervisor-pre-begin-state",
+		});
+		const socket = new PassThrough();
+		socket.resume();
+		const client = socketClient("pre-begin", socket);
+		const records: DaemonOutbound[] = [];
+		const preparationError = new Error("supervisor snapshot preparation failed");
+		const attachClient = vi.fn(async () => {
+			throw preparationError;
+		});
+		const internals = supervisor as unknown as {
+			clients: Set<DaemonSocketClient>;
+			attachClient: typeof attachClient;
+			writeSnapshotRecord(client: DaemonSocketClient, message: DaemonOutbound): Promise<boolean>;
+			queueCatchup(client: DaemonSocketClient, activeSessionId: string, purpose: "replacement" | "resync"): void;
+			catchUpClient(client: DaemonSocketClient): Promise<void>;
+		};
+		internals.clients.add(client);
+		internals.attachClient = attachClient;
+		internals.writeSnapshotRecord = async (_client, message) => {
+			records.push(message);
+			return true;
+		};
+
+		internals.queueCatchup(client, activeSessionId, "resync");
+		await internals.catchUpClient(client);
+
+		expect(attachClient).toHaveBeenCalledOnce();
+		expect(records).toEqual([
+			expect.objectContaining({
+				type: "session_snapshot_failed",
+				activeSessionId,
+				error: preparationError.message,
+				purpose: "resync",
+			}),
+		]);
+		expect(client.catchupActiveSessionIds).toEqual(new Set());
+		socket.destroy();
 	});
 
 	it("emits one terminal failure without a supervisor-side retry loop", async () => {

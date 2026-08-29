@@ -88,6 +88,15 @@ describe("snapshot transcript cache", () => {
 		const end = cache.waitForChunk(1);
 		cache.markComplete();
 		await expect(end).resolves.toBeUndefined();
+		const reEnveloped = await cache.waitForTransferChunk("snapshot-fresh", 0);
+		expect(Array.isArray(reEnveloped)).toBe(true);
+		const reEnvelopedParts = reEnveloped as readonly Buffer[];
+		expect(reEnvelopedParts[1]?.buffer).toBe(encoded.buffer);
+		expect(JSON.parse(Buffer.concat(reEnvelopedParts).toString("utf8"))).toMatchObject({
+			snapshotId: "snapshot-fresh",
+			index: 0,
+			messages: [],
+		});
 		cache.dispose();
 	});
 
@@ -333,6 +342,24 @@ describe("snapshot transcript cache", () => {
 		symlinkSync(parent, symlinkParent);
 		expect(() => createSnapshotCacheProcessRoot(symlinkParent)).toThrow("private directory");
 	});
+
+	it("prepares 10,000 small messages with linear scaling", async () => {
+		const cacheRoot = tempDir();
+		const measure = async (count: number) => {
+			const started = performance.now();
+			const payload = await prepareSnapshotTranscriptPayload({ messages: messages(count, 8), cacheRoot });
+			const elapsedMs = performance.now() - started;
+			payload.dispose();
+			return elapsedMs;
+		};
+
+		await measure(1_000);
+		const halfElapsedMs = await measure(5_000);
+		const fullElapsedMs = await measure(10_000);
+
+		expect(fullElapsedMs).toBeLessThan(5_000);
+		expect(fullElapsedMs).toBeLessThan(halfElapsedMs * 3 + 250);
+	}, 15_000);
 
 	it("bounds 36 MiB single and multi-message preparation and shares one payload across three purposes", async () => {
 		const cacheRoot = tempDir();

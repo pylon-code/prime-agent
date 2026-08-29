@@ -5533,16 +5533,85 @@ describe("DaemonAgentConnection", () => {
 		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
 	});
 
-	it("retries one failed attach request and clears attempt state after success", async () => {
+	it("retains the retry request created while a runtime snapshot close is being rejected", async () => {
 		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		let resolveRecovery!: () => void;
+		const recovery = new Promise<void>((resolve) => {
+			resolveRecovery = resolve;
+		});
+		const internals = connection as unknown as {
+			attachmentEpoch: number;
+			snapshotRequestAttempts: Map<number, { logicalPurpose: string }>;
+			getSnapshotAssembly(snapshotId: string): {
+				begin?: Extract<DaemonOutbound, { type: "session_snapshot_begin" }>;
+			};
+			startSnapshotRequestAttempt(
+				activeSessionId: string,
+				attachmentEpoch: number,
+				logicalPurpose: "replacement",
+				wirePurpose: "attach",
+			): unknown;
+			recoverFailedSnapshot(): Promise<void>;
+			rejectSnapshotAssemblies(error: Error, recoverRuntime: boolean): void;
+		};
+		internals.recoverFailedSnapshot = () => {
+			internals.startSnapshotRequestAttempt("active-1", internals.attachmentEpoch, "replacement", "attach");
+			return recovery;
+		};
+		const assembly = internals.getSnapshotAssembly("runtime-close");
+		const result = createAttachResult("active-1", "client-1", undefined, 12);
+		const { messages: _messages, ...snapshot } = result.snapshot;
+		assembly.begin = {
+			type: "session_snapshot_begin",
+			activeSessionId: "active-1",
+			snapshotId: "runtime-close",
+			snapshot,
+			messageCount: result.snapshot.messages.length,
+			targetChunkBytes: 512 * 1024,
+			purpose: "replacement",
+		};
+
+		internals.rejectSnapshotAssemblies(new Error("transport closed"), true);
+
+		expect([...internals.snapshotRequestAttempts.values()]).toEqual([
+			expect.objectContaining({ logicalPurpose: "replacement" }),
+		]);
+		resolveRecovery();
+		await recovery;
+		await Promise.resolve();
+		await connection.dispose();
+	});
+
+	it("retries one failed attach request with a fresh negotiated generation nonce", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("snapshot_generation_nonce_v1");
 		fakeClient.attachFailures = 1;
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
 
 		await expect(connection.attach()).resolves.toBeUndefined();
-		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+		const attachRequests = fakeClient.requests.filter((request) => request.type === "attach");
+		expect(attachRequests).toHaveLength(2);
+		expect(attachRequests[0]?.snapshotGenerationNonce).toEqual(expect.any(String));
+		expect(attachRequests[1]?.snapshotGenerationNonce).toEqual(expect.any(String));
+		expect(attachRequests[1]?.snapshotGenerationNonce).not.toBe(attachRequests[0]?.snapshotGenerationNonce);
 		expect(
 			(connection as unknown as { snapshotRequestAttempts: Map<number, unknown> }).snapshotRequestAttempts.size,
 		).toBe(0);
+	});
+
+	it("omits generation nonces from a revision 27 daemon even if it advertises the newer capability", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("snapshot_generation_nonce_v1");
+		fakeClient.hello = { ...fakeClient.hello!, schemaRevision: 27 };
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await connection.attach();
+
+		const attachRequests = fakeClient.requests.filter((request) => request.type === "attach");
+		expect(attachRequests).toHaveLength(1);
+		expect(attachRequests[0]?.snapshotGenerationNonce).toBeUndefined();
+		await connection.dispose();
 	});
 
 	it("reuses a settled same-id assembly with a fresh timer and resolves the original attach caller", async () => {
@@ -5605,6 +5674,60 @@ describe("DaemonAgentConnection", () => {
 		expect(
 			(connection as unknown as { snapshotRequestAttempts: Map<number, unknown> }).snapshotRequestAttempts.size,
 		).toBe(0);
+	});
+
+	it("rejects a streamed begin that mismatches its response descriptor and retries fresh", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("snapshot_generation_nonce_v1");
+		let attempt = 0;
+		fakeClient.attachResultFactory = (command) => {
+			const currentAttempt = ++attempt;
+			const full = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12, {
+				messages: [{ role: "user", content: `generation-${currentAttempt}`, timestamp: currentAttempt }],
+			});
+			const snapshotId = `descriptor-${currentAttempt}`;
+			const { messages: _messages, ...snapshot } = full.snapshot;
+			queueMicrotask(() => {
+				fakeClient.emitMessage({
+					type: "session_snapshot_begin",
+					activeSessionId: command.activeSessionId,
+					snapshotId,
+					snapshot,
+					messageCount: currentAttempt === 1 ? 2 : 1,
+					targetChunkBytes: 512 * 1024,
+				});
+				if (currentAttempt === 1) return;
+				fakeClient.emitMessage({
+					type: "session_snapshot_chunk",
+					activeSessionId: command.activeSessionId,
+					snapshotId,
+					index: 0,
+					messages: full.snapshot.messages,
+				});
+				fakeClient.emitMessage({
+					type: "session_snapshot_end",
+					activeSessionId: command.activeSessionId,
+					snapshotId,
+					chunkCount: 1,
+					lastEventSequence: full.lastEventSequence,
+					lastEventCursor: full.lastEventCursor,
+				});
+			});
+			return {
+				...full,
+				snapshot: { ...full.snapshot, messages: [] },
+				snapshotStream: { id: snapshotId, messageCount: 1, targetChunkBytes: 512 * 1024 },
+			};
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await expect(connection.attach()).resolves.toBeUndefined();
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+			messages: [{ role: "user", content: "generation-2", timestamp: 2 }],
+		});
+		const attachRequests = fakeClient.requests.filter((request) => request.type === "attach");
+		expect(attachRequests).toHaveLength(2);
+		expect(attachRequests[1]?.snapshotGenerationNonce).not.toBe(attachRequests[0]?.snapshotGenerationNonce);
 	});
 
 	it("aliases a failed command reattach to one fresh attach and resolves the switch caller", async () => {
@@ -5687,6 +5810,23 @@ describe("DaemonAgentConnection", () => {
 		);
 	});
 
+	it("does not attach-fallback after an invalid reattach response", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-source");
+		await connection.attach();
+		fakeClient.requests.length = 0;
+		fakeClient.switchSessionActiveSessionId = "active-target";
+		fakeClient.reattachResultFactory = () => createAttachResult("active-wrong", "client-1", undefined, 1);
+		fakeClient.attachResultFactory = () => {
+			throw new Error("fallback must not run");
+		};
+
+		await expect(connection.switchSession("/tmp/target.jsonl")).rejects.toThrow(
+			"Daemon returned an invalid session snapshot",
+		);
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["switch_session", "reattach"]);
+	});
+
 	it("rejects one failed snapshot without interrupting another session on the shared client", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const sibling = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-2");
@@ -5742,24 +5882,122 @@ describe("DaemonAgentConnection", () => {
 		await sibling.dispose();
 	});
 
-	it("does not start runtime recovery from an unfenced failure-before-begin frame", async () => {
+	it.each(["replacement", "resync"] as const)(
+		"recovers a current %s failure-before-begin frame without an assembly",
+		async (purpose) => {
+			const fakeClient = new FakeDaemonClient();
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+			await connection.attach();
+			const events: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				events.push(event);
+			});
+			const snapshotId = `pre-begin-${purpose}`;
+
+			fakeClient.emitMessage({
+				type: "session_snapshot_failed",
+				activeSessionId: "active-1",
+				snapshotId,
+				purpose,
+				error: `${purpose} preparation failed before begin`,
+			});
+
+			await vi.waitFor(() =>
+				expect(
+					events.some(
+						(event) => event.type === (purpose === "replacement" ? "session_replaced" : "session_resynced"),
+					),
+				).toBe(true),
+			);
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+			expect((connection as unknown as { runtimeSnapshotAttempt?: unknown }).runtimeSnapshotAttempt).toBeUndefined();
+			expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(
+				0,
+			);
+
+			fakeClient.emitMessage({
+				type: "session_snapshot_failed",
+				activeSessionId: "active-1",
+				snapshotId,
+				purpose,
+				error: "duplicate stale failure",
+			});
+			await Promise.resolve();
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+			await connection.dispose();
+		},
+	);
+
+	it("ignores a pre-begin runtime failure queued under a stale attachment epoch", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
 		await connection.attach();
+		let releaseRoute!: () => void;
+		const routeGate = new Promise<void>((resolve) => {
+			releaseRoute = resolve;
+		});
+		const internals = connection as unknown as {
+			attachmentEpoch: number;
+			replacementMessageTail?: Promise<void>;
+			runtimeSnapshotAttempt?: unknown;
+		};
+		internals.replacementMessageTail = routeGate;
 
 		fakeClient.emitMessage({
 			type: "session_snapshot_failed",
 			activeSessionId: "active-1",
-			snapshotId: "unfenced-runtime-failure",
+			snapshotId: "stale-epoch-failure",
 			purpose: "resync",
-			error: "private unfenced failure",
+			error: "stale preparation failed",
 		});
-		await Promise.resolve();
+		internals.attachmentEpoch++;
+		releaseRoute();
+		await new Promise<void>((resolve) => setImmediate(resolve));
 
 		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
-		expect((connection as unknown as { runtimeSnapshotAttempt?: unknown }).runtimeSnapshotAttempt).toBeUndefined();
-		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
+		expect(internals.runtimeSnapshotAttempt).toBeUndefined();
+		await connection.dispose();
 	});
+
+	it.each(["replacement", "resync"] as const)(
+		"terminates one failed retry for a pre-begin %s failure and fences later failures",
+		async (purpose) => {
+			const fakeClient = new FakeDaemonClient();
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+			await connection.attach();
+			fakeClient.attachResultFactory = () => {
+				throw new Error("retry preparation also failed");
+			};
+			const events: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				events.push(event);
+			});
+
+			fakeClient.emitMessage({
+				type: "session_snapshot_failed",
+				activeSessionId: "active-1",
+				snapshotId: `terminal-${purpose}`,
+				purpose,
+				error: "pre-begin preparation failed",
+			});
+			await vi.waitFor(() => expect(events.filter((event) => event.type === "closed")).toHaveLength(1));
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+
+			for (const snapshotId of [`terminal-${purpose}`, `late-${purpose}`]) {
+				fakeClient.emitMessage({
+					type: "session_snapshot_failed",
+					activeSessionId: "active-1",
+					snapshotId,
+					purpose,
+					error: "late terminal failure",
+				});
+			}
+			await Promise.resolve();
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+			expect(events.filter((event) => event.type === "closed")).toHaveLength(1);
+			await connection.dispose();
+		},
+	);
 
 	it("binds a failure-before-begin frame to the exact current attach attempt", async () => {
 		const fakeClient = new FakeDaemonClient();

@@ -85,13 +85,17 @@ function spawnSupervisor(
 	extraEnv: NodeJS.ProcessEnv = {},
 ): ChildProcess {
 	daemonSockets.add(socketPath);
+	const inheritedEnv = { ...process.env };
+	for (const name of Object.keys(inheritedEnv)) {
+		if (name.startsWith("PRIME_AGENT_INTERNAL_DAEMON_") || name.startsWith("RLM_")) delete inheritedEnv[name];
+	}
 	const child = spawn(
 		process.execPath,
 		[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", socketPath, "--offline", ...extraArgs],
 		{
 			cwd,
 			env: {
-				...process.env,
+				...inheritedEnv,
 				...extraEnv,
 				[ENV_AGENT_DIR]: agentDir,
 				PI_OFFLINE: "1",
@@ -209,6 +213,7 @@ async function connectEventually(socketPath: string, child?: ChildProcess): Prom
 async function createSnapshotRetryProxy(
 	proxyPath: string,
 	targetPath: string,
+	fault: "corrupt-first-chunk" | "corrupt-every-first-chunk" | "drop-first-end" = "corrupt-first-chunk",
 ): Promise<{
 	server: Server;
 	attachRequests: () => number;
@@ -223,6 +228,7 @@ async function createSnapshotRetryProxy(
 		let firstTransferId: string | undefined;
 		let firstChunk: Buffer | undefined;
 		let firstEnd: Buffer | undefined;
+		const corruptedTransferIds = new Set<string>();
 		downstream.on("data", (chunk: Buffer) => {
 			requestBuffer = Buffer.concat([requestBuffer, chunk]);
 			while (true) {
@@ -260,16 +266,17 @@ async function createSnapshotRetryProxy(
 					if (!observedTransferIds.includes(parsed.snapshotId)) observedTransferIds.push(parsed.snapshotId);
 					firstTransferId ??= parsed.snapshotId;
 				}
-				if (
-					parsed.type === "session_snapshot_chunk" &&
-					typeof parsed.snapshotId === "string" &&
-					parsed.snapshotId === firstTransferId &&
-					!firstChunk
-				) {
-					firstChunk = original;
-					parsed.snapshotId = `${parsed.snapshotId}-corrupted`;
-					downstream.write(`${JSON.stringify(parsed)}\n`);
-					continue;
+				if (parsed.type === "session_snapshot_chunk" && typeof parsed.snapshotId === "string") {
+					if (parsed.snapshotId === firstTransferId && !firstChunk) firstChunk = original;
+					const corruptsThisTransfer =
+						(fault === "corrupt-first-chunk" && parsed.snapshotId === firstTransferId) ||
+						fault === "corrupt-every-first-chunk";
+					if (corruptsThisTransfer && !corruptedTransferIds.has(parsed.snapshotId)) {
+						corruptedTransferIds.add(parsed.snapshotId);
+						parsed.snapshotId = `${parsed.snapshotId}-corrupted`;
+						downstream.write(`${JSON.stringify(parsed)}\n`);
+						continue;
+					}
 				}
 				if (
 					parsed.type === "session_snapshot_end" &&
@@ -277,6 +284,7 @@ async function createSnapshotRetryProxy(
 					parsed.snapshotId === firstTransferId
 				) {
 					firstEnd = original;
+					if (fault === "drop-first-end") continue;
 				}
 				downstream.write(original);
 				if (
@@ -310,6 +318,67 @@ async function createSnapshotRetryProxy(
 	};
 }
 
+async function createSnapshotDrainAbortProxy(
+	proxyPath: string,
+	targetPath: string,
+): Promise<{ server: Server; aborted: Promise<number> }> {
+	let resolveAborted!: (bufferedBytes: number) => void;
+	const aborted = new Promise<number>((resolve) => {
+		resolveAborted = resolve;
+	});
+	const server = createServer((downstream: Socket) => {
+		const upstream = createConnection(targetPath);
+		let responseBuffer = Buffer.alloc(0);
+		let paused = false;
+		downstream.on("data", (chunk: Buffer) => {
+			upstream.write(chunk);
+		});
+		upstream.on("data", (chunk: Buffer) => {
+			if (paused) return;
+			responseBuffer = Buffer.concat([responseBuffer, chunk]);
+			while (true) {
+				const newline = responseBuffer.indexOf(0x0a);
+				if (newline < 0) break;
+				const original = Buffer.from(responseBuffer.subarray(0, newline + 1));
+				responseBuffer = responseBuffer.subarray(newline + 1);
+				downstream.write(original);
+				let type: unknown;
+				try {
+					type = (JSON.parse(original.toString("utf8")) as { type?: unknown }).type;
+				} catch {
+					continue;
+				}
+				if (type !== "session_snapshot_begin") continue;
+				paused = true;
+				upstream.pause();
+				let settled = false;
+				const abort = () => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(deadline);
+					const bufferedBytes = responseBuffer.length + upstream.readableLength;
+					resolveAborted(bufferedBytes);
+					upstream.destroy();
+					downstream.destroy();
+				};
+				const deadline = setTimeout(abort, 1_000);
+				deadline.unref();
+				upstream.once("readable", abort);
+				return;
+			}
+		});
+		upstream.on("error", () => downstream.destroy());
+		downstream.on("error", () => upstream.destroy());
+		upstream.on("close", () => downstream.destroy());
+		downstream.on("close", () => upstream.destroy());
+	});
+	await new Promise<void>((resolveListen, reject) => {
+		server.once("error", reject);
+		server.listen(proxyPath, () => resolveListen());
+	});
+	return { server, aborted };
+}
+
 async function waitForSocketGone(socketPath: string): Promise<void> {
 	const deadline = Date.now() + 10_000;
 	while (Date.now() < deadline) {
@@ -331,6 +400,31 @@ function requireSummary(responseData: unknown): SessionSummary {
 		throw new Error("Missing daemon session summary");
 	}
 	return responseData as SessionSummary;
+}
+
+function createSnapshotSessionFile(agentDir: string, projectDir: string, label: string): string {
+	const sessionManager = SessionManager.create(projectDir, join(agentDir, "sessions"));
+	sessionManager.appendMessage({ role: "user", content: label, timestamp: 1 });
+	sessionManager.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "fixture complete" }],
+		api: "openai-responses",
+		provider: "faux",
+		model: "faux",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: 2,
+	});
+	const sessionFile = sessionManager.getSessionFile();
+	if (!sessionFile) throw new Error("Snapshot fixture did not persist");
+	return sessionFile;
 }
 
 function requireSessionList(responseData: unknown): SessionSummary[] {
@@ -627,6 +721,184 @@ describe("daemon supervisor resident workers", () => {
 		const shutdownClient = await connectEventually(socketPath);
 		await shutdownClient.request({ type: "shutdown" });
 		shutdownClient.close();
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
+	it("retries a real worker snapshot whose first generation never sends an end frame", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const suffix = `${process.pid}-${randomUUID().slice(0, 8)}`;
+		const socketPath = join(tmpdir(), `prime-snapshot-missing-end-${suffix}.sock`);
+		const proxyPath = join(tmpdir(), `prime-snapshot-missing-end-proxy-${suffix}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const fixtureLabel = "real missing-end snapshot fixture";
+		const sessionFile = createSnapshotSessionFile(agentDir, projectDir, fixtureLabel);
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const creator = await connectEventually(socketPath, supervisor);
+		const created = await creator.request({
+			type: "create",
+			sessionPath: sessionFile,
+			config: {
+				cwd: projectDir,
+				agentDir,
+				sessionDir: join(agentDir, "sessions"),
+				noTools: true,
+				noExtensions: true,
+			},
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.activeSessionId || !summary.workerPid) throw new Error("Missing-end worker was incomplete");
+		workerPids.add(summary.workerPid);
+		creator.close();
+
+		const proxy = await createSnapshotRetryProxy(proxyPath, socketPath, "drop-first-end");
+		const client = new DaemonClient(proxyPath);
+		try {
+			await client.connect(3_000);
+			await client.waitForHello(3_000);
+			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
+				supportsExtensionUi: false,
+				snapshotTimeoutMs: 250,
+			});
+			await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+				messages: expect.arrayContaining([expect.objectContaining({ role: "user", content: fixtureLabel })]),
+			});
+			expect(proxy.attachRequests()).toBe(2);
+			expect(proxy.transferIds()).toHaveLength(2);
+			expect(new Set(proxy.transferIds()).size).toBe(2);
+			await connection.dispose();
+		} finally {
+			client.close();
+			await new Promise<void>((resolveClose) => proxy.server.close(() => resolveClose()));
+		}
+
+		const shutdownClient = await connectEventually(socketPath);
+		await shutdownClient.request({ type: "shutdown" });
+		shutdownClient.close();
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
+	it("terminates after two corrupted real worker snapshot generations without self-requeue", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const suffix = `${process.pid}-${randomUUID().slice(0, 8)}`;
+		const socketPath = join(tmpdir(), `prime-snapshot-terminal-${suffix}.sock`);
+		const proxyPath = join(tmpdir(), `prime-snapshot-terminal-proxy-${suffix}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionFile = createSnapshotSessionFile(agentDir, projectDir, "real terminal snapshot fixture");
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const creator = await connectEventually(socketPath, supervisor);
+		const created = await creator.request({
+			type: "create",
+			sessionPath: sessionFile,
+			config: {
+				cwd: projectDir,
+				agentDir,
+				sessionDir: join(agentDir, "sessions"),
+				noTools: true,
+				noExtensions: true,
+			},
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.activeSessionId || !summary.workerPid) throw new Error("Terminal worker was incomplete");
+		workerPids.add(summary.workerPid);
+		creator.close();
+
+		const proxy = await createSnapshotRetryProxy(proxyPath, socketPath, "corrupt-every-first-chunk");
+		const client = new DaemonClient(proxyPath);
+		try {
+			await client.connect(3_000);
+			await client.waitForHello(3_000);
+			await expect(
+				DaemonAgentConnection.attach(client, summary.activeSessionId, {
+					supportsExtensionUi: false,
+					snapshotTimeoutMs: 1_000,
+				}),
+			).rejects.toThrow();
+			expect(proxy.attachRequests()).toBe(2);
+			expect(proxy.transferIds()).toHaveLength(2);
+			expect(new Set(proxy.transferIds()).size).toBe(2);
+		} finally {
+			client.close();
+			await new Promise<void>((resolveClose) => proxy.server.close(() => resolveClose()));
+		}
+
+		const shutdownClient = await connectEventually(socketPath);
+		await shutdownClient.request({ type: "shutdown" });
+		shutdownClient.close();
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
+	it("releases a real public snapshot drain when the client detaches", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const suffix = `${process.pid}-${randomUUID().slice(0, 8)}`;
+		const socketPath = join(tmpdir(), `prime-snapshot-drain-${suffix}.sock`);
+		const proxyPath = join(tmpdir(), `prime-snapshot-drain-proxy-${suffix}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const largeFixture = `drain:${"x".repeat(8 * 1024 * 1024)}`;
+		const sessionFile = createSnapshotSessionFile(agentDir, projectDir, largeFixture);
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const creator = await connectEventually(socketPath, supervisor);
+		const created = await creator.request({
+			type: "create",
+			sessionPath: sessionFile,
+			config: {
+				cwd: projectDir,
+				agentDir,
+				sessionDir: join(agentDir, "sessions"),
+				noTools: true,
+				noExtensions: true,
+			},
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.activeSessionId || !summary.workerPid) throw new Error("Drain worker was incomplete");
+		workerPids.add(summary.workerPid);
+		creator.close();
+
+		const proxy = await createSnapshotDrainAbortProxy(proxyPath, socketPath);
+		const blockedClient = new DaemonClient(proxyPath);
+		try {
+			await blockedClient.connect(3_000);
+			await blockedClient.waitForHello(3_000);
+			const failedAttach = DaemonAgentConnection.attach(blockedClient, summary.activeSessionId, {
+				supportsExtensionUi: false,
+				snapshotTimeoutMs: 3_000,
+			});
+			const bufferedBytes = await proxy.aborted;
+			expect(bufferedBytes).toBeGreaterThan(0);
+			await expect(failedAttach).rejects.toThrow();
+		} finally {
+			blockedClient.close();
+			await new Promise<void>((resolveClose) => proxy.server.close(() => resolveClose()));
+		}
+
+		const recoveryClient = await connectEventually(socketPath);
+		const connection = await DaemonAgentConnection.attach(recoveryClient, summary.activeSessionId, {
+			supportsExtensionUi: false,
+			snapshotTimeoutMs: 5_000,
+		});
+		const recovered = await connection.getInitialSnapshot();
+		const recoveredUser = recovered.messages.find((message) => message.role === "user");
+		expect(recoveredUser?.content).toBe(largeFixture);
+		await connection.dispose();
+		await recoveryClient.request({ type: "shutdown" });
+		recoveryClient.close();
 		await waitForProcessGone(summary.workerPid);
 		workerPids.delete(summary.workerPid);
 		await waitForSocketGone(socketPath);

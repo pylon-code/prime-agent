@@ -78,8 +78,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 25 negotiates immutable snapshot transfer identities with session workers.
 // Revision 26 correlates snapshot failures that occur before a begin frame can be emitted.
 // Revision 27 adds a capability-gated authoritative owned-session cleanup query.
-export const DAEMON_SCHEMA_REVISION = 27;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-27-7c0c21a689b5";
+// Revision 28 negotiates fresh snapshot generations and adds private worker chunk routing metadata.
+export const DAEMON_SCHEMA_REVISION = 28;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-7c0c21a689b5";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -131,6 +132,7 @@ export type DaemonServerCapability =
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
+	| "snapshot_generation_nonce_v1"
 	| "authoritative_owned_session_cleanup_v1";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
@@ -178,6 +180,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
+	"snapshot_generation_nonce_v1",
 ];
 
 /** Supervisor-only offers. Private session workers must not advertise these commands. */
@@ -773,6 +776,12 @@ const CORRELATED_PROMPT_LIFECYCLE_COMMAND = {
 	minSchemaRevision: 24,
 	capability: "correlated_prompt_lifecycle_v1",
 } as const;
+export const DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION = 28;
+const SNAPSHOT_GENERATION_NONCE_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION,
+	capability: "snapshot_generation_nonce_v1",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -888,6 +897,9 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	const requirements: DaemonCommandCompatibility[] = [];
 	if ((command.type === "attach" || command.type === "reattach") && command.recoveryConfig !== undefined) {
 		requirements.push(OWNED_SESSION_RECOVERY_CONTEXT);
+	}
+	if (command.type === "attach" && command.snapshotGenerationNonce !== undefined) {
+		requirements.push(SNAPSHOT_GENERATION_NONCE_COMMAND);
 	}
 	const carriesTelemetryPolicy =
 		((command.type === "attach" || command.type === "reattach") && command.telemetryDisabled !== undefined) ||
