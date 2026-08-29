@@ -9,6 +9,7 @@ interface ReceivedRecord {
 	clientId: DaemonClientId;
 	commandId: DaemonCommandId;
 	commandType: string;
+	requestIdentity?: string;
 	recordedAt: string;
 }
 
@@ -37,7 +38,8 @@ interface JournalEntry {
 export type CommandJournalBeginResult =
 	| { status: "new" }
 	| { status: "pending" }
-	| { status: "complete"; response: DaemonResponse };
+	| { status: "complete"; response: DaemonResponse }
+	| { status: "conflict" };
 
 const COMPACT_AFTER_RECORDS = 4096;
 
@@ -48,7 +50,8 @@ export function createCommandIdempotencyKey(clientId: DaemonClientId, commandId:
 /**
  * Append-only command journal used at the supervisor boundary. A received
  * record is durable before a mutating command is dispatched; a missing result
- * after a crash is therefore treated as uncertain and is never replayed.
+ * after a crash is therefore treated as uncertain. Only callers with a durable
+ * request identity may explicitly choose a safe redrive.
  */
 export class CommandRecoveryJournal {
 	private readonly entries = new Map<string, JournalEntry>();
@@ -62,17 +65,27 @@ export class CommandRecoveryJournal {
 	lookup(
 		clientId: DaemonClientId,
 		commandId: DaemonCommandId,
+		requestIdentity?: string,
 	): Exclude<CommandJournalBeginResult, { status: "new" }> | undefined {
 		const existing = this.entries.get(createCommandIdempotencyKey(clientId, commandId));
-		if (existing?.response) {
+		if (!existing) return undefined;
+		if (requestIdentity !== undefined && existing.received.requestIdentity !== requestIdentity) {
+			return { status: "conflict" };
+		}
+		if (existing.response) {
 			return { status: "complete", response: existing.response };
 		}
-		return existing ? { status: "pending" } : undefined;
+		return { status: "pending" };
 	}
 
-	begin(clientId: DaemonClientId, commandId: DaemonCommandId, commandType: string): CommandJournalBeginResult {
+	begin(
+		clientId: DaemonClientId,
+		commandId: DaemonCommandId,
+		commandType: string,
+		requestIdentity?: string,
+	): CommandJournalBeginResult {
 		const key = createCommandIdempotencyKey(clientId, commandId);
-		const existing = this.lookup(clientId, commandId);
+		const existing = this.lookup(clientId, commandId, requestIdentity);
 		if (existing) return existing;
 		const received: ReceivedRecord = {
 			version: 1,
@@ -81,6 +94,7 @@ export class CommandRecoveryJournal {
 			clientId,
 			commandId,
 			commandType,
+			...(requestIdentity === undefined ? {} : { requestIdentity }),
 			recordedAt: new Date().toISOString(),
 		};
 		this.append(received);
@@ -154,7 +168,8 @@ export class CommandRecoveryJournal {
 				if (
 					typeof record.clientId === "string" &&
 					typeof record.commandId === "string" &&
-					typeof record.commandType === "string"
+					typeof record.commandType === "string" &&
+					(record.requestIdentity === undefined || typeof record.requestIdentity === "string")
 				) {
 					this.entries.set(record.key, { received: record });
 				}

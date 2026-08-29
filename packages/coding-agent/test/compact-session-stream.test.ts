@@ -43,7 +43,9 @@ describe("compact daemon assistant streaming", () => {
 				type: "message_update",
 				message: started,
 				assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: started },
+				promptCorrelationId: null,
 			},
+			attribution: { scope: "session" },
 		});
 		expect(startFrame).toBeDefined();
 		expect(reconstructor.reconstruct(startFrame!)).toMatchObject({
@@ -58,7 +60,9 @@ describe("compact daemon assistant streaming", () => {
 				type: "message_update",
 				message: updated,
 				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello", partial: updated },
+				promptCorrelationId: "correlation-1",
 			},
+			attribution: { scope: "prompt", correlationId: "correlation-1" },
 			meta: {
 				id: "active-1:2",
 				protocol: DAEMON_PROTOCOL_INFO,
@@ -79,12 +83,35 @@ describe("compact daemon assistant streaming", () => {
 				type: "message_update",
 				message: { content: [{ type: "text", text: "hello" }] },
 				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello" },
+				promptCorrelationId: "correlation-1",
 			},
+			attribution: { scope: "prompt", correlationId: "correlation-1" },
 			meta: { cursor: { generation: "generation-1", sequence: 2 } },
 		});
 		expect((reconstructed as Extract<DaemonOutbound, { type: "session_event" }>).event).not.toHaveProperty(
 			"assistantMessageEvent.partial",
 		);
+	});
+
+	it("rejects compact deltas without consistent provenance", () => {
+		const partial = assistant([{ type: "text", text: "x" }]);
+		const missing = {
+			type: "session_event",
+			activeSessionId: "active-missing",
+			event: {
+				type: "message_update",
+				message: partial,
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x", partial },
+			},
+		} satisfies DaemonOutbound;
+		expect(createCompactAssistantDelta(missing)).toBeUndefined();
+		expect(
+			createCompactAssistantDelta({
+				...missing,
+				event: { ...missing.event, promptCorrelationId: "correlation-1" },
+				attribution: { scope: "session" },
+			}),
+		).toBeUndefined();
 	});
 
 	it("keeps delta payload size independent of the growing assistant message", () => {
@@ -97,7 +124,9 @@ describe("compact daemon assistant streaming", () => {
 				type: "message_update",
 				message: partial,
 				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x", partial },
+				promptCorrelationId: null,
 			},
+			attribution: { scope: "session" },
 		};
 		const compact = createCompactAssistantDelta(full);
 		expect(compact).toBeDefined();
@@ -120,7 +149,9 @@ describe("compact daemon assistant streaming", () => {
 				type: "message_update",
 				message: started,
 				assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: started },
+				promptCorrelationId: null,
 			},
+			attribution: { scope: "session" },
 		});
 		const deltaFrame = createCompactAssistantDelta({
 			type: "session_event",
@@ -129,7 +160,9 @@ describe("compact daemon assistant streaming", () => {
 				type: "message_update",
 				message: started,
 				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "Hello", partial: started },
+				promptCorrelationId: null,
 			},
+			attribution: { scope: "session" },
 		});
 
 		expect(reconstructor.reconstruct(startFrame!)).toMatchObject({
@@ -159,7 +192,9 @@ describe("compact daemon assistant streaming", () => {
 					delta: 'lo"}',
 					partial: updated,
 				},
+				promptCorrelationId: null,
 			},
+			attribution: { scope: "session" },
 		});
 
 		expect(reconstructor.reconstruct(delta!)).toMatchObject({

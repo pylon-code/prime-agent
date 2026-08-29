@@ -76,6 +76,27 @@ decisions:
     revisit_when:
       - Prime publishes list, correlation, cancellation, and terminal lifecycle events.
 
+
+  correlated-prompt-lifecycle:
+    area: prompt-ownership
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/3
+      - https://github.com/pylon-code/prime-agent/pull/9
+      - https://github.com/pylon-code/pylon/issues/114
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/800
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1239
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1859
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1861
+    fork_change: negotiated-correlated-prompt-lifecycle-v1
+    upstream_support: Prime has queue, background, cancellation, reconnect, and event primitives, but no optional contract proving per-prompt ownership, delivery, provenance, terminal usage, and durable generation-scoped recovery together.
+    revisit_when:
+      - Prime upstream ships an equivalent negotiated lifecycle with exact delivery, provenance, scoped cancellation, recovery, and per-prompt usage guarantees.
+      - Pylon can remove the fork contract without weakening stock-Prime fallback behavior.
+
   heartbeat-projection:
     area: autonomous-work
     state: blocked

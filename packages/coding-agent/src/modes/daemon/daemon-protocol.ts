@@ -19,6 +19,12 @@ import type {
 import type { InputSource } from "../../core/extensions/types.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { CustomMessage } from "../../core/messages.js";
+import type {
+	PromptEventAttribution,
+	PromptLifecycleCancellationResult,
+	PromptLifecycleSnapshot,
+	PromptLifecycleStateSnapshot,
+} from "../../core/prompt-lifecycle.js";
 import type { QueuedMessageLane, QueuedMessageMutation } from "../../core/session-action-store.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
@@ -66,9 +72,11 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 19 adds daemon-held session input pauses.
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
+// Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
 // Revision 23 lets workers query the supervisor agent roster on demand.
-export const DAEMON_SCHEMA_REVISION = 23;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-649fe649d15e";
+// Revision 24 adds capability-gated correlated prompt lifecycle and event provenance.
+export const DAEMON_SCHEMA_REVISION = 24;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-24-2c8fb17d3895";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -86,7 +94,8 @@ export type DaemonClientCapability =
 	| "extension_ui"
 	| "slim_attach"
 	| "chunked_snapshot"
-	| "client_owned_sessions";
+	| "client_owned_sessions"
+	| "correlated_prompt_lifecycle_v1";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -139,6 +148,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"slim_attach",
 	"chunked_snapshot",
 	"client_owned_sessions",
+	"correlated_prompt_lifecycle_v1",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
@@ -301,6 +311,8 @@ export interface DaemonSessionSnapshot {
 	};
 	/** Live RLM child sessions (including grandchildren) hosted by the daemon under this session. */
 	children?: AgentConnectionRlmChildAgentSnapshot[];
+	/** Bounded active and terminal prompt ownership records for reconnect reconciliation. */
+	promptLifecycles?: PromptLifecycleStateSnapshot;
 }
 
 export interface DaemonAttachResult {
@@ -453,6 +465,24 @@ export type DaemonCommand =
 			/** Unique only when the caller needs cancellable pre-ownership admission. */
 			admissionId?: string;
 	  }
+	| {
+			id?: string;
+			type: "submit_correlated_prompt";
+			activeSessionId: string;
+			sessionId: string;
+			correlationId: string;
+			message: string;
+			images?: ImageContent[];
+			queueIfBusy?: boolean;
+	  }
+	| {
+			id?: string;
+			type: "cancel_correlated_prompt";
+			activeSessionId: string;
+			sessionId: string;
+			correlationId: string;
+	  }
+	| { id?: string; type: "get_prompt_lifecycles"; activeSessionId: string; sessionId: string }
 	| {
 			id?: string;
 			type: "steer";
@@ -714,6 +744,11 @@ const SESSION_INPUT_PAUSE_COMMAND = {
 	capability: "session_input_pause",
 } as const;
 const AGENT_PEER_LIST_COMMAND = { minProtocol: 7, minSchemaRevision: 23 } as const;
+const CORRELATED_PROMPT_LIFECYCLE_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 24,
+	capability: "correlated_prompt_lifecycle_v1",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -731,6 +766,9 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	prompt: SESSION_INPUT_ADMISSION_COMMAND,
 	cancel_prompt_admission: PROMPT_ADMISSION_CANCELLATION_COMMAND,
 	prompt_and_wait: SESSION_INPUT_ADMISSION_COMMAND,
+	submit_correlated_prompt: CORRELATED_PROMPT_LIFECYCLE_COMMAND,
+	cancel_correlated_prompt: CORRELATED_PROMPT_LIFECYCLE_COMMAND,
+	get_prompt_lifecycles: CORRELATED_PROMPT_LIFECYCLE_COMMAND,
 	steer: SESSION_INPUT_ADMISSION_COMMAND,
 	follow_up: SESSION_INPUT_ADMISSION_COMMAND,
 	restore_next_turn: LEGACY_DAEMON_COMMAND,
@@ -842,6 +880,13 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	return [...requirements, DAEMON_COMMAND_COMPATIBILITY[command.type]];
 }
 
+export interface DaemonSubmitCorrelatedPromptResult {
+	lifecycle: PromptLifecycleSnapshot;
+	duplicate: boolean;
+}
+
+export type DaemonCancelCorrelatedPromptResult = PromptLifecycleCancellationResult;
+
 export type DaemonResponse =
 	| { id?: string; type: "response"; command: string; success: true; data?: unknown }
 	| {
@@ -949,7 +994,19 @@ export type DaemonOutbound =
 	  }
 	| { type: "daemon_closing"; reason: DaemonClosingReason }
 	| { type: "heartbeats_changed" }
-	| { type: "session_event"; activeSessionId: string; event: AgentConnectionSessionEvent; meta?: DaemonEventMeta }
+	| {
+			type: "session_event";
+			activeSessionId: string;
+			event: AgentConnectionSessionEvent;
+			attribution?: PromptEventAttribution;
+			meta?: DaemonEventMeta;
+	  }
+	| {
+			type: "prompt_lifecycle";
+			activeSessionId: string;
+			lifecycle: PromptLifecycleSnapshot;
+			meta?: DaemonEventMeta;
+	  }
 	| { type: "side_question_event"; activeSessionId: string; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_status"; activeSessionId: string; recap?: string; meta?: DaemonEventMeta }
 	| {
@@ -1013,6 +1070,7 @@ export type DaemonOutbound =
 			id: string;
 			method: string;
 			payload: Record<string, unknown>;
+			attribution?: PromptEventAttribution;
 			meta?: DaemonEventMeta;
 	  }
 	| {
@@ -1021,8 +1079,47 @@ export type DaemonOutbound =
 			extensionPath: string;
 			event: string;
 			error: string;
+			attribution?: PromptEventAttribution;
 			meta?: DaemonEventMeta;
 	  };
+
+export function withoutCorrelatedPromptLifecycleSnapshot(snapshot: DaemonSessionSnapshot): DaemonSessionSnapshot {
+	const { promptLifecycles: _promptLifecycles, ...legacySnapshot } = snapshot;
+	return legacySnapshot;
+}
+
+export function daemonOutboundForCorrelatedPromptCapability(
+	message: DaemonOutbound,
+	supported: boolean,
+): DaemonOutbound | undefined {
+	if (supported) return message;
+	switch (message.type) {
+		case "prompt_lifecycle":
+			return undefined;
+		case "session_event": {
+			const { attribution: _attribution, ...legacyMessage } = message;
+			const { promptCorrelationId: _promptCorrelationId, ...legacyEvent } = message.event;
+			return { ...legacyMessage, event: legacyEvent as AgentConnectionSessionEvent };
+		}
+		case "extension_ui_request":
+		case "extension_error": {
+			const { attribution: _attribution, ...legacyMessage } = message;
+			return legacyMessage;
+		}
+		case "session_resynced":
+			return { ...message, snapshot: withoutCorrelatedPromptLifecycleSnapshot(message.snapshot) };
+		case "session_attached":
+			return message.snapshot === undefined
+				? message
+				: { ...message, snapshot: withoutCorrelatedPromptLifecycleSnapshot(message.snapshot) };
+		case "session_snapshot_begin": {
+			const { promptLifecycles: _promptLifecycles, ...legacySnapshot } = message.snapshot;
+			return { ...message, snapshot: legacySnapshot };
+		}
+		default:
+			return message;
+	}
+}
 
 export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	response: LEGACY_DAEMON_COMMAND,
@@ -1032,6 +1129,7 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	daemon_closing: LEGACY_DAEMON_COMMAND,
 	heartbeats_changed: { minProtocol: 7, capability: "heartbeat_catalog" },
 	session_event: LEGACY_DAEMON_COMMAND,
+	prompt_lifecycle: CORRELATED_PROMPT_LIFECYCLE_COMMAND,
 	side_question_event: LEGACY_DAEMON_COMMAND,
 	session_status: LEGACY_DAEMON_COMMAND,
 	session_replaced: LEGACY_DAEMON_COMMAND,
@@ -1123,6 +1221,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"get_context_tree",
 	"get_commands",
 	"get_resource_snapshot",
+	"get_prompt_lifecycles",
 	"get_model_catalog",
 	"get_available_models",
 	"get_queue",

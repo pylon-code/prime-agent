@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
 	chmodSync,
 	closeSync,
@@ -10,15 +11,44 @@ import {
 	writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import type { SessionActionRecoverySnapshot } from "../../core/agent-session.js";
+import {
+	isPromptLifecycleRecoveryStateSnapshot,
+	type PromptLifecycleRecoveryStateSnapshot,
+} from "../../core/prompt-lifecycle.js";
 
 export interface WorkerRecoveryRecord {
-	version: 1;
+	version: 1 | 2 | 3;
 	activeSessionId: string;
 	sessionId: string;
 	sessionFile?: string;
 	busy: boolean;
 	operation: string;
+	promptLifecycles?: PromptLifecycleRecoveryStateSnapshot;
+	sessionActions?: SessionActionRecoverySnapshot;
+	sessionActionsHash?: string;
 	recordedAt: string;
+}
+
+function sessionActionsHash(snapshot: SessionActionRecoverySnapshot): string {
+	return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+}
+
+function isSessionActionRecoverySnapshot(value: unknown): value is SessionActionRecoverySnapshot {
+	if (typeof value !== "object" || value === null) return false;
+	const snapshot = value as Partial<SessionActionRecoverySnapshot>;
+	return (
+		snapshot.formatVersion === 1 &&
+		Array.isArray(snapshot.actions) &&
+		snapshot.actions.every(
+			(action) =>
+				typeof action === "object" &&
+				action !== null &&
+				typeof action.id === "string" &&
+				(typeof action.promptCorrelationId === "undefined" || typeof action.promptCorrelationId === "string"),
+		) &&
+		(snapshot.promptLifecycles === undefined || isPromptLifecycleRecoveryStateSnapshot(snapshot.promptLifecycles))
+	);
 }
 
 function parseRecords(path: string): Map<string, WorkerRecoveryRecord> {
@@ -43,7 +73,12 @@ function parseRecords(path: string): Map<string, WorkerRecoveryRecord> {
 			continue;
 		}
 		if (
-			record.version === 1 &&
+			(record.version === 1 || record.version === 2 || record.version === 3) &&
+			(record.promptLifecycles === undefined || isPromptLifecycleRecoveryStateSnapshot(record.promptLifecycles)) &&
+			(record.sessionActions === undefined ||
+				(isSessionActionRecoverySnapshot(record.sessionActions) &&
+					typeof record.sessionActionsHash === "string" &&
+					record.sessionActionsHash === sessionActionsHash(record.sessionActions))) &&
 			typeof record.activeSessionId === "string" &&
 			typeof record.sessionId === "string" &&
 			typeof record.busy === "boolean" &&
@@ -63,18 +98,21 @@ export class WorkerRecoveryJournal {
 		this.latest = parseRecords(path);
 	}
 
-	record(input: Omit<WorkerRecoveryRecord, "version" | "recordedAt">): void {
+	record(input: Omit<WorkerRecoveryRecord, "version" | "recordedAt" | "sessionActionsHash">): void {
 		const previous = this.latest.get(input.activeSessionId);
 		if (
 			previous?.busy === input.busy &&
 			previous.operation === input.operation &&
-			previous.sessionFile === input.sessionFile
+			previous.sessionFile === input.sessionFile &&
+			JSON.stringify(previous.promptLifecycles) === JSON.stringify(input.promptLifecycles) &&
+			JSON.stringify(previous.sessionActions) === JSON.stringify(input.sessionActions)
 		) {
 			return;
 		}
 		const record: WorkerRecoveryRecord = {
-			version: 1,
+			version: 3,
 			...input,
+			...(input.sessionActions ? { sessionActionsHash: sessionActionsHash(input.sessionActions) } : {}),
 			recordedAt: new Date().toISOString(),
 		};
 		this.append(record);

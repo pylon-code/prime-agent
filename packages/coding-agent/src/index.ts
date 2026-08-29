@@ -279,6 +279,8 @@ export {
 	type AgentConnection,
 	type AgentConnectionArtifactReference,
 	type AgentConnectionArtifactType,
+	type AgentConnectionCorrelatedPromptOptions,
+	type AgentConnectionCorrelatedPromptResult,
 	type AgentConnectionEvent,
 	type AgentConnectionExtensionUiRequest,
 	type AgentConnectionExtensionUiResponse,
@@ -291,7 +293,14 @@ export {
 	type AgentConnectionSlashCommand,
 	type AgentConnectionState,
 	DaemonAgentConnection,
+	type ExpiredPromptLifecycle,
 	InProcessAgentConnection,
+	type PromptEventAttribution,
+	type PromptLifecycleCancellationResult,
+	type PromptLifecycleKind,
+	type PromptLifecyclePhase,
+	type PromptLifecycleSnapshot,
+	type PromptLifecycleStateSnapshot,
 } from "./modes/agent-connection/index.js";
 // Run modes for programmatic SDK usage
 export {

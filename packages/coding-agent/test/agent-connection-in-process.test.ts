@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { emptyGoalState } from "../src/core/goals.js";
+import { createPromptRequestFingerprint, type PromptLifecycleSnapshot } from "../src/core/prompt-lifecycle.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
 
@@ -100,6 +101,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 		autoCompactionEnabled: true,
 		messages,
 		getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+		getPromptLifecycles: () => ({ records: [], expired: [] }),
 		goalState: emptyGoalState(),
 		modelRegistry: {
 			refreshModelCatalog: async () => ({ models: model ? [model] : [], configuredProviders: ["openai"] }),
@@ -196,6 +198,87 @@ describe("InProcessAgentConnection", () => {
 			"hello",
 			expect.objectContaining({ signal: controller.signal, preflightResult: expect.any(Function) }),
 		);
+	});
+
+	it("rejects failed correlated admission and conflicting correlation reuse", async () => {
+		const session = createFakeSession("correlated-submit", []);
+		let lifecycle: PromptLifecycleSnapshot | undefined;
+		let requestFingerprint: string | undefined;
+		const promptUntilAccepted = vi.fn(async (message: string, options?: PromptOptions) => {
+			requestFingerprint = createPromptRequestFingerprint({
+				message,
+				images: options?.images,
+				queueIfBusy: options?.queueIfBusy,
+			});
+			lifecycle = {
+				correlationId: options?.promptCorrelationId ?? "missing",
+				phase: "queued",
+				kind: "model_prompt",
+				revision: 2,
+				deliveryCrossed: false,
+			};
+		});
+		Object.assign(session.session, {
+			isRetrying: false,
+			isBashRunning: false,
+			unfinishedActionCount: 0,
+			getPromptLifecycle: () => lifecycle,
+			getPromptLifecycleRequestFingerprint: () => requestFingerprint,
+			promptUntilAccepted,
+		});
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		await expect(
+			connection.submitCorrelatedPrompt("first", { correlationId: "correlation-1", queueIfBusy: true }),
+		).resolves.toMatchObject({ duplicate: false });
+		await expect(
+			connection.submitCorrelatedPrompt("first", { correlationId: "correlation-1", queueIfBusy: true }),
+		).resolves.toMatchObject({ duplicate: true });
+		await expect(
+			connection.submitCorrelatedPrompt("different", { correlationId: "correlation-1", queueIfBusy: true }),
+		).rejects.toThrow("Prompt correlation id was reused with a different request");
+
+		lifecycle = undefined;
+		requestFingerprint = undefined;
+		Object.assign(session.session, {
+			promptUntilAccepted: vi.fn(async () => {
+				lifecycle = {
+					correlationId: "failed-1",
+					phase: "failed",
+					kind: "model_prompt",
+					revision: 2,
+					deliveryCrossed: false,
+				};
+				throw new Error("admission failed");
+			}),
+		});
+		await expect(
+			connection.submitCorrelatedPrompt("fails", { correlationId: "failed-1", queueIfBusy: true }),
+		).rejects.toThrow("admission failed");
+	});
+
+	it("cancels the exact correlated lifecycle through the in-process boundary", async () => {
+		const session = createFakeSession("correlated-cancellation", []);
+		const cancelPromptLifecycle = vi.fn(() => ({
+			status: "cancelled" as const,
+			ownershipCrossed: true as const,
+			deliveryCrossed: false as const,
+			lifecycle: {
+				correlationId: "correlation-1",
+				phase: "cancelled" as const,
+				kind: "model_prompt" as const,
+				revision: 2,
+				deliveryCrossed: false,
+			},
+		}));
+		Object.assign(session.session, { cancelPromptLifecycle });
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+
+		await expect(connection.cancelPromptLifecycle("correlation-1")).resolves.toMatchObject({
+			status: "cancelled",
+			deliveryCrossed: false,
+		});
+		expect(cancelPromptLifecycle).toHaveBeenCalledWith("correlation-1");
 	});
 
 	it("loads the full model catalog through the connection boundary", async () => {
@@ -335,6 +418,7 @@ describe("InProcessAgentConnection", () => {
 					type: "session_action_update",
 					actions: { queuedCount: 2, steering: ["new"], followUps: ["later"] },
 				},
+				attribution: { scope: "session" },
 			},
 		]);
 

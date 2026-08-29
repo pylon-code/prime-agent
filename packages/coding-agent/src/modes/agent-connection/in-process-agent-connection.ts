@@ -15,6 +15,7 @@ import type {
 } from "../../core/cron-jobs.js";
 import type { ExtensionUIContext } from "../../core/extensions/types.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
+import { createPromptRequestFingerprint } from "../../core/prompt-lifecycle.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
 import { SessionManager } from "../../core/session-manager.js";
@@ -31,6 +32,8 @@ import { createAgentConnectionToolDefinition } from "./tool-definition.js";
 import type {
 	AgentConnection,
 	AgentConnectionBeforeSessionInvalidateListener,
+	AgentConnectionCorrelatedPromptOptions,
+	AgentConnectionCorrelatedPromptResult,
 	AgentConnectionEvent,
 	AgentConnectionEventListener,
 	AgentConnectionExecuteBashOptions,
@@ -115,6 +118,18 @@ export class InProcessAgentConnection implements AgentConnection {
 		return true;
 	}
 
+	supportsCorrelatedPromptLifecycle(): boolean {
+		return true;
+	}
+
+	async getPromptLifecycles() {
+		return this.session.getPromptLifecycles();
+	}
+
+	async cancelPromptLifecycle(correlationId: string) {
+		return this.session.cancelPromptLifecycle(correlationId);
+	}
+
 	async replaceAcpMcpServers(servers: readonly AcpMcpServerConfig[], ownerId: string): Promise<void> {
 		this.runtimeHost.session.replaceAcpMcpServers(servers, ownerId);
 	}
@@ -142,7 +157,10 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getInitialSnapshot(): Promise<AgentConnectionSnapshot> {
-		return createAgentConnectionSnapshot(this.runtimeHost);
+		return {
+			...createAgentConnectionSnapshot(this.runtimeHost),
+			promptLifecycles: this.session.getPromptLifecycles(),
+		};
 	}
 
 	async getRlmChildSnapshots(): Promise<AgentConnectionRlmChildAgentSnapshot[]> {
@@ -330,6 +348,43 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async respondToExtensionUiRequest(_requestId: string, _response: AgentConnectionExtensionUiResponse): Promise<void> {
 		// In-process extension UI requests are handled directly by InteractiveMode.
+	}
+
+	async submitCorrelatedPrompt(
+		message: string,
+		options: AgentConnectionCorrelatedPromptOptions,
+	): Promise<AgentConnectionCorrelatedPromptResult> {
+		const requestFingerprint = createPromptRequestFingerprint({
+			message,
+			images: options.images,
+			queueIfBusy: options.queueIfBusy,
+		});
+		const existing = this.session.getPromptLifecycle(options.correlationId);
+		if (existing) {
+			if (this.session.getPromptLifecycleRequestFingerprint(options.correlationId) !== requestFingerprint) {
+				throw new Error("Prompt correlation id was reused with a different request");
+			}
+			return { lifecycle: existing, duplicate: true };
+		}
+		const busy =
+			this.session.isStreaming ||
+			this.session.isCompacting ||
+			this.session.isRetrying ||
+			this.session.isBashRunning ||
+			this.session.unfinishedActionCount > 0;
+		if (busy && options.queueIfBusy !== true) {
+			throw new Error("Agent is busy and queueIfBusy was not enabled");
+		}
+		await this.session.promptUntilAccepted(message, {
+			...(options.images ? { images: options.images } : {}),
+			...(busy ? { streamingBehavior: "followUp" as const } : {}),
+			...(options.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
+			...(options.signal ? { signal: options.signal } : {}),
+			promptCorrelationId: options.correlationId,
+		});
+		const lifecycle = this.session.getPromptLifecycle(options.correlationId);
+		if (!lifecycle) throw new Error("Correlated prompt admission completed without a lifecycle record");
+		return { lifecycle, duplicate: false };
 	}
 
 	async prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
@@ -606,7 +661,18 @@ export class InProcessAgentConnection implements AgentConnection {
 			getMessages: async () => child.messages,
 			getCommands: async () => createAgentConnectionCommands(child),
 			subscribe: (listener) => {
-				const unsubscribe = child.subscribe((event) => void listener({ type: "session_event", event }));
+				const unsubscribe = child.subscribe((event) => {
+					if (event.type === "prompt_lifecycle") {
+						const { type: _type, promptCorrelationId: _promptCorrelationId, ...lifecycle } = event;
+						void listener({ type: "prompt_lifecycle", lifecycle });
+						return;
+					}
+					const attribution =
+						event.promptCorrelationId === null || event.promptCorrelationId === undefined
+							? { scope: "session" as const }
+							: { scope: "prompt" as const, correlationId: event.promptCorrelationId };
+					void listener({ type: "session_event", event, attribution });
+				});
 				unsubscribes.add(unsubscribe);
 				return () => {
 					unsubscribes.delete(unsubscribe);
@@ -643,7 +709,16 @@ export class InProcessAgentConnection implements AgentConnection {
 	private bindCurrentSessionEvents(): void {
 		this.unsubscribeSessionEvents?.();
 		this.unsubscribeSessionEvents = this.session.subscribe((event) => {
-			void this.emit({ type: "session_event", event });
+			if (event.type === "prompt_lifecycle") {
+				const { type: _type, promptCorrelationId: _promptCorrelationId, ...lifecycle } = event;
+				void this.emit({ type: "prompt_lifecycle", lifecycle });
+				return;
+			}
+			const attribution =
+				event.promptCorrelationId === null || event.promptCorrelationId === undefined
+					? { scope: "session" as const }
+					: { scope: "prompt" as const, correlationId: event.promptCorrelationId };
+			void this.emit({ type: "session_event", event, attribution });
 		});
 	}
 

@@ -310,7 +310,9 @@ describe("AgentSession bash and persistence characterization", () => {
 		await run;
 		unsubscribe();
 
-		expect(events).toEqual([{ type: "bash_end", exitCode: undefined, cancelled: true, truncated: false }]);
+		expect(events).toEqual([
+			{ type: "bash_end", exitCode: undefined, cancelled: true, truncated: false, promptCorrelationId: null },
+		]);
 		const lastMessage = harness.session.messages[harness.session.messages.length - 1];
 		expect(lastMessage?.role).toBe("bashExecution");
 		if (lastMessage?.role === "bashExecution") {

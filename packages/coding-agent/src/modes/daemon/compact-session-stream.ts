@@ -1,4 +1,5 @@
 import { type AssistantMessage, type AssistantMessageEvent, parseStreamingJson } from "@earendil-works/pi-ai";
+import type { PromptEventAttribution } from "../../core/prompt-lifecycle.js";
 import type { DaemonEventMeta, DaemonOutbound } from "./daemon-protocol.js";
 
 type SessionEvent = Extract<DaemonOutbound, { type: "session_event" }>["event"];
@@ -12,6 +13,8 @@ export interface CompactAssistantDelta {
 	assistantMessageEvent: CompactAssistantMessageEvent;
 	contentStart?: AssistantMessage["content"][number];
 	toolCallArguments?: Record<string, unknown>;
+	attribution: PromptEventAttribution;
+	promptCorrelationId: string | null;
 	meta?: DaemonEventMeta;
 }
 
@@ -20,6 +23,15 @@ export function createCompactAssistantDelta(message: DaemonOutbound): CompactAss
 		return undefined;
 	}
 	if (message.event.message.role !== "assistant") {
+		return undefined;
+	}
+	const promptCorrelationId = message.event.promptCorrelationId;
+	if (
+		message.attribution === undefined ||
+		promptCorrelationId === undefined ||
+		(message.attribution.scope === "session" && promptCorrelationId !== null) ||
+		(message.attribution.scope === "prompt" && promptCorrelationId !== message.attribution.correlationId)
+	) {
 		return undefined;
 	}
 	const { partial: _partial, ...assistantMessageEvent } = message.event
@@ -34,6 +46,8 @@ export function createCompactAssistantDelta(message: DaemonOutbound): CompactAss
 		assistantMessageEvent: assistantMessageEvent as CompactAssistantMessageEvent,
 		...(contentStart ? { contentStart } : {}),
 		...(toolCallArguments ? { toolCallArguments } : {}),
+		attribution: message.attribution,
+		promptCorrelationId,
 		...(message.meta ? { meta: message.meta } : {}),
 	};
 }
@@ -180,7 +194,9 @@ export class CompactAssistantStreamReconstructor {
 				type: "message_update",
 				message: { ...partial, content: [...partial.content] },
 				assistantMessageEvent: event as MessageUpdateEvent["assistantMessageEvent"],
+				promptCorrelationId: delta.promptCorrelationId,
 			},
+			attribution: delta.attribution,
 			...(delta.meta ? { meta: delta.meta } : {}),
 		};
 	}
@@ -203,11 +219,27 @@ export function isCompactAssistantDelta(value: unknown): value is CompactAssista
 	if (!value || typeof value !== "object") {
 		return false;
 	}
-	const candidate = value as { type?: unknown; activeSessionId?: unknown; assistantMessageEvent?: unknown };
-	return (
-		candidate.type === "assistant_stream_delta" &&
-		typeof candidate.activeSessionId === "string" &&
-		typeof candidate.assistantMessageEvent === "object" &&
-		candidate.assistantMessageEvent !== null
-	);
+	const candidate = value as {
+		type?: unknown;
+		activeSessionId?: unknown;
+		assistantMessageEvent?: unknown;
+		attribution?: unknown;
+		promptCorrelationId?: unknown;
+	};
+	if (
+		candidate.type !== "assistant_stream_delta" ||
+		typeof candidate.activeSessionId !== "string" ||
+		typeof candidate.assistantMessageEvent !== "object" ||
+		candidate.assistantMessageEvent === null ||
+		typeof candidate.attribution !== "object" ||
+		candidate.attribution === null
+	) {
+		return false;
+	}
+	const attribution = candidate.attribution as { scope?: unknown; correlationId?: unknown };
+	return attribution.scope === "session"
+		? candidate.promptCorrelationId === null
+		: attribution.scope === "prompt" &&
+				typeof attribution.correlationId === "string" &&
+				candidate.promptCorrelationId === attribution.correlationId;
 }

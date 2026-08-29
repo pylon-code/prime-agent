@@ -1,0 +1,1 @@
+- Added optional correlated prompt lifecycle tracking and event provenance for capable daemon clients.

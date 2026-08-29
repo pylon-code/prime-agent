@@ -56,6 +56,7 @@ interface MockRecoveryAction {
 	queueKey?: string;
 	snapshot?: unknown;
 	agentMessageId?: string;
+	promptCorrelationId?: string;
 	payload: { kind: "turn" | "session_command"; text: string; [key: string]: unknown };
 }
 
@@ -67,7 +68,16 @@ interface MockUpdateRestartSession {
 	config: Record<string, unknown>;
 	runtimeMetadata?: AgentSessionRuntimeMetadata;
 	queue: {
-		actions: { formatVersion: 1; actions: MockRecoveryAction[] };
+		actions: {
+			formatVersion: 1;
+			actions: MockRecoveryAction[];
+			promptLifecycles?: {
+				records: Array<Record<string, unknown>>;
+				expired: Array<Record<string, unknown>>;
+				pendingUsage: Array<Record<string, unknown>>;
+				requestFingerprints?: Array<Record<string, unknown>>;
+			};
+		};
 		nextTurn: MockCustomMessage[];
 	};
 	shouldResume: boolean;
@@ -569,7 +579,7 @@ describe("self-update daemon restart", () => {
 		process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] = "1";
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ version: "0.2.6" })),
+			vi.fn(async () => Response.json({ version: VERSION })),
 		);
 
 		await expect(handlePackageCommand(["update", "--self"])).resolves.toBe(true);
@@ -1318,6 +1328,7 @@ describe("self-update daemon restart", () => {
 			wake: "external_resume",
 			queueKey: "heartbeat:job-1",
 			agentMessageId: "agentmsg_followup",
+			promptCorrelationId: "correlation-1",
 			payload: {
 				kind: "turn",
 				text: "heartbeat body",
@@ -1336,6 +1347,20 @@ describe("self-update daemon restart", () => {
 				acceptedBeforeCompletion: false,
 			},
 		};
+		const promptLifecycles = {
+			records: [
+				{
+					correlationId: "correlation-1",
+					phase: "queued",
+					kind: "model_prompt",
+					revision: 2,
+					deliveryCrossed: false,
+				},
+			],
+			expired: [{ correlationId: "expired-1", deliveryCrossed: true }],
+			pendingUsage: [],
+			requestFingerprints: [{ correlationId: "correlation-1", fingerprint: "a".repeat(64) }],
+		};
 		mockState.prepareManifest = {
 			formatVersion: 1,
 			createdAt: "2026-07-07T00:00:00.000Z",
@@ -1346,7 +1371,10 @@ describe("self-update daemon restart", () => {
 					sessionFile: join(projectDir, "session.jsonl"),
 					cwd: projectDir,
 					config: { cwd: projectDir, agentDir },
-					queue: { actions: { formatVersion: 1, actions: [recoveredAction] }, nextTurn: [] },
+					queue: {
+						actions: { formatVersion: 1, actions: [recoveredAction], promptLifecycles },
+						nextTurn: [],
+					},
 					shouldResume: true,
 					wasStreaming: false,
 					wasCompacting: false,
@@ -1365,7 +1393,7 @@ describe("self-update daemon restart", () => {
 			expect(mockState.requestPayloads).toContainEqual({
 				type: "restore_actions",
 				activeSessionId: "restored-active",
-				snapshot: { formatVersion: 1, actions: [recoveredAction] },
+				snapshot: { formatVersion: 1, actions: [recoveredAction], promptLifecycles },
 			});
 			mockState.prepareResponse = {
 				success: true,
@@ -1378,6 +1406,34 @@ describe("self-update daemon restart", () => {
 			errorSpy.mockRestore();
 			logSpy.mockRestore();
 		}
+	});
+
+	it("rejects malformed prompt lifecycle recovery state", async () => {
+		const manifest = createAcceptedRecoveryManifest();
+		manifest.sessions[0]!.queue.actions.promptLifecycles = {
+			records: [
+				{
+					correlationId: "correlation-1",
+					phase: "queued",
+					kind: "model_prompt",
+					revision: 2,
+				},
+			],
+			expired: [],
+			pendingUsage: [],
+		};
+		mockState.prepareResponse = { success: true, data: manifest };
+
+		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow(
+			"Daemon update restart response contains invalid prompt lifecycles",
+		);
+
+		const missingLifecycle = createAcceptedRecoveryManifest();
+		missingLifecycle.sessions[0]!.queue.actions.actions[0]!.promptCorrelationId = "correlation-1";
+		mockState.prepareResponse = { success: true, data: missingLifecycle };
+		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow(
+			"Daemon update restart response contains invalid prompt lifecycles",
+		);
 	});
 
 	it("resumes restored queued work when continuation replay fails", async () => {

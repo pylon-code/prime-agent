@@ -17,6 +17,12 @@ import type { InputSource } from "../../core/extensions/types.js";
 import type { GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
+import type {
+	PromptEventAttribution,
+	PromptLifecycleCancellationResult,
+	PromptLifecycleSnapshot,
+	PromptLifecycleStateSnapshot,
+} from "../../core/prompt-lifecycle.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { RlmMaxDepthStatus, SetRlmMaxDepthResult } from "../../core/rlm-max-depth.js";
 import type {
@@ -305,6 +311,7 @@ export interface AgentConnectionSnapshot {
 	parent?: AgentConnectionParentMetadata;
 	/** Live RLM children, including descendants, known to the host at snapshot time. */
 	children?: AgentConnectionRlmChildAgentSnapshot[];
+	promptLifecycles?: PromptLifecycleStateSnapshot;
 	lastEventSequence?: number;
 	lastEventCursor?: AgentConnectionEventCursor;
 	replay?: AgentConnectionReplayInfo;
@@ -459,6 +466,18 @@ export interface AgentConnectionPromptOptions {
 	signal?: AbortSignal;
 }
 
+export interface AgentConnectionCorrelatedPromptOptions {
+	correlationId: string;
+	images?: ImageContent[];
+	queueIfBusy?: boolean;
+	signal?: AbortSignal;
+}
+
+export interface AgentConnectionCorrelatedPromptResult {
+	lifecycle: PromptLifecycleSnapshot;
+	duplicate: boolean;
+}
+
 export interface AgentConnectionSideQuestionEvent {
 	id: string;
 	question: string;
@@ -536,6 +555,7 @@ export interface AgentConnectionExtensionUiRequest {
 	id: string;
 	method: string;
 	payload: Record<string, unknown>;
+	attribution?: PromptEventAttribution;
 }
 
 export type AgentConnectionRlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
@@ -567,7 +587,7 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	error?: string;
 }
 
-export type AgentConnectionSessionEvent =
+type AgentConnectionSessionEventBody =
 	| AgentEvent
 	| { type: "ipython_sent_agent_message"; toolCallId: string; message: KernelSentAgentMessage }
 	| { type: "session_action_update"; actions: SessionActionSnapshot }
@@ -610,14 +630,26 @@ export type AgentConnectionSessionEvent =
 	| { type: "refine_complete"; result: RefinementResult }
 	| { type: "refine_failed"; error: string };
 
+export type AgentConnectionSessionEvent = AgentConnectionSessionEventBody & {
+	promptCorrelationId?: string | null;
+};
+
 export type AgentConnectionEvent =
-	| { type: "session_event"; event: AgentConnectionSessionEvent }
+	| { type: "session_event"; event: AgentConnectionSessionEvent; attribution?: PromptEventAttribution }
+	| { type: "prompt_lifecycle"; lifecycle: PromptLifecycleSnapshot }
+	| { type: "correlated_prompt_protocol_violation" }
 	| { type: "side_question_event"; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_replaced"; state: AgentConnectionState; messages: AgentMessage[] }
 	| { type: "session_resynced"; snapshot: AgentConnectionSnapshot }
 	| { type: "session_status"; recap?: string }
 	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
-	| { type: "extension_error"; extensionPath: string; event: string; error: string }
+	| {
+			type: "extension_error";
+			extensionPath: string;
+			event: string;
+			error: string;
+			attribution?: PromptEventAttribution;
+	  }
 	| { type: "connection_status"; status: "reconnecting" | "connected"; error?: string }
 	| { type: "heartbeats_changed" }
 	| { type: "closed"; error?: string };
@@ -696,6 +728,13 @@ export interface AgentConnection {
 	replaceAcpMcpServers?(servers: readonly AcpMcpServerConfig[], ownerId: string): Promise<void>;
 	releaseAcpMcpServers?(ownerId: string, serverNames: readonly string[]): Promise<void>;
 
+	supportsCorrelatedPromptLifecycle?(): boolean;
+	getPromptLifecycles?(): Promise<PromptLifecycleStateSnapshot>;
+	submitCorrelatedPrompt?(
+		message: string,
+		options: AgentConnectionCorrelatedPromptOptions,
+	): Promise<AgentConnectionCorrelatedPromptResult>;
+	cancelPromptLifecycle?(correlationId: string): Promise<PromptLifecycleCancellationResult>;
 	prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
 	promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
 	startSideQuestion(id: string, question: string, previousTurns?: AgentConnectionSideQuestionTurn[]): Promise<void>;

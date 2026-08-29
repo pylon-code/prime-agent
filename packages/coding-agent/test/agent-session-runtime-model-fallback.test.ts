@@ -11,6 +11,7 @@ function makeRuntime(options: { model?: Model<Api>; modelFallbackMessage?: strin
 	const session = {
 		model: options.model,
 		setSubagentRuntimeHost: () => {},
+		setSessionReplacementAdmissionGuard: () => {},
 	} as unknown as AgentSession;
 	const createRuntime: CreateAgentSessionRuntimeFactory = () => {
 		throw new Error("not used");

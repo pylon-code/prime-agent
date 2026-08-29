@@ -47,6 +47,7 @@ import { SESSION_ACTION_RECOVERY_FORMAT_VERSION } from "./core/agent-session.js"
 import type { AgentSessionRuntimeMetadata } from "./core/agent-session-runtime.js";
 import { type CustomMessage, isSessionSlashCommand } from "./core/messages.js";
 import { DefaultPackageManager } from "./core/package-manager.js";
+import { isPromptLifecycleRecoveryStateSnapshot } from "./core/prompt-lifecycle.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { DaemonClient, type DaemonHello } from "./modes/daemon/daemon-client.js";
 import {
@@ -615,6 +616,10 @@ function isSessionActionRecoveryAction(value: unknown): value is SessionActionRe
 		typeof value.source !== "string" ||
 		(value.delivery !== "next_turn_boundary" && value.delivery !== "when_run_idle") ||
 		(value.wake !== "immediate" && value.wake !== "on_lower_boundary" && value.wake !== "external_resume") ||
+		(value.promptCorrelationId !== undefined &&
+			(typeof value.promptCorrelationId !== "string" ||
+				value.promptCorrelationId.length === 0 ||
+				value.promptCorrelationId.length > 128)) ||
 		!isRecord(value.payload) ||
 		typeof value.payload.text !== "string" ||
 		(value.payload.images !== undefined &&
@@ -668,9 +673,41 @@ function parseSessionActionRecoverySnapshot(value: unknown): SessionActionRecove
 	if (!Array.isArray(value.actions) || !value.actions.every(isSessionActionRecoveryAction)) {
 		throw new Error("Daemon update restart response is missing session actions");
 	}
+	if (new Set(value.actions.map((action) => action.id)).size !== value.actions.length) {
+		throw new Error("Daemon update restart response contains duplicate session actions");
+	}
+	const correlatedActions = value.actions.filter(
+		(action): action is typeof action & { promptCorrelationId: string } => action.promptCorrelationId !== undefined,
+	);
+	if (
+		(value.promptLifecycles !== undefined && !isPromptLifecycleRecoveryStateSnapshot(value.promptLifecycles)) ||
+		(value.promptLifecycles === undefined && correlatedActions.length > 0)
+	) {
+		throw new Error("Daemon update restart response contains invalid prompt lifecycles");
+	}
+	if (value.promptLifecycles !== undefined) {
+		const records = new Map(value.promptLifecycles.records.map((lifecycle) => [lifecycle.correlationId, lifecycle]));
+		const fingerprints = new Set(
+			(value.promptLifecycles.requestFingerprints ?? []).map((entry) => entry.correlationId),
+		);
+		const correlations = new Set<string>();
+		for (const action of correlatedActions) {
+			const lifecycle = records.get(action.promptCorrelationId);
+			if (
+				correlations.has(action.promptCorrelationId) ||
+				!fingerprints.has(action.promptCorrelationId) ||
+				lifecycle?.phase !== "queued" ||
+				lifecycle.deliveryCrossed
+			) {
+				throw new Error("Daemon update restart response contains invalid prompt lifecycles");
+			}
+			correlations.add(action.promptCorrelationId);
+		}
+	}
 	return {
 		formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION,
 		actions: value.actions,
+		...(value.promptLifecycles === undefined ? {} : { promptLifecycles: value.promptLifecycles }),
 	};
 }
 
@@ -1047,13 +1084,13 @@ async function restoreDaemonUpdateRestartSession(
 		session.hadAcceptedPromptInFlight;
 	let resumedSession = false;
 	let restoredQueuedWork = false;
-	if (session.queue.actions.actions.length > 0) {
+	if (session.queue.actions.actions.length > 0 || session.queue.actions.promptLifecycles !== undefined) {
 		const response = await client.request(
 			{ type: "restore_actions", activeSessionId, snapshot: session.queue.actions },
 			30000,
 		);
 		if (response.success) {
-			restoredQueuedWork = true;
+			restoredQueuedWork = session.queue.actions.actions.length > 0;
 		} else {
 			console.error(
 				chalk.yellow(`Warning: could not restore queued actions for ${session.sessionFile}: ${response.error}`),

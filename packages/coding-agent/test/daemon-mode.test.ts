@@ -7946,6 +7946,209 @@ describe("daemon mode helpers", () => {
 		rejectPrompt?.(new Error("test cleanup"));
 	});
 
+	it("rejects correlated commands for a stale worker session generation", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const state = makeState("active-stale-correlated") as ActiveSessionState;
+		state.runtime = {
+			...state.runtime,
+			session: { sessionId: "current-session", getPromptLifecycle: () => undefined },
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			correlatedPromptSubmissions: Map<string, unknown>;
+			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): DaemonCommand;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-stale", state.activeSessionId);
+		const submit = internals.parseCommandAndRegisterPromptAdmission(
+			client,
+			JSON.stringify({
+				id: "submit-stale",
+				type: "submit_correlated_prompt",
+				activeSessionId: state.activeSessionId,
+				sessionId: "stale-session",
+				correlationId: "correlation-stale",
+				message: "hello",
+			}),
+		);
+
+		await expect(internals.handleCommand(client, submit)).rejects.toThrow(
+			"Correlated prompt targeted a stale session generation",
+		);
+		expect(internals.correlatedPromptSubmissions.size).toBe(0);
+		await expect(
+			internals.handleCommand(client, {
+				id: "cancel-stale",
+				type: "cancel_correlated_prompt",
+				activeSessionId: state.activeSessionId,
+				sessionId: "stale-session",
+				correlationId: "correlation-stale",
+			}),
+		).rejects.toThrow("Correlated prompt cancellation targeted a stale session generation");
+		await expect(
+			internals.handleCommand(client, {
+				id: "query-stale",
+				type: "get_prompt_lifecycles",
+				activeSessionId: state.activeSessionId,
+				sessionId: "stale-session",
+			}),
+		).rejects.toThrow("Prompt lifecycle query targeted a stale session generation");
+	});
+
+	it("deduplicates concurrent correlated submissions before executing a second prompt", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		let releasePrompt = () => {};
+		const promptGate = new Promise<void>((resolve) => {
+			releasePrompt = resolve;
+		});
+		const lifecycle = {
+			correlationId: "correlation-1",
+			phase: "queued" as const,
+			kind: "model_prompt" as const,
+			revision: 2,
+			deliveryCrossed: false,
+		};
+		let lifecycleVisible = false;
+		const promptUntilAccepted = vi.fn(async () => {
+			await promptGate;
+			lifecycleVisible = true;
+		});
+		const state = makeState("active-correlated") as ActiveSessionState;
+		state.runtime = {
+			...state.runtime,
+			session: {
+				sessionId: "durable-session-1",
+				isStreaming: true,
+				isCompacting: false,
+				isRetrying: false,
+				isBashRunning: false,
+				unfinishedActionCount: 1,
+				promptUntilAccepted,
+				getPromptLifecycle: () => (lifecycleVisible ? lifecycle : undefined),
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-correlated", state.activeSessionId);
+		const first = {
+			id: "submit-1",
+			type: "submit_correlated_prompt" as const,
+			activeSessionId: state.activeSessionId,
+			sessionId: "durable-session-1",
+			correlationId: "correlation-1",
+			message: "hello",
+			queueIfBusy: true,
+		};
+		const duplicate = { ...first, id: "submit-2" };
+		internals.parseCommandAndRegisterPromptAdmission(client, JSON.stringify(first));
+		internals.parseCommandAndRegisterPromptAdmission(client, JSON.stringify(duplicate));
+		expect(() =>
+			internals.parseCommandAndRegisterPromptAdmission(
+				client,
+				JSON.stringify({ ...duplicate, id: "submit-conflict", message: "different" }),
+			),
+		).toThrow("Prompt correlation id was reused with a different request");
+		const firstResult = internals.handleCommand(client, first);
+		const duplicateResult = internals.handleCommand(client, duplicate);
+		releasePrompt();
+
+		await expect(firstResult).resolves.toMatchObject({ success: true, data: { duplicate: false } });
+		await expect(duplicateResult).resolves.toMatchObject({ success: true, data: { duplicate: true } });
+		expect(promptUntilAccepted).toHaveBeenCalledOnce();
+	});
+
+	it("does not abort a correlated submission after delivery crossed", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const lifecycle = {
+			correlationId: "correlation-delivered",
+			phase: "delivered" as const,
+			kind: "model_prompt" as const,
+			revision: 3,
+			deliveryCrossed: true,
+		};
+		const state = makeState("active-delivered-cancel") as ActiveSessionState;
+		state.runtime = {
+			...state.runtime,
+			session: {
+				sessionId: "durable-session-1",
+				cancelPromptLifecycle: vi.fn(() => ({
+					status: "too_late",
+					ownershipCrossed: true,
+					deliveryCrossed: true,
+					lifecycle,
+				})),
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			correlatedPromptSubmissions: Map<string, { controller: AbortController }>;
+			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-delivered", state.activeSessionId);
+		const submit = {
+			id: "submit-delivered",
+			type: "submit_correlated_prompt" as const,
+			activeSessionId: state.activeSessionId,
+			sessionId: "durable-session-1",
+			correlationId: lifecycle.correlationId,
+			message: "hello",
+			queueIfBusy: true,
+		};
+		internals.parseCommandAndRegisterPromptAdmission(client, JSON.stringify(submit));
+		const submission = [...internals.correlatedPromptSubmissions.values()][0]!;
+
+		await expect(
+			internals.handleCommand(client, {
+				id: "cancel-delivered",
+				type: "cancel_correlated_prompt",
+				activeSessionId: state.activeSessionId,
+				sessionId: "durable-session-1",
+				correlationId: lifecycle.correlationId,
+			}),
+		).resolves.toMatchObject({ success: true, data: { status: "too_late", deliveryCrossed: true } });
+		expect(submission.controller.signal.aborted).toBe(false);
+	});
+
+	it("capability-filters lifecycle events from legacy attached clients", () => {
+		const client = makeClient("legacy-client", "active-1");
+		const event: DaemonOutbound = {
+			type: "prompt_lifecycle",
+			activeSessionId: "active-1",
+			lifecycle: {
+				correlationId: "correlation-1",
+				phase: "owned",
+				kind: "model_prompt",
+				revision: 1,
+				deliveryCrossed: false,
+			},
+		};
+		expect(shouldSendDaemonOutboundToClient(client, event)).toBe(false);
+		setDaemonClientSessionCapabilities(client, "active-1", new Set(["correlated_prompt_lifecycle_v1"]));
+		expect(shouldSendDaemonOutboundToClient(client, event)).toBe(true);
+	});
+
 	it("aborts waiting prompt admissions when their session closes", () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -8917,6 +9120,7 @@ function makeRuntimeSession(
 			return sessionManager.getSessionName();
 		},
 		setSubagentRuntimeHost: vi.fn(),
+		setSessionReplacementAdmissionGuard: vi.fn(),
 		getRlmChildRunStatus: vi.fn(() => "running"),
 		registerRlmChildSession: vi.fn(() => true),
 		releaseRlmChildSession: vi.fn(() => vi.fn()),

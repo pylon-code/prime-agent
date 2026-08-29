@@ -253,4 +253,127 @@ describe("daemon extension binding", () => {
 			"assistant:replacement reply",
 		]);
 	});
+
+	it("keeps the replacement fence on the new session until publication finishes", async () => {
+		const runtime = await createRuntimeForTest(() => {}, []);
+		let markWithSession = () => {};
+		const withSessionReached = new Promise<void>((resolve) => {
+			markWithSession = resolve;
+		});
+		let releaseWithSession = () => {};
+		const withSessionGate = new Promise<void>((resolve) => {
+			releaseWithSession = resolve;
+		});
+
+		const replacement = runtime.newSession({
+			withSession: async () => {
+				markWithSession();
+				await withSessionGate;
+			},
+		});
+		await withSessionReached;
+
+		await expect(
+			runtime.session.prompt("must not admit", { promptCorrelationId: "replacement-publication" }),
+		).rejects.toThrow("A session replacement or reload is already in progress");
+		await expect(runtime.newSession()).rejects.toThrow("A session replacement or reload is already in progress");
+		expect(runtime.session.getPromptLifecycle("replacement-publication")).toBeUndefined();
+
+		releaseWithSession();
+		await replacement;
+	});
+
+	it("blocks uncorrelated session replacement while another correlated prompt is active", async () => {
+		let releaseHold = () => {};
+		let markHoldStarted = () => {};
+		const holdStarted = new Promise<void>((resolve) => {
+			markHoldStarted = resolve;
+		});
+		const hold = new Promise<void>((resolve) => {
+			releaseHold = resolve;
+		});
+		const runtime = await createRuntimeForTest((pi) => {
+			pi.registerCommand("daemon-hold-correlated", {
+				description: "hold a correlated command open",
+				handler: async () => {
+					markHoldStarted();
+					await hold;
+				},
+			});
+			pi.registerCommand("daemon-replace-uncorrelated", {
+				description: "attempt uncorrelated replacement",
+				handler: async (_args, ctx) => {
+					await ctx.newSession();
+				},
+			});
+		}, []);
+		const outbound: DaemonOutbound[] = [];
+		const state: ActiveSessionState = {
+			activeSessionId: "active-cross-client-replace",
+			runtime,
+			clients: new Set(),
+			pendingAttaches: 0,
+			extensionUiRequests: new Map(),
+			eventGeneration: "generation-cross-client-replace",
+			lastEventSequence: 0,
+		};
+		await bindActiveSessionState(state, {
+			broadcast: (_state, message) => outbound.push(message),
+			shutdown: () => {},
+		});
+		const sessionId = runtime.session.sessionId;
+
+		const correlated = runtime.session.prompt("/daemon-hold-correlated", {
+			promptCorrelationId: "correlation-hold",
+		});
+		await holdStarted;
+		await runtime.session.prompt("/daemon-replace-uncorrelated");
+
+		expect(runtime.session.sessionId).toBe(sessionId);
+		expect(outbound.some((message) => message.type === "session_replaced")).toBe(false);
+		expect(runtime.session.getPromptLifecycle("correlation-hold")).toMatchObject({
+			phase: "delivered",
+			deliveryCrossed: true,
+		});
+		releaseHold();
+		await correlated;
+		expect(runtime.session.getPromptLifecycle("correlation-hold")).toMatchObject({ phase: "completed" });
+	});
+
+	it("fails a correlated extension command before it can replace its session", async () => {
+		const runtime = await createRuntimeForTest((pi) => {
+			pi.registerCommand("daemon-replace-correlated", {
+				description: "daemon replace correlated",
+				handler: async (_args, ctx) => {
+					await ctx.newSession();
+				},
+			});
+		}, []);
+		const outbound: DaemonOutbound[] = [];
+		const state: ActiveSessionState = {
+			activeSessionId: "active-correlated-replace",
+			runtime,
+			clients: new Set(),
+			pendingAttaches: 0,
+			extensionUiRequests: new Map(),
+			eventGeneration: "generation-correlated-replace",
+			lastEventSequence: 0,
+		};
+		await bindActiveSessionState(state, {
+			broadcast: (_state, message) => outbound.push(message),
+			shutdown: () => {},
+		});
+		const sessionId = runtime.session.sessionId;
+
+		await runtime.session.prompt("/daemon-replace-correlated", {
+			promptCorrelationId: "correlation-replace",
+		});
+
+		expect(runtime.session.sessionId).toBe(sessionId);
+		expect(outbound.some((message) => message.type === "session_replaced")).toBe(false);
+		expect(runtime.session.getPromptLifecycle("correlation-replace")).toMatchObject({
+			phase: "failed",
+			deliveryCrossed: true,
+		});
+	});
 });
