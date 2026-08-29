@@ -6,8 +6,8 @@ fork:
   mirror_branch: main
   product_branch: pylon
   tracking_issue: https://github.com/pylon-code/prime-agent/issues/1
-  reviewed_upstream_commit: bc0fa7606abb3b7af0f765319518d255e6ae553d
-  reviewed_at: 2026-08-27
+  reviewed_upstream_commit: d60fab8a76d9c169f945341f0ee3bde21903bb55
+  reviewed_at: 2026-08-29
 
 decisions:
   managed-plan-daemon:
@@ -115,3 +115,21 @@ decisions:
     upstream_support: not applicable
     revisit_when:
       - Pylon ships scoped read-only context and checkpoint MCP capabilities.
+
+  prime-inference-catalog-capabilities:
+    area: model-catalog
+    state: shipped
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/4
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1878
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1876
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1877
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1633
+    fork_change: route-specific-live-pricing-invariants
+    upstream_support: Prime refreshes the generated catalog from live providers and currently pins sampled vendor prices in tests.
+    revisit_when:
+      - Prime adopts deterministic catalog fixtures or repo-owned structural invariants.
+      - Prime stops regenerating vendor pricing before tests and releases.
