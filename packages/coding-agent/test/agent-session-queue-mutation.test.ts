@@ -148,6 +148,38 @@ describe("AgentSession queue mutation", () => {
 		await running.catch(() => {});
 	});
 
+	it("keeps correlated queued payloads immutable while allowing reordering and cancellation", async () => {
+		createSession();
+		const { running } = await blockSession();
+		await session.prompt("owned", {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+			promptCorrelationId: "owned-queue",
+		});
+		await session.followUp("other");
+		const fingerprintBefore = session
+			.getSessionActionRecoverySnapshot()
+			.promptLifecycles?.requestFingerprints?.find((entry) => entry.correlationId === "owned-queue");
+
+		expect(queue().followUp).toEqual(["owned", "other"]);
+		expect(fingerprintBefore).toBeDefined();
+		expect(mutate("followUp", 0, "owned", { type: "replace", text: "rewritten", lane: "steering" })).toBe("rejected");
+		expect(queue().followUp).toEqual(["owned", "other"]);
+		expect(
+			session
+				.getSessionActionRecoverySnapshot()
+				.promptLifecycles?.requestFingerprints?.find((entry) => entry.correlationId === "owned-queue"),
+		).toEqual(fingerprintBefore);
+
+		expect(mutate("followUp", 0, "owned", { type: "move", direction: 1 })).toBe("applied");
+		expect(queue().followUp).toEqual(["other", "owned"]);
+		expect(mutate("followUp", 1, "owned", { type: "delete" })).toBe("applied");
+		expect(session.getPromptLifecycle("owned-queue")).toMatchObject({ phase: "cancelled" });
+
+		await session.abort();
+		await running.catch(() => {});
+	});
+
 	it("replaces turn text in place across the image tri-state and rebuilds content and records", async () => {
 		createSession();
 		const { running } = await blockSession();

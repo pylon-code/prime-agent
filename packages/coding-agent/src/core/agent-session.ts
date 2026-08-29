@@ -1071,6 +1071,11 @@ export class AgentSession {
 	private readonly _promptLifecycles = new PromptLifecycleStore();
 	private readonly _pendingCorrelatedPromptAdmissions = new Map<string, AbortController>();
 	private readonly _promptEventContext = new AsyncLocalStorage<string>();
+	private readonly _deferredPromptLifecycleSettlements = new Map<Promise<void>, string>();
+	private readonly _postCompactionPromptOwners = new WeakMap<PostCompactionContinuationSettlement, string>();
+	private readonly _agentEventPromptCorrelations = new WeakMap<AgentEvent, string>();
+	private readonly _postCompactionPromptScheduleRevisions = new Map<string, number>();
+	private _activePostCompactionPromptCorrelationId: string | undefined;
 	private _sessionReplacementFenced = false;
 	private _sessionReplacementAdmissionGuard: (() => boolean) | undefined;
 	private _sessionInputPump: Promise<void> = Promise.resolve();
@@ -1313,6 +1318,14 @@ export class AgentSession {
 			this._goalAccountingStartedAt = Date.now();
 		}
 
+		// A continuation settlement can be reused or replaced, so ownership follows
+		// the causal scheduling call rather than object identity.
+		const schedulePostCompactionContinue = this._schedulePostCompactionContinue.bind(this);
+		this._schedulePostCompactionContinue = (...args: Parameters<typeof this._schedulePostCompactionContinue>) => {
+			this._recordPostCompactionPromptSchedule();
+			return schedulePostCompactionContinue(...args);
+		};
+
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
 		this._installAgentTurnHook();
@@ -1539,18 +1552,83 @@ export class AgentSession {
 		if (correlationId === undefined) return;
 		const current = this._promptLifecycles.get(correlationId);
 		if (!current || isPromptLifecycleTerminal(current.phase)) return;
+		this._postCompactionPromptScheduleRevisions.delete(correlationId);
 		this._transitionPromptLifecycle(correlationId, phase);
 	}
 
-	private _emit(event: AgentSessionEvent): void {
+	private _isDeliveredPromptLifecycleActive(correlationId: string | undefined): correlationId is string {
+		if (correlationId === undefined) return false;
+		const lifecycle = this._promptLifecycles.get(correlationId);
+		return lifecycle?.deliveryCrossed === true && !isPromptLifecycleTerminal(lifecycle.phase);
+	}
+
+	private _currentPromptEventCorrelationId(): string | undefined {
 		const contextualCorrelationId = this._promptEventContext.getStore();
-		const contextualLifecycle =
-			contextualCorrelationId === undefined ? undefined : this._promptLifecycles.get(contextualCorrelationId);
-		const promptCorrelationId =
-			event.promptCorrelationId ??
-			(contextualLifecycle?.deliveryCrossed === true && !isPromptLifecycleTerminal(contextualLifecycle.phase)
-				? contextualLifecycle.correlationId
-				: null);
+		return this._isDeliveredPromptLifecycleActive(contextualCorrelationId) ? contextualCorrelationId : undefined;
+	}
+
+	private _recordPostCompactionPromptSchedule(): void {
+		const correlationId = this._currentPromptEventCorrelationId();
+		if (correlationId !== undefined) {
+			const revision = this._postCompactionPromptScheduleRevisions.get(correlationId) ?? 0;
+			this._postCompactionPromptScheduleRevisions.set(correlationId, revision + 1);
+		}
+	}
+
+	private _transferDeferredPromptLifecycle(
+		correlationId: string,
+		settlement: PostCompactionContinuationSettlement,
+	): boolean {
+		const replacement = this._postCompactionContinuationSettlement;
+		if (
+			replacement === undefined ||
+			replacement === settlement ||
+			replacement.settled ||
+			this._postCompactionPromptOwners.get(settlement) !== correlationId ||
+			!this._isDeliveredPromptLifecycleActive(correlationId)
+		) {
+			return false;
+		}
+		this._postCompactionPromptOwners.set(replacement, correlationId);
+		this._deferPromptLifecycleSettlement(correlationId, replacement);
+		return true;
+	}
+
+	private _deferPromptLifecycleSettlement(
+		correlationId: string,
+		settlement: PostCompactionContinuationSettlement,
+	): void {
+		const settle = async (phase: "completed" | "failed") => {
+			try {
+				await this._agentEventQueue;
+			} catch {
+				phase = "failed";
+			}
+			this._settlePromptLifecycle(correlationId, phase);
+		};
+		const operation = settlement.promise.then(
+			() => {
+				if (this._transferDeferredPromptLifecycle(correlationId, settlement)) return;
+				return settle("completed");
+			},
+			() => settle("failed"),
+		);
+		this._deferredPromptLifecycleSettlements.set(operation, correlationId);
+		void operation
+			.finally(() => {
+				this._deferredPromptLifecycleSettlements.delete(operation);
+			})
+			.catch(() => undefined);
+	}
+
+	private _failDeferredPromptLifecycles(): void {
+		for (const correlationId of new Set(this._deferredPromptLifecycleSettlements.values())) {
+			this._settlePromptLifecycle(correlationId, "failed");
+		}
+	}
+
+	private _emit(event: AgentSessionEvent): void {
+		const promptCorrelationId = event.promptCorrelationId ?? this._currentPromptEventCorrelationId() ?? null;
 		const correlatedEvent =
 			event.promptCorrelationId === undefined ? ({ ...event, promptCorrelationId } as AgentSessionEvent) : event;
 		for (const l of this._eventListeners) {
@@ -3492,6 +3570,13 @@ export class AgentSession {
 	}
 
 	private _handleAgentEvent = (event: AgentEvent): void => {
+		if (event.type === "agent_start" && this.unfinishedActionCount === 0) {
+			const settlement = this._postCompactionContinuationSettlement;
+			const correlationId = settlement ? this._postCompactionPromptOwners.get(settlement) : undefined;
+			if (this._isDeliveredPromptLifecycleActive(correlationId)) {
+				this._activePostCompactionPromptCorrelationId = correlationId;
+			}
+		}
 		this._createRetryPromiseForAgentEnd(event);
 		if (event.type === "message_start" || event.type === "message_end") {
 			for (const action of this._actionStore.ownedActions()) {
@@ -3551,10 +3636,32 @@ export class AgentSession {
 				}
 			}
 		}
-		this._agentEventQueue = this._agentEventQueue.then(
-			() => this._processAgentEvent(event),
-			() => this._processAgentEvent(event),
-		);
+		const contextualCorrelationId = this._currentPromptEventCorrelationId();
+		const eventCorrelationId =
+			contextualCorrelationId ??
+			(this._isDeliveredPromptLifecycleActive(this._activePostCompactionPromptCorrelationId)
+				? this._activePostCompactionPromptCorrelationId
+				: undefined);
+		if (eventCorrelationId !== undefined) this._agentEventPromptCorrelations.set(event, eventCorrelationId);
+		if (
+			event.type === "agent_end" &&
+			eventCorrelationId !== undefined &&
+			this._activePostCompactionPromptCorrelationId === eventCorrelationId
+		) {
+			this._activePostCompactionPromptCorrelationId = undefined;
+		}
+		const processEvent = async () => {
+			try {
+				if (eventCorrelationId === undefined) {
+					await this._processAgentEvent(event);
+				} else {
+					await this._promptEventContext.run(eventCorrelationId, () => this._processAgentEvent(event));
+				}
+			} finally {
+				this._agentEventPromptCorrelations.delete(event);
+			}
+		};
+		this._agentEventQueue = this._agentEventQueue.then(processEvent, processEvent);
 		this._agentEventQueue.catch(() => {});
 	};
 
@@ -3610,6 +3717,7 @@ export class AgentSession {
 
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
 		let clearedDispatchEnded = false;
+		const eventCorrelationId = this._agentEventPromptCorrelations.get(event);
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "toolResult") {
 			this._applyLateIpythonSentAgentMessages(event.message);
 		}
@@ -3662,11 +3770,10 @@ export class AgentSession {
 
 		this._addLoginGuidanceToAuthError(event);
 
-		if (event.type === "message_end" && event.message.role === "assistant") {
-			const correlationId = this._promptEventContext.getStore();
-			if (correlationId !== undefined) this._promptLifecycles.addUsage(correlationId, event.message.usage);
+		if (event.type === "message_end" && event.message.role === "assistant" && eventCorrelationId !== undefined) {
+			this._promptLifecycles.addUsage(eventCorrelationId, event.message.usage);
 		}
-		this._emit(event);
+		this._emit({ ...event, promptCorrelationId: eventCorrelationId ?? null } as AgentSessionEvent);
 
 		if (event.type === "message_end") {
 			if (event.message.role === "custom") {
@@ -4251,6 +4358,7 @@ export class AgentSession {
 			return;
 		}
 		this._disposed = true;
+		this._failDeferredPromptLifecycles();
 		for (const run of this._unsettledRlmChildRuns) run.suppressTerminalNotice = true;
 		for (const controller of this._rlmQuiescenceWaitAborts) controller.abort();
 		this._sessionActionCommitDisposeAbortController.abort();
@@ -6063,7 +6171,7 @@ export class AgentSession {
 				this._emitQueueUpdate();
 				try {
 					const startPreparedTurnActions = () => this._startPreparedTurnActions(actions, epoch);
-					await (first.promptCorrelationId
+					const postCompactionPromptSettlement = await (first.promptCorrelationId
 						? this._promptEventContext.run(first.promptCorrelationId, startPreparedTurnActions)
 						: startPreparedTurnActions());
 					for (const action of actions) {
@@ -6079,7 +6187,14 @@ export class AgentSession {
 						}
 						if (action.lifecycle.state === "running") {
 							transitionSessionAction(action, { state: "completed" });
-							this._settlePromptLifecycle(action.promptCorrelationId, "completed");
+							if (action.promptCorrelationId !== undefined && postCompactionPromptSettlement) {
+								this._deferPromptLifecycleSettlement(
+									action.promptCorrelationId,
+									postCompactionPromptSettlement,
+								);
+							} else {
+								this._settlePromptLifecycle(action.promptCorrelationId, "completed");
+							}
 							this._actionStore.ticketFor(action).settleCompleted();
 							this._settleAgentMessage(action.agentMessageId, "completion");
 						}
@@ -6266,7 +6381,10 @@ export class AgentSession {
 		}
 	}
 
-	private async _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
+	private async _startPreparedTurnActions(
+		actions: QueuedSessionAction[],
+		epoch: number,
+	): Promise<PostCompactionContinuationSettlement | undefined> {
 		let nextTurnMessages: CustomMessage[] = [];
 		const activeTurns = () =>
 			actions.filter(
@@ -6274,7 +6392,11 @@ export class AgentSession {
 					action.payload.kind === "turn" && action.lifecycle.state === "preparing",
 			);
 		const firstTurn = activeTurns()[0];
-		if (!firstTurn) return;
+		if (!firstTurn) return undefined;
+		const postCompactionScheduleRevisionBeforeTurn =
+			firstTurn.promptCorrelationId === undefined
+				? 0
+				: (this._postCompactionPromptScheduleRevisions.get(firstTurn.promptCorrelationId) ?? 0);
 		const executionPolicy = firstTurn.payload.executionPolicy;
 		const restoreNextTurnContext = () => {
 			this._pendingNextTurnMessages.unshift(...nextTurnMessages);
@@ -6386,6 +6508,18 @@ export class AgentSession {
 				throw new Error("Session input dispatch settled without durable delivery");
 			}
 			this._forgetConsumedPostCompactionContinuations(turns.map((action) => primaryDeliveryRecord(action).message));
+			const postCompactionContinuation = this._postCompactionContinuationSettlement;
+			if (
+				firstTurn.promptCorrelationId !== undefined &&
+				postCompactionContinuation !== undefined &&
+				!postCompactionContinuation.settled &&
+				(this._postCompactionPromptScheduleRevisions.get(firstTurn.promptCorrelationId) ?? 0) !==
+					postCompactionScheduleRevisionBeforeTurn
+			) {
+				this._postCompactionPromptOwners.set(postCompactionContinuation, firstTurn.promptCorrelationId);
+				return postCompactionContinuation;
+			}
+			return undefined;
 		} catch (error) {
 			const delivered = new Set(this.agent.state.messages);
 			this._pendingNextTurnMessages.unshift(...nextTurnMessages.filter((message) => !delivered.has(message)));
@@ -6748,6 +6882,8 @@ export class AgentSession {
 			this._emitQueueUpdate();
 			return "applied";
 		}
+		// Correlated ownership binds the request fingerprint to the admitted payload.
+		if (item.promptCorrelationId !== undefined) return "rejected";
 		if (
 			item.payload.kind === "turn" &&
 			(item.payload.acceptedAgentMessage ||
@@ -7187,8 +7323,14 @@ export class AgentSession {
 		while (true) {
 			await this.waitForIdle();
 			const postCompactionContinuation = this._postCompactionContinuationSettlement?.promise;
-			if (!postCompactionContinuation) return;
-			await postCompactionContinuation;
+			const promptLifecycleSettlements = [...this._deferredPromptLifecycleSettlements.keys()];
+			if (!postCompactionContinuation && promptLifecycleSettlements.length === 0) return;
+			const settlements = postCompactionContinuation
+				? [postCompactionContinuation, ...promptLifecycleSettlements]
+				: promptLifecycleSettlements;
+			const results = await Promise.allSettled(settlements);
+			const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+			if (failure) throw failure.reason;
 		}
 	}
 
@@ -7239,6 +7381,7 @@ export class AgentSession {
 	}
 
 	requestAbort(): void {
+		this._failDeferredPromptLifecycles();
 		for (const run of [...this._unsettledRlmChildRuns]) {
 			if (run.status === "cancelled") this._abandonRlmRunForQuiescence(run);
 		}
@@ -7286,6 +7429,7 @@ export class AgentSession {
 	}
 
 	abortForUpdateRestart(): void {
+		this._failDeferredPromptLifecycles();
 		// Cancel scheduled pumps and suspend new ones: queued inputs must survive
 		// into the restart manifest instead of starting a turn during teardown.
 		this._sessionInputPumpRequested = false;
@@ -7890,6 +8034,7 @@ export class AgentSession {
 	}
 
 	private async _invalidatePendingAutoRefineForBranchChange(): Promise<void> {
+		this._failDeferredPromptLifecycles();
 		this._autoRefineReviewAbort?.abort();
 		this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
 		this._assistantTurnsSinceAutoRefine = 0;

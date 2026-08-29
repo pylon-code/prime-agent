@@ -156,7 +156,7 @@ describe("issue #3 correlated prompt lifecycle", () => {
 		await expect(prompt).rejects.toThrow("Correlated prompt was cancelled before delivery");
 	});
 
-	it("cancels only the queued correlated prompt", async () => {
+	it("cancels a queued correlated prompt while post-compaction continuation is parked", async () => {
 		let markBackgroundStarted = () => {};
 		const backgroundStarted = new Promise<void>((resolve) => {
 			markBackgroundStarted = resolve;
@@ -179,19 +179,32 @@ describe("issue #3 correlated prompt lifecycle", () => {
 
 		const background = harness.session.prompt("background");
 		await backgroundStarted;
+		const internals = harness.session as unknown as { _schedulePostCompactionContinue(): void };
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+		internals._schedulePostCompactionContinue();
+		await new Promise<void>(setImmediate);
+		expect(continueSpy).not.toHaveBeenCalled();
+
 		await harness.session.prompt("foreground", {
 			streamingBehavior: "followUp",
 			queueIfBusy: true,
 			promptCorrelationId: "foreground-2",
 		});
-		expect(harness.session.cancelPromptLifecycle("foreground-2")).toMatchObject({ status: "cancelled" });
+		expect(harness.session.getPromptLifecycle("foreground-2")).toMatchObject({
+			phase: "queued",
+			deliveryCrossed: false,
+		});
+		expect(harness.session.cancelPromptLifecycle("foreground-2")).toMatchObject({
+			status: "cancelled",
+			deliveryCrossed: false,
+		});
 		expect(harness.session.getPromptLifecycles().records).toContainEqual(
 			expect.objectContaining({ correlationId: "foreground-2", phase: "cancelled", kind: "model_prompt" }),
 		);
 
 		releaseBackground();
 		await background;
-		await harness.session.waitForIdle();
+		await harness.session.waitForHeadlessIdle();
 		expect(foregroundProvider).not.toHaveBeenCalled();
 	});
 	it("does not abort an async input handler after its delivery boundary", async () => {

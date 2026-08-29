@@ -16,6 +16,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../../src/core/agent-session.js";
 import { createHarness, type Harness } from "./harness.js";
+import { gatedHook } from "./scheduling.js";
 
 type SessionInternals = {
 	_shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
@@ -39,6 +40,23 @@ function createUsage(totalTokens: number): Usage {
 		totalTokens,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
+}
+
+function sumUsage(usages: Usage[]): Usage {
+	const total = createUsage(0);
+	for (const usage of usages) {
+		total.input += usage.input;
+		total.output += usage.output;
+		total.cacheRead += usage.cacheRead;
+		total.cacheWrite += usage.cacheWrite;
+		total.totalTokens += usage.totalTokens;
+		total.cost.input += usage.cost.input;
+		total.cost.output += usage.cost.output;
+		total.cost.cacheRead += usage.cost.cacheRead;
+		total.cost.cacheWrite += usage.cost.cacheWrite;
+		total.cost.total += usage.cost.total;
+	}
+	return total;
 }
 
 function createAssistant(
@@ -76,6 +94,40 @@ function createFauxIpythonTool(sessionRef: { current?: AgentSession }) {
 			return { content: [{ type: "text" as const, text }], details: {} };
 		},
 	};
+}
+
+function createBigTool() {
+	return {
+		name: "big",
+		label: "big",
+		description: "returns big text",
+		parameters: Type.Object({}),
+		execute: async () => ({
+			content: [{ type: "text" as const, text: "x".repeat(40_000) }],
+			details: {},
+		}),
+	};
+}
+
+async function createCompactingHarness() {
+	return createHarness({
+		tools: [createBigTool()],
+		settings: { compaction: { enabled: true, reserveTokens: 500, keepRecentTokens: 1 } },
+		models: [{ id: "faux-1", contextWindow: 6_000 }],
+		persistSession: true,
+		extensionFactories: [
+			(pi) => {
+				pi.on("session_before_compact", async (event) => ({
+					compaction: {
+						summary: "auto compacted",
+						firstKeptEntryId: event.preparation.firstKeptEntryId,
+						tokensBefore: event.preparation.tokensBefore,
+						details: {},
+					},
+				}));
+			},
+		],
+	});
 }
 
 describe("compaction continuation", () => {
@@ -196,47 +248,303 @@ describe("compaction continuation", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
-	it("headless idle includes a successful post-compaction continuation", async () => {
-		const bigTool = {
-			name: "big",
-			label: "big",
-			description: "returns big text",
-			parameters: Type.Object({}),
-			execute: async () => ({
-				content: [{ type: "text" as const, text: "x".repeat(40_000) }],
-				details: {},
-			}),
-		};
+	it("keeps correlated lifecycle ownership through a successful post-compaction continuation", async () => {
+		const harness = await createCompactingHarness();
+		harnesses.push(harness);
+		const beforeCompact = fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" });
+		const afterCompact = fauxAssistantMessage("final answer after successful compaction");
+		harness.setResponses([beforeCompact, afterCompact]);
+		const correlationId = "post-compaction-1";
+
+		await harness.session.prompt("run the tool then summarize", { promptCorrelationId: correlationId });
+		await harness.session.waitForHeadlessIdle();
+
+		expect(harness.eventsOfType("compaction_end").find((event) => event.result)?.result).toBeDefined();
+		const assistantEnds = harness.events.filter(
+			(event) => event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds).toHaveLength(2);
+		expect(assistantEnds.every((event) => event.promptCorrelationId === correlationId)).toBe(true);
+		const expectedUsage = sumUsage(
+			harness.events.flatMap((event) =>
+				event.type === "message_end" && event.message.role === "assistant" ? [event.message.usage] : [],
+			),
+		);
+		const lifecycle = harness
+			.eventsOfType("prompt_lifecycle")
+			.filter((event) => event.correlationId === correlationId);
+		expect(lifecycle.map((event) => event.phase)).toEqual(["owned", "delivered", "completed"]);
+		expect(lifecycle.filter((event) => ["completed", "cancelled", "failed"].includes(event.phase))).toEqual([
+			expect.objectContaining({ phase: "completed", usage: expectedUsage }),
+		]);
+		expect(harness.session.getPromptLifecycle(correlationId)).toMatchObject({
+			phase: "completed",
+			usage: expectedUsage,
+		});
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(harness.session.getLastAssistantText()).toBe("final answer after successful compaction");
+	});
+
+	it("does not correlate unrelated session events while a continuation streams", async () => {
+		let markContinuationStarted = () => {};
+		const continuationStarted = new Promise<void>((resolve) => {
+			markContinuationStarted = resolve;
+		});
+		let releaseContinuation = () => {};
+		const continuationGate = new Promise<void>((resolve) => {
+			releaseContinuation = resolve;
+		});
+		const harness = await createCompactingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" }),
+			async () => {
+				markContinuationStarted();
+				await continuationGate;
+				return fauxAssistantMessage("final answer after successful compaction");
+			},
+		]);
+
+		await harness.session.prompt("foreground", { promptCorrelationId: "streaming-continuation" });
+		await continuationStarted;
+		harness.session.handleGoalHostRequest("goal.create", { objective: "unrelated background goal" });
+
+		expect(harness.eventsOfType("goal_update").at(-1)?.promptCorrelationId).toBeNull();
+		releaseContinuation();
+		await harness.session.waitForHeadlessIdle();
+		expect(
+			harness.events.filter((event) => event.type === "message_end" && event.message.role === "assistant").at(-1)
+				?.promptCorrelationId,
+		).toBe("streaming-continuation");
+	});
+
+	it("retains correlation when a turn reuses an older parked continuation settlement", async () => {
+		let markBackgroundStarted = () => {};
+		const backgroundStarted = new Promise<void>((resolve) => {
+			markBackgroundStarted = resolve;
+		});
+		let releaseBackground = () => {};
+		const backgroundGate = new Promise<void>((resolve) => {
+			releaseBackground = resolve;
+		});
+		const harness = await createCompactingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				markBackgroundStarted();
+				await backgroundGate;
+				return fauxAssistantMessage("background complete");
+			},
+			fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("final answer after compaction"),
+		]);
+
+		const background = harness.session.prompt("background");
+		await backgroundStarted;
+		const internals = harness.session as unknown as { _schedulePostCompactionContinue(): void };
+		internals._schedulePostCompactionContinue();
+		await new Promise<void>(setImmediate);
+		await harness.session.prompt("foreground", {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+			promptCorrelationId: "shared-settlement",
+		});
+		releaseBackground();
+		await background;
+		await harness.session.waitForHeadlessIdle();
+
+		const foregroundAssistantEnds = harness.events
+			.flatMap((event) => (event.type === "message_end" && event.message.role === "assistant" ? [event] : []))
+			.slice(-2);
+		const foregroundUsage = harness.events
+			.flatMap((event) =>
+				event.type === "message_end" && event.message.role === "assistant" ? [event.message.usage] : [],
+			)
+			.slice(-2);
+		expect(foregroundAssistantEnds.map((event) => event.promptCorrelationId)).toEqual([
+			"shared-settlement",
+			"shared-settlement",
+		]);
+		expect(harness.session.getPromptLifecycle("shared-settlement")).toMatchObject({
+			phase: "completed",
+			usage: sumUsage(foregroundUsage),
+		});
+	});
+
+	it("does not let an unrelated compaction claim a parked settlement", async () => {
+		const beforeStart = gatedHook({ prompt: "foreground" });
 		const harness = await createHarness({
-			tools: [bigTool],
+			persistSession: true,
+			extensionFactories: [beforeStart.factory],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("background"), fauxAssistantMessage("foreground done")]);
+
+		await harness.session.prompt("background");
+		const foreground = harness.session.prompt("foreground", { promptCorrelationId: "unrelated-compaction" });
+		await beforeStart.reached;
+		const internals = harness.session as unknown as {
+			_schedulePostCompactionContinue(): void;
+			_postCompactionContinuationSettlement?: object;
+			_postCompactionPromptOwners: WeakMap<object, string>;
+		};
+		internals._schedulePostCompactionContinue();
+		await harness.session.compact(undefined, { skipAbort: true }).catch(() => undefined);
+		const settlement = internals._postCompactionContinuationSettlement;
+		expect(settlement).toBeDefined();
+
+		beforeStart.release();
+		await foreground;
+		expect(internals._postCompactionPromptOwners.get(settlement!)).toBeUndefined();
+		await harness.session.waitForHeadlessIdle();
+	});
+
+	it("adopts an older settlement when a skipped compaction schedules recovery", async () => {
+		let markBackgroundStarted = () => {};
+		const backgroundStarted = new Promise<void>((resolve) => {
+			markBackgroundStarted = resolve;
+		});
+		let releaseBackground = () => {};
+		const backgroundGate = new Promise<void>((resolve) => {
+			releaseBackground = resolve;
+		});
+		const harness = await createHarness({
+			tools: [createBigTool()],
 			settings: { compaction: { enabled: true, reserveTokens: 500, keepRecentTokens: 1 } },
 			models: [{ id: "faux-1", contextWindow: 6_000 }],
 			persistSession: true,
 			extensionFactories: [
 				(pi) => {
-					pi.on("session_before_compact", async (event) => ({
-						compaction: {
-							summary: "auto compacted",
-							firstKeptEntryId: event.preparation.firstKeptEntryId,
-							tokensBefore: event.preparation.tokensBefore,
-							details: {},
-						},
-					}));
+					pi.on("session_before_compact", async () => ({ cancel: true }));
 				},
 			],
 		});
 		harnesses.push(harness);
 		harness.setResponses([
+			async () => {
+				markBackgroundStarted();
+				await backgroundGate;
+				return fauxAssistantMessage("background complete");
+			},
 			fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" }),
-			fauxAssistantMessage("final answer after successful compaction"),
 		]);
 
-		await harness.session.prompt("run the tool then summarize");
+		const background = harness.session.prompt("background");
+		await backgroundStarted;
+		const internals = harness.session as unknown as {
+			_schedulePostCompactionContinue(): void;
+			_postCompactionContinuationSettlement?: object;
+			_postCompactionPromptOwners: WeakMap<object, string>;
+		};
+		internals._schedulePostCompactionContinue();
+		const olderSettlement = internals._postCompactionContinuationSettlement;
+		expect(olderSettlement).toBeDefined();
+		let releaseOlderContinuation = () => {};
+		const olderContinuation = new Promise<void>((resolve) => {
+			releaseOlderContinuation = resolve;
+		});
+		vi.spyOn(harness.session.agent, "continue").mockReturnValue(olderContinuation);
+		await harness.session.prompt("foreground", {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+			promptCorrelationId: "cancelled-compaction",
+		});
+		releaseBackground();
+		await background;
+		await harness.session.waitForIdle();
+
+		expect(internals._postCompactionPromptOwners.get(olderSettlement!)).toBe("cancelled-compaction");
+		expect(harness.session.getPromptLifecycle("cancelled-compaction")).toMatchObject({ phase: "delivered" });
+		releaseOlderContinuation();
+		await harness.session.waitForHeadlessIdle();
+		expect(harness.session.getPromptLifecycle("cancelled-compaction")).toMatchObject({ phase: "completed" });
+	});
+
+	it("transfers correlated ownership across queued manual compaction", async () => {
+		let markProviderStarted = () => {};
+		const providerStarted = new Promise<void>((resolve) => {
+			markProviderStarted = resolve;
+		});
+		let releaseProvider = () => {};
+		const providerGate = new Promise<void>((resolve) => {
+			releaseProvider = resolve;
+		});
+		const harness = await createCompactingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				markProviderStarted();
+				await providerGate;
+				return fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" });
+			},
+			fauxAssistantMessage("final answer after manual compaction"),
+		]);
+
+		const foreground = harness.session.prompt("foreground", { promptCorrelationId: "manual-transfer" });
+		await providerStarted;
+		await harness.session.prompt("/compact", {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+		});
+		releaseProvider();
+		await foreground;
 		await harness.session.waitForHeadlessIdle();
 
-		expect(harness.eventsOfType("compaction_end").find((event) => event.result)?.result).toBeDefined();
-		expect(harness.getPendingResponseCount()).toBe(0);
-		expect(harness.session.getLastAssistantText()).toBe("final answer after successful compaction");
+		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(["threshold", "manual"]);
+		const assistantCorrelations = harness.events.flatMap((event) =>
+			event.type === "message_end" && event.message.role === "assistant" ? [event.promptCorrelationId] : [],
+		);
+		const assistantUsage = harness.events.flatMap((event) =>
+			event.type === "message_end" && event.message.role === "assistant" ? [event.message.usage] : [],
+		);
+		expect(assistantCorrelations).toEqual(["manual-transfer", "manual-transfer"]);
+		expect(harness.session.getPromptLifecycle("manual-transfer")).toMatchObject({
+			phase: "completed",
+			usage: sumUsage(assistantUsage),
+		});
+	});
+
+	it("fails a delivered lifecycle when disposal cancels its continuation", async () => {
+		const harness = await createCompactingHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" })]);
+		let releaseContinue = () => {};
+		const pendingContinue = new Promise<void>((resolve) => {
+			releaseContinue = resolve;
+		});
+		vi.spyOn(harness.session.agent, "continue").mockReturnValue(pendingContinue);
+
+		await harness.session.prompt("foreground", { promptCorrelationId: "disposed-continuation" });
+		expect(harness.session.getPromptLifecycle("disposed-continuation")).toMatchObject({ phase: "delivered" });
+		harness.session.dispose();
+
+		expect(harness.session.getPromptLifecycle("disposed-continuation")).toMatchObject({ phase: "failed" });
+		releaseContinue();
+	});
+
+	it("fails rather than orphaning a lifecycle when the continuation event queue rejects", async () => {
+		vi.useFakeTimers();
+		const harness = await createCompactingHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" })]);
+		let releaseContinue = () => {};
+		const pendingContinue = new Promise<void>((resolve) => {
+			releaseContinue = resolve;
+		});
+		const continueSpy = vi.spyOn(harness.session.agent, "continue").mockReturnValue(pendingContinue);
+
+		await harness.session.prompt("foreground", { promptCorrelationId: "failed-event-queue" });
+		await vi.advanceTimersByTimeAsync(100);
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		const internals = harness.session as unknown as { _agentEventQueue: Promise<void> };
+		const failedQueue = Promise.reject(new Error("event persistence failed"));
+		void failedQueue.catch(() => undefined);
+		internals._agentEventQueue = failedQueue;
+		releaseContinue();
+		await vi.waitFor(() => {
+			expect(harness.session.getPromptLifecycle("failed-event-queue")).toMatchObject({ phase: "failed" });
+		});
+		expect(harness.session.hasNonterminalPromptLifecycle).toBe(false);
 	});
 
 	it("rejects headless idle waiters when a continuation cannot start", async () => {
