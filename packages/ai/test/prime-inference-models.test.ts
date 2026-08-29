@@ -96,7 +96,7 @@ describe("Prime Inference models", () => {
 			expect(model.input).toEqual(["text", "image"]);
 			expect(model.contextWindow).toBe(1048576);
 			expect(model.maxTokens).toBe(1048576);
-			// Each build refreshes route-specific pricing from live catalogs.
+			// Prices come from each route's live provider catalog and can drift independently.
 			expect(model.cost.input).toBeGreaterThan(0);
 			expect(model.cost.output).toBeGreaterThan(model.cost.input);
 		}
