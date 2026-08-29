@@ -7,6 +7,11 @@ on:
         description: Exact candidate commit to verify from a trusted Pylon workflow
         required: false
         type: string
+      require_trusted:
+        description: Fail the aggregate when a trusted caller is not recognized
+        required: false
+        default: false
+        type: boolean
   push:
     branches: [pylon]
   pull_request:
@@ -26,8 +31,26 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     outputs:
-      allowed: ${{ github.event_name == 'workflow_call' || github.event_name == 'push' || steps.sync.outputs.allowed == 'true' || steps.vouch.outputs.vouched == 'true' }}
+      allowed: ${{ steps.internal.outputs.allowed == 'true' || steps.sync.outputs.allowed == 'true' || steps.vouch.outputs.vouched == 'true' }}
     steps:
+      - name: Recognize a trusted Pylon execution
+        id: internal
+        if: github.event_name == 'push' || inputs.checkout_ref != ''
+        env:
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          CALLER_EVENT: ${{ github.event_name }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+        run: |
+          if [[ "$CALLER_REPOSITORY" != "pylon-code/prime-agent" || "$CALLER_REF" != "refs/heads/pylon" ]]; then
+            exit 0
+          fi
+          if [[ "$CALLER_EVENT" == "push" && -z "$CHECKOUT_REF" ]]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          elif [[ ("$CALLER_EVENT" == "workflow_dispatch" || "$CALLER_EVENT" == "schedule") && "$CHECKOUT_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Recognize the internal upstream sync pull request
         id: sync
         if: github.event_name == 'pull_request'
@@ -167,14 +190,16 @@ jobs:
 
   build-check-test:
     name: build-check-test
-    if: always() && needs.trust.outputs.allowed == 'true'
+    if: always() && (needs.trust.outputs.allowed == 'true' || inputs.require_trusted)
     needs: [trust, build-check, test]
     runs-on: ubuntu-latest
     steps:
       - name: Verify CI results
         env:
+          TRUST_ALLOWED: ${{ needs.trust.outputs.allowed }}
           BUILD_CHECK_RESULT: ${{ needs.build-check.result }}
           TEST_RESULT: ${{ needs.test.result }}
         run: |
+          test "$TRUST_ALLOWED" = true
           test "$BUILD_CHECK_RESULT" = success
           test "$TEST_RESULT" = success
