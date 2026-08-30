@@ -153,12 +153,15 @@ describe("DaemonClient", () => {
 		client.onClose(closed);
 
 		client.close();
+		expect(client.isClosed).toBe(true);
 		expect(client.getTransportGeneration()).toBe(4);
 		expect(closed).toHaveBeenCalledTimes(1);
 		expect(closed.mock.calls[0]?.[0]).toBeInstanceOf(Error);
 		expect(closed.mock.calls[0]?.[0]?.message).toContain(
 			"Prime Agent daemon client closed before the operation completed.",
 		);
+		await expect(client.connect()).rejects.toThrow("Prime Agent daemon client is closed.");
+		expect(netMock.sockets).toHaveLength(2);
 		client.close();
 		expect(client.getTransportGeneration()).toBe(4);
 		expect(closed).toHaveBeenCalledTimes(1);

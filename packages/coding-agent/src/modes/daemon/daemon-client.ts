@@ -167,6 +167,11 @@ export class DaemonClient {
 		return this.socket !== undefined && !this.socket.destroyed;
 	}
 
+	/** True after explicit owner disposal through close(). */
+	get isClosed(): boolean {
+		return this.closed;
+	}
+
 	/** Monotonic identity for the current physical daemon transport. */
 	getTransportGeneration(): number {
 		return this.transportGeneration;
@@ -207,6 +212,9 @@ export class DaemonClient {
 	}
 
 	async connect(timeoutMs = 3000): Promise<void> {
+		if (this.closed) {
+			throw new Error(`Prime Agent daemon client is closed. ${daemonEndpointDetails(this.socketPath)}`);
+		}
 		if (this.socket) {
 			throw new Error(`Prime Agent daemon client is already connected. ${daemonEndpointDetails(this.socketPath)}`);
 		}

@@ -325,6 +325,56 @@ export function buildSessionTreeFromFlatNodes(
 const sharedAttachmentOwners = new WeakMap<DaemonClient, Map<string, DaemonAgentConnection>>();
 const sharedAttachmentMutationTails = new WeakMap<DaemonClient, Promise<void>>();
 const MAX_PENDING_NEGOTIATED_RUNTIME_FRAMES = 128;
+const MAX_PENDING_NEGOTIATED_RUNTIME_FRAME_WEIGHT = 256 * 1024;
+
+function boundedJsonStructuralWeight(value: unknown, maxWeight: number): number | undefined {
+	let weight = 0;
+	const values: unknown[] = [value];
+	const seen = new WeakSet<object>();
+	const add = (amount: number): boolean => {
+		if (!Number.isSafeInteger(amount) || amount < 0 || amount > maxWeight - weight) return false;
+		weight += amount;
+		return true;
+	};
+	while (values.length > 0) {
+		const current = values.pop();
+		if (current === null || current === undefined) {
+			if (!add(8)) return undefined;
+			continue;
+		}
+		switch (typeof current) {
+			case "boolean":
+			case "number":
+				if (!add(8)) return undefined;
+				continue;
+			case "string":
+				if (!add(16 + current.length * 2)) return undefined;
+				continue;
+			case "object":
+				break;
+			default:
+				return undefined;
+		}
+		if (seen.has(current)) return undefined;
+		seen.add(current);
+		if (Array.isArray(current)) {
+			if (!add(24 + current.length * 8)) return undefined;
+			for (let index = 0; index < current.length; index++) values.push(current[index]);
+			continue;
+		}
+		if (!add(32)) return undefined;
+		try {
+			for (const key in current) {
+				if (!Object.hasOwn(current, key)) continue;
+				if (!add(16 + key.length * 2)) return undefined;
+				values.push((current as Record<string, unknown>)[key]);
+			}
+		} catch {
+			return undefined;
+		}
+	}
+	return weight;
+}
 
 function isCorrelatedPromptRuntimeFrame(message: DaemonOutbound): boolean {
 	switch (message.type) {
@@ -375,12 +425,14 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly snapshotRequestAttempts = new Map<number, DaemonSnapshotRequestAttempt>();
 	private snapshotRequestAttemptSequence = 0;
 	private attachmentEpoch = 0;
+	private attachmentAdmissionRevision = 0;
 	private attachmentInvalidationRevision = 0;
 	private negotiatedCapabilities: ReadonlySet<DaemonClientCapability> = new Set();
 	private negotiatedTransportGeneration: number | undefined;
 	private negotiatedRuntimeCapabilities: ReadonlySet<DaemonClientCapability> = new Set();
 	private negotiatedRuntimeTransportGeneration: number | undefined;
 	private pendingNegotiatedRuntimeFrames: DaemonOutbound[] = [];
+	private pendingNegotiatedRuntimeFrameWeight = 0;
 	private sharedAttachmentActiveSessionId: string | undefined;
 	private reconnectPromise?: Promise<void>;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
@@ -456,6 +508,11 @@ export class DaemonAgentConnection implements AgentConnection {
 			if (this.disposed || this.terminalCloseEmitted) {
 				return;
 			}
+			if (this.client.isClosed) {
+				this.terminalCloseEmitted = true;
+				void this.emit({ type: "closed", error: "Prime Agent daemon client was closed." });
+				return;
+			}
 			if (invalidatedInputPause) {
 				this.terminalCloseEmitted = true;
 				void this.emit({
@@ -512,6 +569,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		logicalPurpose: DaemonSnapshotPurpose = "attach",
 		allowWhileDisposing = false,
 	): Promise<void> {
+		const admissionRevision = ++this.attachmentAdmissionRevision;
 		this.invalidateNegotiatedCapabilityProof();
 		if (this.replacementReconciliationFailed) {
 			return Promise.reject(new Error("Daemon connection replacement reconciliation has failed"));
@@ -525,6 +583,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					maxAttempts,
 					logicalPurpose,
 					allowWhileDisposing,
+					admissionRevision,
 				);
 			} catch (error) {
 				this.invalidateNegotiatedCapabilityProof();
@@ -540,7 +599,11 @@ export class DaemonAgentConnection implements AgentConnection {
 		maxAttempts: number,
 		logicalPurpose: DaemonSnapshotPurpose,
 		allowWhileDisposing: boolean,
+		admissionRevision: number,
 	): Promise<void> {
+		if (admissionRevision !== this.attachmentAdmissionRevision) {
+			throw new Error("Daemon connection attachment changed during attach");
+		}
 		if (this.disposed || (this.disposing && !allowWhileDisposing)) {
 			throw new Error("Daemon connection is disposing");
 		}
@@ -596,6 +659,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					attachmentEpoch,
 					invalidationRevision,
 					transportGeneration,
+					admissionRevision,
 					allowWhileDisposing,
 				);
 				if ("snapshot" in result && result.snapshotStream) {
@@ -613,6 +677,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					attemptIndex === maxAttempts - 1 ||
 					this.disposing ||
 					this.disposed ||
+					this.attachmentAdmissionRevision !== admissionRevision ||
 					this.attachmentEpoch !== attachmentEpoch ||
 					this.attachmentInvalidationRevision !== invalidationRevision ||
 					this.client.getTransportGeneration() !== transportGeneration ||
@@ -661,6 +726,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				attachmentEpoch,
 				invalidationRevision,
 				transportGeneration,
+				admissionRevision,
 				allowWhileDisposing,
 			);
 			this.commitStagedSnapshot(staged);
@@ -672,6 +738,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				attachmentEpoch,
 				invalidationRevision,
 				transportGeneration,
+				admissionRevision,
 				allowWhileDisposing,
 			);
 			this.activeSessionId = nextActiveSessionId;
@@ -848,9 +915,12 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private supportsNegotiatedRuntimeCapability(capability: DaemonClientCapability): boolean {
+		const activeSessionId = this.sharedAttachmentActiveSessionId;
 		return (
 			!this.disposed &&
 			!this.replacementReconciliationFailed &&
+			activeSessionId !== undefined &&
+			sharedAttachmentOwners.get(this.client)?.get(activeSessionId) === this &&
 			this.negotiatedRuntimeTransportGeneration === this.client.getTransportGeneration() &&
 			this.negotiatedRuntimeCapabilities.has(capability)
 		);
@@ -1754,13 +1824,18 @@ export class DaemonAgentConnection implements AgentConnection {
 		sourceActiveSessionId: string,
 		targetActiveSessionId: string,
 	): Promise<{ cancelled: false }> {
+		const admissionRevision = ++this.attachmentAdmissionRevision;
 		this.invalidateNegotiatedCapabilityProof();
 		if (this.replacementReconciliationFailed) {
 			return Promise.reject(new Error("Daemon connection replacement reconciliation has failed"));
 		}
 		return this.withSharedAttachmentMutation(async () => {
 			try {
-				return await this.reattachSessionUnserialized(sourceActiveSessionId, targetActiveSessionId);
+				return await this.reattachSessionUnserialized(
+					sourceActiveSessionId,
+					targetActiveSessionId,
+					admissionRevision,
+				);
 			} catch (error) {
 				this.invalidateNegotiatedCapabilityProof();
 				throw error;
@@ -1771,7 +1846,11 @@ export class DaemonAgentConnection implements AgentConnection {
 	private async reattachSessionUnserialized(
 		sourceActiveSessionId: string,
 		targetActiveSessionId: string,
+		admissionRevision: number,
 	): Promise<{ cancelled: false }> {
+		if (admissionRevision !== this.attachmentAdmissionRevision) {
+			throw new Error("Daemon connection attachment changed during attach");
+		}
 		if (this.disposing || this.disposed) throw new Error("Daemon connection is disposing");
 		if (this.replacementReconciliationFailed) {
 			throw new Error("Daemon connection replacement reconciliation has failed");
@@ -1835,6 +1914,7 @@ export class DaemonAgentConnection implements AgentConnection {
 						attachmentEpoch,
 						invalidationRevision,
 						transportGeneration,
+						admissionRevision,
 					);
 					if (result.activeSessionId !== targetActiveSessionId) {
 						throw new Error("Daemon returned an invalid session snapshot");
@@ -1855,6 +1935,7 @@ export class DaemonAgentConnection implements AgentConnection {
 						!reattached ||
 						this.disposing ||
 						this.disposed ||
+						this.attachmentAdmissionRevision !== admissionRevision ||
 						this.attachmentEpoch !== attachmentEpoch ||
 						this.attachmentInvalidationRevision !== invalidationRevision ||
 						this.client.getTransportGeneration() !== transportGeneration ||
@@ -1866,7 +1947,13 @@ export class DaemonAgentConnection implements AgentConnection {
 					this.finishSnapshotRequestAttempt(requestAttempt);
 				}
 			}
-			this.assertAttachmentCommit(targetActiveSessionId, attachmentEpoch, invalidationRevision, transportGeneration);
+			this.assertAttachmentCommit(
+				targetActiveSessionId,
+				attachmentEpoch,
+				invalidationRevision,
+				transportGeneration,
+				admissionRevision,
+			);
 			const negotiatedCapabilities = this.negotiatedCapabilitiesFromAttach(result, capabilities);
 			const includePromptLifecycles = negotiatedCapabilities.has("correlated_prompt_lifecycle_v1");
 
@@ -1883,7 +1970,13 @@ export class DaemonAgentConnection implements AgentConnection {
 					{ cursor: snapshot.lastEventCursor, sequence: snapshot.lastEventSequence },
 				],
 			});
-			this.assertAttachmentCommit(targetActiveSessionId, attachmentEpoch, invalidationRevision, transportGeneration);
+			this.assertAttachmentCommit(
+				targetActiveSessionId,
+				attachmentEpoch,
+				invalidationRevision,
+				transportGeneration,
+				admissionRevision,
+			);
 			this.activeSideQuestionIds.clear();
 			this.commitStagedSnapshot(staged);
 			this.publishNegotiatedCapabilityProof(negotiatedCapabilities, transportGeneration);
@@ -1895,6 +1988,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			return { cancelled: false };
 		} catch (error) {
 			const stillCurrent =
+				this.attachmentAdmissionRevision === admissionRevision &&
 				this.attachmentEpoch === attachmentEpoch &&
 				this.attachmentInvalidationRevision === invalidationRevision &&
 				sharedAttachmentOwners.get(this.client)?.get(targetActiveSessionId) === this;
@@ -2400,9 +2494,16 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.pendingChunkedReplacement = { header: message, queuedMessages: [] };
 				return;
 			}
-			const promptLifecycles = this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")
+			const shapingRevision = this.attachmentInvalidationRevision;
+			const queriedPromptLifecycles = this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")
 				? await this.getPromptLifecyclesFor(message.activeSessionId, message.state.sessionId)
 				: undefined;
+			const promptLifecycles =
+				queriedPromptLifecycles &&
+				this.attachmentInvalidationRevision === shapingRevision &&
+				this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")
+					? queriedPromptLifecycles
+					: undefined;
 			const reconciledPromptLifecycles =
 				promptLifecycles && this.latestSnapshot?.state.sessionId === message.state.sessionId
 					? reconcilePromptLifecycleSnapshot(promptLifecycles, this.latestSnapshot.promptLifecycles)
@@ -2629,10 +2730,17 @@ export class DaemonAgentConnection implements AgentConnection {
 		if ("activeSessionId" in message && typeof message.activeSessionId === "string") {
 			const attempt = this.latestSnapshotRequestAttempt(message.activeSessionId);
 			if (attempt?.state === "requesting" || attempt?.state === "receiving") {
-				if (this.pendingNegotiatedRuntimeFrames.length >= MAX_PENDING_NEGOTIATED_RUNTIME_FRAMES) {
+				const remainingWeight =
+					MAX_PENDING_NEGOTIATED_RUNTIME_FRAME_WEIGHT - this.pendingNegotiatedRuntimeFrameWeight;
+				const frameWeight = boundedJsonStructuralWeight(message, remainingWeight);
+				if (
+					this.pendingNegotiatedRuntimeFrames.length >= MAX_PENDING_NEGOTIATED_RUNTIME_FRAMES ||
+					frameWeight === undefined
+				) {
 					this.failClosedReplacementReconciliation();
 				} else {
 					this.pendingNegotiatedRuntimeFrames.push(message);
+					this.pendingNegotiatedRuntimeFrameWeight += frameWeight;
 				}
 			}
 		}
@@ -2642,6 +2750,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private releasePendingNegotiatedRuntimeFrames(): void {
 		const pending = this.pendingNegotiatedRuntimeFrames;
 		this.pendingNegotiatedRuntimeFrames = [];
+		this.pendingNegotiatedRuntimeFrameWeight = 0;
 		if (!this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")) return;
 		for (const message of pending) this.dispatchDaemonMessage(message);
 	}
@@ -2680,6 +2789,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.negotiatedRuntimeTransportGeneration = undefined;
 		}
 		this.pendingNegotiatedRuntimeFrames = [];
+		this.pendingNegotiatedRuntimeFrameWeight = 0;
 		if (!clearRuntimeCapabilities) return;
 		const activeSessionId = this.sharedAttachmentActiveSessionId;
 		this.sharedAttachmentActiveSessionId = undefined;
@@ -2722,12 +2832,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		attachmentEpoch: number,
 		invalidationRevision: number,
 		transportGeneration: number,
+		admissionRevision: number,
 		allowWhileDisposing = false,
 	): void {
 		if (
 			(this.disposing && !allowWhileDisposing) ||
 			this.disposed ||
 			this.replacementReconciliationFailed ||
+			this.attachmentAdmissionRevision !== admissionRevision ||
 			this.attachmentEpoch !== attachmentEpoch ||
 			this.attachmentInvalidationRevision !== invalidationRevision ||
 			this.client.getTransportGeneration() !== transportGeneration ||
