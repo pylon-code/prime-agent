@@ -73,7 +73,7 @@ Due ticks are claimed and advanced before prompt delivery. A crash therefore doe
 
 Resident workers keep scheduling across supervisor replacement. Worker recovery marks uncertain claims interrupted, keeps the advanced schedule, and resumes future ticks only. The supervisor routes schedule commands and merges worker summaries for global listing.
 
-## Public Daemon Protocol v4
+## Public Daemon Protocol v7
 
 The public local socket is JSONL-framed. The current protocol provides:
 
@@ -93,6 +93,18 @@ Protocol version and schema revision are independent. A compatible addition can 
 Protocol v1 is retained only for the one-release update handoff that prepares and stops an older daemon. A busy older daemon that cannot produce a recovery manifest is left running.
 
 JSON and RPC client modes do not expose daemon greetings, envelopes, snapshot records, lifecycle events, or connection metadata.
+
+### Public client ingress bound
+
+The public SDK `DaemonClient` bounds each inbound JSONL frame before UTF-8 decoding or JSON parsing. The default is 128 MiB and embedders can set a lower finite limit with `maxInboundFrameBytes`. Limits are positive safe integers and stay fixed for the lifetime of the client, including reconnects.
+
+The bound counts raw bytes before LF. LF is excluded. A CR immediately before LF counts toward the limit and is then removed. The limit applies to each frame, not to the cumulative snapshot: normal snapshots remain valid as a sequence of bounded chunks. A single indivisible message or legacy monolithic frame above the limit requires a deliberate higher finite override.
+
+Overflow, including bytes without LF, raises `DaemonInboundFrameTooLargeError`. It is terminal for that socket epoch: the client does not truncate, discard-and-resume, process later bytes from that socket, preserve requests for replay, or automatically reconnect to the same peer. Every handshake and request waiter is rejected, close listeners are notified once, and an explicit later reconnect starts with an empty byte buffer and the same configured bound. The error exposes only its stable code and configured limit, never frame content.
+
+`PRIME_AGENT_SDK_FEATURES` contains `bounded_daemon_ingress_v1` when this complete client-local contract is present. This token describes the installed SDK artifact. It is not a daemon capability, hello offer, protocol version, or schema revision.
+
+The raw frame limit bounds pending reader-owned bytes. A valid near-limit frame also needs memory for decoded strings, parsed objects, and consumer state, so embedders must set their process heap and downstream queues separately.
 
 ## Reconnect, Replay, and Snapshots
 
@@ -160,7 +172,9 @@ npx tsx test/daemon-multiclient-bench.ts
 npx tsx test/daemon-multiclient-bench.ts --generated-session-mib 100
 npx tsx test/daemon-multiclient-bench.ts --generated-session-mib 500
 npx tsx test/daemon-multiclient-bench.ts --session-file /path/to/session.jsonl
+npx tsx test/daemon-bounded-ingress-bench.ts --generated-session-mib 100
+npx tsx test/daemon-bounded-ingress-bench.ts --generated-session-mib 500
 PRIME_AGENT_STRESS_WORKERS=50 npx tsx ../../node_modules/vitest/dist/cli.js --run test/daemon-supervisor-process.test.ts -t "hosts resident roots"
 ```
 
-The benchmark compares fanout and attach paths, including serialization count, throughput, elapsed time, and sampled RSS. The stress case starts many resident roots and verifies that their schedules advance independently while sessions are busy.
+The multi-client benchmark compares legacy and chunked fanout/attach paths, including serialization count, throughput, elapsed time, and sampled RSS. Its legacy monolithic path is not an ingress-safety receipt. The bounded-ingress benchmark sends deterministic snapshot-like chunks through a real public `DaemonClient`, asserts each raw frame stays within both its 512 KiB target and a 64 MiB client limit, then verifies the full 100/500 MiB cumulative byte count and SHA-256. The stress case starts many resident roots and verifies that their schedules advance independently while sessions are busy.

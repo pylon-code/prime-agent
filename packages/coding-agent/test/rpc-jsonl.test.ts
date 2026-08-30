@@ -1,8 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { unlink } from "node:fs/promises";
+import { createServer } from "node:net";
 import { performance } from "node:perf_hooks";
 import { Readable } from "node:stream";
 import { describe, expect, test } from "vitest";
-import { attachJsonlLineReader, serializeJsonLine } from "../src/modes/rpc/jsonl.js";
+import { DaemonClient, DaemonInboundFrameTooLargeError } from "../src/modes/daemon/daemon-client.js";
+import { attachBoundedJsonlByteReader, attachJsonlLineReader, serializeJsonLine } from "../src/modes/rpc/jsonl.js";
 
 /**
  * Drive the reader with precise control over chunk boundaries (Readable.from
@@ -151,5 +155,141 @@ describe("RPC JSONL framing", () => {
 
 		expect(overflows).toEqual(["abcde"]);
 		expect(lines).toEqual(["ok"]);
+	});
+
+	test("fails immediately when a no-LF frame exceeds its raw-byte limit", () => {
+		const lines: string[] = [];
+		let failures = 0;
+		const emitter = new EventEmitter();
+		attachBoundedJsonlByteReader(emitter as unknown as Readable, (line) => lines.push(line), {
+			maxFrameBytes: 5,
+			onFrameTooLarge: () => failures++,
+		});
+
+		emitter.emit("data", Buffer.from("abc"));
+		emitter.emit("data", Buffer.from("de"));
+		expect(failures).toBe(0);
+		emitter.emit("data", Buffer.from("f"));
+		expect(failures).toBe(1);
+
+		emitter.emit("data", Buffer.from("\nok\n"));
+		emitter.emit("end");
+		expect(lines).toEqual([]);
+		expect(failures).toBe(1);
+	});
+
+	test("never resumes after a complete oversized frame", () => {
+		const lines: string[] = [];
+		let failures = 0;
+		const emitter = new EventEmitter();
+		attachBoundedJsonlByteReader(emitter as unknown as Readable, (line) => lines.push(line), {
+			maxFrameBytes: 5,
+			onFrameTooLarge: () => failures++,
+		});
+
+		emitter.emit("data", Buffer.from("abcdef\nok\n"));
+		expect(lines).toEqual([]);
+		expect(failures).toBe(1);
+	});
+
+	test("counts UTF-8 bytes and counts CR while excluding LF", () => {
+		const allowed: string[] = [];
+		let allowedFailures = 0;
+		const allowedEmitter = new EventEmitter();
+		attachBoundedJsonlByteReader(allowedEmitter as unknown as Readable, (line) => allowed.push(line), {
+			maxFrameBytes: 4,
+			onFrameTooLarge: () => allowedFailures++,
+		});
+		const euro = Buffer.from("€", "utf8");
+		allowedEmitter.emit("data", euro.subarray(0, 1));
+		allowedEmitter.emit("data", euro.subarray(1));
+		allowedEmitter.emit("data", Buffer.from("\nabc\r"));
+		allowedEmitter.emit("data", Buffer.from("\n"));
+		allowedEmitter.emit("end");
+		expect(allowed).toEqual(["€", "abc"]);
+		expect(allowedFailures).toBe(0);
+
+		let byteFailures = 0;
+		const byteEmitter = new EventEmitter();
+		attachBoundedJsonlByteReader(
+			byteEmitter as unknown as Readable,
+			() => {
+				throw new Error("oversized UTF-8 was decoded");
+			},
+			{
+				maxFrameBytes: 2,
+				onFrameTooLarge: () => byteFailures++,
+			},
+		);
+		byteEmitter.emit("data", euro);
+		expect(byteFailures).toBe(1);
+
+		let crFailures = 0;
+		const crEmitter = new EventEmitter();
+		attachBoundedJsonlByteReader(
+			crEmitter as unknown as Readable,
+			() => {
+				throw new Error("oversized CRLF was decoded");
+			},
+			{
+				maxFrameBytes: 3,
+				onFrameTooLarge: () => crFailures++,
+			},
+		);
+		crEmitter.emit("data", Buffer.from("abc\r\n"));
+		expect(crFailures).toBe(1);
+	});
+
+	test("preserves bounded EOF lines and handles many tiny chunks", () => {
+		const lines: string[] = [];
+		let failures = 0;
+		const emitter = new EventEmitter();
+		attachBoundedJsonlByteReader(emitter as unknown as Readable, (line) => lines.push(line), {
+			maxFrameBytes: 70_000,
+			onFrameTooLarge: () => failures++,
+		});
+		for (let i = 0; i < 65_537; i++) {
+			emitter.emit("data", Buffer.from("x"));
+		}
+		emitter.emit("data", Buffer.from("\nfinal"));
+		emitter.emit("end");
+
+		expect(lines).toEqual(["x".repeat(65_537), "final"]);
+		expect(failures).toBe(0);
+	});
+
+	test("fails a real socket that overflows immediately on accept", async () => {
+		const socketPath = `/tmp/prime-ingress-${process.pid}-${randomUUID()}.sock`;
+		const server = createServer((socket) => {
+			socket.on("error", () => {});
+			socket.write(Buffer.alloc(65, 0x78));
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(socketPath, resolve);
+		});
+
+		const client = new DaemonClient(socketPath, { maxInboundFrameBytes: 64 });
+		const closed: Error[] = [];
+		client.onClose((error) => closed.push(error));
+		try {
+			const outcome = client.connect().then(() => client.waitForHello(1000));
+			const error = await outcome.then(
+				() => {
+					throw new Error("Expected immediate socket overflow");
+				},
+				(reason: unknown) => reason,
+			);
+			expect(error).toBeInstanceOf(DaemonInboundFrameTooLargeError);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(closed).toEqual([error]);
+			expect(client.isConnected).toBe(false);
+		} finally {
+			client.close();
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+			await unlink(socketPath).catch(() => {});
+		}
 	});
 });

@@ -1,0 +1,1 @@
+- Bounded public daemon client JSONL ingress by raw bytes and added explicit SDK safety metadata ([#13](https://github.com/pylon-code/prime-agent/issues/13)).

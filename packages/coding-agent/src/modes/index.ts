@@ -2,6 +2,7 @@
  * Run modes for the coding agent.
  */
 
+export { PRIME_AGENT_SDK_FEATURES, type PrimeAgentSdkFeature } from "../sdk-features.js";
 export {
 	type AcpModeOptions,
 	acpStopReason,
@@ -66,6 +67,9 @@ export {
 	DaemonCapabilityUnavailableError,
 	DaemonClient,
 	type DaemonClientMessageListener,
+	type DaemonClientOptions,
+	DaemonInboundFrameTooLargeError,
+	DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES,
 } from "./daemon/daemon-client.js";
 export { type DaemonModeOptions, runDaemonMode } from "./daemon/daemon-mode.js";
 export type {

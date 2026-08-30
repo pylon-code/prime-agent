@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createConnection, type Socket } from "node:net";
 import { getDaemonLogPath } from "../../config.js";
-import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
+import { attachBoundedJsonlByteReader, serializeJsonLine } from "../rpc/jsonl.js";
 import {
 	createDaemonCommandEnvelope,
 	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
@@ -31,6 +31,22 @@ export type DaemonHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
 export type DaemonClientMessageListener = (message: DaemonOutbound) => void;
 export type DaemonClientCloseListener = (error: Error) => void;
 export type DaemonClientProgressListener = (message: DaemonRequestProgress) => void;
+
+export const DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES = 128 * 1024 * 1024;
+
+export interface DaemonClientOptions {
+	/** Maximum raw bytes before LF in one inbound daemon JSONL frame. */
+	readonly maxInboundFrameBytes?: number;
+}
+
+export class DaemonInboundFrameTooLargeError extends Error {
+	readonly code = "daemon_inbound_frame_too_large" as const;
+
+	constructor(readonly maxInboundFrameBytes: number) {
+		super(`Prime Agent daemon inbound frame exceeded the configured ${maxInboundFrameBytes}-byte limit.`);
+		this.name = "DaemonInboundFrameTooLargeError";
+	}
+}
 
 export interface DaemonClientRequestOptions {
 	onProgress?: DaemonClientProgressListener;
@@ -118,14 +134,29 @@ export class DaemonClient {
 	private closed = false;
 	private helloMessage?: DaemonHello;
 	private daemonClosingReason?: DaemonClosingReason;
+	private terminalTransportError?: DaemonInboundFrameTooLargeError;
 	private reconnectPromise?: Promise<void>;
+	private connectingSocket?: { socket: Socket; reject: (error: Error) => void };
+	private readonly maxInboundFrameBytes: number;
 	private readonly helloWaiters = new Set<{
 		resolve: (hello: DaemonHello) => void;
 		reject: (error: Error) => void;
 		timeout: ReturnType<typeof setTimeout>;
 	}>();
 
-	constructor(private readonly socketPath: string) {}
+	constructor(
+		private readonly socketPath: string,
+		options: DaemonClientOptions = {},
+	) {
+		const maxInboundFrameBytes =
+			options.maxInboundFrameBytes === undefined
+				? DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES
+				: options.maxInboundFrameBytes;
+		if (!Number.isSafeInteger(maxInboundFrameBytes) || maxInboundFrameBytes <= 0) {
+			throw new RangeError("maxInboundFrameBytes must be a positive safe integer");
+		}
+		this.maxInboundFrameBytes = maxInboundFrameBytes;
+	}
 
 	get hello(): DaemonHello | undefined {
 		return this.helloMessage;
@@ -145,6 +176,9 @@ export class DaemonClient {
 			return this.helloMessage;
 		}
 		if (!this.socket || this.socket.destroyed) {
+			if (this.terminalTransportError) {
+				throw this.terminalTransportError;
+			}
 			throw new Error(
 				`Cannot wait for the Prime Agent daemon handshake because the daemon is not connected. ${daemonEndpointDetails(this.socketPath)}`,
 			);
@@ -172,41 +206,56 @@ export class DaemonClient {
 		}
 		this.helloMessage = undefined;
 		this.daemonClosingReason = undefined;
+		this.terminalTransportError = undefined;
 		const socket = createConnection(this.socketPath);
 		this.socket = socket;
-		this.detachReader = attachJsonlLineReader(socket, (line) => this.handleLine(line));
 
-		await new Promise<void>((resolve, reject) => {
-			const timeout = setTimeout(() => {
+		const connection = new Promise<void>((resolve, reject) => {
+			const cleanup = () => {
+				clearTimeout(timeout);
+				socket.off("connect", onConnect);
+				socket.off("error", onError);
+				socket.off("close", onCloseBeforeConnect);
+			};
+			const rejectConnection = (error: Error) => {
 				cleanup();
+				if (this.connectingSocket?.socket === socket) {
+					this.connectingSocket = undefined;
+				}
 				this.clearSocketReference(socket);
 				socket.destroy();
-				reject(
+				reject(error);
+			};
+			const onConnect = () => {
+				cleanup();
+				if (this.connectingSocket?.socket === socket) {
+					this.connectingSocket = undefined;
+				}
+				resolve();
+			};
+			const onError = (error: Error) => {
+				rejectConnection(
+					error instanceof DaemonInboundFrameTooLargeError
+						? error
+						: new Error(
+								`Failed to connect to the Prime Agent daemon: ${error.message}. ${daemonEndpointDetails(this.socketPath)}`,
+							),
+				);
+			};
+			const onCloseBeforeConnect = () => {
+				rejectConnection(new DaemonSocketClosedError(this.socketPath, this.daemonClosingReason));
+			};
+			const timeout = setTimeout(() => {
+				rejectConnection(
 					new Error(
 						`Timed out after ${timeoutMs}ms connecting to the Prime Agent daemon. ${daemonEndpointDetails(this.socketPath)}`,
 					),
 				);
 			}, timeoutMs);
-			const cleanup = () => {
-				clearTimeout(timeout);
-				socket.off("connect", onConnect);
-				socket.off("error", onError);
-			};
-			const onConnect = () => {
-				cleanup();
-				resolve();
-			};
-			const onError = (error: Error) => {
-				cleanup();
-				this.clearSocketReference(socket);
-				reject(
-					new Error(
-						`Failed to connect to the Prime Agent daemon: ${error.message}. ${daemonEndpointDetails(this.socketPath)}`,
-					),
-				);
-			};
+			this.connectingSocket = { socket, reject: rejectConnection };
 			socket.once("connect", onConnect);
 			socket.once("error", onError);
+			socket.once("close", onCloseBeforeConnect);
 		});
 
 		socket.on("error", (error) =>
@@ -220,6 +269,12 @@ export class DaemonClient {
 		socket.on("close", () =>
 			this.notifyClosed(socket, new DaemonSocketClosedError(this.socketPath, this.daemonClosingReason)),
 		);
+		this.detachReader = attachBoundedJsonlByteReader(socket, (line) => this.handleLine(line), {
+			maxFrameBytes: this.maxInboundFrameBytes,
+			onFrameTooLarge: () => this.failInboundFrame(socket),
+		});
+
+		await connection;
 	}
 
 	async reconnect(timeoutMs = 3000): Promise<void> {
@@ -253,8 +308,11 @@ export class DaemonClient {
 
 	/** Discard a partially recovered transport so the next retry can reconnect cleanly. */
 	resetTransportForReconnect(): void {
-		const socket = this.socket;
-		if (!socket) {
+		this.resetTransportForReconnectAttempt(this.socket);
+	}
+
+	private resetTransportForReconnectAttempt(socket: Socket | undefined): void {
+		if (!socket || this.socket !== socket) {
 			return;
 		}
 		this.clearSocketReference(socket);
@@ -296,6 +354,9 @@ export class DaemonClient {
 		options: DaemonClientRequestOptions = {},
 	): Promise<DaemonResponse> {
 		if (!this.socket || this.socket.destroyed) {
+			if (this.terminalTransportError) {
+				throw this.terminalTransportError;
+			}
 			throw new Error(
 				`Cannot send daemon command "${command.type}" because the Prime Agent daemon is not connected. ${daemonEndpointDetails(this.socketPath)}`,
 			);
@@ -348,6 +409,9 @@ export class DaemonClient {
 		compatibilities: readonly DaemonCommandCompatibility[] = [],
 	): Promise<DaemonResponse> {
 		if (!this.socket || this.socket.destroyed) {
+			if (this.terminalTransportError) {
+				throw this.terminalTransportError;
+			}
 			throw new Error(
 				`Cannot send daemon command "${command.type}" because the Prime Agent daemon is not connected. ${daemonEndpointDetails(this.socketPath)}`,
 			);
@@ -399,6 +463,7 @@ export class DaemonClient {
 	close(): void {
 		this.closed = true;
 		this.reconnectOptions = undefined;
+		this.terminalTransportError = undefined;
 		this.detachReader?.();
 		this.detachReader = undefined;
 		this.rejectAll(
@@ -409,6 +474,26 @@ export class DaemonClient {
 		this.socket?.end();
 		this.socket?.destroy();
 		this.socket = undefined;
+	}
+
+	private failInboundFrame(socket: Socket): void {
+		if (this.socket !== socket) {
+			return;
+		}
+		const error = new DaemonInboundFrameTooLargeError(this.maxInboundFrameBytes);
+		this.terminalTransportError = error;
+		const rejectConnecting = this.connectingSocket?.socket === socket ? this.connectingSocket.reject : undefined;
+		this.reconnectOptions = undefined;
+		this.helloMessage = undefined;
+		this.daemonClosingReason = undefined;
+		this.clearSocketReference(socket);
+		this.rejectAll(error, false);
+		this.emitCloseListeners(error);
+		if (rejectConnecting) {
+			rejectConnecting(error);
+		} else {
+			socket.destroy();
+		}
 	}
 
 	private clearSocketReference(socket: Socket): void {
@@ -536,15 +621,23 @@ export class DaemonClient {
 		}
 	}
 
+	private emitCloseListeners(error: Error): void {
+		for (const listener of [...this.closeListeners]) {
+			try {
+				listener(error);
+			} catch {
+				// One consumer must not hide a terminal transport failure from others.
+			}
+		}
+	}
+
 	private notifyClosed(socket: Socket, error: Error): void {
 		if (this.socket !== socket) {
 			return;
 		}
 		this.clearSocketReference(socket);
 		this.rejectAll(error, this.requestRecoveryEnabled);
-		for (const listener of [...this.closeListeners]) {
-			listener(error);
-		}
+		this.emitCloseListeners(error);
 		if (this.reconnectOptions && !this.closed) {
 			void this.autoReconnect(error);
 		}
@@ -564,18 +657,28 @@ export class DaemonClient {
 			let attempt = 0;
 			let lastError: Error = cause;
 			while (!this.closed && this.reconnectOptions === options && Date.now() < deadline) {
+				let reconnectSocket: Socket | undefined;
 				try {
 					await options.recoverDaemon();
 					if (this.closed || this.reconnectOptions !== options) {
 						return;
 					}
-					await this.connect(RECONNECT_CONNECT_TIMEOUT_MS);
+					const socketBeforeConnect = this.socket;
+					const connectAttempt = this.connect(RECONNECT_CONNECT_TIMEOUT_MS);
+					reconnectSocket = socketBeforeConnect === undefined ? this.socket : undefined;
+					await connectAttempt;
 					await this.waitForHello(RECONNECT_HELLO_TIMEOUT_MS);
+					if (this.closed || this.reconnectOptions !== options || !this.isConnected) {
+						return;
+					}
 					this.emitReconnectStatus({ status: "connected" });
 					return;
 				} catch (error) {
 					lastError = error instanceof Error ? error : new Error(String(error));
-					this.resetTransportForReconnect();
+					if (this.closed || this.reconnectOptions !== options) {
+						return;
+					}
+					this.resetTransportForReconnectAttempt(reconnectSocket);
 					const remainingMs = deadline - Date.now();
 					if (remainingMs <= 0) {
 						break;

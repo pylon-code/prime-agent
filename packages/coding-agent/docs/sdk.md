@@ -47,6 +47,31 @@ The SDK is included in the main package. No separate installation needed.
 
 ## Core Concepts
 
+### SDK feature metadata and bounded daemon ingress
+
+Long-lived daemon embedders should verify client-local transport features from the package's public root before constructing a client. Use a namespace import when the same code must also load an older package: a named import of a new export fails while linking old ESM builds.
+
+```typescript
+const sdk = await import("@earendil-works/pi-coding-agent");
+const features: unknown = sdk.PRIME_AGENT_SDK_FEATURES;
+if (!Array.isArray(features) || !features.includes("bounded_daemon_ingress_v1")) {
+  throw new Error("This SDK cannot safely host a long-lived daemon session");
+}
+
+const client = new sdk.DaemonClient(socketPath, {
+  maxInboundFrameBytes: 64 * 1024 * 1024,
+});
+await client.connect();
+```
+
+`PRIME_AGENT_SDK_FEATURES` is immutable metadata for behavior implemented by the local SDK artifact. Do not infer it from package versions, constructor arity, method presence, daemon hello capabilities, protocol versions, or schema revisions. Older JavaScript constructors can silently ignore an extra options argument.
+
+`DaemonClientOptions.maxInboundFrameBytes` is the maximum raw bytes before LF in one inbound JSONL frame. It defaults to `DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES` (128 MiB) and must be a positive safe integer. LF is excluded. A CR immediately before LF is counted and then stripped.
+
+`DaemonInboundFrameTooLargeError` has code `daemon_inbound_frame_too_large` and exposes the configured limit. It never includes frame content. Overflow terminally closes that socket, rejects handshake and request waiters even when request recovery was enabled, suppresses automatic replay/reconnect, and discards the partial buffer. A later explicit reconnect uses a fresh reader with the same bound. Applications that surface errors across a trust boundary should map the class or code to their own fixed message rather than forwarding an SDK error, stack, socket path, or daemon log path.
+
+The frame limit is not a total heap limit. Valid frames also allocate decoded strings, parsed values, and application state. Set a lower explicit frame limit only with enough heap for valid boundary frames, and bound all downstream queues independently.
+
 ### createAgentSession()
 
 The main factory function for a single `AgentSession`.
