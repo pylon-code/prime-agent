@@ -1,3 +1,4 @@
 - Added a generation-scoped public proof for attach-negotiated daemon client capabilities.
 - Made explicit `DaemonClient.close()` terminal, including during in-flight normal and update recovery.
 - Bounded chunked-replacement frame retention and retired stale replacement fences across attachment or transport changes.
+- Fenced unsolicited snapshot transfers across superseded same-connection admissions and terminal or update session close, with bounded fail-closed retirement tombstones.

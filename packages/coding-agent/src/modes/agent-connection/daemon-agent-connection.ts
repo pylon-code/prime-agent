@@ -139,6 +139,7 @@ interface DaemonSnapshotRequestAttempt {
 	id: number;
 	activeSessionId: string;
 	attachmentEpoch: number;
+	attachmentAdmissionRevision: number;
 	candidateSnapshotIds: Set<string>;
 	logicalPurpose: DaemonSnapshotPurpose;
 	wirePurpose: DaemonSnapshotPurpose;
@@ -452,6 +453,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private snapshotRequestAttemptSequence = 0;
 	private attachmentEpoch = 0;
 	private attachmentAdmissionRevision = 0;
+	private attachmentAdmissionInFlight = false;
 	private attachmentInvalidationRevision = 0;
 	private negotiatedCapabilities: ReadonlySet<DaemonClientCapability> = new Set();
 	private negotiatedTransportGeneration: number | undefined;
@@ -462,6 +464,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private sharedAttachmentActiveSessionId: string | undefined;
 	private reconnectPromise?: Promise<void>;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
+	private transportCloseRetirementInProgress = false;
 	private disposing = false;
 	private disposed = false;
 
@@ -523,6 +526,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.invalidateNegotiatedCapabilityProof();
 		this.replacementReconciliationFailed = true;
 		this.retirePendingChunkedReplacement();
+		this.retireSnapshotTransfers(new Error("Daemon replacement lifecycle state could not be reconciled."));
 		this.latestSnapshotIsFresh = false;
 		if (this.terminalCloseEmitted) return;
 		this.terminalCloseEmitted = true;
@@ -545,12 +549,19 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 		this.captureDaemonLogPath();
 		this.unsubscribeDaemonClose = this.client.onClose((error) => {
-			this.retirePendingChunkedReplacement();
-			this.invalidateNegotiatedCapabilityProof();
+			const closeReason = getDaemonSocketCloseReason(error);
+			if (closeReason === "update") this.updateRestartPending = true;
+			this.transportCloseRetirementInProgress = true;
 			const invalidatedInputPause = this.sessionInputPauses.size > 0;
-			this.sessionInputPauses.clear();
-			this.sessionInputPauseGeneration++;
-			this.rejectSnapshotAssemblies(error, true);
+			try {
+				this.retirePendingChunkedReplacement();
+				this.invalidateNegotiatedCapabilityProof();
+				this.sessionInputPauses.clear();
+				this.sessionInputPauseGeneration++;
+				this.rejectSnapshotAssemblies(error);
+			} finally {
+				this.transportCloseRetirementInProgress = false;
+			}
 			if (this.disposed || this.terminalCloseEmitted) {
 				return;
 			}
@@ -566,7 +577,6 @@ export class DaemonAgentConnection implements AgentConnection {
 				});
 				return;
 			}
-			const closeReason = getDaemonSocketCloseReason(error);
 			if (closeReason === "shutdown") {
 				this.terminalCloseEmitted = true;
 				void this.emit({ type: "closed", error: this.formatDaemonSessionClosedError("shutdown") });
@@ -613,11 +623,15 @@ export class DaemonAgentConnection implements AgentConnection {
 		maxAttempts = 2,
 		logicalPurpose: DaemonSnapshotPurpose = "attach",
 		allowWhileDisposing = false,
+		preserveRuntimeSnapshotAttempt = false,
 	): Promise<void> {
 		const admissionRevision = ++this.attachmentAdmissionRevision;
+		this.attachmentAdmissionInFlight = true;
+		this.fenceSnapshotTransfersForAttachmentAdmission(preserveRuntimeSnapshotAttempt);
 		this.retirePendingChunkedReplacement();
 		this.invalidateNegotiatedCapabilityProof();
 		if (this.replacementReconciliationFailed) {
+			if (this.attachmentAdmissionRevision === admissionRevision) this.attachmentAdmissionInFlight = false;
 			return Promise.reject(new Error("Daemon connection replacement reconciliation has failed"));
 		}
 		return this.withSharedAttachmentMutation(async () => {
@@ -634,6 +648,8 @@ export class DaemonAgentConnection implements AgentConnection {
 			} catch (error) {
 				this.invalidateNegotiatedCapabilityProof();
 				throw error;
+			} finally {
+				if (this.attachmentAdmissionRevision === admissionRevision) this.attachmentAdmissionInFlight = false;
 			}
 		});
 	}
@@ -1871,9 +1887,12 @@ export class DaemonAgentConnection implements AgentConnection {
 		targetActiveSessionId: string,
 	): Promise<{ cancelled: false }> {
 		const admissionRevision = ++this.attachmentAdmissionRevision;
+		this.attachmentAdmissionInFlight = true;
+		this.fenceSnapshotTransfersForAttachmentAdmission(false);
 		this.retirePendingChunkedReplacement();
 		this.invalidateNegotiatedCapabilityProof();
 		if (this.replacementReconciliationFailed) {
+			if (this.attachmentAdmissionRevision === admissionRevision) this.attachmentAdmissionInFlight = false;
 			return Promise.reject(new Error("Daemon connection replacement reconciliation has failed"));
 		}
 		return this.withSharedAttachmentMutation(async () => {
@@ -1886,6 +1905,8 @@ export class DaemonAgentConnection implements AgentConnection {
 			} catch (error) {
 				this.invalidateNegotiatedCapabilityProof();
 				throw error;
+			} finally {
+				if (this.attachmentAdmissionRevision === admissionRevision) this.attachmentAdmissionInFlight = false;
 			}
 		});
 	}
@@ -2330,15 +2351,11 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.failClosedReplacementReconciliation();
 			return;
 		}
-		if (
-			"snapshotId" in message &&
-			message.type !== "session_snapshot_begin" &&
-			this.ignoredSnapshotIds.has(message.snapshotId)
-		) {
-			if (message.type === "session_snapshot_end" || message.type === "session_snapshot_failed") {
-				this.ignoredSnapshotIds.delete(message.snapshotId);
-			}
-			return;
+		if ("snapshotId" in message && this.ignoredSnapshotIds.has(message.snapshotId)) {
+			const exactRequestBegin =
+				message.type === "session_snapshot_begin" &&
+				this.activeSnapshotRequestAttempt(message.activeSessionId) !== undefined;
+			if (!exactRequestBegin) return;
 		}
 		if (message.type === "session_snapshot_begin") {
 			const terminalRuntimeAttempt = this.runtimeSnapshotAttempt;
@@ -2351,8 +2368,8 @@ export class DaemonAgentConnection implements AgentConnection {
 				return;
 			}
 			const pendingReplacement = this.pendingChunkedReplacement;
-			const requestAttempt = this.latestSnapshotRequestAttempt(message.activeSessionId);
-			if (this.discardUnsolicitedRuntimeSnapshots && !requestAttempt) {
+			const requestAttempt = this.activeSnapshotRequestAttempt(message.activeSessionId);
+			if (!requestAttempt && this.suppressesUnsolicitedSnapshotTransfers()) {
 				this.ignoreSnapshotId(message.snapshotId);
 				return;
 			}
@@ -2427,6 +2444,14 @@ export class DaemonAgentConnection implements AgentConnection {
 			if (!assembly || assembly.settled || !assembly.begin || assembly.attachmentEpoch !== this.attachmentEpoch) {
 				return;
 			}
+			if (this.suppressesUnsolicitedSnapshotTransfers() && !this.snapshotAssemblyHasActiveRequest(assembly)) {
+				this.retireSnapshotAssembly(
+					message.snapshotId,
+					assembly,
+					new Error("Daemon snapshot was retired by a session lifecycle change"),
+				);
+				return;
+			}
 			if (
 				message.activeSessionId !== assembly.begin.activeSessionId ||
 				!Number.isSafeInteger(message.index) ||
@@ -2448,24 +2473,42 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (message.type === "session_snapshot_end") {
 			const assembly = this.snapshotAssemblies.get(message.snapshotId);
 			if (!assembly || assembly.settled || assembly.attachmentEpoch !== this.attachmentEpoch) return;
+			if (this.suppressesUnsolicitedSnapshotTransfers() && !this.snapshotAssemblyHasActiveRequest(assembly)) {
+				this.retireSnapshotAssembly(
+					message.snapshotId,
+					assembly,
+					new Error("Daemon snapshot was retired by a session lifecycle change"),
+				);
+				return;
+			}
 			await this.completeSnapshotAssembly(message);
 			return;
 		}
 		if (message.type === "session_snapshot_failed") {
 			const existingAssembly = this.snapshotAssemblies.get(message.snapshotId);
-			const requestAttempt = this.latestSnapshotRequestAttempt(message.activeSessionId);
-			const activeRequestAttempt =
-				requestAttempt?.state === "requesting" || requestAttempt?.state === "receiving"
-					? requestAttempt
-					: undefined;
-			if (this.discardUnsolicitedRuntimeSnapshots && !existingAssembly && !activeRequestAttempt) {
+			const activeRequestAttempt = this.activeSnapshotRequestAttempt(message.activeSessionId);
+			if (!activeRequestAttempt && this.suppressesUnsolicitedSnapshotTransfers()) {
+				if (existingAssembly) {
+					this.retireSnapshotAssembly(
+						message.snapshotId,
+						existingAssembly,
+						new Error("Daemon connection attachment changed during attach"),
+					);
+				} else {
+					this.completedSnapshots.delete(message.snapshotId);
+					this.completedSnapshotAttemptIds.delete(message.snapshotId);
+					this.ignoreSnapshotId(message.snapshotId);
+				}
+				return;
+			}
+			if (!existingAssembly && !this.pendingChunkedReplacement && !activeRequestAttempt) {
 				this.ignoreSnapshotId(message.snapshotId);
 				return;
 			}
 			const explicitPurpose = message.purpose;
 			const assembly =
 				existingAssembly ??
-				(this.pendingChunkedReplacement || explicitPurpose || activeRequestAttempt
+				(this.pendingChunkedReplacement || activeRequestAttempt
 					? this.getSnapshotAssembly(message.snapshotId, activeRequestAttempt)
 					: undefined);
 			if (!assembly || assembly.settled || assembly.attachmentEpoch !== this.attachmentEpoch) return;
@@ -2677,13 +2720,19 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		if (message.type === "session_closed") {
 			this.invalidateNegotiatedCapabilityProof();
-			if (message.reason === "update") {
+			const updateClose = message.reason === "update";
+			if (updateClose) {
 				this.captureDaemonLogPath();
 				this.updateRestartPending = true;
+			} else {
+				this.terminalCloseEmitted = true;
+			}
+			this.retirePendingChunkedReplacement();
+			this.retireSnapshotTransfers(new Error("Daemon session closed during snapshot transfer"));
+			if (updateClose) {
 				void this.reconnectAfterUpdate();
 				return;
 			}
-			this.terminalCloseEmitted = true;
 			await this.emit({ type: "closed", error: this.formatDaemonSessionClosedError(message.reason) });
 		}
 	}
@@ -3081,6 +3130,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			id: ++this.snapshotRequestAttemptSequence,
 			activeSessionId,
 			attachmentEpoch,
+			attachmentAdmissionRevision: this.attachmentAdmissionRevision,
 			candidateSnapshotIds: new Set(),
 			logicalPurpose,
 			wirePurpose,
@@ -3097,6 +3147,37 @@ export class DaemonAgentConnection implements AgentConnection {
 				(attempt) =>
 					attempt.activeSessionId === activeSessionId && attempt.attachmentEpoch === this.attachmentEpoch,
 			);
+	}
+
+	private activeSnapshotRequestAttempt(activeSessionId: string): DaemonSnapshotRequestAttempt | undefined {
+		const attempt = this.latestSnapshotRequestAttempt(activeSessionId);
+		return attempt?.attachmentAdmissionRevision === this.attachmentAdmissionRevision &&
+			(attempt.state === "requesting" || attempt.state === "receiving")
+			? attempt
+			: undefined;
+	}
+
+	private snapshotAssemblyHasActiveRequest(assembly: DaemonSnapshotAssembly): boolean {
+		if (assembly.requestAttemptId === undefined) return false;
+		const attempt = this.snapshotRequestAttempts.get(assembly.requestAttemptId);
+		return (
+			attempt !== undefined &&
+			attempt.attachmentEpoch === assembly.attachmentEpoch &&
+			attempt.attachmentAdmissionRevision === this.attachmentAdmissionRevision &&
+			(attempt.state === "requesting" || attempt.state === "receiving")
+		);
+	}
+
+	private suppressesUnsolicitedSnapshotTransfers(): boolean {
+		return (
+			this.discardUnsolicitedRuntimeSnapshots ||
+			this.attachmentAdmissionInFlight ||
+			this.disposing ||
+			this.disposed ||
+			this.terminalCloseEmitted ||
+			this.updateRestartPending ||
+			this.replacementReconciliationFailed
+		);
 	}
 
 	private finishSnapshotRequestAttempt(attempt: DaemonSnapshotRequestAttempt): void {
@@ -3208,14 +3289,29 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private ignoreSnapshotId(snapshotId: string): void {
-		this.ignoredSnapshotIds.add(snapshotId);
-		while (this.ignoredSnapshotIds.size > MAX_IGNORED_SNAPSHOT_IDS) {
-			const oldest = this.ignoredSnapshotIds.values().next().value;
-			if (oldest === undefined) {
-				break;
+		if (this.ignoredSnapshotIds.has(snapshotId)) return;
+		if (this.ignoredSnapshotIds.size >= MAX_IGNORED_SNAPSHOT_IDS) {
+			if (
+				!this.replacementReconciliationFailed &&
+				!this.terminalCloseEmitted &&
+				!this.updateRestartPending &&
+				!this.transportCloseRetirementInProgress &&
+				!this.disposing &&
+				!this.disposed
+			) {
+				this.failClosedReplacementReconciliation();
 			}
-			this.ignoredSnapshotIds.delete(oldest);
+			return;
 		}
+		this.ignoredSnapshotIds.add(snapshotId);
+	}
+
+	private retireSnapshotAssembly(snapshotId: string, assembly: DaemonSnapshotAssembly, error: Error): void {
+		this.rejectSnapshotAssembly(snapshotId, assembly, error);
+		this.snapshotAssemblies.delete(snapshotId);
+		this.completedSnapshots.delete(snapshotId);
+		this.completedSnapshotAttemptIds.delete(snapshotId);
+		this.ignoreSnapshotId(snapshotId);
 	}
 
 	private rejectSnapshotAssembly(snapshotId: string, assembly: DaemonSnapshotAssembly, error: Error): void {
@@ -3356,7 +3452,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private async recoverFailedSnapshot(purpose: "replacement" | "resync"): Promise<void> {
-		await this.attachSession(this.activeSessionId, this.lastEventCursor, false, 1, purpose);
+		await this.attachSession(this.activeSessionId, this.lastEventCursor, false, 1, purpose, false, true);
 		const snapshot = this.latestSnapshot;
 		if (!snapshot) throw new Error("Daemon snapshot retry returned no snapshot");
 		if (this.disposed) return;
@@ -3497,6 +3593,25 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.latestSnapshotIsFresh = true;
 	}
 
+	private fenceSnapshotTransfersForAttachmentAdmission(preserveRuntimeSnapshotAttempt: boolean): void {
+		this.retireSnapshotTransfers(
+			new Error("Daemon connection attachment changed during attach"),
+			preserveRuntimeSnapshotAttempt,
+		);
+	}
+
+	private retireSnapshotTransfers(error: Error, preserveRuntimeSnapshotAttempt = false): void {
+		this.discardUnsolicitedRuntimeSnapshots = true;
+		const completedSnapshotIds = [...this.completedSnapshots.keys()];
+		for (const [snapshotId, assembly] of [...this.snapshotAssemblies]) {
+			this.retireSnapshotAssembly(snapshotId, assembly, error);
+		}
+		this.completedSnapshots.clear();
+		this.completedSnapshotAttemptIds.clear();
+		for (const snapshotId of completedSnapshotIds) this.ignoreSnapshotId(snapshotId);
+		if (!preserveRuntimeSnapshotAttempt) this.runtimeSnapshotAttempt = undefined;
+	}
+
 	private retirePendingChunkedReplacement(): void {
 		const pending = this.pendingChunkedReplacement;
 		if (!pending) return;
@@ -3602,7 +3717,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		};
 		const purpose = assembly.begin.purpose ?? "attach";
 		const pendingReattach = this.pendingReattachActiveSessionIds.has(message.activeSessionId);
-		if (purpose === "attach" || pendingReattach) {
+		if (assembly.requestAttemptId !== undefined || purpose === "attach" || pendingReattach) {
 			assembly.resolve(snapshot);
 			clearTimeout(assembly.timeout);
 			if (pendingReattach) {
