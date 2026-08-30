@@ -41,6 +41,7 @@ import { deserializeDaemonError } from "../daemon/daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	collectDaemonLaunchEnv,
+	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
 	type DaemonCommand,
@@ -321,6 +322,9 @@ export function buildSessionTreeFromFlatNodes(
 	return roots;
 }
 
+const sharedAttachmentOwners = new WeakMap<DaemonClient, Map<string, DaemonAgentConnection>>();
+const sharedAttachmentMutationTails = new WeakMap<DaemonClient, Promise<void>>();
+
 export class DaemonAgentConnection implements AgentConnection {
 	private readonly listeners = new Set<AgentConnectionEventListener>();
 	private readonly unsubscribeDaemonMessages: () => void;
@@ -356,6 +360,10 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly snapshotRequestAttempts = new Map<number, DaemonSnapshotRequestAttempt>();
 	private snapshotRequestAttemptSequence = 0;
 	private attachmentEpoch = 0;
+	private attachmentInvalidationRevision = 0;
+	private negotiatedCapabilities: ReadonlySet<DaemonClientCapability> = new Set();
+	private negotiatedTransportGeneration: number | undefined;
+	private sharedAttachmentActiveSessionId: string | undefined;
 	private reconnectPromise?: Promise<void>;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
 	private disposing = false;
@@ -394,6 +402,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private failClosedReplacementReconciliation(): void {
+		this.invalidateNegotiatedCapabilityProof();
 		this.replacementReconciliationFailed = true;
 		this.pendingChunkedReplacement = undefined;
 		this.latestSnapshotIsFresh = false;
@@ -418,6 +427,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 		this.captureDaemonLogPath();
 		this.unsubscribeDaemonClose = this.client.onClose((error) => {
+			this.invalidateNegotiatedCapabilityProof();
 			const invalidatedInputPause = this.sessionInputPauses.size > 0;
 			this.sessionInputPauses.clear();
 			this.sessionInputPauseGeneration++;
@@ -469,18 +479,60 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async attach(): Promise<void> {
+		if (this.disposing || this.disposed) throw new Error("Daemon connection is disposing");
 		await this.attachSession(this.activeSessionId, this.lastEventCursor, false);
 	}
 
-	private async attachSession(
+	private attachSession(
 		requestedActiveSessionId: string,
 		resumeCursor: DaemonEventCursor | undefined,
 		resetEventProgress: boolean,
 		maxAttempts = 2,
 		logicalPurpose: DaemonSnapshotPurpose = "attach",
+		allowWhileDisposing = false,
 	): Promise<void> {
+		return this.withSharedAttachmentMutation(async () => {
+			try {
+				await this.attachSessionUnserialized(
+					requestedActiveSessionId,
+					resumeCursor,
+					resetEventProgress,
+					maxAttempts,
+					logicalPurpose,
+					allowWhileDisposing,
+				);
+			} catch (error) {
+				this.invalidateNegotiatedCapabilityProof();
+				throw error;
+			}
+		});
+	}
+
+	private async attachSessionUnserialized(
+		requestedActiveSessionId: string,
+		resumeCursor: DaemonEventCursor | undefined,
+		resetEventProgress: boolean,
+		maxAttempts: number,
+		logicalPurpose: DaemonSnapshotPurpose,
+		allowWhileDisposing: boolean,
+	): Promise<void> {
+		if (this.disposed || (this.disposing && !allowWhileDisposing)) {
+			throw new Error("Daemon connection is disposing");
+		}
 		const supportsExtensionUi = this.options.supportsExtensionUi !== false;
+		const capabilities: DaemonClientCapability[] = [
+			"attach_snapshot",
+			"event_sequence",
+			...(supportsExtensionUi ? (["extension_ui"] as const) : []),
+			"slim_attach",
+			"chunked_snapshot",
+			...(this.supportsCorrelatedPromptLifecycle() ? (["correlated_prompt_lifecycle_v1"] as const) : []),
+			...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
+		];
 		const attachmentEpoch = this.advanceAttachmentEpoch();
+		this.reserveSharedAttachment(requestedActiveSessionId);
+		const invalidationRevision = this.attachmentInvalidationRevision;
+		const transportGeneration = this.client.getTransportGeneration();
 		let result!: SessionSummary | DaemonAttachResult;
 		let streamedSnapshot: DaemonSessionSnapshot | undefined;
 		for (let attemptIndex = 0; attemptIndex < maxAttempts; attemptIndex++) {
@@ -497,15 +549,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					snapshotGenerationNonce: randomUUID(),
 					supportsExtensionUi,
 					clientId: this.clientId,
-					capabilities: [
-						"attach_snapshot",
-						"event_sequence",
-						...(supportsExtensionUi ? (["extension_ui"] as const) : []),
-						"slim_attach",
-						"chunked_snapshot",
-						...(this.supportsCorrelatedPromptLifecycle() ? (["correlated_prompt_lifecycle_v1"] as const) : []),
-						...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
-					],
+					capabilities,
 					env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
 					launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
 					...(this.options.ownedSession &&
@@ -519,9 +563,13 @@ export class DaemonAgentConnection implements AgentConnection {
 							? undefined
 							: { activeSessionId: requestedActiveSessionId, ...resumeCursor },
 				});
-				if (this.disposed || this.attachmentEpoch !== attachmentEpoch) {
-					throw new Error("Daemon connection attachment changed during attach");
-				}
+				this.assertAttachmentCommit(
+					requestedActiveSessionId,
+					attachmentEpoch,
+					invalidationRevision,
+					transportGeneration,
+					allowWhileDisposing,
+				);
 				if ("snapshot" in result && result.snapshotStream) {
 					this.bindSnapshotExpectation(requestAttempt, result);
 					requestAttempt.state = "receiving";
@@ -533,23 +581,38 @@ export class DaemonAgentConnection implements AgentConnection {
 				break;
 			} catch (error) {
 				requestAttempt.state = "failed";
-				if (attemptIndex === maxAttempts - 1 || this.disposed || this.attachmentEpoch !== attachmentEpoch) {
+				if (
+					attemptIndex === maxAttempts - 1 ||
+					this.disposing ||
+					this.disposed ||
+					this.attachmentEpoch !== attachmentEpoch ||
+					this.attachmentInvalidationRevision !== invalidationRevision ||
+					this.client.getTransportGeneration() !== transportGeneration ||
+					sharedAttachmentOwners.get(this.client)?.get(requestedActiveSessionId) !== this
+				) {
 					throw error;
 				}
 			} finally {
 				this.finishSnapshotRequestAttempt(requestAttempt);
 			}
 		}
+		const negotiatedCapabilities =
+			"snapshot" in result
+				? this.negotiatedCapabilitiesFromAttach(result, capabilities)
+				: new Set<DaemonClientCapability>();
 		const nextActiveSessionId = getAttachActiveSessionId(result);
+		this.retargetSharedAttachment(requestedActiveSessionId, nextActiveSessionId);
 
 		if ("snapshot" in result) {
 			const snapshot = streamedSnapshot ?? result.snapshot;
 			let staged: StagedSnapshotCommit;
 			try {
 				validateDaemonSnapshotIdentity(result.snapshot, nextActiveSessionId);
-				mapDaemonSessionSnapshot(result.snapshot, undefined, this.supportsCorrelatedPromptLifecycle());
+				const includePromptLifecycles = negotiatedCapabilities.has("correlated_prompt_lifecycle_v1");
+				mapDaemonSessionSnapshot(result.snapshot, undefined, includePromptLifecycles);
 				staged = this.stageSnapshotCommit(snapshot, {
 					purpose: "attach",
+					includePromptLifecycles,
 					envelopeActiveSessionId: nextActiveSessionId,
 					expectedState: result.snapshot.state,
 					replay: result.replay,
@@ -565,14 +628,30 @@ export class DaemonAgentConnection implements AgentConnection {
 				}
 				throw error;
 			}
+			this.assertAttachmentCommit(
+				nextActiveSessionId,
+				attachmentEpoch,
+				invalidationRevision,
+				transportGeneration,
+				allowWhileDisposing,
+			);
 			this.commitStagedSnapshot(staged);
+			if (!this.disposing) this.publishNegotiatedCapabilityProof(negotiatedCapabilities, transportGeneration);
 		} else {
 			validateSummaryIdentity(result, nextActiveSessionId);
+			this.assertAttachmentCommit(
+				nextActiveSessionId,
+				attachmentEpoch,
+				invalidationRevision,
+				transportGeneration,
+				allowWhileDisposing,
+			);
 			this.activeSessionId = nextActiveSessionId;
 			this.attachedSessionId = result.sessionId;
 			this.attachedSessionFile = result.sessionFile;
 			this.latestSnapshot = undefined;
 			this.latestSnapshotIsFresh = false;
+			if (!this.disposing) this.publishNegotiatedCapabilityProof(negotiatedCapabilities, transportGeneration);
 		}
 		this.captureDaemonLogPath();
 		this.updateReconnectFailed = false;
@@ -716,6 +795,28 @@ export class DaemonAgentConnection implements AgentConnection {
 		return this.client.supportsServerCapability("acp_mcp_servers");
 	}
 
+	/**
+	 * Whether the daemon proved this client capability for the current committed
+	 * attachment. This is false while attach/reattach is pending and after the
+	 * attachment is invalidated. Server hello offers alone are not proof.
+	 */
+	supportsNegotiatedCapability(capability: DaemonClientCapability): boolean {
+		if (
+			this.disposing ||
+			this.disposed ||
+			this.negotiatedTransportGeneration !== this.client.getTransportGeneration()
+		) {
+			return false;
+		}
+		const activeSessionId = this.sharedAttachmentActiveSessionId;
+		return (
+			activeSessionId !== undefined &&
+			sharedAttachmentOwners.get(this.client)?.get(activeSessionId) === this &&
+			this.negotiatedCapabilities.has(capability)
+		);
+	}
+
+	/** Server-offer evidence used to construct the pre-attach capability list. */
 	supportsCorrelatedPromptLifecycle(): boolean {
 		return this.client.supportsServerCapability("correlated_prompt_lifecycle_v1");
 	}
@@ -1606,15 +1707,35 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
-	private async reattachSession(
+	private reattachSession(
 		sourceActiveSessionId: string,
 		targetActiveSessionId: string,
 	): Promise<{ cancelled: false }> {
+		return this.withSharedAttachmentMutation(async () => {
+			try {
+				return await this.reattachSessionUnserialized(sourceActiveSessionId, targetActiveSessionId);
+			} catch (error) {
+				this.invalidateNegotiatedCapabilityProof();
+				throw error;
+			}
+		});
+	}
+
+	private async reattachSessionUnserialized(
+		sourceActiveSessionId: string,
+		targetActiveSessionId: string,
+	): Promise<{ cancelled: false }> {
+		if (this.disposing || this.disposed) throw new Error("Daemon connection is disposing");
 		this.pendingReattachActiveSessionIds.add(targetActiveSessionId);
 		let reattached = false;
+		let attachmentEpoch: number | undefined;
+		let invalidationRevision: number | undefined;
 		try {
 			const supportsExtensionUi = this.options.supportsExtensionUi !== false;
-			const attachmentEpoch = this.advanceAttachmentEpoch();
+			attachmentEpoch = this.advanceAttachmentEpoch();
+			this.reserveSharedAttachment(targetActiveSessionId);
+			invalidationRevision = this.attachmentInvalidationRevision;
+			const transportGeneration = this.client.getTransportGeneration();
 			const capabilities: DaemonClientCapability[] = [
 				"attach_snapshot",
 				"event_sequence",
@@ -1659,6 +1780,12 @@ export class DaemonAgentConnection implements AgentConnection {
 								},
 					);
 					reattached = true;
+					this.assertAttachmentCommit(
+						targetActiveSessionId,
+						attachmentEpoch,
+						invalidationRevision,
+						transportGeneration,
+					);
 					if (result.activeSessionId !== targetActiveSessionId) {
 						throw new Error("Daemon returned an invalid session snapshot");
 					}
@@ -1673,21 +1800,31 @@ export class DaemonAgentConnection implements AgentConnection {
 					break;
 				} catch (error) {
 					requestAttempt.state = "failed";
-					if (attemptIndex === 1 || !reattached || this.disposed || this.attachmentEpoch !== attachmentEpoch) {
+					if (
+						attemptIndex === 1 ||
+						!reattached ||
+						this.disposing ||
+						this.disposed ||
+						this.attachmentEpoch !== attachmentEpoch ||
+						this.attachmentInvalidationRevision !== invalidationRevision ||
+						this.client.getTransportGeneration() !== transportGeneration ||
+						sharedAttachmentOwners.get(this.client)?.get(targetActiveSessionId) !== this
+					) {
 						throw error;
 					}
 				} finally {
 					this.finishSnapshotRequestAttempt(requestAttempt);
 				}
 			}
-			if (this.disposed || this.attachmentEpoch !== attachmentEpoch) {
-				throw new Error("Daemon connection attachment changed during reattach");
-			}
+			this.assertAttachmentCommit(targetActiveSessionId, attachmentEpoch, invalidationRevision, transportGeneration);
+			const negotiatedCapabilities = this.negotiatedCapabilitiesFromAttach(result, capabilities);
+			const includePromptLifecycles = negotiatedCapabilities.has("correlated_prompt_lifecycle_v1");
 
 			validateDaemonSnapshotIdentity(result.snapshot, result.activeSessionId);
-			mapDaemonSessionSnapshot(result.snapshot, undefined, this.supportsCorrelatedPromptLifecycle());
+			mapDaemonSessionSnapshot(result.snapshot, undefined, includePromptLifecycles);
 			const staged = this.stageSnapshotCommit(snapshot, {
 				purpose: "replacement",
+				includePromptLifecycles,
 				envelopeActiveSessionId: result.activeSessionId,
 				expectedState: result.snapshot.state,
 				replay: result.replay,
@@ -1696,8 +1833,10 @@ export class DaemonAgentConnection implements AgentConnection {
 					{ cursor: snapshot.lastEventCursor, sequence: snapshot.lastEventSequence },
 				],
 			});
+			this.assertAttachmentCommit(targetActiveSessionId, attachmentEpoch, invalidationRevision, transportGeneration);
 			this.activeSideQuestionIds.clear();
 			this.commitStagedSnapshot(staged);
+			this.publishNegotiatedCapabilityProof(negotiatedCapabilities, transportGeneration);
 			await this.emit({
 				type: "session_replaced",
 				state: snapshot.state,
@@ -1705,11 +1844,17 @@ export class DaemonAgentConnection implements AgentConnection {
 			});
 			return { cancelled: false };
 		} catch (error) {
-			if (reattached) {
+			const stillCurrent =
+				this.attachmentEpoch === attachmentEpoch &&
+				this.attachmentInvalidationRevision === invalidationRevision &&
+				sharedAttachmentOwners.get(this.client)?.get(targetActiveSessionId) === this;
+			if (reattached && stillCurrent) {
 				if (this.supportsCorrelatedPromptLifecycle()) {
 					await this.emit({ type: "correlated_prompt_protocol_violation" });
 				}
 				this.failClosedReplacementReconciliation();
+			} else if (!reattached && stillCurrent) {
+				this.invalidateNegotiatedCapabilityProof();
 			}
 			throw error;
 		} finally {
@@ -1834,12 +1979,14 @@ export class DaemonAgentConnection implements AgentConnection {
 			);
 		}
 		this.disposed = true;
+		this.invalidateNegotiatedCapabilityProof();
 		this.updateRestartPending = false;
 		await Promise.allSettled([...this.activeSideQuestionIds].map((id) => this.abortSideQuestion(id)));
 		this.unsubscribeDaemonMessages();
 		this.unsubscribeDaemonClose();
 		const pendingActiveSessionId = [...this.pendingReattachActiveSessionIds].at(-1);
 		const serverRoutedActiveSessionId = pendingActiveSessionId ?? this.activeSessionId;
+		this.invalidateSharedAttachment(serverRoutedActiveSessionId);
 		if (this.options.ownedSession) {
 			await this.requestOk({ type: "complete_owned_session", activeSessionId: serverRoutedActiveSessionId }).catch(
 				() => undefined,
@@ -1893,12 +2040,21 @@ export class DaemonAgentConnection implements AgentConnection {
 					}
 					await this.client.connect(1000);
 					await this.client.waitForHello(3000);
-					await this.attach();
-					if (!this.disposed) {
-						const snapshot = await this.getInitialSnapshot();
-						void this.emit({ type: "session_resynced", snapshot });
-						void this.emit({ type: "connection_status", status: "connected" });
-					}
+					// Owned disposal may need one authenticated reattach to reach the
+					// authoritative completion command. Disposal keeps the public proof
+					// false and suppresses restoration events throughout this path.
+					await this.attachSession(
+						this.activeSessionId,
+						this.lastEventCursor,
+						false,
+						2,
+						"attach",
+						this.disposing && this.options.ownedSession === true,
+					);
+					if (this.disposing || this.disposed) return;
+					const snapshot = await this.getInitialSnapshot();
+					void this.emit({ type: "session_resynced", snapshot });
+					void this.emit({ type: "connection_status", status: "connected" });
 					return;
 				} catch (error) {
 					lastError = error instanceof Error ? error : new Error(String(error));
@@ -1952,6 +2108,10 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (!this.isMessageForActiveSession(message)) {
+			return;
+		}
+		if (this.isPendingTargetInvalidation(message) || this.isInvalidationDuringPendingAttachment(message)) {
+			this.failClosedReplacementReconciliation();
 			return;
 		}
 		if (
@@ -2173,6 +2333,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (message.type === "session_replaced") {
+			this.invalidateNegotiatedCapabilityProof();
 			try {
 				validateConnectionStateIdentity(message.state, message.activeSessionId);
 			} catch {
@@ -2261,6 +2422,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (message.type === "session_closed") {
+			this.invalidateNegotiatedCapabilityProof();
 			if (message.reason === "update") {
 				this.captureDaemonLogPath();
 				this.updateRestartPending = true;
@@ -2411,7 +2573,133 @@ export class DaemonAgentConnection implements AgentConnection {
 		throw lastError ?? new Error("the restored session did not become available");
 	}
 
+	private withSharedAttachmentMutation<T>(operation: () => Promise<T>): Promise<T> {
+		const previous = sharedAttachmentMutationTails.get(this.client) ?? Promise.resolve();
+		const run = previous.then(operation, operation);
+		const tail = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		sharedAttachmentMutationTails.set(this.client, tail);
+		void tail.finally(() => {
+			if (sharedAttachmentMutationTails.get(this.client) === tail) {
+				sharedAttachmentMutationTails.delete(this.client);
+			}
+		});
+		return run;
+	}
+
+	private attachmentOwners(): Map<string, DaemonAgentConnection> {
+		let owners = sharedAttachmentOwners.get(this.client);
+		if (!owners) {
+			owners = new Map();
+			sharedAttachmentOwners.set(this.client, owners);
+		}
+		return owners;
+	}
+
+	private invalidateNegotiatedCapabilityProof(): void {
+		this.attachmentInvalidationRevision++;
+		this.negotiatedCapabilities = new Set();
+		this.negotiatedTransportGeneration = undefined;
+		const activeSessionId = this.sharedAttachmentActiveSessionId;
+		this.sharedAttachmentActiveSessionId = undefined;
+		if (!activeSessionId) return;
+		const owners = sharedAttachmentOwners.get(this.client);
+		if (owners?.get(activeSessionId) === this) owners.delete(activeSessionId);
+	}
+
+	private reserveSharedAttachment(activeSessionId: string): void {
+		const owners = this.attachmentOwners();
+		for (const previous of new Set(owners.values())) {
+			if (previous !== this) previous.invalidateNegotiatedCapabilityProof();
+		}
+		owners.clear();
+		owners.set(activeSessionId, this);
+		this.sharedAttachmentActiveSessionId = activeSessionId;
+	}
+
+	private retargetSharedAttachment(requestedActiveSessionId: string, activeSessionId: string): void {
+		if (requestedActiveSessionId === activeSessionId) return;
+		const owners = this.attachmentOwners();
+		if (owners.get(requestedActiveSessionId) !== this) {
+			throw new Error("Daemon connection attachment changed during attach");
+		}
+		owners.delete(requestedActiveSessionId);
+		this.sharedAttachmentActiveSessionId = undefined;
+		this.reserveSharedAttachment(activeSessionId);
+	}
+
+	private invalidateSharedAttachment(activeSessionId: string): void {
+		const owners = sharedAttachmentOwners.get(this.client);
+		const owner = owners?.get(activeSessionId);
+		if (!owner) return;
+		owners?.delete(activeSessionId);
+		owner.invalidateNegotiatedCapabilityProof();
+	}
+
+	private assertAttachmentCommit(
+		activeSessionId: string,
+		attachmentEpoch: number,
+		invalidationRevision: number,
+		transportGeneration: number,
+		allowWhileDisposing = false,
+	): void {
+		if (
+			(this.disposing && !allowWhileDisposing) ||
+			this.disposed ||
+			this.attachmentEpoch !== attachmentEpoch ||
+			this.attachmentInvalidationRevision !== invalidationRevision ||
+			this.client.getTransportGeneration() !== transportGeneration ||
+			this.sharedAttachmentActiveSessionId !== activeSessionId ||
+			sharedAttachmentOwners.get(this.client)?.get(activeSessionId) !== this
+		) {
+			throw new Error("Daemon connection attachment changed during attach");
+		}
+	}
+
+	private publishNegotiatedCapabilityProof(
+		capabilities: ReadonlySet<DaemonClientCapability>,
+		transportGeneration: number,
+	): void {
+		this.negotiatedCapabilities = capabilities;
+		this.negotiatedTransportGeneration = transportGeneration;
+	}
+
+	private negotiatedCapabilitiesFromAttach(
+		result: DaemonAttachResult,
+		requestedCapabilities: readonly DaemonClientCapability[],
+	): ReadonlySet<DaemonClientCapability> {
+		if (
+			typeof result.client !== "object" ||
+			result.client === null ||
+			result.client.id !== this.clientId ||
+			!Array.isArray(result.client.capabilities)
+		) {
+			throw new Error("Daemon returned invalid attached client capability proof");
+		}
+		const requested = new Set(requestedCapabilities);
+		const supported = new Set<unknown>(DAEMON_SUPPORTED_CLIENT_CAPABILITIES);
+		const observed = new Set<DaemonClientCapability>();
+		const negotiated = new Set<DaemonClientCapability>();
+		for (const capability of result.client.capabilities as unknown[]) {
+			if (
+				typeof capability !== "string" ||
+				!supported.has(capability) ||
+				!requested.has(capability as DaemonClientCapability) ||
+				observed.has(capability as DaemonClientCapability)
+			) {
+				throw new Error("Daemon returned invalid attached client capability proof");
+			}
+			const typed = capability as DaemonClientCapability;
+			observed.add(typed);
+			if (this.client.supportsServerCapability(typed)) negotiated.add(typed);
+		}
+		return negotiated;
+	}
+
 	private advanceAttachmentEpoch(): number {
+		this.invalidateNegotiatedCapabilityProof();
 		const nextEpoch = ++this.attachmentEpoch;
 		for (const [snapshotId, assembly] of this.snapshotAssemblies) {
 			if (assembly.attachmentEpoch === nextEpoch) continue;
@@ -2805,6 +3093,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			expectedState?: AgentConnectionState;
 			replay?: DaemonReplayInfo;
 			resetEventProgress?: boolean;
+			includePromptLifecycles?: boolean;
 			progress: Array<{ cursor: DaemonEventCursor | undefined; sequence: number | undefined }>;
 		},
 	): StagedSnapshotCommit {
@@ -2815,7 +3104,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			expectedState: options.expectedState,
 			cachedSnapshot: this.latestSnapshot,
 			replay: options.replay,
-			includePromptLifecycles: this.supportsCorrelatedPromptLifecycle(),
+			includePromptLifecycles: options.includePromptLifecycles ?? this.supportsCorrelatedPromptLifecycle(),
 		});
 		return this.stageMappedSnapshotCommit(latestSnapshot, {
 			activeSessionId: options.envelopeActiveSessionId,
@@ -3132,12 +3421,41 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
+	private isInvalidationDuringPendingAttachment(message: DaemonOutbound): boolean {
+		if (
+			!("activeSessionId" in message) ||
+			typeof message.activeSessionId !== "string" ||
+			(message.type !== "session_closed" &&
+				message.type !== "session_replaced" &&
+				message.type !== "session_resynced")
+		) {
+			return false;
+		}
+		const attempt = this.latestSnapshotRequestAttempt(message.activeSessionId);
+		return attempt?.state === "requesting" || attempt?.state === "receiving";
+	}
+
+	private isPendingTargetInvalidation(message: DaemonOutbound): boolean {
+		return (
+			"activeSessionId" in message &&
+			typeof message.activeSessionId === "string" &&
+			message.activeSessionId !== this.activeSessionId &&
+			this.pendingReattachActiveSessionIds.has(message.activeSessionId) &&
+			(message.type === "session_closed" ||
+				message.type === "session_replaced" ||
+				message.type === "session_resynced")
+		);
+	}
+
 	private isMessageForActiveSession(message: DaemonOutbound): boolean {
 		if (!("activeSessionId" in message) || typeof message.activeSessionId !== "string") {
 			return false;
 		}
 		if (message.activeSessionId === this.activeSessionId) return true;
-		return isSnapshotTransferMessage(message) && this.pendingReattachActiveSessionIds.has(message.activeSessionId);
+		return (
+			this.pendingReattachActiveSessionIds.has(message.activeSessionId) &&
+			(isSnapshotTransferMessage(message) || this.isPendingTargetInvalidation(message))
+		);
 	}
 
 	private isStaleSequencedMessage(message: DaemonOutbound): boolean {

@@ -229,11 +229,12 @@ decisions:
 
   bounded-public-daemon-ingress:
     area: runtime-reliability
-    state: candidate
+    state: shipped
     owner: shared
     decision: hybridize
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/13
+      - https://github.com/pylon-code/prime-agent/pull/16
       - https://github.com/pylon-code/pylon/issues/114
       - https://github.com/rynfar/comet/issues/5
     upstream_refs:
@@ -243,3 +244,20 @@ decisions:
     revisit_when:
       - Prime upstream exposes an equivalent public-root SDK proof, finite raw-byte default and override, privacy-safe typed terminal error, and no-replay reconnect semantics.
       - Comet and Pylon can remove the fork token without weakening stock-package fail-closed detection or host memory bounds.
+
+  negotiated-daemon-session-capabilities:
+    area: runtime-reliability
+    state: candidate
+    owner: shared
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/17
+      - https://github.com/pylon-code/pylon/issues/190
+      - https://github.com/rynfar/comet/issues/7
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/tree/a903d4b6768f484bd6d459b7b0aa7dee38e461e2
+    fork_change: negotiated-daemon-session-capabilities-v1
+    upstream_support: Prime through a903d4b6768f has no correlated prompt lifecycle and no public post-attach negotiated-capability proof; the Pylon fork attach result already carries the daemon-established client capability set but its public connection exposes only the server hello offer.
+    revisit_when:
+      - Prime upstream exposes an equivalent generation-scoped, post-attach public proof that is false before attach and after invalidation.
+      - Pylon and Comet can remove the fork SDK token/accessor without enabling optional behavior from a server offer, version, or method presence.

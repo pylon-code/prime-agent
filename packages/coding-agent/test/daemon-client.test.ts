@@ -131,11 +131,47 @@ describe("DaemonClient", () => {
 		vi.useRealTimers();
 	});
 
+	it("increments the physical transport generation on connect, reset, and direct close", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		expect(client.getTransportGeneration()).toBe(0);
+
+		const connecting = client.connect();
+		const firstSocket = netMock.sockets[0];
+		firstSocket.emit("connect");
+		await connecting;
+		expect(client.getTransportGeneration()).toBe(1);
+
+		client.resetTransportForReconnect();
+		expect(client.getTransportGeneration()).toBe(2);
+
+		const reconnecting = client.connect();
+		const secondSocket = netMock.sockets[1];
+		secondSocket.emit("connect");
+		await reconnecting;
+		expect(client.getTransportGeneration()).toBe(3);
+		const closed = vi.fn();
+		client.onClose(closed);
+
+		client.close();
+		expect(client.getTransportGeneration()).toBe(4);
+		expect(closed).toHaveBeenCalledTimes(1);
+		expect(closed.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+		expect(closed.mock.calls[0]?.[0]?.message).toContain(
+			"Prime Agent daemon client closed before the operation completed.",
+		);
+		client.close();
+		expect(client.getTransportGeneration()).toBe(4);
+		expect(closed).toHaveBeenCalledTimes(1);
+	});
+
 	it("exports the bounded-ingress SDK proof and validates finite byte limits", () => {
 		const rootOptions: RootDaemonClientOptions = { maxInboundFrameBytes: 1 };
-		const rootFeature: RootPrimeAgentSdkFeature = "bounded_daemon_ingress_v1";
+		const rootFeatures: RootPrimeAgentSdkFeature[] = [
+			"bounded_daemon_ingress_v1",
+			"negotiated_daemon_session_capabilities_v1",
+		];
 		expect(Array.isArray(publicSdk.PRIME_AGENT_SDK_FEATURES)).toBe(true);
-		expect(publicSdk.PRIME_AGENT_SDK_FEATURES).toEqual([rootFeature]);
+		expect(publicSdk.PRIME_AGENT_SDK_FEATURES).toEqual(rootFeatures);
 		expect(Object.isFrozen(publicSdk.PRIME_AGENT_SDK_FEATURES)).toBe(true);
 		expect(publicSdk.DaemonClient).toBe(DaemonClient);
 		expect(publicSdk.DaemonInboundFrameTooLargeError).toBe(DaemonInboundFrameTooLargeError);

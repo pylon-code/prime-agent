@@ -137,6 +137,7 @@ export class DaemonClient {
 	private terminalTransportError?: DaemonInboundFrameTooLargeError;
 	private reconnectPromise?: Promise<void>;
 	private connectingSocket?: { socket: Socket; reject: (error: Error) => void };
+	private transportGeneration = 0;
 	private readonly maxInboundFrameBytes: number;
 	private readonly helloWaiters = new Set<{
 		resolve: (hello: DaemonHello) => void;
@@ -164,6 +165,11 @@ export class DaemonClient {
 
 	get isConnected(): boolean {
 		return this.socket !== undefined && !this.socket.destroyed;
+	}
+
+	/** Monotonic identity for the current physical daemon transport. */
+	getTransportGeneration(): number {
+		return this.transportGeneration;
 	}
 
 	supportsServerCapability(capability: DaemonServerCapability): boolean {
@@ -209,6 +215,7 @@ export class DaemonClient {
 		this.terminalTransportError = undefined;
 		const socket = createConnection(this.socketPath);
 		this.socket = socket;
+		this.transportGeneration++;
 
 		const connection = new Promise<void>((resolve, reject) => {
 			const cleanup = () => {
@@ -464,16 +471,15 @@ export class DaemonClient {
 		this.closed = true;
 		this.reconnectOptions = undefined;
 		this.terminalTransportError = undefined;
-		this.detachReader?.();
-		this.detachReader = undefined;
-		this.rejectAll(
-			new Error(
-				`Prime Agent daemon client closed before the operation completed. ${daemonEndpointDetails(this.socketPath)}`,
-			),
+		const socket = this.socket;
+		const error = new Error(
+			`Prime Agent daemon client closed before the operation completed. ${daemonEndpointDetails(this.socketPath)}`,
 		);
-		this.socket?.end();
-		this.socket?.destroy();
-		this.socket = undefined;
+		if (socket) this.clearSocketReference(socket);
+		this.rejectAll(error);
+		if (socket) this.emitCloseListeners(error);
+		socket?.end();
+		socket?.destroy();
 	}
 
 	private failInboundFrame(socket: Socket): void {
@@ -503,6 +509,7 @@ export class DaemonClient {
 		this.detachReader?.();
 		this.detachReader = undefined;
 		this.socket = undefined;
+		this.transportGeneration++;
 	}
 
 	private handleLine(line: string): void {

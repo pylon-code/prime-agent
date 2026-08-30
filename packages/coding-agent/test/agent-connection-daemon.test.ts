@@ -40,11 +40,15 @@ class FakeDaemonClient {
 	attachResultFactory: ((command: Extract<DaemonCommand, { type: "attach" }>) => DaemonAttachResult) | undefined;
 	reattachResultFactory: ((command: Extract<DaemonCommand, { type: "reattach" }>) => DaemonAttachResult) | undefined;
 	switchSessionActiveSessionId: string | undefined;
+	attachGate: Promise<void> | undefined;
+	reattachGate: Promise<void> | undefined;
+	reconnectGate: Promise<void> | undefined;
 	restoredAttachGate: Promise<void> | undefined;
 	restoredAttachCompleted = 0;
 	closeCount = 0;
 	emitCloseOnClose = false;
 	connected = true;
+	transportGeneration = 1;
 	reconnectCount = 0;
 	resetTransportCount = 0;
 	reconnectError: Error | undefined;
@@ -161,6 +165,7 @@ class FakeDaemonClient {
 					data: { sessions: this.updateRestartSessions },
 				};
 			case "attach":
+				if (this.attachGate) await this.attachGate;
 				if (this.attachFailures > 0) {
 					this.attachFailures--;
 					throw new Error("attach failed");
@@ -186,6 +191,7 @@ class FakeDaemonClient {
 						createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12),
 				};
 			case "reattach":
+				if (this.reattachGate) await this.reattachGate;
 				return {
 					type: "response",
 					command: command.type,
@@ -607,12 +613,20 @@ class FakeDaemonClient {
 	}
 
 	emitClose(error: Error): void {
+		if (this.connected) {
+			this.connected = false;
+			this.transportGeneration++;
+		}
 		for (const listener of [...this.closeListeners]) {
 			listener(error);
 		}
 	}
 
 	enableRequestRecovery(): void {}
+
+	getTransportGeneration(): number {
+		return this.transportGeneration;
+	}
 
 	async connect(): Promise<void> {
 		if (this.connected) {
@@ -623,6 +637,7 @@ class FakeDaemonClient {
 			throw this.reconnectError;
 		}
 		this.connected = true;
+		this.transportGeneration++;
 	}
 
 	async waitForHello(): Promise<DaemonHello> {
@@ -631,6 +646,7 @@ class FakeDaemonClient {
 
 	resetTransportForReconnect(): void {
 		this.resetTransportCount++;
+		if (this.connected) this.transportGeneration++;
 		this.connected = false;
 	}
 
@@ -639,10 +655,12 @@ class FakeDaemonClient {
 			return;
 		}
 		this.reconnectCount++;
+		if (this.reconnectGate) await this.reconnectGate;
 		if (this.reconnectError) {
 			throw this.reconnectError;
 		}
 		this.connected = true;
+		this.transportGeneration++;
 	}
 
 	getMessageListenerCount(): number {
@@ -655,6 +673,7 @@ class FakeDaemonClient {
 
 	close(): void {
 		this.closeCount++;
+		if (this.connected) this.transportGeneration++;
 		this.connected = false;
 		if (this.emitCloseOnClose) {
 			this.emitClose(new Error("Daemon socket closed"));
@@ -663,6 +682,7 @@ class FakeDaemonClient {
 
 	disconnectForReconnect(reason: "shutdown" | "update"): void {
 		this.closeCount++;
+		if (this.connected) this.transportGeneration++;
 		this.connected = false;
 		this.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", reason));
 	}
@@ -899,6 +919,347 @@ describe("DaemonAgentConnection", () => {
 			expect(request.capabilities?.includes("correlated_prompt_lifecycle_v1") ?? false).toBe(supported);
 		},
 	);
+
+	it("proves negotiated capabilities only after the exact attach commits", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		releaseAttach();
+		await attaching;
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("does not treat a server offer as attach-side negotiation", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			result.client.capabilities = result.client.capabilities.filter(
+				(capability) => capability !== "correlated_prompt_lifecycle_v1",
+			);
+			delete result.snapshot.promptLifecycles;
+			return result;
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await connection.attach();
+
+		expect(connection.supportsCorrelatedPromptLifecycle()).toBe(true);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("rejects a wrong-client attach proof without retaining capability state", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			result.client.id = "private-client-canary";
+			return result;
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		const error = await connection.attach().catch((cause: unknown) => cause);
+
+		expect(error).toEqual(new Error("Daemon returned invalid attached client capability proof"));
+		expect(String(error)).not.toContain("private-client-canary");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it.each(["duplicate", "unrequested", "unknown", "non-array", "non-string"] as const)(
+		"rejects %s attached capability proof without retaining state",
+		async (mode) => {
+			const fakeClient = new FakeDaemonClient();
+			if (mode !== "unrequested") fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+			fakeClient.attachResultFactory = (command) => {
+				const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+				if (mode === "duplicate") {
+					result.client.capabilities.push("correlated_prompt_lifecycle_v1");
+				} else if (mode === "unrequested") {
+					result.client.capabilities.push("correlated_prompt_lifecycle_v1");
+					result.snapshot.promptLifecycles = { records: [], expired: [] };
+				} else if (mode === "unknown") {
+					(result.client.capabilities as unknown[]).push("private-capability-canary");
+				} else if (mode === "non-array") {
+					(result.client as unknown as { capabilities: unknown }).capabilities = null;
+				} else {
+					(result.client.capabilities as unknown[]).push(undefined);
+				}
+				return result;
+			};
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+			const error = await connection.attach().catch((cause: unknown) => cause);
+			expect(error).toEqual(new Error("Daemon returned invalid attached client capability proof"));
+			expect(String(error)).not.toContain("private-capability-canary");
+			expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		},
+	);
+
+	it("clears negotiated proof synchronously when the daemon socket closes", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		fakeClient.emitClose(new Error("private close canary"));
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("serializes shared-client attaches and proves only the latest completed attachment", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseFirst!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const first = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		const second = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-b");
+
+		const firstAttach = first.attach();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1),
+		);
+		const secondAttach = second.attach();
+		await Promise.resolve();
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
+		releaseFirst();
+		await Promise.all([firstAttach, secondAttach]);
+
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("fences an in-flight attach across a silent shared transport reset", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+		fakeClient.resetTransportForReconnect();
+		releaseAttach();
+
+		await expect(attaching).rejects.toThrow("Daemon connection attachment changed during attach");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("fences an in-flight attach when its session closes before the response", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const closed: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "closed") closed.push(event);
+		});
+
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-1", reason: "killed" });
+		releaseAttach();
+
+		await expect(attaching).rejects.toThrow("Daemon connection attachment changed during attach");
+		await vi.waitFor(() => expect(closed).toHaveLength(1));
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("fences a pending target reattach when the target generation closes", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.switchSessionActiveSessionId = "active-target";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-source");
+		await connection.attach();
+		let releaseReattach!: () => void;
+		fakeClient.reattachGate = new Promise<void>((resolve) => {
+			releaseReattach = resolve;
+		});
+
+		const switching = connection.switchSession("/tmp/target.jsonl");
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "reattach")).toBe(true));
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-target", reason: "replaced" });
+		releaseReattach();
+
+		await expect(switching).rejects.toThrow("Daemon connection attachment changed during attach");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("rejects attach re-entry throughout the owned-session dispose wait", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+		});
+		await connection.attach();
+		let releaseReconnect!: () => void;
+		const reconnect = new Promise<void>((resolve) => {
+			releaseReconnect = resolve;
+		});
+		fakeClient.connected = false;
+		(connection as unknown as { reconnectPromise?: Promise<void> }).reconnectPromise = reconnect;
+
+		const disposing = connection.dispose();
+		await Promise.resolve();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await expect(connection.attach()).rejects.toThrow("Daemon connection is disposing");
+		releaseReconnect();
+		await disposing;
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("allows only an unproved owned-session cleanup reattach once disposal begins", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseRecovery!: () => void;
+		const recoverDaemon = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					releaseRecovery = resolve;
+				}),
+		);
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			recoverDaemon,
+			reconnectTimeoutMs: 2000,
+		});
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		fakeClient.connected = false;
+		fakeClient.emitClose(new Error("Daemon socket closed"));
+		await vi.waitFor(() => expect(recoverDaemon).toHaveBeenCalledOnce());
+
+		const disposing = connection.dispose();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await expect(connection.attach()).rejects.toThrow("Daemon connection is disposing");
+		releaseRecovery();
+		await disposing;
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "complete_owned_session",
+			activeSessionId: "active-owned",
+		});
+		expect(events).not.toContainEqual(expect.objectContaining({ type: "session_resynced" }));
+	});
+
+	it("invalidates same-session peers on shared-client attach and detach", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.serverCapabilities.add("extension_ui");
+		const first = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-shared");
+		const second = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-shared", {
+			supportsExtensionUi: false,
+		});
+		await first.attach();
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		expect(first.supportsNegotiatedCapability("extension_ui")).toBe(true);
+
+		await second.attach();
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		expect(second.supportsNegotiatedCapability("extension_ui")).toBe(false);
+
+		await first.dispose();
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("keeps only the latest shared-client attachment proved across different sessions", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const first = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		const second = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-b");
+		await first.attach();
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		await second.attach();
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		fakeClient.resetTransportForReconnect();
+
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("clears negotiated proof before a failed replacement attach and restores it only after a proved reattach", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-source");
+		await connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		fakeClient.attachFailures = 2;
+		await expect(connection.attach()).rejects.toThrow("attach failed");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+
+		fakeClient.switchSessionActiveSessionId = "active-target";
+		fakeClient.reattachResultFactory = (command) =>
+			createAttachResult(command.targetActiveSessionId, command.clientId, command.capabilities, 1, {
+				state: createConnectionState(command.targetActiveSessionId, "session-target"),
+			});
+		await connection.switchSession("/tmp/target.jsonl");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("clears negotiated proof when the attached session generation is replaced", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-1",
+			state: createConnectionState("active-1", "session-next"),
+			messages: [],
+		});
+		await vi.waitFor(() =>
+			expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false),
+		);
+	});
+
+	it("retains negotiated proof across a valid same-generation resync", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const resynced = new Promise<void>((resolve) => {
+			connection.subscribe((event) => {
+				if (event.type === "session_resynced") resolve();
+			});
+		});
+		await connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		const snapshot = createAttachResult("active-1", "resync-client", ["correlated_prompt_lifecycle_v1"], 13).snapshot;
+
+		fakeClient.emitMessage({ type: "session_resynced", activeSessionId: "active-1", snapshot });
+		await resynced;
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
 
 	it("does not expose lifecycle frames when correlated lifecycle was not negotiated", async () => {
 		const fakeClient = new FakeDaemonClient();
@@ -3508,7 +3869,12 @@ describe("DaemonAgentConnection", () => {
 			state: createConnectionState("active-target", "session-target"),
 			messages: [{ role: "user", content: "target", timestamp: 1 }],
 		});
-		const emitTransfer = (snapshotId: string, fail: boolean, purpose: "attach" | "replacement") => {
+		const emitTransfer = (
+			snapshotId: string,
+			fail: boolean,
+			purpose: "attach" | "replacement",
+			clientId: string | undefined,
+		) => {
 			const { messages: _messages, ...snapshot } = target.snapshot;
 			setImmediate(() => {
 				fakeClient.emitMessage({
@@ -3549,10 +3915,12 @@ describe("DaemonAgentConnection", () => {
 				...target,
 				snapshot: { ...target.snapshot, messages: [] },
 				snapshotStream: { id: snapshotId, messageCount: 1, targetChunkBytes: 512 * 1024 },
+				client: { ...target.client, id: clientId ?? "missing-client" },
 			};
 		};
-		fakeClient.reattachResultFactory = () => emitTransfer("reattach-g1", true, "replacement");
-		fakeClient.attachResultFactory = () => emitTransfer("reattach-g2", false, "attach");
+		fakeClient.reattachResultFactory = (command) =>
+			emitTransfer("reattach-g1", true, "replacement", command.clientId);
+		fakeClient.attachResultFactory = (command) => emitTransfer("reattach-g2", false, "attach", command.clientId);
 		const events: AgentConnectionEvent[] = [];
 		connection.subscribe((event) => {
 			events.push(event);
@@ -3817,7 +4185,10 @@ describe("DaemonAgentConnection", () => {
 		full.lastEventCursor = full.snapshot.lastEventCursor;
 		full.replay = { status: "complete", toSequence: 1, toCursor: full.lastEventCursor };
 		const { messages: _messages, ...snapshot } = full.snapshot;
-		fakeClient.attachResultFactory = () => full;
+		fakeClient.attachResultFactory = (command) => ({
+			...full,
+			client: { ...full.client, id: command.clientId ?? "missing-client" },
+		});
 		fakeClient.requests.length = 0;
 		fakeClient.emitMessage({
 			type: "session_replaced",
