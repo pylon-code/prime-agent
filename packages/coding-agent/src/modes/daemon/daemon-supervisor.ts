@@ -6474,7 +6474,6 @@ export class DaemonSupervisor {
 		const preserveRecoveryRegistration =
 			!removeDescriptor &&
 			recoveryCleanup &&
-			directChild !== undefined &&
 			this.workers.get(worker.descriptor.workerId) === worker &&
 			(worker.descriptor.stopRequestedAt !== undefined || this.shuttingDown);
 		if (!preserveRecoveryRegistration) {

@@ -2534,7 +2534,10 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
-	it("preserves a tombstoned registration when replacement-child rollback joins exact cleanup", async () => {
+	it.each([
+		{ name: "direct-child cancellation rollback", passDirectChild: true },
+		{ name: "ordinary failed-recovery rollback", passDirectChild: false },
+	])("preserves a tombstoned registration during $name", async ({ passDirectChild }) => {
 		const rollbackGate = createDeferred<void>();
 		const worker = {
 			descriptor: {
@@ -2583,8 +2586,15 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 		worker.recovery = (async () => {
 			await rollbackGate.promise;
-			await supervisor.stopWorker(worker, false, true, false, true, { child, closed: Promise.resolve() });
-			// The replacement child is gone, but its tombstoned descriptor and
+			await supervisor.stopWorker(
+				worker,
+				false,
+				true,
+				false,
+				true,
+				passDirectChild ? { child, closed: Promise.resolve() } : undefined,
+			);
+			// The replacement process is gone, but its tombstoned descriptor and
 			// registration still belong to the outer authoritative stop.
 			expect(workers.get(worker.descriptor.workerId)).toBe(worker);
 			expect(worker.descriptor.stopRequestedAt).toBeDefined();
@@ -2598,7 +2608,8 @@ describe("daemon worker supervisor monitoring", () => {
 			rollbackGate.resolve();
 			await stopping;
 
-			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			if (passDirectChild) expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			else expect(child.kill).not.toHaveBeenCalled();
 			expect(deleteWorkerDescriptor).toHaveBeenCalledOnce();
 			expect(workers.has(worker.descriptor.workerId)).toBe(false);
 		} finally {
