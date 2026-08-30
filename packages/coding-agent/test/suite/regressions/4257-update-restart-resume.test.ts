@@ -523,8 +523,8 @@ describe("issue #4257 update restart resume", () => {
 				id,
 				socket: {
 					destroyed: false,
-					write: (chunk: string) => {
-						writes.push(chunk);
+					write: (chunk: string | Uint8Array) => {
+						writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
 						return true;
 					},
 				},

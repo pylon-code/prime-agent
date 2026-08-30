@@ -81,6 +81,8 @@ export type {
 	DaemonEventMeta,
 	DaemonEventSequence,
 	DaemonOutbound,
+	DaemonOwnedSessionCleanupResult,
+	DaemonOwnedSessionCleanupStatus,
 	DaemonProtocolInfo,
 	DaemonProtocolName,
 	DaemonProtocolVersion,

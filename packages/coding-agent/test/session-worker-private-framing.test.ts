@@ -1,7 +1,11 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { createServer, type Socket } from "node:net";
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
 	encodePrivateFrame,
+	encodePrivateFrameParts,
 	PrivateFrameDecoder,
 	PrivateFramedChannel,
 	type PrivateFrameHeaderValidator,
@@ -40,6 +44,136 @@ describe("private worker framing", () => {
 			{ header: { type: "event", requestId: "one" }, payload: Buffer.from([0, 1, 2, 255]) },
 			{ header: { type: "response", requestId: "two" }, payload: Buffer.from("payload") },
 		]);
+	});
+
+	it("coalesces a 36 MiB fragmented payload at most once", () => {
+		const payload = Buffer.alloc(36 * 1024 * 1024, 0x61);
+		const frame = encodePrivateFrame({ type: "snapshot", requestId: "large" }, payload);
+		const decoder = new PrivateFrameDecoder(isTestHeader);
+		const frames = [];
+		let peakBufferedBytes = 0;
+		for (let offset = 0; offset < frame.length; offset += 64 * 1024) {
+			frames.push(...decoder.push(frame.subarray(offset, offset + 64 * 1024)));
+			peakBufferedBytes = Math.max(peakBufferedBytes, decoder.bufferedBytes);
+		}
+		decoder.finish();
+
+		expect(frames).toHaveLength(1);
+		expect(frames[0]?.payload.equals(payload)).toBe(true);
+		expect(peakBufferedBytes).toBeLessThanOrEqual(payload.length);
+		expect(decoder.coalescedBytes).toBeLessThanOrEqual(frame.length);
+	});
+
+	it("keeps segmented new-worker payloads byte-compatible with the legacy decoder", () => {
+		const header = { type: "snapshot", requestId: "compat" };
+		const payloadParts = [Buffer.from('{"messages":['), Buffer.from('{"content":"ok"}'), Buffer.from("]}")];
+		const segmented = encodePrivateFrameParts(header, payloadParts);
+		const legacyWire = encodePrivateFrame(header, Buffer.concat(payloadParts));
+		expect(Buffer.concat(segmented)).toEqual(legacyWire);
+
+		const decoder = new PrivateFrameDecoder(isTestHeader);
+		const frames = segmented.flatMap((part) => decoder.push(part));
+		decoder.finish();
+		expect(frames).toEqual([{ header, payload: Buffer.concat(payloadParts) }]);
+	});
+
+	it("crosses a real process boundary with new segmented writes and legacy contiguous replies", async () => {
+		const server = createServer();
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", () => resolve());
+		});
+		const address = server.address();
+		if (!address || typeof address === "string") throw new Error("expected TCP test address");
+		const connection = new Promise<Socket>((resolve) => server.once("connection", resolve));
+		const childScript = `
+const net = require("node:net");
+let buffered = Buffer.alloc(0);
+const socket = net.createConnection({ host: "127.0.0.1", port: Number(process.argv[1]) });
+const encodeLegacy = (header, payload) => {
+  const encodedHeader = Buffer.from(JSON.stringify(header));
+  const frame = Buffer.allocUnsafe(8 + encodedHeader.length + payload.length);
+  frame.writeUInt32BE(encodedHeader.length, 0);
+  frame.writeUInt32BE(payload.length, 4);
+  encodedHeader.copy(frame, 8);
+  payload.copy(frame, 8 + encodedHeader.length);
+  return frame;
+};
+socket.on("data", (chunk) => {
+  buffered = buffered.length === 0 ? chunk : Buffer.concat([buffered, chunk]);
+  const replies = [];
+  while (buffered.length >= 8) {
+    const headerLength = buffered.readUInt32BE(0);
+    const payloadLength = buffered.readUInt32BE(4);
+    const frameLength = 8 + headerLength + payloadLength;
+    if (buffered.length < frameLength) break;
+    const header = JSON.parse(buffered.toString("utf8", 8, 8 + headerLength));
+    const payload = Buffer.from(buffered.subarray(8 + headerLength, frameLength));
+    replies.push(encodeLegacy({ type: "ack", requestId: header.requestId }, payload));
+    buffered = Buffer.from(buffered.subarray(frameLength));
+  }
+  if (replies.length > 0) socket.write(Buffer.concat(replies));
+  if (replies.some((reply) => JSON.parse(reply.toString("utf8", 8, 8 + reply.readUInt32BE(0))).requestId === "three")) {
+    socket.end();
+  }
+});`;
+		const child = spawn(process.execPath, ["--eval", childScript, String(address.port)], {
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		let socket: Socket | undefined;
+		try {
+			socket = await Promise.race([
+				connection,
+				new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error("legacy framing child did not connect")), 3000),
+				),
+			]);
+			const decoder = new PrivateFrameDecoder(isTestHeader);
+			const replies: Array<{ header: TestHeader; payload: Buffer }> = [];
+			const completed = new Promise<void>((resolve, reject) => {
+				socket!.on("data", (chunk) => replies.push(...decoder.push(chunk)));
+				socket!.once("error", reject);
+				socket!.once("end", () => {
+					try {
+						decoder.finish();
+						resolve();
+					} catch (error) {
+						reject(error);
+					}
+				});
+			});
+			for (const [requestId, payloadParts] of [
+				["one", [Buffer.from("a"), Buffer.from("b")]],
+				["two", [Buffer.from("c"), Buffer.from("d")]],
+				["three", [Buffer.from("e"), Buffer.from("f")]],
+			] as const) {
+				for (const part of encodePrivateFrameParts({ type: "snapshot", requestId }, payloadParts)) {
+					socket.write(part);
+				}
+			}
+			await Promise.race([
+				completed,
+				new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error("legacy framing child did not finish")), 3000),
+				),
+			]);
+			expect(replies).toEqual([
+				{ header: { type: "ack", requestId: "one" }, payload: Buffer.from("ab") },
+				{ header: { type: "ack", requestId: "two" }, payload: Buffer.from("cd") },
+				{ header: { type: "ack", requestId: "three" }, payload: Buffer.from("ef") },
+			]);
+			const [exitCode] = (await Promise.race([
+				once(child, "close"),
+				new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error("legacy framing child did not close")), 3000),
+				),
+			])) as [number | null];
+			expect(exitCode).toBe(0);
+		} finally {
+			socket?.destroy();
+			server.close();
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+		}
 	});
 
 	it("rejects invalid lengths, JSON, and routing headers", () => {

@@ -1,7 +1,7 @@
 import { createConnection, type Socket } from "node:net";
 import { serializeJsonLine } from "../rpc/jsonl.js";
 import { type PrivateFrame, PrivateFramedChannel } from "../session-worker/private-framing.js";
-import type { DaemonCommand, DaemonOutbound, DaemonResponse } from "./daemon-protocol.js";
+import type { DaemonCommand, DaemonOutbound, DaemonResponse, DaemonServerCapability } from "./daemon-protocol.js";
 import {
 	type DaemonWorkerCommand,
 	type DaemonWorkerCommandBody,
@@ -76,6 +76,10 @@ export class DaemonWorkerClient {
 
 		socket.on("error", (error) => this.notifyClosed(socket, error));
 		socket.on("close", () => this.notifyClosed(socket, new Error("Daemon worker socket closed")));
+	}
+
+	supportsServerCapability(capability: DaemonServerCapability): boolean {
+		return this.hello?.serverCapabilities.includes(capability) === true;
 	}
 
 	waitForHello(timeoutMs = 3000): Promise<DaemonHello> {

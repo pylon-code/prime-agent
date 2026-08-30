@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,7 +23,8 @@ const directories: string[] = [];
 
 interface WorkerHarness {
 	descriptor: { workerId: string; rootActiveSessionId: string; lifecycle: "ready"; pid: number };
-	client?: { request: ReturnType<typeof vi.fn> };
+	client?: { close: ReturnType<typeof vi.fn>; request: ReturnType<typeof vi.fn> };
+	authorizedActiveSessionIds: Set<string>;
 	summaries: Map<string, SessionSummary>;
 	snapshotCache: Map<string, DaemonAttachResult>;
 	transcriptCaches: Map<string, SnapshotTranscriptCache>;
@@ -134,10 +135,12 @@ function workerHarness(result: DaemonAttachResult, transcript: SnapshotTranscrip
 			pid: 4677,
 		},
 		client: {
+			close: vi.fn(),
 			request: vi.fn(async () => {
 				throw new Error("unexpected snapshot reload");
 			}),
 		},
+		authorizedActiveSessionIds: new Set([activeSessionId]),
 		summaries: new Map([[activeSessionId, result.snapshot.summary]]),
 		snapshotCache: new Map([[activeSessionId, result]]),
 		transcriptCaches: new Map([[activeSessionId, transcript]]),
@@ -148,7 +151,178 @@ function workerHarness(result: DaemonAttachResult, transcript: SnapshotTranscrip
 	};
 }
 
+function registerWorker(supervisor: DaemonSupervisor, worker: WorkerHarness): void {
+	(supervisor as unknown as { workers: Map<string, WorkerHarness> }).workers.set(worker.descriptor.workerId, worker);
+}
+
 describe("ENG-4677 snapshot catch-up replacement", () => {
+	it("atomically remaps an alias snapshot fence before canonical events can pass", () => {
+		const root = tempDirectory();
+		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			descriptorDir: join(root, "state"),
+		});
+		const client = socketClient("alias-client");
+		client.capabilities.add("correlated_prompt_lifecycle_v1");
+		const transcript = new SnapshotTranscriptCache({
+			activeSessionId,
+			snapshotId: "alias-snapshot",
+			cacheRoot: root,
+		});
+		const worker = workerHarness(streamedResult("alias-snapshot", 0, 1), transcript);
+		registerWorker(supervisor, worker);
+		const written: Buffer[] = [];
+		const internals = supervisor as unknown as {
+			clients: Set<DaemonSocketClient>;
+			writeSerialized(client: DaemonSocketClient, payload: Buffer): boolean;
+			reserveSnapshotStream(client: DaemonSocketClient, selector: string): () => void;
+			remapSnapshotStreamReservation(
+				client: DaemonSocketClient,
+				selector: string,
+				activeSessionId: string,
+				release: () => void,
+			): () => void;
+			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		internals.clients.add(client);
+		internals.writeSerialized = (_client, payload) => {
+			written.push(payload);
+			return true;
+		};
+		const alias = "session-4677";
+		const releaseAlias = internals.reserveSnapshotStream(client, alias);
+		const releaseCanonical = internals.remapSnapshotStreamReservation(client, alias, activeSessionId, releaseAlias);
+
+		expect(client.snapshotActiveSessionIds).toEqual(new Set([activeSessionId]));
+		internals.handleWorkerFrame(worker, {
+			header: {
+				kind: "outbound",
+				outboundType: "session_event",
+				activeSessionId,
+				sessionEventType: "agent_start",
+				payloadEncoding: "jsonl",
+			},
+			payload: Buffer.from(
+				JSON.stringify({
+					type: "session_event",
+					activeSessionId,
+					event: { type: "agent_start" },
+					attribution: { scope: "session" },
+				}),
+			),
+		});
+		expect(written).toEqual([]);
+		expect(client.catchupActiveSessionIds).toEqual(new Set([activeSessionId]));
+		client.catchupActiveSessionIds?.clear();
+		releaseCanonical();
+		expect(client.snapshotActiveSessionIds).toEqual(new Set());
+		transcript.dispose();
+		client.socket.destroy();
+	});
+
+	it("assigns supervisor-owned UUIDs to mixed-version full snapshots with the same cursor and count", async () => {
+		const root = tempDirectory();
+		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			descriptorDir: join(root, "state"),
+		});
+		const large = "x".repeat(400 * 1024);
+		const firstMessages = [
+			{ role: "user", content: { nested: `before-${large}` }, timestamp: 1 },
+			{ role: "user", content: { nested: `before-2-${large}` }, timestamp: 2 },
+		] as unknown as AgentMessage[];
+		const secondMessages = [
+			{ role: "user", content: { nested: "after" }, timestamp: 1 },
+			{ role: "user", content: { nested: "after-2" }, timestamp: 2 },
+		] as unknown as AgentMessage[];
+		const withoutStream = (messages: AgentMessage[]): DaemonAttachResult => {
+			const result = streamedResult("legacy", messages.length, 7);
+			const { snapshotStream: _snapshotStream, ...full } = result;
+			full.snapshot = { ...full.snapshot, messages };
+			return full;
+		};
+		const firstResult = withoutStream(firstMessages);
+		const secondResult = withoutStream(secondMessages);
+		const worker = workerHarness(
+			firstResult,
+			new SnapshotTranscriptCache({
+				activeSessionId,
+				snapshotId: "placeholder",
+				cacheRoot: root,
+			}),
+		);
+		registerWorker(supervisor, worker);
+		worker.transcriptCaches.clear();
+		worker.snapshotCache.clear();
+		worker.snapshotCache.set(activeSessionId, firstResult);
+		worker.snapshotGenerations.clear();
+		const internals = supervisor as unknown as {
+			getOrCreateTranscriptCache(worker: object, result: DaemonAttachResult): Promise<SnapshotTranscriptCache>;
+		};
+
+		const first = await internals.getOrCreateTranscriptCache(worker, firstResult);
+		const firstId = first.snapshotId;
+		const firstChunkCount = first.chunkCount;
+		worker.snapshotCache.set(activeSessionId, secondResult);
+		const second = await internals.getOrCreateTranscriptCache(worker, secondResult);
+
+		expect(firstId).not.toBe(second.snapshotId);
+		expect(firstId).toMatch(/^snapshot-[0-9a-f-]+$/);
+		expect(second.snapshotId).toMatch(/^snapshot-[0-9a-f-]+$/);
+		expect(firstChunkCount).toBe(2);
+		expect(second.chunkCount).toBe(1);
+		expect(Buffer.concat([...second]).toString("utf8")).toContain('"nested":"after"');
+		second.dispose();
+	});
+
+	it("does not publish a legacy transcript after its snapshot selection is invalidated", async () => {
+		const root = tempDirectory();
+		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			descriptorDir: join(root, "state"),
+		});
+		const withoutStream = (content: string, sequence: number): DaemonAttachResult => {
+			const result = streamedResult("legacy", 1, sequence);
+			const { snapshotStream: _snapshotStream, ...full } = result;
+			full.snapshot = {
+				...full.snapshot,
+				messages: [{ role: "user", content, timestamp: sequence }] as unknown as AgentMessage[],
+			};
+			return full;
+		};
+		const staleResult = withoutStream(`stale-${"x".repeat(2 * 1024 * 1024)}`, 7);
+		const freshResult = withoutStream("fresh", 8);
+		const worker = workerHarness(
+			staleResult,
+			new SnapshotTranscriptCache({ activeSessionId, snapshotId: "placeholder", cacheRoot: root }),
+		);
+		registerWorker(supervisor, worker);
+		worker.transcriptCaches.clear();
+		worker.snapshotGenerations.clear();
+		worker.snapshotCache.set(activeSessionId, staleResult);
+		const internals = supervisor as unknown as {
+			workers: Map<string, object>;
+			getOrCreateTranscriptCache(worker: object, result: DaemonAttachResult): Promise<SnapshotTranscriptCache>;
+			invalidateWorkerSnapshot(worker: object, activeSessionId: string, transcriptChanged?: boolean): void;
+			transcriptPreparations?: WeakMap<object, Map<string, unknown>>;
+		};
+		internals.workers.set(worker.descriptor.workerId, worker);
+
+		const stalePreparation = internals.getOrCreateTranscriptCache(worker, staleResult);
+		expect(internals.transcriptPreparations?.get(worker)?.has(activeSessionId)).toBe(true);
+		internals.invalidateWorkerSnapshot(worker, activeSessionId, false);
+
+		await expect(stalePreparation).rejects.toThrow("changed during transcript preparation");
+		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
+		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
+		expect(worker.snapshotGenerations.get(activeSessionId)?.size ?? 0).toBe(0);
+
+		worker.snapshotCache.set(activeSessionId, freshResult);
+		const freshTranscript = await internals.getOrCreateTranscriptCache(worker, freshResult);
+		expect(Buffer.concat([...freshTranscript]).toString("utf8")).toContain("fresh");
+		freshTranscript.dispose();
+	});
+
 	it("lets an incomplete retained snapshot finish after a newer generation begins", async () => {
 		const root = tempDirectory();
 		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
@@ -164,6 +338,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			targetChunkBytes: 1,
 		});
 		const worker = workerHarness(streamedResult(firstSnapshotId, 1, 1), placeholder);
+		registerWorker(supervisor, worker);
 		worker.snapshotCache.clear();
 		worker.transcriptCaches.clear();
 		const client = socketClient("incomplete-reader");
@@ -281,10 +456,12 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			targetChunkBytes: 1,
 		});
 		const worker = workerHarness(firstResult, placeholder);
+		registerWorker(supervisor, worker);
 		worker.snapshotCache.clear();
 		worker.transcriptCaches.clear();
 		let resolveAttach!: (response: { success: true; data: DaemonAttachResult }) => void;
 		worker.client = {
+			close: vi.fn(),
 			request: vi.fn(
 				() =>
 					new Promise<{ success: true; data: DaemonAttachResult }>((resolve) => {
@@ -377,11 +554,12 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 		});
 		firstTranscript.appendEncodedChunk(Buffer.from("orphaned transcript chunk"));
 		expect(firstTranscript.fileBacked).toBe(true);
-		const cacheDirectory = join(root, firstSnapshotId);
+		const cacheDirectory = join(root, readdirSync(root).find((entry) => entry.startsWith(firstSnapshotId))!);
 		expect(existsSync(cacheDirectory)).toBe(true);
 		const waiter = firstTranscript.waitForChunk(1);
 		void waiter.catch(() => undefined);
 		const worker = workerHarness(firstResult, firstTranscript);
+		registerWorker(supervisor, worker);
 		const internals = supervisor as unknown as {
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		};
@@ -422,6 +600,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			targetChunkBytes: 1,
 		});
 		const worker = workerHarness(firstResult, placeholder);
+		registerWorker(supervisor, worker);
 		worker.snapshotCache.clear();
 		worker.transcriptCaches.clear();
 		const client = socketClient("validation-waiter");
@@ -599,6 +778,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			targetChunkBytes: 1,
 		});
 		const worker = workerHarness(firstResult, firstTranscript);
+		registerWorker(supervisor, worker);
 		const client = socketClient("slow-client");
 		const written: DaemonOutbound[] = [];
 		let releaseFirstChunk!: (accepted: boolean) => void;
@@ -700,14 +880,13 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 		internals.queueCatchup(client, activeSessionId, "replacement");
 		await internals.catchUpClient(client);
 
+		const publicReplacement = written.find(
+			(message) => message.type === "session_snapshot_begin" && message.purpose === "replacement",
+		);
+		expect(publicReplacement).toBeDefined();
 		expect(
-			written.some(
-				(message) =>
-					message.type === "session_snapshot_begin" &&
-					message.snapshotId === replacementSnapshotId &&
-					message.purpose === "replacement",
-			),
-		).toBe(true);
+			publicReplacement && "snapshotId" in publicReplacement ? publicReplacement.snapshotId : undefined,
+		).not.toBe(replacementSnapshotId);
 		expect(worker.transcriptCaches.get(activeSessionId)?.snapshotId).toBe(replacementSnapshotId);
 		client.socket.destroy();
 	});

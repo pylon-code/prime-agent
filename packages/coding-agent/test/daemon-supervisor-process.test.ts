@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +16,7 @@ import {
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import { createDaemonCommandEnvelope } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
 
@@ -198,7 +200,114 @@ async function connectEventually(socketPath: string, child?: ChildProcess): Prom
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
 	}
-	throw new Error(`Timed out waiting for supervisor: ${String(lastError)}`);
+	const diagnostics = child ? childDiagnostics.get(child) : undefined;
+	throw new Error(
+		`Timed out waiting for supervisor: ${String(lastError)}\nstdout:\n${diagnostics?.stdout ?? ""}\nstderr:\n${diagnostics?.stderr ?? ""}`,
+	);
+}
+
+async function createSnapshotRetryProxy(
+	proxyPath: string,
+	targetPath: string,
+): Promise<{
+	server: Server;
+	attachRequests: () => number;
+	transferIds: () => string[];
+}> {
+	let attachCount = 0;
+	const observedTransferIds: string[] = [];
+	const server = createServer((downstream: Socket) => {
+		const upstream = createConnection(targetPath);
+		let requestBuffer = Buffer.alloc(0);
+		let responseBuffer = Buffer.alloc(0);
+		let firstTransferId: string | undefined;
+		let firstChunk: Buffer | undefined;
+		let firstEnd: Buffer | undefined;
+		downstream.on("data", (chunk: Buffer) => {
+			requestBuffer = Buffer.concat([requestBuffer, chunk]);
+			while (true) {
+				const newline = requestBuffer.indexOf(0x0a);
+				if (newline < 0) break;
+				const line = requestBuffer.subarray(0, newline);
+				requestBuffer = requestBuffer.subarray(newline + 1);
+				try {
+					const parsed = JSON.parse(line.toString("utf8")) as {
+						type?: unknown;
+						command?: { type?: unknown };
+					};
+					if (parsed.type === "attach" || parsed.command?.type === "attach") attachCount++;
+				} catch {
+					// The real daemon owns command validation.
+				}
+				upstream.write(Buffer.concat([line, Buffer.from("\n")]));
+			}
+		});
+		upstream.on("data", (chunk: Buffer) => {
+			responseBuffer = Buffer.concat([responseBuffer, chunk]);
+			while (true) {
+				const newline = responseBuffer.indexOf(0x0a);
+				if (newline < 0) break;
+				const original = Buffer.from(responseBuffer.subarray(0, newline + 1));
+				responseBuffer = responseBuffer.subarray(newline + 1);
+				let parsed: { type?: unknown; snapshotId?: unknown } | undefined;
+				try {
+					parsed = JSON.parse(original.toString("utf8")) as { type?: unknown; snapshotId?: unknown };
+				} catch {
+					downstream.write(original);
+					continue;
+				}
+				if (parsed.type === "session_snapshot_begin" && typeof parsed.snapshotId === "string") {
+					if (!observedTransferIds.includes(parsed.snapshotId)) observedTransferIds.push(parsed.snapshotId);
+					firstTransferId ??= parsed.snapshotId;
+				}
+				if (
+					parsed.type === "session_snapshot_chunk" &&
+					typeof parsed.snapshotId === "string" &&
+					parsed.snapshotId === firstTransferId &&
+					!firstChunk
+				) {
+					firstChunk = original;
+					parsed.snapshotId = `${parsed.snapshotId}-corrupted`;
+					downstream.write(`${JSON.stringify(parsed)}\n`);
+					continue;
+				}
+				if (
+					parsed.type === "session_snapshot_end" &&
+					typeof parsed.snapshotId === "string" &&
+					parsed.snapshotId === firstTransferId
+				) {
+					firstEnd = original;
+				}
+				downstream.write(original);
+				if (
+					parsed.type === "session_snapshot_end" &&
+					typeof parsed.snapshotId === "string" &&
+					parsed.snapshotId !== firstTransferId &&
+					firstChunk &&
+					firstEnd
+				) {
+					// Old-generation frames arrive after the fresh attempt's terminal end.
+					downstream.write(firstChunk);
+					downstream.write(firstEnd);
+					firstChunk = undefined;
+					firstEnd = undefined;
+				}
+			}
+		});
+		upstream.on("error", (error) => downstream.destroy(error));
+		downstream.on("error", () => upstream.destroy());
+		upstream.on("close", () => downstream.destroy());
+		downstream.on("close", () => upstream.destroy());
+	});
+	await new Promise<void>((resolveListen, reject) => {
+		server.once("error", reject);
+		server.listen(proxyPath, () => resolveListen());
+	});
+	return {
+		server,
+		attachRequests: () => attachCount,
+		transferIds: () => [...observedTransferIds],
+	};
 }
 
 async function waitForSocketGone(socketPath: string): Promise<void> {
@@ -449,6 +558,80 @@ describe("daemon supervisor resident workers", () => {
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 
+	it("retries one corrupted real worker snapshot with fresh transfer identity and ignores stale terminal frames", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const suffix = `${process.pid}-${randomUUID().slice(0, 8)}`;
+		const socketPath = join(tmpdir(), `prime-snapshot-retry-${suffix}.sock`);
+		const proxyPath = join(tmpdir(), `prime-snapshot-proxy-${suffix}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "real snapshot retry fixture", timestamp: 1 });
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "fixture complete" }],
+			api: "openai-responses",
+			provider: "faux",
+			model: "faux",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 2,
+		});
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Snapshot retry fixture did not persist");
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const creator = await connectEventually(socketPath, supervisor);
+		const created = await creator.request({
+			type: "create",
+			sessionPath: sessionFile,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.activeSessionId || !summary.workerPid) throw new Error("Snapshot retry worker was incomplete");
+		workerPids.add(summary.workerPid);
+		creator.close();
+
+		const proxy = await createSnapshotRetryProxy(proxyPath, socketPath);
+		const client = new DaemonClient(proxyPath);
+		try {
+			await client.connect(3_000);
+			await client.waitForHello(3_000);
+			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
+				supportsExtensionUi: false,
+				snapshotTimeoutMs: 3_000,
+			});
+			const snapshot = await connection.getInitialSnapshot();
+			expect(snapshot.messages).toContainEqual(
+				expect.objectContaining({ role: "user", content: "real snapshot retry fixture" }),
+			);
+			expect(proxy.attachRequests()).toBe(2);
+			expect(proxy.transferIds()).toHaveLength(2);
+			expect(new Set(proxy.transferIds()).size).toBe(2);
+			await connection.dispose();
+		} finally {
+			client.close();
+			await new Promise<void>((resolveClose) => proxy.server.close(() => resolveClose()));
+		}
+
+		const shutdownClient = await connectEventually(socketPath);
+		await shutdownClient.request({ type: "shutdown" });
+		shutdownClient.close();
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
 	it("keeps client-owned workers hidden and removes them without archiving", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");
@@ -508,7 +691,11 @@ describe("daemon supervisor resident workers", () => {
 			success: false,
 			error: `Unknown active session: ${summary.activeSessionId}`,
 		});
-		otherClient.close();
+		const activeCleanup = await otherClient.request({
+			type: "get_owned_session_cleanup",
+			activeSessionId: summary.activeSessionId,
+		});
+		expect(activeCleanup).toMatchObject({ success: true, data: { status: "active" } });
 		const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 			ownedSession: true,
 			supportsExtensionUi: false,
@@ -534,7 +721,19 @@ describe("daemon supervisor resident workers", () => {
 		expect(descriptor.createCommand).not.toHaveProperty("launchEnv");
 		expect(descriptor.createCommand).not.toHaveProperty("lifecycle");
 
+		const completed = await client.request({
+			type: "complete_owned_session",
+			activeSessionId: summary.activeSessionId,
+		});
+		expect(completed.success).toBe(true);
+		const settledCleanup = await otherClient.request({
+			type: "get_owned_session_cleanup",
+			activeSessionId: summary.activeSessionId,
+		});
+		expect(settledCleanup).toEqual(expect.objectContaining({ success: true, data: { status: "settled" } }));
+		expect(settledCleanup.success ? Object.keys(settledCleanup.data as object) : []).toEqual(["status"]);
 		await connection.dispose();
+		otherClient.close();
 		await waitForProcessGone(summary.workerPid);
 		workerPids.delete(summary.workerPid);
 		await waitForCondition(
@@ -547,6 +746,163 @@ describe("daemon supervisor resident workers", () => {
 		client.close();
 		await waitForSocketGone(socketPath);
 	}, 60_000);
+
+	it("lets a different client prove cleanup after the owner socket disappears", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const socketPath = join(tmpdir(), `prime-supervisor-owned-crash-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const owner = await connectEventually(socketPath, supervisor);
+		const created = await owner.request({
+			type: "create",
+			lifecycle: "client_owned",
+			noSession: true,
+			launchEnv: { TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json") },
+			config: { cwd: projectDir, agentDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid || !summary.activeSessionId) {
+			throw new Error("Client-owned worker did not expose its process identity");
+		}
+		workerPids.add(summary.workerPid);
+		const observer = await connectEventually(socketPath);
+		try {
+			await expect(
+				observer.request({ type: "get_owned_session_cleanup", activeSessionId: summary.activeSessionId }),
+			).resolves.toMatchObject({ success: true, data: { status: "active" } });
+			process.kill(summary.workerPid, "SIGSTOP");
+			owner.close();
+
+			let sawStopping = false;
+			let settled = false;
+			const deadline = Date.now() + 50_000;
+			while (Date.now() < deadline) {
+				const response = await observer.request({
+					type: "get_owned_session_cleanup",
+					activeSessionId: summary.activeSessionId,
+				});
+				if (!response.success) throw new Error(response.error);
+				const status = (response.data as { status?: string } | undefined)?.status;
+				if (status === "stopping") sawStopping = true;
+				if (status === "settled") {
+					settled = true;
+					break;
+				}
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+			}
+			expect(sawStopping).toBe(true);
+			expect(settled).toBe(true);
+			await waitForProcessGone(summary.workerPid);
+			workerPids.delete(summary.workerPid);
+			expect(countWorkerDescriptors(agentDir)).toBe(0);
+			await observer.request({ type: "shutdown" });
+			await waitForSocketGone(socketPath);
+		} finally {
+			owner.close();
+			observer.close();
+			if (workerPids.has(summary.workerPid)) {
+				try {
+					process.kill(summary.workerPid, "SIGCONT");
+					process.kill(summary.workerPid, "SIGKILL");
+				} catch {
+					// The authoritative cleanup path already removed it.
+				}
+				workerPids.delete(summary.workerPid);
+			}
+		}
+	}, 75_000);
+
+	it("cleans up a client-owned create whose owner disconnects before registration", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-owned-opening-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(projectDir, { recursive: true });
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const readiness = await connectEventually(socketPath, supervisor);
+		readiness.close();
+		const openingOwner = createConnection(socketPath);
+		openingOwner.on("error", () => undefined);
+		await new Promise<void>((resolveConnect, rejectConnect) => {
+			openingOwner.once("connect", resolveConnect);
+			openingOwner.once("error", rejectConnect);
+		});
+		const commandId = `opening-${randomUUID()}`;
+		const wire = `${JSON.stringify(
+			createDaemonCommandEnvelope(
+				{
+					type: "create",
+					lifecycle: "client_owned",
+					noSession: true,
+					launchEnv: { TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json") },
+					config: { cwd: projectDir, agentDir, noTools: true, noExtensions: true },
+				},
+				commandId,
+				"opening-owner",
+			),
+		)}\n`;
+		const closed = new Promise<void>((resolveClose) => openingOwner.once("close", resolveClose));
+		await new Promise<void>((resolveWrite, rejectWrite) => {
+			openingOwner.end(wire, (error?: Error | null) => (error ? rejectWrite(error) : resolveWrite()));
+		});
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+		expect(countWorkerDescriptors(agentDir)).toBe(0);
+		openingOwner.destroy();
+		// The command bytes are committed to the socket, but the client is gone
+		// before launchWorker can publish the new resident registration.
+		await closed;
+
+		let descriptor: DaemonWorkerDescriptor | undefined;
+		const descriptorDeadline = Date.now() + 15_000;
+		while (!descriptor && Date.now() < descriptorDeadline) {
+			try {
+				descriptor = readWorkerDescriptor(agentDir);
+			} catch {
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+			}
+		}
+		if (!descriptor) throw new Error(`Opening client-owned create was not registered\n${readDaemonLogs(agentDir)}`);
+		expect(descriptor.ownerClientId).toBe("opening-owner");
+		workerPids.add(descriptor.pid);
+
+		const observer = await connectEventually(socketPath, supervisor);
+		try {
+			let sawStopping = false;
+			let settled = false;
+			const deadline = Date.now() + 50_000;
+			while (Date.now() < deadline) {
+				const response = await observer.request({
+					type: "get_owned_session_cleanup",
+					activeSessionId: descriptor.rootActiveSessionId,
+				});
+				if (!response.success) throw new Error(response.error);
+				const status = (response.data as { status?: string } | undefined)?.status;
+				if (status === "stopping") sawStopping = true;
+				if (status === "settled") {
+					settled = true;
+					break;
+				}
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+			}
+			expect(sawStopping).toBe(true);
+			expect(settled).toBe(true);
+			await waitForProcessGone(descriptor.pid);
+			workerPids.delete(descriptor.pid);
+			expect(countWorkerDescriptors(agentDir)).toBe(0);
+			await observer.request({ type: "shutdown" });
+			await waitForSocketGone(socketPath);
+		} finally {
+			observer.close();
+		}
+	}, 75_000);
 
 	it("releases an adopted client-owned worker when disposal races supervisor replacement", async () => {
 		const root = tempDir();
@@ -591,6 +947,11 @@ describe("daemon supervisor resident workers", () => {
 			"Adopted client-owned worker descriptor was not removed",
 		);
 		const replacementClient = await connectEventually(socketPath);
+		const replacementCleanup = await replacementClient.request({
+			type: "get_owned_session_cleanup",
+			activeSessionId: summary.activeSessionId,
+		});
+		expect(replacementCleanup).toMatchObject({ success: true, data: { status: "settled" } });
 		await replacementClient.request({ type: "shutdown" });
 		replacementClient.close();
 		await waitForSocketGone(socketPath);

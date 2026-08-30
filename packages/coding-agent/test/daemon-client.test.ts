@@ -215,6 +215,66 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("does not send authoritative cleanup queries to stock-compatible capability offers", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["client_owned_sessions"], DAEMON_SCHEMA_REVISION);
+
+		await expect(client.request({ type: "get_owned_session_cleanup", activeSessionId: "active-1" })).rejects.toThrow(
+			"does not support authoritative_owned_session_cleanup_v1",
+		);
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("schema-gates authoritative cleanup queries before writing", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["authoritative_owned_session_cleanup_v1"], 26);
+
+		await expect(client.request({ type: "get_owned_session_cleanup", activeSessionId: "active-1" })).rejects.toThrow(
+			"does not support authoritative_owned_session_cleanup_v1",
+		);
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("sends authoritative cleanup queries only to a capable current supervisor", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["authoritative_owned_session_cleanup_v1"], DAEMON_SCHEMA_REVISION);
+
+		const response = client.request({ type: "get_owned_session_cleanup", activeSessionId: "active-1" });
+		expect(socket.writes).toHaveLength(1);
+		const envelope = JSON.parse(socket.writes[0]!.trim()) as {
+			id: string;
+			command: { type: string; activeSessionId: string };
+		};
+		expect(envelope.command).toMatchObject({ type: "get_owned_session_cleanup", activeSessionId: "active-1" });
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "get_owned_session_cleanup",
+				success: true,
+				data: { status: "settled" },
+			})}
+`,
+		);
+		await expect(response).resolves.toMatchObject({ success: true, data: { status: "settled" } });
+		client.close();
+	});
+
 	it("does not send subagent deletion to an old daemon without the capability", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

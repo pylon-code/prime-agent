@@ -1,9 +1,10 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { AgentDaemon, markClientSnapshotStreaming } from "../../../src/modes/daemon/daemon-mode.js";
@@ -13,10 +14,15 @@ import {
 	type DaemonOutbound,
 } from "../../../src/modes/daemon/daemon-protocol.js";
 import {
+	type DaemonWorkerFrameHeader,
+	isDaemonWorkerFrameHeader,
+} from "../../../src/modes/daemon/daemon-worker-protocol.js";
+import {
 	createSnapshotTranscriptChunks,
 	SnapshotTranscriptCache,
 	type SnapshotTranscriptChunkSource,
 } from "../../../src/modes/daemon/snapshot-transcript-cache.js";
+import { encodePrivateFrameParts, PrivateFrameDecoder } from "../../../src/modes/session-worker/private-framing.js";
 
 const tempDirectories: string[] = [];
 const activeSessionId = "active-4601";
@@ -112,6 +118,98 @@ describe("ENG-4601 worker snapshot cache", () => {
 		]);
 		expect([...createSnapshotTranscriptChunks({ activeSessionId, snapshotId, messages: [] })]).toEqual([]);
 	});
+
+	it("freezes nested transcript bytes when the selected message later mutates", () => {
+		const cacheRoot = tempDirectory();
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "selected" }],
+			api: "openai-responses",
+			provider: "openai",
+			model: "gpt-4o-mini",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		};
+		const chunks = createSnapshotTranscriptChunks({
+			activeSessionId,
+			snapshotId,
+			messages: [message],
+			cacheRoot,
+			memoryCacheBytes: 1,
+		});
+		const cacheDirectory = join(cacheRoot, readdirSync(cacheRoot)[0]!);
+		expect(existsSync(cacheDirectory)).toBe(true);
+
+		const selected = message.content[0];
+		if (selected?.type !== "text") throw new Error("expected text content");
+		selected.text = "mutated";
+
+		const frozenBytes = Buffer.concat([...chunks]).toString("utf8");
+		expect(frozenBytes).toContain('"text":"selected"');
+		expect(frozenBytes).not.toContain('"text":"mutated"');
+		chunks.dispose?.();
+		expect(existsSync(cacheDirectory)).toBe(false);
+	});
+
+	it("evicts an exact failed spill generation before a fresh nonce re-encodes it", async () => {
+		const root = tempDirectory();
+		const daemon = new AgentDaemon(join(root, "worker.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const internals = daemon as unknown as {
+			snapshotPayloadGenerations: Map<string, object>;
+			prepareWorkerSnapshotTranscript(options: {
+				activeSessionId: string;
+				snapshotId: string;
+				generationKey: string;
+				messages: readonly AgentMessage[];
+			}): Promise<SnapshotTranscriptChunkSource>;
+		};
+		const source: AgentMessage[] = [{ role: "user", content: "x".repeat(5 * 1024 * 1024), timestamp: 1 }];
+		const first = await internals.prepareWorkerSnapshotTranscript({
+			activeSessionId,
+			snapshotId: "generation-one",
+			generationKey: "stable:nonce-one",
+			messages: source,
+		});
+		const firstGeneration = internals.snapshotPayloadGenerations.get(activeSessionId);
+		const firstIterator = (first as AsyncIterable<readonly Buffer[]>)[Symbol.asyncIterator]();
+		const firstChunk = await firstIterator.next();
+		first.markFailed?.(new Error("corrupted generation one"));
+		await firstIterator.return?.();
+		expect(internals.snapshotPayloadGenerations.has(activeSessionId)).toBe(false);
+
+		const second = await internals.prepareWorkerSnapshotTranscript({
+			activeSessionId,
+			snapshotId: "generation-two",
+			generationKey: "stable:nonce-two",
+			messages: source,
+		});
+		const secondGeneration = internals.snapshotPayloadGenerations.get(activeSessionId);
+		const secondIterator = (second as AsyncIterable<readonly Buffer[]>)[Symbol.asyncIterator]();
+		const secondChunk = await secondIterator.next();
+		expect(secondGeneration).not.toBe(firstGeneration);
+		expect(secondChunk.value?.[1]).not.toBe(firstChunk.value?.[1]);
+		expect(JSON.parse(Buffer.concat(secondChunk.value ?? []).toString("utf8"))).toMatchObject({
+			type: "session_snapshot_chunk",
+			snapshotId: "generation-two",
+		});
+		while (!(await secondIterator.next()).done) {
+			// Fully consume the fresh generation to prove its new backing is readable.
+		}
+		second.dispose?.();
+	}, 60_000);
 
 	it.each([1, 2])(
 		"keeps %i same-ID worker stream(s) bounded by socket drain without shared cleanup",
@@ -222,16 +320,15 @@ describe("ENG-4601 worker snapshot cache", () => {
 			return true;
 		};
 
+		const abortedTranscript = createSnapshotTranscriptChunks({
+			activeSessionId,
+			snapshotId,
+			messages: messages("aborted"),
+			signal,
+		});
 		internals.detachClientFromSession(client, state);
 		await Promise.all([
-			internals.streamWorkerSnapshot(
-				client,
-				streamedResult(2),
-				createSnapshotTranscriptChunks({ activeSessionId, snapshotId, messages: messages("aborted"), signal }),
-				"attach",
-				signal,
-				true,
-			),
+			internals.streamWorkerSnapshot(client, streamedResult(2), abortedTranscript, "attach", signal, true),
 			internals.streamWorkerSnapshot(
 				client,
 				streamedResult(2, 1, siblingActiveSessionId, siblingSnapshotId),
@@ -356,6 +453,7 @@ describe("ENG-4601 worker snapshot cache", () => {
 			activeSessionId,
 			snapshotId,
 			error: `Snapshot ${snapshotId} was aborted`,
+			purpose: "attach",
 		});
 		expect(written).toContainEqual(
 			expect.objectContaining({
@@ -376,6 +474,143 @@ describe("ENG-4601 worker snapshot cache", () => {
 		expect(socket.listenerCount("error")).toBe(0);
 		expect(socket.destroyed).toBe(false);
 		socket.destroy();
+	});
+
+	it("keeps an aborted queued private frame behind its still-writing predecessor", async () => {
+		const root = tempDirectory();
+		const daemon = new AgentDaemon(join(root, "worker.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { client, socket } = socketClient("worker-private-frame-reservation");
+		const written: Buffer[] = [];
+		let writes = 0;
+		vi.spyOn(socket, "write").mockImplementation(((chunk: Uint8Array) => {
+			written.push(Buffer.from(chunk));
+			writes++;
+			return writes !== 1;
+		}) as typeof socket.write);
+		const frame = (snapshot: string, payload: string) =>
+			encodePrivateFrameParts<DaemonWorkerFrameHeader>(
+				{
+					kind: "outbound",
+					outboundType: "session_snapshot_chunk",
+					activeSessionId,
+					snapshotId: snapshot,
+					payloadEncoding: "jsonl",
+				},
+				[Buffer.from(payload)],
+			);
+		const internals = daemon as unknown as {
+			writePrivateFrameParts(
+				client: DaemonSocketClient,
+				parts: readonly Buffer[],
+				signal?: AbortSignal,
+			): Promise<boolean>;
+			write(client: DaemonSocketClient, message: DaemonOutbound): boolean;
+		};
+
+		const first = internals.writePrivateFrameParts(client, frame("frame-a", "payload-a"));
+		for (let attempt = 0; attempt < 10 && socket.listenerCount("drain") === 0; attempt++) {
+			await Promise.resolve();
+		}
+		const abortQueued = new AbortController();
+		const second = internals.writePrivateFrameParts(client, frame("frame-b", "payload-b"), abortQueued.signal);
+		internals.write(client, {
+			type: "session_closed",
+			activeSessionId,
+			reason: "killed",
+		});
+		abortQueued.abort();
+
+		await expect(second).rejects.toThrow("was aborted");
+		expect(written).toHaveLength(1);
+		expect(client.privateFrameWriteTail).toBeDefined();
+
+		socket.emit("drain");
+		await expect(first).resolves.toBe(true);
+		await client.privateFrameWriteTail;
+		await Promise.resolve();
+
+		const decoder = new PrivateFrameDecoder(isDaemonWorkerFrameHeader);
+		const decoded = decoder.push(Buffer.concat(written));
+		decoder.finish();
+		expect(
+			decoded.map((entry) =>
+				entry.header.kind === "outbound" ? (entry.header.snapshotId ?? entry.header.outboundType) : "command",
+			),
+		).toEqual(["frame-a", "session_closed"]);
+		expect(decoded.map((entry) => entry.payload.toString("utf8"))).not.toContain("payload-b");
+		expect(client.privateFrameWriteTail).toBeUndefined();
+		expect(socket.listenerCount("drain")).toBe(0);
+		expect(socket.listenerCount("close")).toBe(0);
+		expect(socket.listenerCount("error")).toBe(0);
+		socket.destroy();
+	});
+
+	it("closes a private channel when an active frame aborts after committing its length", async () => {
+		const root = tempDirectory();
+		const daemon = new AgentDaemon(join(root, "worker.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { client, socket } = socketClient("worker-private-frame-active-abort");
+		socket.on("error", () => {});
+		const written: Buffer[] = [];
+		let writes = 0;
+		vi.spyOn(socket, "write").mockImplementation(((chunk: Uint8Array) => {
+			written.push(Buffer.from(chunk));
+			writes++;
+			return writes !== 3;
+		}) as typeof socket.write);
+		const parts = encodePrivateFrameParts<DaemonWorkerFrameHeader>(
+			{
+				kind: "outbound",
+				outboundType: "session_snapshot_chunk",
+				activeSessionId,
+				snapshotId: "active-abort-frame",
+				payloadEncoding: "jsonl",
+			},
+			[Buffer.alloc(128 * 1024, 0x61)],
+		);
+		const internals = daemon as unknown as {
+			writePrivateFrameParts(
+				client: DaemonSocketClient,
+				parts: readonly Buffer[],
+				signal?: AbortSignal,
+			): Promise<boolean>;
+			write(client: DaemonSocketClient, message: DaemonOutbound): boolean;
+		};
+		const controller = new AbortController();
+
+		const activeWrite = internals.writePrivateFrameParts(client, parts, controller.signal);
+		for (let attempt = 0; attempt < 10 && socket.listenerCount("drain") === 0; attempt++) {
+			await Promise.resolve();
+		}
+		expect(writes).toBe(3);
+		expect(socket.listenerCount("drain")).toBe(1);
+		controller.abort();
+
+		await expect(activeWrite).resolves.toBe(false);
+		await client.privateFrameWriteTail;
+		await Promise.resolve();
+		const writesAfterAbort = written.length;
+		expect(socket.destroyed).toBe(true);
+		expect(
+			internals.write(client, {
+				type: "session_closed",
+				activeSessionId,
+				reason: "killed",
+			}),
+		).toBe(false);
+		expect(written).toHaveLength(writesAfterAbort);
+		expect(client.privateFrameWriteTail).toBeUndefined();
+		expect(socket.listenerCount("drain")).toBe(0);
+		expect(socket.listenerCount("close")).toBe(0);
 	});
 
 	it("closes a permanently backpressured worker channel after an aborted snapshot", async () => {
