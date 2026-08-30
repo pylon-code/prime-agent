@@ -715,6 +715,7 @@ export class DaemonSupervisor {
 	private socketLease?: DaemonSocketPathLease;
 	private ownership?: Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>>;
 	private cleanupPromise?: Promise<void>;
+	private shutdownTask?: Promise<never>;
 	private shuttingDown = false;
 	private updateRestartPhase?: "draining" | "fencing" | "prepared";
 	private readonly mutationDrain = new MutationDrainLatch();
@@ -6470,7 +6471,15 @@ export class DaemonSupervisor {
 		if (removeDescriptor) {
 			this.deleteWorkerDescriptor(worker);
 		}
-		this.workers.delete(worker.descriptor.workerId);
+		const preserveRecoveryRegistration =
+			!removeDescriptor &&
+			recoveryCleanup &&
+			directChild !== undefined &&
+			this.workers.get(worker.descriptor.workerId) === worker &&
+			(worker.descriptor.stopRequestedAt !== undefined || this.shuttingDown);
+		if (!preserveRecoveryRegistration) {
+			this.workers.delete(worker.descriptor.workerId);
+		}
 		if (!this.shuttingDown) {
 			this.broadcastHeartbeatsChanged();
 		}
@@ -6797,16 +6806,26 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async shutdown(
+	private shutdown(
 		exitCode: number,
 		stopWorkers: boolean,
 		relaunch = false,
 		forceWorkers = false,
 		closingReason?: DaemonClosingReason,
 	): Promise<never> {
-		if (this.shuttingDown) {
-			process.exit(exitCode);
-		}
+		if (this.shutdownTask) return this.shutdownTask;
+		const task = this.runShutdown(exitCode, stopWorkers, relaunch, forceWorkers, closingReason);
+		this.shutdownTask = task;
+		return task;
+	}
+
+	private async runShutdown(
+		exitCode: number,
+		stopWorkers: boolean,
+		relaunch: boolean,
+		forceWorkers: boolean,
+		closingReason?: DaemonClosingReason,
+	): Promise<never> {
 		this.shuttingDown = true;
 		this.clearIdleEvictionTimer();
 		await this.idleEvictionSweep?.catch(() => undefined);

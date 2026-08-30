@@ -1064,12 +1064,19 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 
 		try {
-			const shutdown = supervisor.shutdown(0, true, false, true).then(
+			const shutdownTask = supervisor.shutdown(0, true, false, true);
+			const shutdown = shutdownTask.then(
 				() => undefined,
 				(error: unknown) => error,
 			);
 			await cleanupStarted.promise;
 			expect(catalogStop).not.toHaveBeenCalled();
+			expect(exit).not.toHaveBeenCalled();
+
+			// A second public command or signal joins the authoritative drain;
+			// it cannot force process exit while the descriptor is still present.
+			const reentrantShutdown = supervisor.shutdown(99, true, false, true);
+			expect(reentrantShutdown).toBe(shutdownTask);
 			expect(exit).not.toHaveBeenCalled();
 
 			releaseCleanup.resolve();
@@ -2524,6 +2531,79 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(workers.has(worker.descriptor.workerId)).toBe(false);
 		} finally {
 			existsSpy.mockRestore();
+		}
+	});
+
+	it("preserves a tombstoned registration when replacement-child rollback joins exact cleanup", async () => {
+		const rollbackGate = createDeferred<void>();
+		const worker = {
+			descriptor: {
+				workerId: "owned-cleanup-published-recovery-worker",
+				pid: 111_126,
+				processStartId: "proc:owned-cleanup-published-recovery",
+				rootActiveSessionId: "active-owned-cleanup-published-recovery",
+				lifecycle: "starting" as const,
+				stopRequestedAt: undefined as string | undefined,
+			},
+			client: undefined,
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+			recovery: undefined as Promise<void> | undefined,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const child = {
+			exitCode: 0,
+			signalCode: null,
+			kill: vi.fn(() => true),
+		} as unknown as ChildProcess;
+		const deleteWorkerDescriptor = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			shuttingDown: false,
+			persistWorker: vi.fn(),
+			abortTranscriptPreparations: vi.fn(),
+			deleteWorkerDescriptor,
+			invalidateWorkerSessionInputPauses: vi.fn(),
+			broadcastHeartbeatsChanged: vi.fn(),
+			log: vi.fn(),
+		}) as {
+			stopWorker(
+				target: typeof worker,
+				removeDescriptor: boolean,
+				force?: boolean,
+				archiveSession?: boolean,
+				recoveryCleanup?: boolean,
+				directChild?: { child: ChildProcess; closed: Promise<void> },
+			): Promise<void>;
+		};
+		worker.recovery = (async () => {
+			await rollbackGate.promise;
+			await supervisor.stopWorker(worker, false, true, false, true, { child, closed: Promise.resolve() });
+			// The replacement child is gone, but its tombstoned descriptor and
+			// registration still belong to the outer authoritative stop.
+			expect(workers.get(worker.descriptor.workerId)).toBe(worker);
+			expect(worker.descriptor.stopRequestedAt).toBeDefined();
+		})();
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
+		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
+		try {
+			const stopping = supervisor.stopWorker(worker, true, true);
+			await Promise.resolve();
+			expect(worker.descriptor.stopRequestedAt).toBeDefined();
+			rollbackGate.resolve();
+			await stopping;
+
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(deleteWorkerDescriptor).toHaveBeenCalledOnce();
+			expect(workers.has(worker.descriptor.workerId)).toBe(false);
+		} finally {
+			existsSpy.mockRestore();
+			aliveSpy.mockRestore();
 		}
 	});
 
