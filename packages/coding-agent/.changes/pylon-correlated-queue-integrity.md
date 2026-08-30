@@ -1,0 +1,1 @@
+- Kept correlated prompt payloads immutable after queue ownership and preserved their event and usage attribution through post-compaction continuation.
