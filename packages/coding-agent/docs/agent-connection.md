@@ -50,6 +50,10 @@ On attach it advertises supported capabilities and receives a coherent session s
 
 The adapter rejects duplicate or retired-generation events. After a transient socket loss it reconnects with the same client identity and last cursor, reattaches, and emits a resynchronized snapshot. If incremental replay is unavailable, the session snapshot is the source of truth.
 
+A daemon hello capability is only an offer. After `attach()`, use `supportsNegotiatedCapability()` to prove that the exact request and validated attach result established an optional client capability on the current physical transport. A new attach invalidates the old public proof synchronously. Stale responses, replacement failure, shared-client capability mutation, socket replacement, and disposal cannot restore it. Correlated runtime frames that arrive before the attach result are held behind this proof and released only when the validated echo commits. The pre-proof fence has independent frame-count and cumulative structural-weight limits. The atomic chunked-replacement fence applies the same limits to its queued frames. Overflow fails closed and discards the entire fence with a fixed payload-free error. Attachment admission, route/epoch change, transport loss, disposal, or matching session close retires an old chunked fence so it cannot block a later proved route; delayed old snapshot transfers stay ignored until a fresh attachment commits.
+
+An explicit `DaemonClient.close()` is terminal owner disposal. It wakes and stops normal or update recovery through every connection sharing the client. An already-running recovery callback cannot be cancelled, but after it returns the adapter cannot connect, attach, query restored sessions, or publish recovery events.
+
 Key files:
 
 - `src/modes/agent-connection/daemon-agent-connection.ts`

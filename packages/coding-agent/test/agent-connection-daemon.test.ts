@@ -40,11 +40,15 @@ class FakeDaemonClient {
 	attachResultFactory: ((command: Extract<DaemonCommand, { type: "attach" }>) => DaemonAttachResult) | undefined;
 	reattachResultFactory: ((command: Extract<DaemonCommand, { type: "reattach" }>) => DaemonAttachResult) | undefined;
 	switchSessionActiveSessionId: string | undefined;
+	attachGate: Promise<void> | undefined;
+	reattachGate: Promise<void> | undefined;
+	reconnectGate: Promise<void> | undefined;
 	restoredAttachGate: Promise<void> | undefined;
 	restoredAttachCompleted = 0;
 	closeCount = 0;
-	emitCloseOnClose = false;
 	connected = true;
+	ownerClosed = false;
+	transportGeneration = 1;
 	reconnectCount = 0;
 	resetTransportCount = 0;
 	reconnectError: Error | undefined;
@@ -161,6 +165,7 @@ class FakeDaemonClient {
 					data: { sessions: this.updateRestartSessions },
 				};
 			case "attach":
+				if (this.attachGate) await this.attachGate;
 				if (this.attachFailures > 0) {
 					this.attachFailures--;
 					throw new Error("attach failed");
@@ -186,6 +191,7 @@ class FakeDaemonClient {
 						createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12),
 				};
 			case "reattach":
+				if (this.reattachGate) await this.reattachGate;
 				return {
 					type: "response",
 					command: command.type,
@@ -607,6 +613,10 @@ class FakeDaemonClient {
 	}
 
 	emitClose(error: Error): void {
+		if (this.connected) {
+			this.connected = false;
+			this.transportGeneration++;
+		}
 		for (const listener of [...this.closeListeners]) {
 			listener(error);
 		}
@@ -614,7 +624,16 @@ class FakeDaemonClient {
 
 	enableRequestRecovery(): void {}
 
+	getTransportGeneration(): number {
+		return this.transportGeneration;
+	}
+
+	get isClosed(): boolean {
+		return this.ownerClosed;
+	}
+
 	async connect(): Promise<void> {
+		if (this.ownerClosed) throw new Error("Prime Agent daemon client is closed");
 		if (this.connected) {
 			throw new Error("Prime Agent daemon client is already connected");
 		}
@@ -623,6 +642,7 @@ class FakeDaemonClient {
 			throw this.reconnectError;
 		}
 		this.connected = true;
+		this.transportGeneration++;
 	}
 
 	async waitForHello(): Promise<DaemonHello> {
@@ -631,18 +651,23 @@ class FakeDaemonClient {
 
 	resetTransportForReconnect(): void {
 		this.resetTransportCount++;
+		if (this.connected) this.transportGeneration++;
 		this.connected = false;
 	}
 
 	async reconnect(): Promise<void> {
+		if (this.ownerClosed) throw new Error("Prime Agent daemon client is closed");
 		if (this.connected) {
 			return;
 		}
 		this.reconnectCount++;
+		if (this.reconnectGate) await this.reconnectGate;
+		if (this.ownerClosed) throw new Error("Prime Agent daemon client is closed");
 		if (this.reconnectError) {
 			throw this.reconnectError;
 		}
 		this.connected = true;
+		this.transportGeneration++;
 	}
 
 	getMessageListenerCount(): number {
@@ -654,15 +679,17 @@ class FakeDaemonClient {
 	}
 
 	close(): void {
+		if (this.ownerClosed) return;
+		this.ownerClosed = true;
 		this.closeCount++;
+		if (this.connected) this.transportGeneration++;
 		this.connected = false;
-		if (this.emitCloseOnClose) {
-			this.emitClose(new Error("Daemon socket closed"));
-		}
+		this.emitClose(new Error("Daemon socket closed"));
 	}
 
 	disconnectForReconnect(reason: "shutdown" | "update"): void {
 		this.closeCount++;
+		if (this.connected) this.transportGeneration++;
 		this.connected = false;
 		this.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", reason));
 	}
@@ -798,6 +825,100 @@ function createAttachResult(
 	};
 }
 
+function fillSnapshotRetirementBudget(
+	client: FakeDaemonClient,
+	activeSessionId: string,
+	lastEventSequence = 20,
+	capabilities?: readonly string[],
+): DaemonAttachResult["snapshot"] {
+	const snapshot = createAttachResult(activeSessionId, "client-1", capabilities, lastEventSequence, {
+		messages: [{ role: "user", content: "retired close-budget tail", timestamp: lastEventSequence }],
+	}).snapshot;
+	const { messages: _messages, ...header } = snapshot;
+	for (let index = 0; index < 129; index++) {
+		client.emitMessage({
+			type: "session_snapshot_begin",
+			activeSessionId,
+			snapshotId: `close-budget-${index}`,
+			snapshot: header,
+			messageCount: 1,
+			targetChunkBytes: 512 * 1024,
+			purpose: "resync",
+		});
+	}
+	return snapshot;
+}
+
+function completeSnapshotRetirementBudget(
+	client: FakeDaemonClient,
+	activeSessionId: string,
+	snapshot: DaemonAttachResult["snapshot"],
+): void {
+	client.emitMessage({
+		type: "session_snapshot_chunk",
+		activeSessionId,
+		snapshotId: "close-budget-128",
+		index: 0,
+		messages: snapshot.messages,
+	});
+	client.emitMessage({
+		type: "session_snapshot_end",
+		activeSessionId,
+		snapshotId: "close-budget-128",
+		chunkCount: 1,
+		lastEventSequence: snapshot.lastEventSequence,
+		lastEventCursor: snapshot.lastEventCursor,
+	});
+}
+
+function emitDirectRuntimeSnapshotFrames(
+	client: FakeDaemonClient,
+	activeSessionId: string,
+	lastEventSequence = 99,
+): void {
+	const snapshot = createAttachResult(activeSessionId, "client-1", undefined, lastEventSequence, {
+		state: createConnectionState(activeSessionId, "session-stale-direct"),
+		messages: [{ role: "user", content: "stale direct snapshot", timestamp: lastEventSequence }],
+	}).snapshot;
+	client.emitMessage({ type: "session_resynced", activeSessionId, snapshot });
+	client.emitMessage({
+		type: "session_replaced",
+		activeSessionId,
+		state: snapshot.state,
+		messages: [],
+		snapshotFollows: true,
+	});
+}
+
+function startPendingChunkedReplacement(
+	client: FakeDaemonClient,
+	activeSessionId: string,
+	snapshotId: string,
+	lastEventSequence = 21,
+): void {
+	const result = createAttachResult(activeSessionId, "client-1", undefined, lastEventSequence, {
+		state: createConnectionState(activeSessionId, "session-pending-replacement"),
+		messages: [{ role: "user", content: "pending replacement", timestamp: lastEventSequence }],
+	});
+	const { messages: _messages, ...header } = result.snapshot;
+	client.emitMessage({
+		type: "session_replaced",
+		activeSessionId,
+		state: result.snapshot.state,
+		messages: [],
+		snapshotFollows: true,
+	});
+	client.emitMessage({
+		type: "session_snapshot_begin",
+		activeSessionId,
+		snapshotId,
+		snapshot: header,
+		messageCount: result.snapshot.messages.length,
+		targetChunkBytes: 512 * 1024,
+		purpose: "replacement",
+	});
+}
+
 function emitRlmChildUpdate(
 	client: FakeDaemonClient,
 	activeSessionId: string,
@@ -899,6 +1020,1644 @@ describe("DaemonAgentConnection", () => {
 			expect(request.capabilities?.includes("correlated_prompt_lifecycle_v1") ?? false).toBe(supported);
 		},
 	);
+
+	it("proves negotiated capabilities only after the exact attach commits", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		releaseAttach();
+		await attaching;
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("clears a proved capability synchronously when a later attach is admitted", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+
+		const attaching = connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2),
+		);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		releaseAttach();
+		await attaching;
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("lets only the latest of two same-stack attach admissions reach the daemon", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+
+		const superseded = connection.attach();
+		const latest = connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await expect(superseded).rejects.toThrow("Daemon connection attachment changed during attach");
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2),
+		);
+		releaseAttach();
+		await latest;
+
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("fails closed before ignored snapshot IDs can evict a queued-admission tombstone", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const active = connection.attach();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2),
+		);
+		const queued = connection.attach();
+		const stale = createAttachResult("active-1", "client-1", undefined, 14, {
+			messages: [{ role: "user", content: "retired overflow", timestamp: 1 }],
+		}).snapshot;
+		const { messages: _messages, ...staleHeader } = stale;
+		const begin = (snapshotId: string) => ({
+			type: "session_snapshot_begin" as const,
+			activeSessionId: "active-1",
+			snapshotId,
+			snapshot: staleHeader,
+			messageCount: 1,
+			targetChunkBytes: 512 * 1024,
+			purpose: "resync" as const,
+		});
+		for (let index = 0; index < 129; index++) fakeClient.emitMessage(begin(`overflow-retired-${index}`));
+		await vi.waitFor(() => expect(events.some((event) => event.type === "closed")).toBe(true));
+		expect((connection as unknown as { ignoredSnapshotIds: Set<string> }).ignoredSnapshotIds.size).toBe(128);
+		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+
+		releaseAttach();
+		await expect(active).rejects.toThrow("Daemon connection attachment changed during attach");
+		await expect(queued).rejects.toThrow("Daemon connection replacement reconciliation has failed");
+		fakeClient.emitMessage(begin("overflow-retired-0"));
+		fakeClient.emitMessage({
+			type: "session_snapshot_chunk",
+			activeSessionId: "active-1",
+			snapshotId: "overflow-retired-0",
+			index: 0,
+			messages: stale.messages,
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_end",
+			activeSessionId: "active-1",
+			snapshotId: "overflow-retired-0",
+			chunkCount: 1,
+			lastEventSequence: 14,
+			lastEventCursor: { generation: "generation-active-1", sequence: 14 },
+		});
+		await Promise.resolve();
+
+		expect(events).toEqual([
+			{ type: "closed", error: "Daemon replacement lifecycle state could not be reconciled." },
+		]);
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("lets a newer admission retire a stalled streamed attach and take the mutation tail", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		let attachmentIndex = 0;
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			if (attachmentIndex++ > 0) return result;
+			return {
+				...result,
+				snapshot: { ...result.snapshot, messages: [] },
+				snapshotStream: { id: "stalled-superseded", messageCount: 0, targetChunkBytes: 512 * 1024 },
+			};
+		};
+
+		const superseded = connection.attach();
+		await vi.waitFor(() =>
+			expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(
+				1,
+			),
+		);
+		const latest = connection.attach();
+
+		await expect(superseded).rejects.toThrow("Daemon connection attachment changed during attach");
+		await latest;
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(3);
+		expect((connection as unknown as { attachmentAdmissionInFlight: boolean }).attachmentAdmissionInFlight).toBe(
+			false,
+		);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("prevents an active superseded attach from publishing or releasing buffered frames", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+
+		const superseded = connection.attach();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2),
+		);
+		fakeClient.emitMessage({
+			type: "prompt_lifecycle",
+			activeSessionId: "active-1",
+			lifecycle: {
+				correlationId: "superseded-buffer",
+				phase: "queued",
+				kind: "model_prompt",
+				revision: 1,
+				deliveryCrossed: false,
+			},
+		});
+		const latest = connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		releaseAttach();
+
+		await expect(superseded).rejects.toThrow("Daemon connection attachment changed during attach");
+		await latest;
+		expect(events).toEqual([]);
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(3);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("prevents a superseded reattach from publishing while a later reattach is pending", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.switchSessionActiveSessionId = "active-next";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		let releaseReattach!: () => void;
+		fakeClient.reattachGate = new Promise<void>((resolve) => {
+			releaseReattach = resolve;
+		});
+		const replacementProofs: boolean[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "session_replaced") {
+				replacementProofs.push(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1"));
+			}
+		});
+
+		const superseded = connection.switchSession("/tmp/session-next.jsonl");
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "reattach")).toHaveLength(1),
+		);
+		const latest = connection.switchSession("/tmp/session-next.jsonl");
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "switch_session")).toHaveLength(2),
+		);
+		await vi.waitFor(() =>
+			expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false),
+		);
+		releaseReattach();
+
+		await expect(superseded).rejects.toThrow("Daemon connection attachment changed during attach");
+		await expect(latest).resolves.toEqual({ cancelled: false });
+		expect(fakeClient.requests.filter((request) => request.type === "reattach")).toHaveLength(2);
+		expect(replacementProofs).toEqual([true]);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("buffers correlated runtime frames until the exact attach proof commits", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+		await expect(
+			connection.submitCorrelatedPrompt("must wait", { correlationId: "before-proof" }),
+		).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach"]);
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
+				promptCorrelationId: null,
+			},
+			attribution: { scope: "session" },
+		});
+		fakeClient.emitMessage({
+			type: "prompt_lifecycle",
+			activeSessionId: "active-1",
+			lifecycle: {
+				correlationId: "prompt-early",
+				phase: "delivered",
+				kind: "model_prompt",
+				revision: 1,
+				deliveryCrossed: true,
+			},
+		});
+		await Promise.resolve();
+		expect(events).toEqual([]);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		const fence = connection as unknown as {
+			pendingNegotiatedRuntimeFrames: unknown[];
+			pendingNegotiatedRuntimeFrameWeight: number;
+		};
+		expect(fence.pendingNegotiatedRuntimeFrames).toHaveLength(2);
+		expect(fence.pendingNegotiatedRuntimeFrameWeight).toBeGreaterThan(0);
+
+		releaseAttach();
+		await attaching;
+		await vi.waitFor(() => expect(events).toHaveLength(2));
+		expect(events.map((event) => event.type)).toEqual(["session_event", "prompt_lifecycle"]);
+		expect(fence.pendingNegotiatedRuntimeFrames).toEqual([]);
+		expect(fence.pendingNegotiatedRuntimeFrameWeight).toBe(0);
+	});
+
+	it("discards pre-proof correlated runtime frames when the attach echo omits the capability", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			result.client.capabilities = result.client.capabilities.filter(
+				(capability) => capability !== "correlated_prompt_lifecycle_v1",
+			);
+			delete result.snapshot.promptLifecycles;
+			return result;
+		};
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+		fakeClient.emitMessage({
+			type: "prompt_lifecycle",
+			activeSessionId: "active-1",
+			lifecycle: {
+				correlationId: "unproved-buffered",
+				phase: "queued",
+				kind: "model_prompt",
+				revision: 1,
+				deliveryCrossed: false,
+			},
+		});
+		const fence = connection as unknown as {
+			pendingNegotiatedRuntimeFrames: unknown[];
+			pendingNegotiatedRuntimeFrameWeight: number;
+		};
+		expect(fence.pendingNegotiatedRuntimeFrames).toHaveLength(1);
+		expect(fence.pendingNegotiatedRuntimeFrameWeight).toBeGreaterThan(0);
+		releaseAttach();
+		await attaching;
+		for (let flush = 0; flush < 3; flush++) await Promise.resolve();
+
+		expect(events).toEqual([]);
+		expect(fence.pendingNegotiatedRuntimeFrames).toEqual([]);
+		expect(fence.pendingNegotiatedRuntimeFrameWeight).toBe(0);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await expect(
+			connection.submitCorrelatedPrompt("must fail", { correlationId: "unproved-buffered" }),
+		).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+	});
+
+	it("fails closed when pre-proof correlated runtime buffering exceeds its bound", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const closed: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "closed") closed.push(event);
+		});
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+
+		for (let revision = 1; revision <= 129; revision++) {
+			fakeClient.emitMessage({
+				type: "prompt_lifecycle",
+				activeSessionId: "active-1",
+				lifecycle: {
+					correlationId: `pre-proof-${revision}`,
+					phase: "queued",
+					kind: "model_prompt",
+					revision,
+					deliveryCrossed: false,
+				},
+			});
+		}
+		await vi.waitFor(() => expect(closed).toHaveLength(1));
+		releaseAttach();
+
+		await expect(attaching).rejects.toThrow("Daemon connection attachment changed during attach");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await expect(connection.attach()).rejects.toThrow("Daemon connection replacement reconciliation has failed");
+	});
+
+	it("fails closed on cumulative pre-proof runtime-frame weight below the count cap", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const closed: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "closed") closed.push(event);
+		});
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+		const canary = `private-payload-canary:${"x".repeat(80 * 1024)}`;
+		const emitLargeAttributedFrame = (id: string) => {
+			fakeClient.emitMessage({
+				type: "extension_ui_request",
+				activeSessionId: "active-1",
+				id,
+				method: "render",
+				payload: { value: canary },
+				attribution: { scope: "session" },
+			});
+		};
+
+		emitLargeAttributedFrame("large-1");
+		const fence = connection as unknown as {
+			pendingNegotiatedRuntimeFrames: unknown[];
+			pendingNegotiatedRuntimeFrameWeight: number;
+		};
+		expect(fence.pendingNegotiatedRuntimeFrames).toHaveLength(1);
+		expect(fence.pendingNegotiatedRuntimeFrameWeight).toBeGreaterThan(0);
+		emitLargeAttributedFrame("large-2");
+		await vi.waitFor(() => expect(closed).toHaveLength(1));
+
+		expect(fence.pendingNegotiatedRuntimeFrames).toEqual([]);
+		expect(fence.pendingNegotiatedRuntimeFrameWeight).toBe(0);
+		expect(closed[0]).toEqual({
+			type: "closed",
+			error: "Daemon replacement lifecycle state could not be reconciled.",
+		});
+		expect(JSON.stringify(closed)).not.toContain("private-payload-canary");
+		releaseAttach();
+		await expect(attaching).rejects.toThrow("Daemon connection attachment changed during attach");
+	});
+
+	it("fails closed without retaining one individually overweight pre-proof frame", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const closed: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "closed") closed.push(event);
+		});
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+
+		fakeClient.emitMessage({
+			type: "extension_ui_request",
+			activeSessionId: "active-1",
+			id: "overweight",
+			method: "render",
+			payload: { value: `single-private-canary:${"x".repeat(140 * 1024)}` },
+			attribution: { scope: "session" },
+		});
+		await vi.waitFor(() => expect(closed).toHaveLength(1));
+		const fence = connection as unknown as {
+			pendingNegotiatedRuntimeFrames: unknown[];
+			pendingNegotiatedRuntimeFrameWeight: number;
+		};
+		expect(fence.pendingNegotiatedRuntimeFrames).toEqual([]);
+		expect(fence.pendingNegotiatedRuntimeFrameWeight).toBe(0);
+		expect(JSON.stringify(closed)).not.toContain("single-private-canary");
+		releaseAttach();
+		await expect(attaching).rejects.toThrow("Daemon connection attachment changed during attach");
+	});
+
+	it("does not treat a server offer as attach-side negotiation", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			result.client.capabilities = result.client.capabilities.filter(
+				(capability) => capability !== "correlated_prompt_lifecycle_v1",
+			);
+			delete result.snapshot.promptLifecycles;
+			return result;
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await connection.attach();
+
+		expect(connection.supportsCorrelatedPromptLifecycle()).toBe(true);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		const events: AgentConnectionEvent[] = [];
+		const resynced = new Promise<void>((resolve) => {
+			connection.subscribe((event) => {
+				events.push(event);
+				if (event.type === "session_resynced") resolve();
+			});
+		});
+		fakeClient.emitMessage({
+			type: "prompt_lifecycle",
+			activeSessionId: "active-1",
+			lifecycle: {
+				correlationId: "unproved-prompt",
+				phase: "delivered",
+				kind: "model_prompt",
+				revision: 1,
+				deliveryCrossed: true,
+			},
+		});
+		await Promise.resolve();
+		expect(events).toEqual([]);
+		const snapshot = createAttachResult("active-1", "resync-client", [], 13).snapshot;
+		fakeClient.emitMessage({ type: "session_resynced", activeSessionId: "active-1", snapshot });
+		await resynced;
+		expect(events.map((event) => event.type)).toEqual(["session_resynced"]);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("rejects a wrong-client attach proof without retaining capability state", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			result.client.id = "private-client-canary";
+			return result;
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		const error = await connection.attach().catch((cause: unknown) => cause);
+
+		expect(error).toEqual(new Error("Daemon returned invalid attached client capability proof"));
+		expect(String(error)).not.toContain("private-client-canary");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it.each(["duplicate", "unrequested", "unknown", "non-array", "non-string"] as const)(
+		"rejects %s attached capability proof without retaining state",
+		async (mode) => {
+			const fakeClient = new FakeDaemonClient();
+			if (mode !== "unrequested") fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+			fakeClient.attachResultFactory = (command) => {
+				const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+				if (mode === "duplicate") {
+					result.client.capabilities.push("correlated_prompt_lifecycle_v1");
+				} else if (mode === "unrequested") {
+					result.client.capabilities.push("correlated_prompt_lifecycle_v1");
+					result.snapshot.promptLifecycles = { records: [], expired: [] };
+				} else if (mode === "unknown") {
+					(result.client.capabilities as unknown[]).push("private-capability-canary");
+				} else if (mode === "non-array") {
+					(result.client as unknown as { capabilities: unknown }).capabilities = null;
+				} else {
+					(result.client.capabilities as unknown[]).push(undefined);
+				}
+				return result;
+			};
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+			const error = await connection.attach().catch((cause: unknown) => cause);
+			expect(error).toEqual(new Error("Daemon returned invalid attached client capability proof"));
+			expect(String(error)).not.toContain("private-capability-canary");
+			expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		},
+	);
+
+	it("clears negotiated proof synchronously when the daemon socket closes", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		fakeClient.emitClose(new Error("private close canary"));
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("treats explicit DaemonClient.close as terminal instead of recovering it", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const recoverDaemon = vi.fn(async () => {});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", { recoverDaemon });
+		await connection.attach();
+		const closed = new Promise<AgentConnectionEvent>((resolve) => {
+			connection.subscribe((event) => {
+				if (event.type === "closed") resolve(event);
+			});
+		});
+
+		fakeClient.ownerClosed = true;
+		fakeClient.emitClose(new Error("private owner-close canary"));
+
+		await expect(closed).resolves.toEqual({
+			type: "closed",
+			error: "Prime Agent daemon client was closed.",
+		});
+		expect(recoverDaemon).not.toHaveBeenCalled();
+		expect(fakeClient.reconnectCount).toBe(0);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("stops an in-flight normal recovery when the owner closes a socketless client", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseRecovery!: () => void;
+		const recoveryGate = new Promise<void>((resolve) => {
+			releaseRecovery = resolve;
+		});
+		const recoverDaemon = vi.fn(async () => recoveryGate);
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			recoverDaemon,
+			reconnectTimeoutMs: 500,
+		});
+		await connection.attach();
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		fakeClient.emitClose(new Error("private transport-loss canary"));
+		await vi.waitFor(() => expect(recoverDaemon).toHaveBeenCalledTimes(1));
+		const recovery = (connection as unknown as { reconnectPromise?: Promise<void> }).reconnectPromise;
+		expect(recovery).toBeDefined();
+		fakeClient.close();
+		await vi.waitFor(() =>
+			expect(events.filter((event) => event.type === "closed")).toEqual([
+				{ type: "closed", error: "Prime Agent daemon client was closed." },
+			]),
+		);
+		releaseRecovery();
+		await recovery;
+
+		expect(recoverDaemon).toHaveBeenCalledTimes(1);
+		expect(fakeClient.reconnectCount).toBe(0);
+		expect(events.filter((event) => event.type === "connection_status" && event.status === "connected")).toEqual([]);
+		expect(JSON.stringify(events.filter((event) => event.type === "closed"))).not.toContain("private");
+	});
+
+	it("stops an in-flight update recovery when the owner closes a socketless client", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseReconnect!: () => void;
+		fakeClient.reconnectGate = new Promise<void>((resolve) => {
+			releaseReconnect = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		fakeClient.emitClose(new DaemonSocketClosedError("/tmp/private-update-canary.sock", "update"));
+		await vi.waitFor(() => expect(fakeClient.reconnectCount).toBe(1));
+		const recovery = (connection as unknown as { updateReconnectPromise?: Promise<void> }).updateReconnectPromise;
+		expect(recovery).toBeDefined();
+		fakeClient.close();
+		await vi.waitFor(() =>
+			expect(events.filter((event) => event.type === "closed")).toEqual([
+				{ type: "closed", error: "Prime Agent daemon client was closed." },
+			]),
+		);
+		releaseReconnect();
+		await recovery;
+
+		expect(fakeClient.reconnectCount).toBe(1);
+		expect(fakeClient.requests.filter((request) => request.type === "list")).toEqual([]);
+		expect(events.filter((event) => event.type === "connection_status" && event.status === "connected")).toEqual([]);
+		expect(JSON.stringify(events.filter((event) => event.type === "closed"))).not.toContain("private");
+	});
+
+	it("serializes shared-client attaches and proves only the latest completed attachment", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseFirst!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const first = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		const second = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-b");
+
+		const firstAttach = first.attach();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1),
+		);
+		const secondAttach = second.attach();
+		await Promise.resolve();
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
+		releaseFirst();
+		await Promise.all([firstAttach, secondAttach]);
+
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("fences an in-flight attach across a silent shared transport reset", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+		fakeClient.resetTransportForReconnect();
+		releaseAttach();
+
+		await expect(attaching).rejects.toThrow("Daemon connection attachment changed during attach");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("fences an in-flight attach when its session closes before the response", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const closed: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "closed") closed.push(event);
+		});
+
+		const attaching = connection.attach();
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "attach")).toBe(true));
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-1", reason: "killed" });
+		releaseAttach();
+
+		await expect(attaching).rejects.toThrow("Daemon connection attachment changed during attach");
+		await vi.waitFor(() => expect(closed).toHaveLength(1));
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await expect(connection.attach()).rejects.toThrow("Daemon connection replacement reconciliation has failed");
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("fences a pending target reattach when the target generation closes", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.switchSessionActiveSessionId = "active-target";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-source");
+		await connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		let releaseReattach!: () => void;
+		fakeClient.reattachGate = new Promise<void>((resolve) => {
+			releaseReattach = resolve;
+		});
+
+		const switching = connection.switchSession("/tmp/target.jsonl");
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "reattach")).toBe(true));
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-target", reason: "replaced" });
+		releaseReattach();
+
+		await expect(switching).rejects.toThrow("Daemon connection attachment changed during attach");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("rejects attach re-entry throughout the owned-session dispose wait", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+		});
+		await connection.attach();
+		let releaseReconnect!: () => void;
+		const reconnect = new Promise<void>((resolve) => {
+			releaseReconnect = resolve;
+		});
+		fakeClient.connected = false;
+		(connection as unknown as { reconnectPromise?: Promise<void> }).reconnectPromise = reconnect;
+
+		const disposing = connection.dispose();
+		await Promise.resolve();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await expect(connection.attach()).rejects.toThrow("Daemon connection is disposing");
+		releaseReconnect();
+		await disposing;
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("allows only an unproved owned-session cleanup reattach once disposal begins", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseRecovery!: () => void;
+		const recoverDaemon = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					releaseRecovery = resolve;
+				}),
+		);
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			recoverDaemon,
+			reconnectTimeoutMs: 2000,
+		});
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		fakeClient.connected = false;
+		fakeClient.emitClose(new Error("Daemon socket closed"));
+		await vi.waitFor(() => expect(recoverDaemon).toHaveBeenCalledOnce());
+
+		const disposing = connection.dispose();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await expect(connection.attach()).rejects.toThrow("Daemon connection is disposing");
+		releaseRecovery();
+		await disposing;
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "complete_owned_session",
+			activeSessionId: "active-owned",
+		});
+		expect(events).not.toContainEqual(expect.objectContaining({ type: "session_resynced" }));
+	});
+
+	it("invalidates same-session peers on shared-client attach and detach", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.serverCapabilities.add("extension_ui");
+		const first = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-shared");
+		const second = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-shared", {
+			supportsExtensionUi: false,
+		});
+		await first.attach();
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		expect(first.supportsNegotiatedCapability("extension_ui")).toBe(true);
+
+		await second.attach();
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		expect(second.supportsNegotiatedCapability("extension_ui")).toBe(false);
+
+		await first.dispose();
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("does not replay a retired same-route snapshot begin after a fresh attach commits", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		await connection.attach();
+		const retired = createAttachResult("active-a", "client-1", ["correlated_prompt_lifecycle_v1"], 14, {
+			messages: [{ role: "user", content: "retired", timestamp: 1 }],
+		}).snapshot;
+		const { messages: _retiredMessages, ...retiredHeader } = retired;
+		const retiredBegin = {
+			type: "session_snapshot_begin" as const,
+			activeSessionId: "active-a",
+			snapshotId: "retired-same-route-snapshot",
+			snapshot: retiredHeader,
+			messageCount: 1,
+			targetChunkBytes: 512 * 1024,
+			purpose: "resync" as const,
+		};
+		const retiredChunk = {
+			type: "session_snapshot_chunk" as const,
+			activeSessionId: "active-a",
+			snapshotId: "retired-same-route-snapshot",
+			index: 0,
+			messages: retired.messages,
+		};
+		const retiredEnd = {
+			type: "session_snapshot_end" as const,
+			activeSessionId: "active-a",
+			snapshotId: "retired-same-route-snapshot",
+			chunkCount: 1,
+			lastEventSequence: 14,
+			lastEventCursor: { generation: "generation-active-a", sequence: 14 },
+		};
+		fakeClient.emitMessage(retiredBegin);
+		fakeClient.emitMessage(retiredChunk);
+		fakeClient.attachResultFactory = (command) =>
+			createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 14, {
+				messages: [{ role: "user", content: "fresh attach", timestamp: 2 }],
+			});
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+
+		fakeClient.emitMessage(retiredBegin);
+		fakeClient.emitMessage(retiredChunk);
+		fakeClient.emitMessage(retiredEnd);
+		fakeClient.emitMessage(retiredEnd);
+		await Promise.resolve();
+
+		expect(events).toEqual([]);
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+			messages: [{ role: "user", content: "fresh attach", timestamp: 2 }],
+		});
+		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
+	});
+
+	it("lets an exact current streamed attach rebind a retired snapshot ID with a fresh begin", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		await connection.attach();
+		const fresh = createAttachResult("active-a", "client-1", ["correlated_prompt_lifecycle_v1"], 15, {
+			messages: [{ role: "user", content: "fresh rebound", timestamp: 3 }],
+		});
+		const { messages: _freshMessages, ...freshHeader } = fresh.snapshot;
+		fakeClient.emitMessage({
+			type: "session_snapshot_begin",
+			activeSessionId: "active-a",
+			snapshotId: "rebound-current-request",
+			snapshot: freshHeader,
+			messageCount: 1,
+			targetChunkBytes: 512 * 1024,
+			purpose: "resync",
+		});
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 15, {
+				messages: fresh.snapshot.messages,
+			});
+			return {
+				...result,
+				snapshot: { ...result.snapshot, messages: [] },
+				snapshotStream: { id: "rebound-current-request", messageCount: 1, targetChunkBytes: 512 * 1024 },
+			};
+		};
+
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		const attaching = connection.attach();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2),
+		);
+		fakeClient.emitMessage({
+			type: "session_snapshot_begin",
+			activeSessionId: "active-a",
+			snapshotId: "rebound-current-request",
+			snapshot: freshHeader,
+			messageCount: 1,
+			targetChunkBytes: 512 * 1024,
+			purpose: "resync",
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_chunk",
+			activeSessionId: "active-a",
+			snapshotId: "rebound-current-request",
+			index: 0,
+			messages: [{ role: "user", content: "retired during request", timestamp: 2 }],
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_end",
+			activeSessionId: "active-a",
+			snapshotId: "rebound-current-request",
+			chunkCount: 1,
+			lastEventSequence: 15,
+			lastEventCursor: { generation: "generation-active-a", sequence: 15 },
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_begin",
+			activeSessionId: "active-a",
+			snapshotId: "rebound-current-request",
+			snapshot: freshHeader,
+			messageCount: 1,
+			targetChunkBytes: 512 * 1024,
+			purpose: "attach",
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_chunk",
+			activeSessionId: "active-a",
+			snapshotId: "rebound-current-request",
+			index: 0,
+			messages: fresh.snapshot.messages,
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_end",
+			activeSessionId: "active-a",
+			snapshotId: "rebound-current-request",
+			chunkCount: 1,
+			lastEventSequence: 15,
+			lastEventCursor: { generation: "generation-active-a", sequence: 15 },
+		});
+		releaseAttach();
+		await attaching;
+
+		expect(events).toEqual([]);
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+			messages: [{ role: "user", content: "fresh rebound", timestamp: 3 }],
+		});
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("keeps a retired same-route failed snapshot ID fenced across duplicate terminal frames", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		await connection.attach();
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+
+		const attaching = connection.attach();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2),
+		);
+		const delayedFailure = {
+			type: "session_snapshot_failed" as const,
+			activeSessionId: "active-a",
+			snapshotId: "same-route-retired-failure",
+			purpose: "resync" as const,
+			error: "private retired failure",
+		};
+		fakeClient.emitMessage(delayedFailure);
+		releaseAttach();
+		await attaching;
+		let releaseNextAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseNextAttach = resolve;
+		});
+		const nextAttach = connection.attach();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(3),
+		);
+		fakeClient.emitMessage(delayedFailure);
+		fakeClient.emitMessage(delayedFailure);
+		releaseNextAttach();
+		await nextAttach;
+		fakeClient.emitMessage(delayedFailure);
+		fakeClient.emitMessage(delayedFailure);
+		await Promise.resolve();
+
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(3);
+		expect((connection as unknown as { runtimeSnapshotAttempt?: unknown }).runtimeSnapshotAttempt).toBeUndefined();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it.each(["inline", "streamed"] as const)(
+		"ignores an old-route replacement header during a newer %s cross-route attachment",
+		async (snapshotMode) => {
+			const fakeClient = new FakeDaemonClient();
+			fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+			fakeClient.switchSessionActiveSessionId = "active-b";
+			const streamed = createAttachResult("active-b", "client-1", ["correlated_prompt_lifecycle_v1"], 2, {
+				messages: [{ role: "user", content: "fresh B", timestamp: 2 }],
+			});
+			if (snapshotMode === "streamed") {
+				fakeClient.reattachResultFactory = (command) => {
+					const result = createAttachResult(
+						command.targetActiveSessionId,
+						command.clientId,
+						command.capabilities,
+						2,
+						{ messages: streamed.snapshot.messages },
+					);
+					return {
+						...result,
+						snapshot: { ...result.snapshot, messages: [] },
+						snapshotStream: { id: "fresh-b-stream", messageCount: 1, targetChunkBytes: 512 * 1024 },
+					};
+				};
+			}
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+			await connection.attach();
+			let releaseReattach!: () => void;
+			fakeClient.reattachGate = new Promise<void>((resolve) => {
+				releaseReattach = resolve;
+			});
+			const events: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				events.push(event);
+			});
+
+			const switching = connection.switchSession("/tmp/session-b.jsonl");
+			await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "reattach")).toBe(true));
+			const staleA = createAttachResult("active-a", "client-1", ["correlated_prompt_lifecycle_v1"], 99, {
+				state: createConnectionState("active-a", "session-stale-a"),
+				messages: [{ role: "user", content: "stale A", timestamp: 99 }],
+			}).snapshot;
+			fakeClient.emitMessage({ type: "session_resynced", activeSessionId: "active-a", snapshot: staleA });
+			fakeClient.emitMessage({
+				type: "session_replaced",
+				activeSessionId: "active-a",
+				state: createConnectionState("active-a", "session-stale-a"),
+				messages: [],
+				snapshotFollows: true,
+			});
+			expect(
+				(connection as unknown as { pendingChunkedReplacement?: unknown }).pendingChunkedReplacement,
+			).toBeUndefined();
+			if (snapshotMode === "streamed") {
+				const { messages: _messages, ...header } = streamed.snapshot;
+				fakeClient.emitMessage({
+					type: "session_snapshot_begin",
+					activeSessionId: "active-b",
+					snapshotId: "fresh-b-stream",
+					snapshot: header,
+					messageCount: 1,
+					targetChunkBytes: 512 * 1024,
+					purpose: "replacement",
+				});
+				fakeClient.emitMessage({
+					type: "session_snapshot_chunk",
+					activeSessionId: "active-b",
+					snapshotId: "fresh-b-stream",
+					index: 0,
+					messages: streamed.snapshot.messages,
+				});
+				fakeClient.emitMessage({
+					type: "session_snapshot_end",
+					activeSessionId: "active-b",
+					snapshotId: "fresh-b-stream",
+					chunkCount: 1,
+					lastEventSequence: 2,
+					lastEventCursor: { generation: "generation-active-b", sequence: 2 },
+				});
+			}
+			releaseReattach();
+			await expect(switching).resolves.toEqual({ cancelled: false });
+
+			expect((connection as unknown as { activeSessionId: string }).activeSessionId).toBe("active-b");
+			expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+			expect(
+				(connection as unknown as { pendingChunkedReplacement?: unknown }).pendingChunkedReplacement,
+			).toBeUndefined();
+			fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-b", reason: "killed" });
+			await vi.waitFor(() => expect(events.map((event) => event.type)).toEqual(["session_replaced", "closed"]));
+		},
+	);
+
+	it("suppresses headerless old-route snapshot recovery during a newer attachment admission", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.switchSessionActiveSessionId = "active-b";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		await connection.attach();
+		let releaseReattach!: () => void;
+		fakeClient.reattachGate = new Promise<void>((resolve) => {
+			releaseReattach = resolve;
+		});
+
+		const switching = connection.switchSession("/tmp/session-b.jsonl");
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "reattach")).toBe(true));
+		const delayedSnapshot = createAttachResult(
+			"active-a",
+			"client-1",
+			["correlated_prompt_lifecycle_v1"],
+			99,
+		).snapshot;
+		const { messages: _messages, ...delayedSnapshotHeader } = delayedSnapshot;
+		fakeClient.emitMessage({
+			type: "session_snapshot_begin",
+			activeSessionId: "active-a",
+			snapshotId: "headerless-old-a-snapshot",
+			snapshot: delayedSnapshotHeader,
+			messageCount: 0,
+			targetChunkBytes: 512 * 1024,
+			purpose: "resync",
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_end",
+			activeSessionId: "active-a",
+			snapshotId: "headerless-old-a-snapshot",
+			chunkCount: 0,
+			lastEventSequence: 99,
+			lastEventCursor: { generation: "generation-active-a", sequence: 99 },
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_failed",
+			activeSessionId: "active-a",
+			snapshotId: "headerless-old-a-failure",
+			purpose: "resync",
+			error: "private old A resync failure",
+		});
+		await Promise.resolve();
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
+		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
+		expect((connection as unknown as { runtimeSnapshotAttempt?: unknown }).runtimeSnapshotAttempt).toBeUndefined();
+		releaseReattach();
+		await expect(switching).resolves.toEqual({ cancelled: false });
+
+		expect((connection as unknown as { activeSessionId: string }).activeSessionId).toBe("active-b");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
+	});
+
+	it("retires a header-only chunked replacement before reattaching to a new route", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.switchSessionActiveSessionId = "active-b";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-a-replacement"),
+			messages: [],
+			snapshotFollows: true,
+		});
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-a",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 99, steering: [], followUps: [] },
+				promptCorrelationId: null,
+			},
+			attribution: { scope: "session" },
+		});
+		let releaseReattach!: () => void;
+		fakeClient.reattachGate = new Promise<void>((resolve) => {
+			releaseReattach = resolve;
+		});
+		const switching = connection.switchSession("/tmp/session-b.jsonl");
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "reattach")).toBe(true));
+		const staleSnapshot = createAttachResult("active-a", "client-1", undefined, 12, {
+			state: createConnectionState("active-a", "session-a-replacement"),
+		}).snapshot;
+		const { messages: _staleMessages, ...staleHeader } = staleSnapshot;
+		fakeClient.emitMessage({
+			type: "session_snapshot_begin",
+			activeSessionId: "active-a",
+			snapshotId: "stale-after-b-admission",
+			snapshot: staleHeader,
+			messageCount: 0,
+			targetChunkBytes: 512 * 1024,
+			purpose: "replacement",
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_end",
+			activeSessionId: "active-a",
+			snapshotId: "stale-after-b-admission",
+			chunkCount: 0,
+			lastEventSequence: staleSnapshot.lastEventSequence,
+			lastEventCursor: staleSnapshot.lastEventCursor,
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_failed",
+			activeSessionId: "active-a",
+			snapshotId: "stale-failed-before-begin",
+			purpose: "replacement",
+			error: "private retired A failure",
+		});
+		await Promise.resolve();
+		expect(events.filter((event) => event.type === "session_replaced")).toEqual([]);
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
+		releaseReattach();
+		await expect(switching).resolves.toEqual({ cancelled: false });
+		const fence = connection as unknown as { pendingChunkedReplacement?: unknown };
+		expect(fence.pendingChunkedReplacement).toBeUndefined();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-b",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
+				promptCorrelationId: null,
+			},
+			attribution: { scope: "session" },
+		});
+		await vi.waitFor(() =>
+			expect(events.filter((event) => event.type === "session_event")).toEqual([
+				expect.objectContaining({
+					type: "session_event",
+					event: expect.objectContaining({ actions: expect.objectContaining({ queuedCount: 0 }) }),
+				}),
+			]),
+		);
+
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-b", reason: "killed" });
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await vi.waitFor(() => expect(events.some((event) => event.type === "closed")).toBe(true));
+	});
+
+	it("retires a header-only chunked replacement across socket recovery", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const recoverDaemon = vi.fn(async () => {});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a", { recoverDaemon });
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-a-replacement"),
+			messages: [],
+			snapshotFollows: true,
+		});
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-a",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 99, steering: [], followUps: [] },
+				promptCorrelationId: null,
+			},
+			attribution: { scope: "session" },
+		});
+
+		fakeClient.emitClose(new Error("transport lost"));
+		await vi.waitFor(() =>
+			expect(events.some((event) => event.type === "connection_status" && event.status === "connected")).toBe(true),
+		);
+		const fence = connection as unknown as { pendingChunkedReplacement?: unknown };
+		expect(fence.pendingChunkedReplacement).toBeUndefined();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-a",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
+				promptCorrelationId: null,
+			},
+			attribution: { scope: "session" },
+		});
+		await vi.waitFor(() =>
+			expect(events.filter((event) => event.type === "session_event")).toEqual([
+				expect.objectContaining({
+					type: "session_event",
+					event: expect.objectContaining({ actions: expect.objectContaining({ queuedCount: 0 }) }),
+				}),
+			]),
+		);
+
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-a", reason: "killed" });
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("bounds queued chunked-replacement frames by cumulative structural weight", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		const closed: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "closed") closed.push(event);
+		});
+		await connection.attach();
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-a-replacement"),
+			messages: [],
+			snapshotFollows: true,
+		});
+		const canary = `chunk-fence-private-canary:${"x".repeat(80 * 1024)}`;
+		const emitLargeFrame = (id: string) => {
+			fakeClient.emitMessage({
+				type: "extension_ui_request",
+				activeSessionId: "active-a",
+				id,
+				method: "render",
+				payload: { value: canary },
+				attribution: { scope: "session" },
+			});
+		};
+
+		emitLargeFrame("large-1");
+		const fence = connection as unknown as {
+			pendingChunkedReplacement?: { queuedMessages: unknown[]; queuedMessageWeight: number };
+		};
+		expect(fence.pendingChunkedReplacement?.queuedMessages).toHaveLength(1);
+		expect(fence.pendingChunkedReplacement?.queuedMessageWeight).toBeGreaterThan(0);
+		emitLargeFrame("large-2");
+		await vi.waitFor(() => expect(closed).toHaveLength(1));
+
+		expect(fence.pendingChunkedReplacement).toBeUndefined();
+		expect(closed).toEqual([
+			{ type: "closed", error: "Daemon replacement lifecycle state could not be reconciled." },
+		]);
+		expect(JSON.stringify(closed)).not.toContain("chunk-fence-private-canary");
+	});
+
+	it("lets session close retire a header-only chunked replacement fence", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		const closed: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "closed") closed.push(event);
+		});
+		await connection.attach();
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-a-replacement"),
+			messages: [],
+			snapshotFollows: true,
+		});
+
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-a", reason: "killed" });
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await vi.waitFor(() => expect(closed).toHaveLength(1));
+		expect(
+			(connection as unknown as { pendingChunkedReplacement?: unknown }).pendingChunkedReplacement,
+		).toBeUndefined();
+	});
+
+	it("discards an old replacement query after the same connection reattaches to a new route", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseLifecycleQuery!: () => void;
+		fakeClient.promptLifecycleGate = new Promise<void>((resolve) => {
+			releaseLifecycleQuery = resolve;
+		});
+		fakeClient.switchSessionActiveSessionId = "active-b";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		await connection.attach();
+		const replacementSessionIds: string[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "session_replaced") replacementSessionIds.push(event.state.sessionId);
+		});
+
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-a-stale"),
+			messages: [{ role: "user", content: "stale replacement", timestamp: 1 }],
+		});
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.some((request) => request.type === "get_prompt_lifecycles")).toBe(true),
+		);
+		await expect(connection.switchSession("/tmp/session-b.jsonl")).resolves.toEqual({ cancelled: false });
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		const tailDrained = new Promise<void>((resolve) => {
+			connection.subscribe((event) => {
+				if (event.type === "heartbeats_changed") resolve();
+			});
+		});
+		releaseLifecycleQuery();
+		fakeClient.emitMessage({ type: "heartbeats_changed" });
+		await tailDrained;
+
+		const route = connection as unknown as {
+			activeSessionId: string;
+			latestSnapshot?: AgentConnectionSnapshot;
+		};
+		expect(route.activeSessionId).toBe("active-b");
+		expect(route.latestSnapshot).toMatchObject({
+			state: { activeSessionId: "active-b", sessionId: "session-current" },
+		});
+		expect(replacementSessionIds).toEqual(["session-current"]);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		await connection.submitCorrelatedPrompt("route to B", { correlationId: "route-b" });
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "submit_correlated_prompt",
+			activeSessionId: "active-b",
+			correlationId: "route-b",
+		});
+	});
+
+	it("drops stale replacement shaping when shared-client capabilities change during its query", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.promptLifecycleResponse = {
+			records: [
+				{
+					correlationId: "stale-replacement-shaping",
+					phase: "delivered",
+					kind: "model_prompt",
+					revision: 3,
+					deliveryCrossed: true,
+				},
+			],
+			expired: [],
+		};
+		let releaseLifecycleQuery!: () => void;
+		fakeClient.promptLifecycleGate = new Promise<void>((resolve) => {
+			releaseLifecycleQuery = resolve;
+		});
+		const first = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		await first.attach();
+		const replaced = new Promise<void>((resolve) => {
+			first.subscribe((event) => {
+				if (event.type === "session_replaced") resolve();
+			});
+		});
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-replaced"),
+			messages: [],
+		});
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.some((request) => request.type === "get_prompt_lifecycles")).toBe(true),
+		);
+
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			result.client.capabilities = result.client.capabilities.filter(
+				(capability) => capability !== "correlated_prompt_lifecycle_v1",
+			);
+			delete result.snapshot.promptLifecycles;
+			return result;
+		};
+		const second = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-b");
+		await second.attach();
+		releaseLifecycleQuery();
+		await replaced;
+
+		const snapshot = (first as unknown as { latestSnapshot?: AgentConnectionSnapshot }).latestSnapshot;
+		expect(snapshot).toMatchObject({ state: { sessionId: "session-replaced" } });
+		expect(snapshot).not.toHaveProperty("promptLifecycles");
+		await expect(
+			first.submitCorrelatedPrompt("must fail", { correlationId: "stale-replacement-shaping" }),
+		).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("invalidates retained replacement shaping when a shared client mutates capabilities", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const first = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		await first.attach();
+		const replaced = new Promise<void>((resolve) => {
+			first.subscribe((event) => {
+				if (event.type === "session_replaced") resolve();
+			});
+		});
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-replaced"),
+			messages: [],
+		});
+		await replaced;
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await expect(
+			first.submitCorrelatedPrompt("still shaped", { correlationId: "before-shared-mutation" }),
+		).resolves.toMatchObject({ lifecycle: { correlationId: "before-shared-mutation" } });
+
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			result.client.capabilities = result.client.capabilities.filter(
+				(capability) => capability !== "correlated_prompt_lifecycle_v1",
+			);
+			delete result.snapshot.promptLifecycles;
+			return result;
+		};
+		const second = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-b");
+		await second.attach();
+
+		await expect(
+			first.submitCorrelatedPrompt("must fail", { correlationId: "after-shared-mutation" }),
+		).rejects.toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("keeps only the latest shared-client attachment proved across different sessions", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const first = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		const second = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-b");
+		await first.attach();
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		await second.attach();
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		fakeClient.resetTransportForReconnect();
+
+		expect(first.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("clears negotiated proof before a failed replacement attach and restores it only after a proved reattach", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-source");
+		await connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		fakeClient.attachFailures = 2;
+		await expect(connection.attach()).rejects.toThrow("attach failed");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+
+		fakeClient.switchSessionActiveSessionId = "active-target";
+		fakeClient.reattachResultFactory = (command) =>
+			createAttachResult(command.targetActiveSessionId, command.clientId, command.capabilities, 1, {
+				state: createConnectionState(command.targetActiveSessionId, "session-target"),
+			});
+		await connection.switchSession("/tmp/target.jsonl");
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
+
+	it("clears negotiated proof when the attached session generation is replaced", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-1",
+			state: createConnectionState("active-1", "session-next"),
+			messages: [],
+		});
+		await vi.waitFor(() =>
+			expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false),
+		);
+	});
+
+	it("retains negotiated proof across a valid same-generation resync", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const resynced = new Promise<void>((resolve) => {
+			connection.subscribe((event) => {
+				if (event.type === "session_resynced") resolve();
+			});
+		});
+		await connection.attach();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		const snapshot = createAttachResult("active-1", "resync-client", ["correlated_prompt_lifecycle_v1"], 13).snapshot;
+
+		fakeClient.emitMessage({ type: "session_resynced", activeSessionId: "active-1", snapshot });
+		await resynced;
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+	});
 
 	it("does not expose lifecycle frames when correlated lifecycle was not negotiated", async () => {
 		const fakeClient = new FakeDaemonClient();
@@ -2420,6 +4179,7 @@ describe("DaemonAgentConnection", () => {
 		connection.subscribe((event) => {
 			events.push(event);
 		});
+		await connection.attach();
 
 		fakeClient.emitMessage({
 			type: "session_event",
@@ -2733,7 +4493,6 @@ describe("DaemonAgentConnection", () => {
 
 	it("reattaches an open window to its restored session after an update restart", async () => {
 		const fakeClient = new FakeDaemonClient();
-		fakeClient.emitCloseOnClose = true;
 		const restoredMessages: AgentMessage[] = [{ role: "user", content: "restored prompt", timestamp: 2 }];
 		fakeClient.updateRestartSessions = [
 			{
@@ -2759,12 +4518,47 @@ describe("DaemonAgentConnection", () => {
 			});
 		});
 		await connection.attach();
-
+		const staleUpdate = createAttachResult("active-original", "client-1", [], 20, {
+			state: createConnectionState("active-original", "session-current"),
+			messages: [{ role: "user", content: "stale update tail", timestamp: 20 }],
+		}).snapshot;
+		const { messages: _staleMessages, ...staleUpdateHeader } = staleUpdate;
+		const staleBegin = {
+			type: "session_snapshot_begin" as const,
+			activeSessionId: "active-original",
+			snapshotId: "stale-update-tail",
+			snapshot: staleUpdateHeader,
+			messageCount: 1,
+			targetChunkBytes: 512 * 1024,
+			purpose: "resync" as const,
+		};
+		const staleChunk = {
+			type: "session_snapshot_chunk" as const,
+			activeSessionId: "active-original",
+			snapshotId: "stale-update-tail",
+			index: 0,
+			messages: staleUpdate.messages,
+		};
+		const staleEnd = {
+			type: "session_snapshot_end" as const,
+			activeSessionId: "active-original",
+			snapshotId: "stale-update-tail",
+			chunkCount: 1,
+			lastEventSequence: 20,
+			lastEventCursor: { generation: "generation-active-original", sequence: 20 },
+		};
+		fakeClient.emitMessage(staleBegin);
+		fakeClient.emitMessage(staleChunk);
 		fakeClient.emitMessage({
 			type: "session_closed",
 			activeSessionId: "active-original",
 			reason: "update",
 		});
+		fakeClient.emitMessage(staleEnd);
+		fakeClient.emitMessage(staleEnd);
+		fakeClient.emitMessage(staleBegin);
+		fakeClient.emitMessage(staleChunk);
+		fakeClient.emitMessage(staleEnd);
 		await vi.waitFor(() => {
 			expect(fakeClient.closeCount).toBe(1);
 			expect(fakeClient.reconnectCount).toBe(1);
@@ -2796,6 +4590,162 @@ describe("DaemonAgentConnection", () => {
 				{ type: "connection_status", status: "connected" },
 			]);
 		});
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({ messages: restoredMessages });
+		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
+	});
+
+	it("restores authoritatively when message-first update retires a pending replacement at the tombstone limit", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.updateRestartSessions = [
+			{
+				id: "active-restored",
+				activeSessionId: "active-restored",
+				sessionId: "session-current",
+				sessionFile: "/tmp/session-current.jsonl",
+			},
+		];
+		const restoredMessages: AgentMessage[] = [
+			{ role: "user", content: "restored after message-first close", timestamp: 2 },
+		];
+		fakeClient.attachResultFactory = (command) =>
+			createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 22, {
+				state: createConnectionState(command.activeSessionId, "session-current"),
+				messages: command.activeSessionId === "active-restored" ? restoredMessages : [],
+			});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+		await connection.attach();
+		const budgetSnapshot = fillSnapshotRetirementBudget(fakeClient, "active-original", 30, [
+			"correlated_prompt_lifecycle_v1",
+		]);
+		completeSnapshotRetirementBudget(fakeClient, "active-original", budgetSnapshot);
+		await Promise.resolve();
+		expect((connection as unknown as { ignoredSnapshotIds: Set<string> }).ignoredSnapshotIds.size).toBe(128);
+		startPendingChunkedReplacement(fakeClient, "active-original", "message-first-update", 31);
+		expect(
+			(connection as unknown as { pendingChunkedReplacement?: unknown }).pendingChunkedReplacement,
+		).toBeDefined();
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "update" });
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "update" });
+		emitDirectRuntimeSnapshotFrames(fakeClient, "active-original");
+		await vi.waitFor(() =>
+			expect(events).toEqual([
+				expect.objectContaining({ type: "connection_status", status: "reconnecting" }),
+				expect.objectContaining({
+					type: "session_resynced",
+					snapshot: expect.objectContaining({ messages: restoredMessages }),
+				}),
+				{ type: "connection_status", status: "connected" },
+			]),
+		);
+
+		expect(
+			(connection as unknown as { replacementReconciliationFailed: boolean }).replacementReconciliationFailed,
+		).toBe(false);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		expect(
+			(connection as unknown as { pendingChunkedReplacement?: unknown }).pendingChunkedReplacement,
+		).toBeUndefined();
+	});
+
+	it.each(["update-first", "terminal-first"] as const)(
+		"keeps one lifecycle owner for contradictory %s session-close ordering",
+		async (ordering) => {
+			const fakeClient = new FakeDaemonClient();
+			fakeClient.updateRestartSessions = [
+				{
+					id: "active-restored",
+					activeSessionId: "active-restored",
+					sessionId: "session-current",
+					sessionFile: "/tmp/session-current.jsonl",
+				},
+			];
+			fakeClient.attachResultFactory = (command) =>
+				createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 23, {
+					state: createConnectionState(command.activeSessionId, "session-current"),
+					messages:
+						command.activeSessionId === "active-restored"
+							? [{ role: "user", content: "one update owner", timestamp: 23 }]
+							: [],
+				});
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+			const events: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				events.push(event);
+			});
+			await connection.attach();
+
+			const firstReason = ordering === "update-first" ? "update" : "killed";
+			const secondReason = ordering === "update-first" ? "killed" : "update";
+			fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: firstReason });
+			fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: secondReason });
+			if (ordering === "update-first") {
+				await vi.waitFor(() =>
+					expect(events.map((event) => event.type)).toEqual([
+						"connection_status",
+						"session_resynced",
+						"connection_status",
+					]),
+				);
+				expect(fakeClient.reconnectCount).toBe(1);
+				expect(events.some((event) => event.type === "closed")).toBe(false);
+			} else {
+				await Promise.resolve();
+				expect(events.map((event) => event.type)).toEqual(["closed"]);
+				expect(fakeClient.reconnectCount).toBe(0);
+			}
+		},
+	);
+
+	it("restores authoritatively when socket-first update retires a full snapshot tombstone budget", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.updateRestartSessions = [
+			{
+				id: "active-restored",
+				activeSessionId: "active-restored",
+				sessionId: "session-current",
+				sessionFile: "/tmp/session-current.jsonl",
+			},
+		];
+		const restoredMessages: AgentMessage[] = [{ role: "user", content: "restored after full budget", timestamp: 2 }];
+		fakeClient.attachResultFactory = (command) =>
+			createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 21, {
+				state: createConnectionState(command.activeSessionId, "session-current"),
+				messages: command.activeSessionId === "active-restored" ? restoredMessages : [],
+			});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		fillSnapshotRetirementBudget(fakeClient, "active-original");
+		expect((connection as unknown as { ignoredSnapshotIds: Set<string> }).ignoredSnapshotIds.size).toBe(128);
+		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(1);
+
+		fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "update"));
+		await vi.waitFor(() =>
+			expect(events).toEqual([
+				expect.objectContaining({ type: "connection_status", status: "reconnecting" }),
+				expect.objectContaining({
+					type: "session_resynced",
+					snapshot: expect.objectContaining({ messages: restoredMessages }),
+				}),
+				{ type: "connection_status", status: "connected" },
+			]),
+		);
+
+		expect(
+			(connection as unknown as { replacementReconciliationFailed: boolean }).replacementReconciliationFailed,
+		).toBe(false);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
 	});
 
 	it("reattaches when an update socket close arrives before the session notice", async () => {
@@ -2839,7 +4789,6 @@ describe("DaemonAgentConnection", () => {
 
 	it("coordinates one transport reconnect across connections sharing a daemon client", async () => {
 		const fakeClient = new FakeDaemonClient();
-		fakeClient.emitCloseOnClose = true;
 		fakeClient.updateRestartSessions = [
 			{
 				id: "restored-a",
@@ -2903,6 +4852,97 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.reconnectCount).toBe(1);
 	});
 
+	it.each([
+		["killed", "The daemon stopped this agent session."],
+		["shutdown", "The Prime Agent daemon shut down while this window was attached."],
+	] as const)(
+		"keeps message-first %s authoritative while retiring a pending replacement at the tombstone limit",
+		async (reason, explanation) => {
+			const fakeClient = new FakeDaemonClient();
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+			await connection.attach();
+			const budgetSnapshot = fillSnapshotRetirementBudget(fakeClient, "active-original");
+			completeSnapshotRetirementBudget(fakeClient, "active-original", budgetSnapshot);
+			await Promise.resolve();
+			expect((connection as unknown as { ignoredSnapshotIds: Set<string> }).ignoredSnapshotIds.size).toBe(128);
+			startPendingChunkedReplacement(fakeClient, "active-original", `message-first-${reason}`);
+			expect(
+				(connection as unknown as { pendingChunkedReplacement?: unknown }).pendingChunkedReplacement,
+			).toBeDefined();
+			const events: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				events.push(event);
+			});
+
+			fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason });
+			fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason });
+			emitDirectRuntimeSnapshotFrames(fakeClient, "active-original");
+			await Promise.resolve();
+
+			expect(events).toHaveLength(1);
+			expect(events[0]).toMatchObject({ type: "closed", error: expect.stringContaining(explanation) });
+			expect(
+				(connection as unknown as { replacementReconciliationFailed: boolean }).replacementReconciliationFailed,
+			).toBe(false);
+			expect(
+				(connection as unknown as { pendingChunkedReplacement?: unknown }).pendingChunkedReplacement,
+			).toBeUndefined();
+			expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(
+				0,
+			);
+		},
+	);
+
+	it("keeps socket-first shutdown authoritative with a full snapshot tombstone budget", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		fillSnapshotRetirementBudget(fakeClient, "active-original");
+		expect((connection as unknown as { ignoredSnapshotIds: Set<string> }).ignoredSnapshotIds.size).toBe(128);
+		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(1);
+
+		fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "shutdown"));
+		await Promise.resolve();
+
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({
+			type: "closed",
+			error: expect.stringContaining("The Prime Agent daemon shut down while this window was attached."),
+		});
+		expect(
+			(connection as unknown as { replacementReconciliationFailed: boolean }).replacementReconciliationFailed,
+		).toBe(false);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
+	});
+
+	it("keeps explicit owner close authoritative with a full snapshot tombstone budget", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		fillSnapshotRetirementBudget(fakeClient, "active-original");
+		expect((connection as unknown as { ignoredSnapshotIds: Set<string> }).ignoredSnapshotIds.size).toBe(128);
+		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(1);
+
+		fakeClient.close();
+		await Promise.resolve();
+
+		expect(events).toEqual([{ type: "closed", error: "Prime Agent daemon client was closed." }]);
+		expect(
+			(connection as unknown as { replacementReconciliationFailed: boolean }).replacementReconciliationFailed,
+		).toBe(false);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
+	});
+
 	it("does not reconnect after an explicit shutdown session close", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
@@ -2952,6 +4992,58 @@ describe("DaemonAgentConnection", () => {
 		expect(closedEvents).toHaveLength(1);
 		const closedError = closedEvents[0]?.type === "closed" ? closedEvents[0].error : undefined;
 		expect(closedError).toContain("The Prime Agent daemon shut down while this window was attached.");
+	});
+
+	it("retires ordinary snapshot tails before publishing a terminal session close", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+		await connection.attach();
+		const stale = createAttachResult("active-original", "client-1", [], 20, {
+			messages: [{ role: "user", content: "stale terminal tail", timestamp: 20 }],
+		}).snapshot;
+		const { messages: _messages, ...staleHeader } = stale;
+		const begin = {
+			type: "session_snapshot_begin" as const,
+			activeSessionId: "active-original",
+			snapshotId: "terminal-snapshot-tail",
+			snapshot: staleHeader,
+			messageCount: 1,
+			targetChunkBytes: 512 * 1024,
+			purpose: "resync" as const,
+		};
+		const chunk = {
+			type: "session_snapshot_chunk" as const,
+			activeSessionId: "active-original",
+			snapshotId: "terminal-snapshot-tail",
+			index: 0,
+			messages: stale.messages,
+		};
+		const end = {
+			type: "session_snapshot_end" as const,
+			activeSessionId: "active-original",
+			snapshotId: "terminal-snapshot-tail",
+			chunkCount: 1,
+			lastEventSequence: 20,
+			lastEventCursor: { generation: "generation-active-original", sequence: 20 },
+		};
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		fakeClient.emitMessage(begin);
+		fakeClient.emitMessage(chunk);
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "killed" });
+		fakeClient.emitMessage(end);
+		fakeClient.emitMessage(end);
+		fakeClient.emitMessage(begin);
+		fakeClient.emitMessage(chunk);
+		fakeClient.emitMessage(end);
+		await Promise.resolve();
+
+		expect(events.map((event) => event.type)).toEqual(["closed"]);
+		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({ messages: [] });
+		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
+		expect((connection as unknown as { runtimeSnapshotAttempt?: unknown }).runtimeSnapshotAttempt).toBeUndefined();
 	});
 
 	it.each([
@@ -3019,6 +5111,25 @@ describe("DaemonAgentConnection", () => {
 		expect(closedEvents).toHaveLength(1);
 		const closedError = closedEvents[0]?.type === "closed" ? closedEvents[0].error : undefined;
 		expect(closedError).toContain("Lost connection to the Prime Agent daemon.");
+	});
+
+	it("suppresses direct snapshot and replacement frames during the disposal await window", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+
+		const disposal = connection.dispose();
+		emitDirectRuntimeSnapshotFrames(fakeClient, "active-original");
+		await disposal;
+
+		expect(events).toEqual([]);
+		expect(
+			(connection as unknown as { pendingChunkedReplacement?: unknown }).pendingChunkedReplacement,
+		).toBeUndefined();
 	});
 
 	it("does not emit a restored session after disposal begins", async () => {
@@ -3508,7 +5619,12 @@ describe("DaemonAgentConnection", () => {
 			state: createConnectionState("active-target", "session-target"),
 			messages: [{ role: "user", content: "target", timestamp: 1 }],
 		});
-		const emitTransfer = (snapshotId: string, fail: boolean, purpose: "attach" | "replacement") => {
+		const emitTransfer = (
+			snapshotId: string,
+			fail: boolean,
+			purpose: "attach" | "replacement",
+			clientId: string | undefined,
+		) => {
 			const { messages: _messages, ...snapshot } = target.snapshot;
 			setImmediate(() => {
 				fakeClient.emitMessage({
@@ -3549,10 +5665,12 @@ describe("DaemonAgentConnection", () => {
 				...target,
 				snapshot: { ...target.snapshot, messages: [] },
 				snapshotStream: { id: snapshotId, messageCount: 1, targetChunkBytes: 512 * 1024 },
+				client: { ...target.client, id: clientId ?? "missing-client" },
 			};
 		};
-		fakeClient.reattachResultFactory = () => emitTransfer("reattach-g1", true, "replacement");
-		fakeClient.attachResultFactory = () => emitTransfer("reattach-g2", false, "attach");
+		fakeClient.reattachResultFactory = (command) =>
+			emitTransfer("reattach-g1", true, "replacement", command.clientId);
+		fakeClient.attachResultFactory = (command) => emitTransfer("reattach-g2", false, "attach", command.clientId);
 		const events: AgentConnectionEvent[] = [];
 		connection.subscribe((event) => {
 			events.push(event);
@@ -3622,6 +5740,64 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.closeCount).toBe(0);
 		await failed.dispose();
 		await sibling.dispose();
+	});
+
+	it("does not start runtime recovery from an unfenced failure-before-begin frame", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		fakeClient.emitMessage({
+			type: "session_snapshot_failed",
+			activeSessionId: "active-1",
+			snapshotId: "unfenced-runtime-failure",
+			purpose: "resync",
+			error: "private unfenced failure",
+		});
+		await Promise.resolve();
+
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
+		expect((connection as unknown as { runtimeSnapshotAttempt?: unknown }).runtimeSnapshotAttempt).toBeUndefined();
+		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
+	});
+
+	it("binds a failure-before-begin frame to the exact current attach attempt", async () => {
+		const fakeClient = new FakeDaemonClient();
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		let attachResultCount = 0;
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			if (attachResultCount++ > 0) return result;
+			return {
+				...result,
+				snapshot: { ...result.snapshot, messages: [] },
+				snapshotStream: { id: "failed-before-begin", messageCount: 0, targetChunkBytes: 512 * 1024 },
+			};
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		const attaching = connection.attach();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1),
+		);
+		fakeClient.emitMessage({
+			type: "session_snapshot_failed",
+			activeSessionId: "active-1",
+			snapshotId: "failed-before-begin",
+			purpose: "attach",
+			error: "snapshot failed before begin",
+		});
+		releaseAttach();
+		await attaching;
+
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+		expect(
+			(connection as unknown as { snapshotRequestAttempts: Map<number, unknown> }).snapshotRequestAttempts.size,
+		).toBe(0);
+		expect((connection as unknown as { runtimeSnapshotAttempt?: unknown }).runtimeSnapshotAttempt).toBeUndefined();
 	});
 
 	it("assembles chunked attach snapshots even when chunks arrive before the attach response continuation", async () => {
@@ -3817,7 +5993,10 @@ describe("DaemonAgentConnection", () => {
 		full.lastEventCursor = full.snapshot.lastEventCursor;
 		full.replay = { status: "complete", toSequence: 1, toCursor: full.lastEventCursor };
 		const { messages: _messages, ...snapshot } = full.snapshot;
-		fakeClient.attachResultFactory = () => full;
+		fakeClient.attachResultFactory = (command) => ({
+			...full,
+			client: { ...full.client, id: command.clientId ?? "missing-client" },
+		});
 		fakeClient.requests.length = 0;
 		fakeClient.emitMessage({
 			type: "session_replaced",

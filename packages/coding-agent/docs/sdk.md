@@ -66,6 +66,19 @@ await client.connect();
 
 `PRIME_AGENT_SDK_FEATURES` is immutable metadata for behavior implemented by the local SDK artifact. Do not infer it from package versions, constructor arity, method presence, daemon hello capabilities, protocol versions, or schema revisions. Older JavaScript constructors can silently ignore an extra options argument.
 
+Optional daemon session behavior also needs post-attach proof. First require the `negotiated_daemon_session_capabilities_v1` SDK token. Then attach the connection and call its generic accessor:
+
+```typescript
+await connection.attach();
+if (!connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")) {
+  throw new Error("The attached daemon session did not negotiate correlated prompt lifecycle support");
+}
+```
+
+`supportsNegotiatedCapability()` is false before attach, while a new attach or reattach is pending, after transport or attachment invalidation, and after disposal. It becomes true only after the same physical transport returns a validated client capability echo and the exact snapshot commit succeeds. `supportsCorrelatedPromptLifecycle()` remains server-offer evidence used to construct the attach request. It is not negotiation proof. Do not substitute a hello offer, method presence, attach success, or package version for the post-attach accessor. Correlated runtime frames are withheld until the attach-side echo commits and are discarded when the echo omits the capability. Pre-proof retention is bounded by both frame count and conservative cumulative structural weight; overflow fails the adapter closed without retaining or reporting attributed payload content. A chunked replacement uses the same count and weight bounds for frames held behind its atomic snapshot fence. New same-connection attachment admission, attachment-epoch change, transport loss, disposal, or matching session close retires that old fence before any later proof can publish; delayed old snapshot frames are ignored until a fresh attachment commits.
+
+`DaemonClient.close()` is terminal owner disposal. `isClosed` becomes true, later `connect()` calls reject, and a live `DaemonAgentConnection` emits one terminal close. Normal and update recovery stop before any later restart, connect, attach, or restored-session query; already-running recovery callbacks are not cancellable but their results are discarded.
+
 `DaemonClientOptions.maxInboundFrameBytes` is the maximum raw bytes before LF in one inbound JSONL frame. It defaults to `DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES` (128 MiB) and must be a positive safe integer. LF is excluded. A CR immediately before LF is counted and then stripped.
 
 `DaemonInboundFrameTooLargeError` has code `daemon_inbound_frame_too_large` and exposes the configured limit. It never includes frame content. Overflow terminally closes that socket, rejects handshake and request waiters even when request recovery was enabled, suppresses automatic replay/reconnect, and discards the partial buffer. A later explicit reconnect uses a fresh reader with the same bound. Applications that surface errors across a trust boundary should map the class or code to their own fixed message rather than forwarding an SDK error, stack, socket path, or daemon log path.

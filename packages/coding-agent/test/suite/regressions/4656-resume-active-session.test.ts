@@ -35,7 +35,7 @@ class ResumeDaemonClient {
 				type: "response",
 				command: command.type,
 				success: true,
-				data: createAttachResult(command.activeSessionId),
+				data: createAttachResult(command.activeSessionId, [], command.clientId, command.capabilities),
 			};
 		}
 		if (command.type === "switch_session") {
@@ -52,9 +52,12 @@ class ResumeDaemonClient {
 			};
 		}
 		if (command.type === "reattach") {
-			const result = createAttachResult(command.targetActiveSessionId, [
-				{ role: "user", content: "target prompt", timestamp: 2 },
-			]);
+			const result = createAttachResult(
+				command.targetActiveSessionId,
+				[{ role: "user", content: "target prompt", timestamp: 2 }],
+				command.clientId,
+				command.capabilities,
+			);
 			const snapshotId = "target-snapshot";
 			const { messages, ...snapshot } = result.snapshot;
 			this.emitMessage({
@@ -118,6 +121,10 @@ class ResumeDaemonClient {
 		}
 	}
 
+	getTransportGeneration(): number {
+		return 1;
+	}
+
 	supportsServerCapability(): boolean {
 		return false;
 	}
@@ -154,7 +161,16 @@ function createConnectionState(activeSessionId: string): AgentConnectionState {
 	};
 }
 
-function createAttachResult(activeSessionId: string, messages: AgentMessage[] = []): DaemonAttachResult {
+function createAttachResult(
+	activeSessionId: string,
+	messages: AgentMessage[] = [],
+	clientId = "client-1",
+	clientCapabilities: readonly NonNullable<DaemonAttachResult["client"]>["capabilities"][number][] = [
+		"attach_snapshot",
+		"event_sequence",
+		"chunked_snapshot",
+	],
+): DaemonAttachResult {
 	const state = createConnectionState(activeSessionId);
 	const lastEventCursor = { generation: `generation-${activeSessionId}`, sequence: 3 };
 	const summary: SessionSummary = {
@@ -187,8 +203,8 @@ function createAttachResult(activeSessionId: string, messages: AgentMessage[] = 
 		lastEventSequence: 3,
 		lastEventCursor,
 		client: {
-			id: "client-1",
-			capabilities: ["attach_snapshot", "event_sequence", "chunked_snapshot"],
+			id: clientId,
+			capabilities: [...clientCapabilities],
 		},
 	};
 }
