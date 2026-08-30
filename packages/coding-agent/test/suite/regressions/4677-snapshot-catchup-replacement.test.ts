@@ -23,7 +23,8 @@ const directories: string[] = [];
 
 interface WorkerHarness {
 	descriptor: { workerId: string; rootActiveSessionId: string; lifecycle: "ready"; pid: number };
-	client?: { request: ReturnType<typeof vi.fn> };
+	client?: { close: ReturnType<typeof vi.fn>; request: ReturnType<typeof vi.fn> };
+	authorizedActiveSessionIds: Set<string>;
 	summaries: Map<string, SessionSummary>;
 	snapshotCache: Map<string, DaemonAttachResult>;
 	transcriptCaches: Map<string, SnapshotTranscriptCache>;
@@ -134,10 +135,12 @@ function workerHarness(result: DaemonAttachResult, transcript: SnapshotTranscrip
 			pid: 4677,
 		},
 		client: {
+			close: vi.fn(),
 			request: vi.fn(async () => {
 				throw new Error("unexpected snapshot reload");
 			}),
 		},
+		authorizedActiveSessionIds: new Set([activeSessionId]),
 		summaries: new Map([[activeSessionId, result.snapshot.summary]]),
 		snapshotCache: new Map([[activeSessionId, result]]),
 		transcriptCaches: new Map([[activeSessionId, transcript]]),
@@ -146,6 +149,10 @@ function workerHarness(result: DaemonAttachResult, transcript: SnapshotTranscrip
 		intentionalStop: false,
 		stopRevision: 0,
 	};
+}
+
+function registerWorker(supervisor: DaemonSupervisor, worker: WorkerHarness): void {
+	(supervisor as unknown as { workers: Map<string, WorkerHarness> }).workers.set(worker.descriptor.workerId, worker);
 }
 
 describe("ENG-4677 snapshot catch-up replacement", () => {
@@ -163,6 +170,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			cacheRoot: root,
 		});
 		const worker = workerHarness(streamedResult("alias-snapshot", 0, 1), transcript);
+		registerWorker(supervisor, worker);
 		const written: Buffer[] = [];
 		const internals = supervisor as unknown as {
 			clients: Set<DaemonSocketClient>;
@@ -243,6 +251,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 				cacheRoot: root,
 			}),
 		);
+		registerWorker(supervisor, worker);
 		worker.transcriptCaches.clear();
 		worker.snapshotCache.clear();
 		worker.snapshotCache.set(activeSessionId, firstResult);
@@ -287,6 +296,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			staleResult,
 			new SnapshotTranscriptCache({ activeSessionId, snapshotId: "placeholder", cacheRoot: root }),
 		);
+		registerWorker(supervisor, worker);
 		worker.transcriptCaches.clear();
 		worker.snapshotGenerations.clear();
 		worker.snapshotCache.set(activeSessionId, staleResult);
@@ -328,6 +338,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			targetChunkBytes: 1,
 		});
 		const worker = workerHarness(streamedResult(firstSnapshotId, 1, 1), placeholder);
+		registerWorker(supervisor, worker);
 		worker.snapshotCache.clear();
 		worker.transcriptCaches.clear();
 		const client = socketClient("incomplete-reader");
@@ -445,10 +456,12 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			targetChunkBytes: 1,
 		});
 		const worker = workerHarness(firstResult, placeholder);
+		registerWorker(supervisor, worker);
 		worker.snapshotCache.clear();
 		worker.transcriptCaches.clear();
 		let resolveAttach!: (response: { success: true; data: DaemonAttachResult }) => void;
 		worker.client = {
+			close: vi.fn(),
 			request: vi.fn(
 				() =>
 					new Promise<{ success: true; data: DaemonAttachResult }>((resolve) => {
@@ -546,6 +559,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 		const waiter = firstTranscript.waitForChunk(1);
 		void waiter.catch(() => undefined);
 		const worker = workerHarness(firstResult, firstTranscript);
+		registerWorker(supervisor, worker);
 		const internals = supervisor as unknown as {
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		};
@@ -586,6 +600,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			targetChunkBytes: 1,
 		});
 		const worker = workerHarness(firstResult, placeholder);
+		registerWorker(supervisor, worker);
 		worker.snapshotCache.clear();
 		worker.transcriptCaches.clear();
 		const client = socketClient("validation-waiter");
@@ -763,6 +778,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 			targetChunkBytes: 1,
 		});
 		const worker = workerHarness(firstResult, firstTranscript);
+		registerWorker(supervisor, worker);
 		const client = socketClient("slow-client");
 		const written: DaemonOutbound[] = [];
 		let releaseFirstChunk!: (accepted: boolean) => void;

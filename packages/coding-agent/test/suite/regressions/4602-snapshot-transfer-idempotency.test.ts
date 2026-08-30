@@ -26,7 +26,8 @@ const activeSessionId = "active-4602";
 const snapshotId = "snapshot-4602";
 
 interface WorkerHarness {
-	descriptor: { workerId: string; lifecycle: "ready" | "recovering"; pid: number };
+	descriptor: { workerId: string; rootActiveSessionId: string; lifecycle: "ready" | "recovering"; pid: number };
+	authorizedActiveSessionIds: Set<string>;
 	client?: { close: ReturnType<typeof vi.fn>; request: ReturnType<typeof vi.fn> };
 	summaries: Map<string, SessionSummary>;
 	snapshotCache: Map<string, DaemonAttachResult>;
@@ -118,7 +119,13 @@ function workerHarness() {
 		throw new Error("unexpected snapshot reload");
 	});
 	const worker: WorkerHarness = {
-		descriptor: { workerId: "worker-4602", lifecycle: "ready", pid: 987_654_321 },
+		descriptor: {
+			workerId: "worker-4602",
+			rootActiveSessionId: activeSessionId,
+			lifecycle: "ready",
+			pid: 987_654_321,
+		},
+		authorizedActiveSessionIds: new Set([activeSessionId]),
 		client: { close, request },
 		summaries: new Map([[activeSessionId, summary()]]),
 		snapshotCache: new Map(),
@@ -129,6 +136,10 @@ function workerHarness() {
 		stopRevision: 0,
 	};
 	return { close, request, worker };
+}
+
+function registerWorker(supervisor: DaemonSupervisor, worker: WorkerHarness): void {
+	(supervisor as unknown as { workers: Map<string, WorkerHarness> }).workers.set(worker.descriptor.workerId, worker);
 }
 
 function socketClient(id: string, socket: PassThrough): DaemonSocketClient {
@@ -399,6 +410,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-fresh-chunk-state",
 		});
 		const { close, worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		const internals = supervisor as unknown as {
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		};
@@ -438,6 +450,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-fresh-end-state",
 		});
 		const { close, worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		const internals = supervisor as unknown as {
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		};
@@ -482,6 +495,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-invalid-begin-state",
 		});
 		const { close, worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		const internals = supervisor as unknown as {
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		};
@@ -503,6 +517,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-failure-state",
 		});
 		const { close, worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		worker.summaries.set("active-4602-sibling", {
 			...summary(),
 			id: "active-4602-sibling",
@@ -580,6 +595,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-state",
 		});
 		const { close, request, worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		const client = socketClient("public", new PassThrough());
 		const streamSnapshot = vi.fn(async () => {});
 		const internals = supervisor as unknown as {
@@ -692,6 +708,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-gate-state",
 		});
 		const { close, request, worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		const client = socketClient("catchup", new PassThrough());
 		const streamSnapshot = vi.fn(async () => {});
 		const internals = supervisor as unknown as {
@@ -757,6 +774,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-stop-state",
 		});
 		const { close, request, worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		const client = socketClient("catchup", new PassThrough());
 		const streamSnapshot = vi.fn(async () => {});
 		const persistWorker = vi.fn();
@@ -818,6 +836,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-reader-stop-state",
 		});
 		const { worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		const persistWorker = vi.fn();
 		const internals = supervisor as unknown as {
 			persistWorker: typeof persistWorker;
@@ -877,6 +896,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(recoverWorker).not.toHaveBeenCalled();
 
 		const completed = workerHarness();
+		registerWorker(supervisor, completed.worker);
 		for (const message of [frames.begin, frames.chunk, frames.end]) {
 			internals.handleWorkerFrame(completed.worker, frame(message));
 		}
@@ -886,6 +906,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(completed.worker.client).toBeDefined();
 
 		const mismatchedEnd = workerHarness();
+		registerWorker(supervisor, mismatchedEnd.worker);
 		for (const message of [frames.begin, frames.chunk, frames.end, frames.begin, frames.chunk]) {
 			internals.handleWorkerFrame(mismatchedEnd.worker, frame(message));
 		}
@@ -895,6 +916,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(mismatchedEnd.worker.client).toBeDefined();
 
 		const replaced = workerHarness();
+		registerWorker(supervisor, replaced.worker);
 		internals.handleWorkerFrame(replaced.worker, frame(frames.begin));
 		internals.handleWorkerFrame(replaced.worker, frame({ ...frames.begin, snapshotId: "snapshot-4602-new" }));
 		expect(replaced.close).not.toHaveBeenCalled();
@@ -921,6 +943,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		socket.resume();
 		const client = socketClient("bounded-retry", socket);
 		const { worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		const records: DaemonOutbound[] = [];
 		let attachIndex = 0;
 		const attachClient = vi.fn(async () => {
@@ -974,6 +997,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 				descriptorDir: "/tmp/eng-4602-supervisor-deadline-state",
 			});
 			const { worker } = workerHarness();
+			registerWorker(supervisor, worker);
 			const client = socketClient("deadline", new PassThrough());
 			const records: DaemonOutbound[] = [];
 			const internals = supervisor as unknown as {
@@ -1012,6 +1036,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-epoch-state",
 		});
 		const { worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		const client = socketClient("epoch", new PassThrough());
 		const transcript = new SnapshotTranscriptCache({ activeSessionId, snapshotId, cacheRoot: "/tmp" });
 		const records: DaemonOutbound[] = [];
@@ -1072,6 +1097,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		failedClient.attachedActiveSessionIds.add("active-4602-sibling");
 		const siblingClient = socketClient("sibling", siblingSocket);
 		const { close, worker } = workerHarness();
+		registerWorker(supervisor, worker);
 		worker.snapshotCache.set(activeSessionId, result);
 		worker.transcriptCaches.set(activeSessionId, transcript);
 		const internals = supervisor as unknown as {
