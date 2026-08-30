@@ -3564,6 +3564,162 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(catchUpClient).not.toHaveBeenCalled();
 	});
 
+	it("rejects worker frames that target another resident or mismatch the routed payload", () => {
+		const writes: string[] = [];
+		const publicClient = {
+			id: "public-b",
+			socket: {
+				destroyed: false,
+				write: vi.fn((value: unknown) => {
+					writes.push(String(value));
+					return true;
+				}),
+			},
+			attachedActiveSessionIds: new Set(["active-b"]),
+			catchupActiveSessionIds: new Set<string>(),
+			backpressured: false,
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+		const makeWorker = (workerId: string, activeId: string) => ({
+			descriptor: { workerId, rootActiveSessionId: activeId },
+			client: { close: vi.fn() },
+			authorizedActiveSessionIds: new Set([activeId]),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+		});
+		const workerA = makeWorker("worker-a", "active-a");
+		const workerB = makeWorker("worker-b", "active-b");
+		const handleWorkerClose = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([
+				["worker-a", workerA],
+				["worker-b", workerB],
+			]),
+			clients: new Set([publicClient]),
+			streamReconstructor: { observe: vi.fn() },
+			handleWorkerClose,
+			invalidateWorkerSnapshot: vi.fn(),
+			refreshWorkerSummaries: vi.fn(async () => undefined),
+		}) as {
+			handleWorkerFrame(residentWorker: typeof workerA, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+
+		supervisor.handleWorkerFrame(workerA, {
+			header: {
+				kind: "outbound",
+				outboundType: "session_snapshot_begin",
+				activeSessionId: "active-b",
+				snapshotId: "foreign-snapshot",
+			},
+			payload: Buffer.from("{}"),
+		});
+		expect(handleWorkerClose).toHaveBeenCalledOnce();
+		expect(workerA.client.close).toHaveBeenCalledOnce();
+		expect(workerA.snapshotCache.size).toBe(0);
+		expect(workerA.snapshotGenerations.size).toBe(0);
+		expect(writes).toEqual([]);
+
+		handleWorkerClose.mockClear();
+		workerA.client.close.mockClear();
+		supervisor.handleWorkerFrame(workerA, {
+			header: { kind: "outbound", outboundType: "extension_error", activeSessionId: "active-a" },
+			payload: Buffer.from(
+				JSON.stringify({
+					type: "extension_error",
+					activeSessionId: "active-b",
+					extensionPath: "/tmp/mismatch.ts",
+					event: "load",
+					error: "mismatch",
+				}),
+			),
+		});
+		expect(handleWorkerClose).toHaveBeenCalledOnce();
+		expect(workerA.client.close).toHaveBeenCalledOnce();
+		expect(writes).toEqual([]);
+	});
+
+	it("pre-binds child session authority from an authorized parent update", () => {
+		const makeWorker = (workerId: string, activeId: string) => ({
+			descriptor: { workerId, rootActiveSessionId: activeId },
+			client: { close: vi.fn() },
+			authorizedActiveSessionIds: new Set([activeId]),
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+		});
+		const workerA = makeWorker("worker-a", "active-a");
+		const workerB = makeWorker("worker-b", "active-b");
+		const handleWorkerClose = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([
+				["worker-a", workerA],
+				["worker-b", workerB],
+			]),
+			clients: new Set(),
+			streamReconstructor: { observe: vi.fn() },
+			handleWorkerClose,
+			invalidateWorkerSnapshot: vi.fn(),
+			refreshWorkerSummaries: vi.fn(async () => undefined),
+		}) as {
+			handleWorkerFrame(residentWorker: typeof workerA, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		const childUpdate = (childActiveSessionId: string) => ({
+			header: {
+				kind: "outbound" as const,
+				outboundType: "session_event" as const,
+				activeSessionId: "active-a",
+				sessionEventType: "rlm_child_update",
+			},
+			payload: Buffer.from(
+				JSON.stringify({
+					type: "session_event",
+					activeSessionId: "active-a",
+					event: {
+						type: "rlm_child_update",
+						child: {
+							id: "child-a",
+							activeSessionId: childActiveSessionId,
+							label: "child",
+							status: "running",
+							sessionDir: "/tmp/child",
+						},
+					},
+					attribution: { scope: "session" },
+				}),
+			),
+		});
+
+		supervisor.handleWorkerFrame(workerA, childUpdate("active-child"));
+		supervisor.handleWorkerFrame(workerA, {
+			header: {
+				kind: "outbound",
+				outboundType: "session_event",
+				activeSessionId: "active-child",
+				sessionEventType: "turn_start",
+			},
+			payload: Buffer.from(
+				JSON.stringify({
+					type: "session_event",
+					activeSessionId: "active-child",
+					event: { type: "turn_start" },
+					attribution: { scope: "session" },
+				}),
+			),
+		});
+		expect(workerA.authorizedActiveSessionIds).toContain("active-child");
+		expect(handleWorkerClose).not.toHaveBeenCalled();
+
+		supervisor.handleWorkerFrame(workerA, childUpdate("active-b"));
+		expect(handleWorkerClose).toHaveBeenCalledOnce();
+		expect(workerA.client.close).toHaveBeenCalledOnce();
+	});
+
 	it("shapes correlated worker events separately for capable and legacy clients", () => {
 		const activeSessionId = "active-correlated";
 		const capableWrites: string[] = [];

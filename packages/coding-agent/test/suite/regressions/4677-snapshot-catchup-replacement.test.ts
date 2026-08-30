@@ -245,6 +245,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 		);
 		worker.transcriptCaches.clear();
 		worker.snapshotCache.clear();
+		worker.snapshotCache.set(activeSessionId, firstResult);
 		worker.snapshotGenerations.clear();
 		const internals = supervisor as unknown as {
 			getOrCreateTranscriptCache(worker: object, result: DaemonAttachResult): Promise<SnapshotTranscriptCache>;
@@ -253,6 +254,7 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 		const first = await internals.getOrCreateTranscriptCache(worker, firstResult);
 		const firstId = first.snapshotId;
 		const firstChunkCount = first.chunkCount;
+		worker.snapshotCache.set(activeSessionId, secondResult);
 		const second = await internals.getOrCreateTranscriptCache(worker, secondResult);
 
 		expect(firstId).not.toBe(second.snapshotId);
@@ -262,6 +264,53 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 		expect(second.chunkCount).toBe(1);
 		expect(Buffer.concat([...second]).toString("utf8")).toContain('"nested":"after"');
 		second.dispose();
+	});
+
+	it("does not publish a legacy transcript after its snapshot selection is invalidated", async () => {
+		const root = tempDirectory();
+		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			descriptorDir: join(root, "state"),
+		});
+		const withoutStream = (content: string, sequence: number): DaemonAttachResult => {
+			const result = streamedResult("legacy", 1, sequence);
+			const { snapshotStream: _snapshotStream, ...full } = result;
+			full.snapshot = {
+				...full.snapshot,
+				messages: [{ role: "user", content, timestamp: sequence }] as unknown as AgentMessage[],
+			};
+			return full;
+		};
+		const staleResult = withoutStream(`stale-${"x".repeat(2 * 1024 * 1024)}`, 7);
+		const freshResult = withoutStream("fresh", 8);
+		const worker = workerHarness(
+			staleResult,
+			new SnapshotTranscriptCache({ activeSessionId, snapshotId: "placeholder", cacheRoot: root }),
+		);
+		worker.transcriptCaches.clear();
+		worker.snapshotGenerations.clear();
+		worker.snapshotCache.set(activeSessionId, staleResult);
+		const internals = supervisor as unknown as {
+			workers: Map<string, object>;
+			getOrCreateTranscriptCache(worker: object, result: DaemonAttachResult): Promise<SnapshotTranscriptCache>;
+			invalidateWorkerSnapshot(worker: object, activeSessionId: string, transcriptChanged?: boolean): void;
+			transcriptPreparations?: WeakMap<object, Map<string, unknown>>;
+		};
+		internals.workers.set(worker.descriptor.workerId, worker);
+
+		const stalePreparation = internals.getOrCreateTranscriptCache(worker, staleResult);
+		expect(internals.transcriptPreparations?.get(worker)?.has(activeSessionId)).toBe(true);
+		internals.invalidateWorkerSnapshot(worker, activeSessionId, false);
+
+		await expect(stalePreparation).rejects.toThrow("changed during transcript preparation");
+		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
+		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
+		expect(worker.snapshotGenerations.get(activeSessionId)?.size ?? 0).toBe(0);
+
+		worker.snapshotCache.set(activeSessionId, freshResult);
+		const freshTranscript = await internals.getOrCreateTranscriptCache(worker, freshResult);
+		expect(Buffer.concat([...freshTranscript]).toString("utf8")).toContain("fresh");
+		freshTranscript.dispose();
 	});
 
 	it("lets an incomplete retained snapshot finish after a newer generation begins", async () => {

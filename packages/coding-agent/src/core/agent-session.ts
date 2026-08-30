@@ -938,6 +938,8 @@ interface RlmChildRun {
 interface RetainedRlmChild {
 	session: AgentSession;
 	run?: RlmChildRun;
+	/** Durable terminal status for a rehydrated child that has no in-memory run. */
+	terminalStatus?: "done" | "error";
 }
 
 interface RlmSubagentModelSelection {
@@ -10052,7 +10054,7 @@ export class AgentSession {
 			});
 			recorded.add(run.id);
 		}
-		for (const [childId, { session: childSession }] of this._rlmChildSessions) {
+		for (const [childId, { session: childSession, terminalStatus }] of this._rlmChildSessions) {
 			if (
 				this._deletingRlmChildren.has(childId) ||
 				recorded.has(childId) ||
@@ -10072,7 +10074,7 @@ export class AgentSession {
 				session_name:
 					daemonChild?.sessionName ?? childSession.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
 				session_dir: sessionDir,
-				status: "completed",
+				status: terminalStatus === "error" ? "error" : "completed",
 			});
 			recorded.add(childId);
 		}
@@ -10440,7 +10442,12 @@ export class AgentSession {
 	 * the child) when the parent is already tearing down, so the caller can drop the
 	 * matching event forwarder too.
 	 */
-	registerRlmChildSession(childId: string, session: AgentSession, unsubscribe?: () => void): boolean {
+	registerRlmChildSession(
+		childId: string,
+		session: AgentSession,
+		unsubscribe?: () => void,
+		terminalStatus: "done" | "error" = "done",
+	): boolean {
 		// A child can finish concurrently while the parent is (or has) torn down; don't
 		// resurrect the map (it would never be disposed), just drop the child now.
 		if (this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId)) {
@@ -10453,7 +10460,11 @@ export class AgentSession {
 			void session.disposeAsync().catch(() => undefined);
 			return false;
 		}
-		this._rlmChildSessions.set(childId, { session, run: this._activeRlmChildRuns.get(childId) });
+		this._rlmChildSessions.set(childId, {
+			session,
+			run: this._activeRlmChildRuns.get(childId),
+			terminalStatus,
+		});
 		if (unsubscribe) {
 			this._rlmChildUnsubscribes.set(childId, unsubscribe);
 		}
@@ -10503,7 +10514,11 @@ export class AgentSession {
 		};
 	}
 
-	private _rlmChildSnapshotForSession(childId: string, child: AgentSession): RlmChildAgentSnapshot {
+	private _rlmChildSnapshotForSession(
+		childId: string,
+		child: AgentSession,
+		terminalStatus: "done" | "error" = "done",
+	): RlmChildAgentSnapshot {
 		let answerPreview: string | undefined;
 		let toolUseCount = 0;
 		const messages =
@@ -10522,16 +10537,16 @@ export class AgentSession {
 			sessionName: child.sessionName,
 			model: child.model ? `${child.model.provider}/${child.model.id}` : undefined,
 			label: child.sessionName ?? "child agent",
-			status: "done",
+			status: terminalStatus,
 			answerPreview,
 			toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
 			tokenCount: child._contextTokensForCurrentMessages(),
 			recap: child.getCurrentRecap(),
 			sessionDir: child._rlmSessionDir ?? child.sessionManager.getSessionDir(),
 			// No run exists (e.g. a child rehydrated after daemon recovery), so live
-			// session state is the only source for in-flight follow-up work. Mirror
-			// the run projection's convention: status stays "done" (the recorded task
-			// finished) and current work surfaces through activity.
+			// session state is the only source for in-flight follow-up work. The
+			// registry owns the recorded task's terminal status while current work
+			// surfaces separately through activity.
 			activity: child.isSessionActive ? { kind: child.isStreaming ? "writing" : "waiting" } : undefined,
 			repliedSinceTask: child._repliedToParentSinceTask,
 		};
@@ -10555,13 +10570,13 @@ export class AgentSession {
 				snapshots.push(...child.getRlmChildSnapshots());
 			}
 		}
-		for (const [childId, { session: child, run }] of this._rlmChildSessions) {
+		for (const [childId, { session: child, run, terminalStatus }] of this._rlmChildSessions) {
 			if (recorded.has(childId) || traversed.has(childId)) continue;
 			const hidden = this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId);
 			if (!hidden) {
 				const snapshot = run
 					? this._rlmChildSnapshotForRun(run, child)
-					: this._rlmChildSnapshotForSession(childId, child);
+					: this._rlmChildSnapshotForSession(childId, child, terminalStatus);
 				snapshots.push({
 					...snapshot,
 					status: this._rlmChildCleanupFailures.has(childId) ? "cancelled" : snapshot.status,

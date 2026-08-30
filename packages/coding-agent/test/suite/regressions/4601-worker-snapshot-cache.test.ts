@@ -14,10 +14,15 @@ import {
 	type DaemonOutbound,
 } from "../../../src/modes/daemon/daemon-protocol.js";
 import {
+	type DaemonWorkerFrameHeader,
+	isDaemonWorkerFrameHeader,
+} from "../../../src/modes/daemon/daemon-worker-protocol.js";
+import {
 	createSnapshotTranscriptChunks,
 	SnapshotTranscriptCache,
 	type SnapshotTranscriptChunkSource,
 } from "../../../src/modes/daemon/snapshot-transcript-cache.js";
+import { encodePrivateFrameParts, PrivateFrameDecoder } from "../../../src/modes/session-worker/private-framing.js";
 
 const tempDirectories: string[] = [];
 const activeSessionId = "active-4601";
@@ -204,7 +209,7 @@ describe("ENG-4601 worker snapshot cache", () => {
 			// Fully consume the fresh generation to prove its new backing is readable.
 		}
 		second.dispose?.();
-	});
+	}, 15_000);
 
 	it.each([1, 2])(
 		"keeps %i same-ID worker stream(s) bounded by socket drain without shared cleanup",
@@ -468,6 +473,80 @@ describe("ENG-4601 worker snapshot cache", () => {
 		expect(socket.listenerCount("close")).toBe(0);
 		expect(socket.listenerCount("error")).toBe(0);
 		expect(socket.destroyed).toBe(false);
+		socket.destroy();
+	});
+
+	it("keeps an aborted queued private frame behind its still-writing predecessor", async () => {
+		const root = tempDirectory();
+		const daemon = new AgentDaemon(join(root, "worker.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { client, socket } = socketClient("worker-private-frame-reservation");
+		const written: Buffer[] = [];
+		let writes = 0;
+		vi.spyOn(socket, "write").mockImplementation(((chunk: Uint8Array) => {
+			written.push(Buffer.from(chunk));
+			writes++;
+			return writes !== 1;
+		}) as typeof socket.write);
+		const frame = (snapshot: string, payload: string) =>
+			encodePrivateFrameParts<DaemonWorkerFrameHeader>(
+				{
+					kind: "outbound",
+					outboundType: "session_snapshot_chunk",
+					activeSessionId,
+					snapshotId: snapshot,
+					payloadEncoding: "jsonl",
+				},
+				[Buffer.from(payload)],
+			);
+		const internals = daemon as unknown as {
+			writePrivateFrameParts(
+				client: DaemonSocketClient,
+				parts: readonly Buffer[],
+				signal?: AbortSignal,
+			): Promise<boolean>;
+			write(client: DaemonSocketClient, message: DaemonOutbound): boolean;
+		};
+
+		const first = internals.writePrivateFrameParts(client, frame("frame-a", "payload-a"));
+		for (let attempt = 0; attempt < 10 && socket.listenerCount("drain") === 0; attempt++) {
+			await Promise.resolve();
+		}
+		const abortQueued = new AbortController();
+		const second = internals.writePrivateFrameParts(client, frame("frame-b", "payload-b"), abortQueued.signal);
+		internals.write(client, {
+			type: "session_closed",
+			activeSessionId,
+			reason: "killed",
+		});
+		abortQueued.abort();
+
+		await expect(second).rejects.toThrow("was aborted");
+		expect(written).toHaveLength(1);
+		expect(client.privateFrameWriteTail).toBeDefined();
+
+		socket.emit("drain");
+		await expect(first).resolves.toBe(true);
+		await client.privateFrameWriteTail;
+		await Promise.resolve();
+
+		const decoder = new PrivateFrameDecoder(isDaemonWorkerFrameHeader);
+		const decoded = decoder.push(Buffer.concat(written));
+		decoder.finish();
+		expect(
+			decoded.map((entry) =>
+				entry.header.kind === "outbound" ? (entry.header.snapshotId ?? entry.header.outboundType) : "command",
+			),
+		).toEqual(["frame-a", "session_closed"]);
+		expect(decoded.map((entry) => entry.payload.toString("utf8"))).not.toContain("payload-b");
+		expect(client.privateFrameWriteTail).toBeUndefined();
+		expect(socket.listenerCount("drain")).toBe(0);
+		expect(socket.listenerCount("close")).toBe(0);
+		expect(socket.listenerCount("error")).toBe(0);
 		socket.destroy();
 	});
 

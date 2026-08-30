@@ -3012,7 +3012,16 @@ export class AgentDaemon {
 			);
 			// The session transcript is authoritative for mutable metadata such as a
 			// later user-assigned name; the registry value is only the spawn snapshot.
-			if (!parentState.runtime.session.registerRlmChildSession(entry.childId, runtime.session)) {
+			const registered =
+				entry.status === "completed"
+					? parentState.runtime.session.registerRlmChildSession(entry.childId, runtime.session)
+					: parentState.runtime.session.registerRlmChildSession(
+							entry.childId,
+							runtime.session,
+							undefined,
+							"error",
+						);
+			if (!registered) {
 				await this.closeSession(state, "replaced");
 				throw new RuntimeOpenCancelledError();
 			}
@@ -5156,38 +5165,50 @@ export class AgentDaemon {
 						...(metadata.rlmChildId ? { childId: metadata.rlmChildId } : {}),
 					}
 				: undefined;
-		let session = state.runtime.session;
-		let children = await this.buildRlmChildSnapshotsWithPassiveRlmSubagents(state);
-		for (
-			let retries = 0;
-			retries < MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES && state.runtime.session !== session;
-			retries++
-		) {
-			session = state.runtime.session;
-			children = await this.buildRlmChildSnapshotsWithPassiveRlmSubagents(state);
+		for (let attempt = 0; attempt <= MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES; attempt++) {
+			const session = state.runtime.session;
+			const eventGeneration = state.eventGeneration;
+			const lastEventSequence = state.lastEventSequence;
+			const children = await this.buildRlmChildSnapshotsWithPassiveRlmSubagents(state);
+			if (
+				state.runtime.session !== session ||
+				state.eventGeneration !== eventGeneration ||
+				state.lastEventSequence !== lastEventSequence
+			) {
+				continue;
+			}
+			const connectionState = this.createConnectionState(state);
+			const messages = createImmutableSnapshotMessages(session.messages);
+			const summary = summaryForActiveSession(state);
+			const promptLifecycles = includePromptLifecycles
+				? (session.getPromptLifecycles?.() ?? { records: [], expired: [] })
+				: undefined;
+			if (
+				state.runtime.session !== session ||
+				state.eventGeneration !== eventGeneration ||
+				state.lastEventSequence !== lastEventSequence
+			) {
+				continue;
+			}
+			return {
+				activeSessionId: state.activeSessionId,
+				summary,
+				state: connectionState,
+				messages,
+				// Omit duplicate heavy payloads from attach. The client can derive render
+				// context from messages + state, and fetch the full session tree lazily
+				// when the tree/branch selector opens.
+				lastEventSequence,
+				lastEventCursor: {
+					generation: eventGeneration,
+					sequence: lastEventSequence,
+				},
+				...(parent ? { parent } : {}),
+				children,
+				...(promptLifecycles ? { promptLifecycles } : {}),
+			};
 		}
-		session = state.runtime.session;
-		const connectionState = this.createConnectionState(state);
-		const messages = createImmutableSnapshotMessages(session.messages);
-		return {
-			activeSessionId: state.activeSessionId,
-			summary: summaryForActiveSession(state),
-			state: connectionState,
-			messages,
-			// Omit duplicate heavy payloads from attach. The client can derive render
-			// context from messages + state, and fetch the full session tree lazily
-			// when the tree/branch selector opens.
-			lastEventSequence: state.lastEventSequence,
-			lastEventCursor: {
-				generation: state.eventGeneration,
-				sequence: state.lastEventSequence,
-			},
-			...(parent ? { parent } : {}),
-			children,
-			...(includePromptLifecycles
-				? { promptLifecycles: session.getPromptLifecycles?.() ?? { records: [], expired: [] } }
-				: {}),
-		};
+		throw new Error(`Session ${state.activeSessionId} changed while its snapshot was being prepared`);
 	}
 
 	private async prepareWorkerSnapshotTranscript(options: {
@@ -5505,11 +5526,16 @@ export class AgentDaemon {
 		drainTimeoutMs?: number,
 	): Promise<boolean> {
 		const previous = client.privateFrameWriteTail;
-		let resolveTail!: () => void;
-		const tail = new Promise<void>((resolve) => {
-			resolveTail = resolve;
+		const previousSettled = previous?.catch(() => undefined);
+		let releaseCurrent!: () => void;
+		const currentReleased = new Promise<void>((resolve) => {
+			releaseCurrent = resolve;
 		});
+		const tail = previousSettled ? previousSettled.then(() => currentReleased) : currentReleased;
 		client.privateFrameWriteTail = tail;
+		void tail.finally(() => {
+			if (client.privateFrameWriteTail === tail) client.privateFrameWriteTail = undefined;
+		});
 		try {
 			if (previous) await waitForSnapshotAttempt(previous, signal ?? AbortSignal.timeout(30_000), "private-frame");
 			for (const part of parts) {
@@ -5523,8 +5549,7 @@ export class AgentDaemon {
 			}
 			return true;
 		} finally {
-			resolveTail();
-			if (client.privateFrameWriteTail === tail) client.privateFrameWriteTail = undefined;
+			releaseCurrent();
 		}
 	}
 

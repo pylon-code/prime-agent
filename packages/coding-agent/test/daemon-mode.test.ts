@@ -4134,6 +4134,7 @@ describe("daemon mode helpers", () => {
 				buildRlmChildSnapshotsWithPassiveRlmSubagents(
 					state: ActiveSessionState,
 				): Promise<NonNullable<DaemonAttachResult["snapshot"]["children"]>>;
+				getOrHydrateBoundSessionState(selector: string): Promise<ActiveSessionState>;
 				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 			};
 
@@ -4255,6 +4256,16 @@ describe("daemon mode helpers", () => {
 					}),
 				]),
 			);
+
+			const hydratedChild = await internals.getOrHydrateBoundSessionState(fixture.childId);
+			expect(hydratedChild.runtime.session).toBe(fixture.runtimeSessions[1]);
+			expect(parentState.runtime.session.registerRlmChildSession).toHaveBeenCalledWith(
+				fixture.childId,
+				hydratedChild.runtime.session,
+				undefined,
+				"error",
+			);
+			expect(fixture.createRuntime).toHaveBeenCalledTimes(2);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -4508,7 +4519,63 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("bounds snapshot stabilization when every child build replaces the runtime session", async () => {
+	it("recomputes snapshot children when the event cursor advances during the passive walk", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-snapshot-child-event-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSessionSnapshot(state: ActiveSessionState): Promise<DaemonAttachResult["snapshot"]>;
+				createConnectionState: ReturnType<typeof vi.fn>;
+				buildRlmChildSnapshotsWithPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+			};
+			const state = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			internals.createConnectionState = vi.fn(() => ({}));
+			let calls = 0;
+			internals.buildRlmChildSnapshotsWithPassiveRlmSubagents = vi.fn(async () => {
+				calls++;
+				if (calls === 1) state.lastEventSequence++;
+				return [{ id: calls === 1 ? "running-child" : "finished-child", status: "done", sessionDir: tempDir }];
+			});
+
+			const snapshot = await internals.createSessionSnapshot(state);
+
+			expect(internals.buildRlmChildSnapshotsWithPassiveRlmSubagents).toHaveBeenCalledTimes(2);
+			expect(snapshot.children).toEqual([expect.objectContaining({ id: "finished-child" })]);
+			expect(snapshot.lastEventSequence).toBe(1);
+			expect(snapshot.lastEventCursor).toMatchObject({ generation: state.eventGeneration, sequence: 1 });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("fails snapshot stabilization when the event cursor advances on every child build", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-snapshot-event-bound-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSessionSnapshot(state: ActiveSessionState): Promise<DaemonAttachResult["snapshot"]>;
+				createConnectionState: ReturnType<typeof vi.fn>;
+				buildRlmChildSnapshotsWithPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+			};
+			const state = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			internals.createConnectionState = vi.fn(() => ({}));
+			internals.buildRlmChildSnapshotsWithPassiveRlmSubagents = vi.fn(async () => {
+				state.lastEventSequence++;
+				return [{ id: `child-${state.lastEventSequence}`, status: "done", sessionDir: tempDir }];
+			});
+
+			await expect(internals.createSessionSnapshot(state)).rejects.toThrow(
+				"changed while its snapshot was being prepared",
+			);
+			expect(internals.buildRlmChildSnapshotsWithPassiveRlmSubagents).toHaveBeenCalledTimes(4);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("fails snapshot stabilization when every child build replaces the runtime session", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-snapshot-stabilization-bound-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
@@ -4534,11 +4601,9 @@ describe("daemon mode helpers", () => {
 				return [{ id: `child-${calls}`, status: "done", sessionDir: tempDir }];
 			});
 
-			await expect(internals.createSessionSnapshot(state)).resolves.toMatchObject({
-				children: [expect.objectContaining({ id: "child-4" })],
-				messages: [{ content: "transcript 4" }],
-				summary: { sessionId: "session-4" },
-			});
+			await expect(internals.createSessionSnapshot(state)).rejects.toThrow(
+				"changed while its snapshot was being prepared",
+			);
 			expect(internals.buildRlmChildSnapshotsWithPassiveRlmSubagents).toHaveBeenCalledTimes(4);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });

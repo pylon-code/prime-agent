@@ -23,7 +23,7 @@ export interface DaemonSocketClient {
 	snapshotActiveSessionCounts?: Map<string, number>;
 	snapshotTransferAbortControllers?: Map<string, AbortController>;
 	snapshotTransferTails?: Map<string, Promise<void>>;
-	/** Serializes private frames when a large snapshot frame pauses between parts. */
+	/** Settles only after all queued private-frame reservations and their predecessors retire. */
 	privateFrameWriteTail?: Promise<void>;
 	detachInput: () => void;
 	supportsExtensionUi: boolean;

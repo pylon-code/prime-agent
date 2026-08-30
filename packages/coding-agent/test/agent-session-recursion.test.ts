@@ -562,6 +562,25 @@ describe("AgentSession rlm recursion", () => {
 		expect(childStatuses).toEqual(["cancelled"]);
 	});
 
+	it("preserves an errored terminal outcome for a restored session-only child", async () => {
+		const childId = "restored-error-child";
+		const childDir = join(tempDir, childId);
+		mkdirSync(childDir, { recursive: true });
+		const child = createSession({ rlmSessionDir: childDir });
+		child.setSessionName("restored-error-worker");
+		const root = createSession();
+
+		expect(root.registerRlmChildSession(childId, child, undefined, "error")).toBe(true);
+		expect(root.getRlmChildSnapshots()).toEqual([expect.objectContaining({ id: childId, status: "error" })]);
+		expect((await root.listRlmSubagents()).subagents).toEqual([
+			expect.objectContaining({ rlm_child_id: childId, status: "error" }),
+		]);
+		const release = root.releaseRlmChildSession(childId, child);
+		expect(release).not.toBe(false);
+		expect(root.getRlmChildSnapshots()).toEqual([expect.objectContaining({ id: childId, status: "error" })]);
+		if (release) release();
+	});
+
 	it("projects live follow-up activity for a restored session-only child", async () => {
 		const childId = "restored-followup-child";
 		const childDir = join(tempDir, childId);

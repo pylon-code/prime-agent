@@ -314,6 +314,8 @@ interface ResidentWorker {
 	snapshotGenerations: Map<string, Map<string, SnapshotTranscriptGeneration>>;
 	snapshotLoads: Map<string, Promise<DaemonAttachResult>>;
 	snapshotLoadSnapshotIds: Map<string, string | undefined>;
+	/** Active-session IDs this authenticated resident worker may emit. */
+	authorizedActiveSessionIds: Set<string>;
 	recovery?: Promise<void>;
 	deferredRecovery?: Promise<void>;
 	intentionalStop: boolean;
@@ -378,6 +380,7 @@ interface SupervisorTranscriptPreparation {
 	controller: AbortController;
 	workerClient: DaemonWorkerClient | undefined;
 	stopRevision: number;
+	selectionRevision: number;
 }
 
 interface SupervisorPromptAdmission {
@@ -732,6 +735,7 @@ export class DaemonSupervisor {
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
 	private transcriptPreparations?: WeakMap<ResidentWorker, Map<string, SupervisorTranscriptPreparation>>;
+	private snapshotSelectionRevisions?: WeakMap<ResidentWorker, Map<string, number>>;
 	private readonly pendingSessionNames = new Set<string>();
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
@@ -1072,6 +1076,7 @@ export class DaemonSupervisor {
 					snapshotGenerations: new Map(),
 					snapshotLoads: new Map(),
 					snapshotLoadSnapshotIds: new Map(),
+					authorizedActiveSessionIds: new Set([durableDescriptor.rootActiveSessionId]),
 					intentionalStop: durableDescriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
 				};
@@ -2851,6 +2856,7 @@ export class DaemonSupervisor {
 				snapshotGenerations: new Map(),
 				snapshotLoads: new Map(),
 				snapshotLoadSnapshotIds: new Map(),
+				authorizedActiveSessionIds: new Set([descriptor.rootActiveSessionId]),
 				intentionalStop: false,
 				stopRevision: 0,
 				launchEnv,
@@ -3239,6 +3245,15 @@ export class DaemonSupervisor {
 		closeWorkerChannel = false,
 		expectedSnapshotId?: string,
 	): void {
+		const selectedSnapshotId = worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id;
+		const selectedTranscriptId = worker.transcriptCaches.get(activeSessionId)?.snapshotId;
+		if (
+			expectedSnapshotId === undefined ||
+			selectedSnapshotId === expectedSnapshotId ||
+			selectedTranscriptId === expectedSnapshotId
+		) {
+			this.invalidateSnapshotSelection(worker, activeSessionId, error);
+		}
 		const generations = worker.snapshotGenerations?.get(activeSessionId);
 		if (expectedSnapshotId) {
 			const generation = generations?.get(expectedSnapshotId);
@@ -3809,6 +3824,44 @@ export class DaemonSupervisor {
 		return promptLifecycles;
 	}
 
+	private workerAuthorizedActiveSessionIds(worker: ResidentWorker): Set<string> {
+		if (!worker.authorizedActiveSessionIds) {
+			const rootActiveSessionId = worker.descriptor?.rootActiveSessionId;
+			worker.authorizedActiveSessionIds = new Set(rootActiveSessionId ? [rootActiveSessionId] : []);
+		}
+		return worker.authorizedActiveSessionIds;
+	}
+
+	private workerOwnsActiveSessionId(worker: ResidentWorker, activeSessionId: string): boolean {
+		// Prototype-only unit harnesses omit both identity fields. Every production
+		// worker has a descriptor and remains registered while its channel is valid.
+		if (!worker.descriptor) return !this.workers;
+		if (this.workers && this.workers.get(worker.descriptor.workerId) !== worker) return false;
+		return this.workerAuthorizedActiveSessionIds(worker).has(activeSessionId);
+	}
+
+	private bindWorkerActiveSessionIds(worker: ResidentWorker, activeSessionIds: Iterable<string>): void {
+		const candidates = new Set(activeSessionIds);
+		for (const activeSessionId of candidates) {
+			if (!activeSessionId) throw new Error("Session worker returned an empty active-session ID");
+			for (const other of this.workers?.values() ?? []) {
+				if (other === worker) continue;
+				if (this.workerAuthorizedActiveSessionIds(other).has(activeSessionId)) {
+					throw new Error(`Active session ${activeSessionId} is already bound to another worker`);
+				}
+			}
+		}
+		const authorized = this.workerAuthorizedActiveSessionIds(worker);
+		for (const activeSessionId of candidates) authorized.add(activeSessionId);
+	}
+
+	private rejectWorkerFrame(worker: ResidentWorker, error: Error): void {
+		const workerClient = worker.client;
+		if (!workerClient) return;
+		this.handleWorkerClose(worker, workerClient, error);
+		workerClient.close();
+	}
+
 	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
 		if (this.isWorkerStopping(worker)) {
 			throw new Error("Session worker is stopping");
@@ -3823,6 +3876,7 @@ export class DaemonSupervisor {
 		if (recovery && !root) {
 			throw new Error(`Session worker omitted its root session during recovery`);
 		}
+		this.bindWorkerActiveSessionIds(worker, nextSummaries.keys());
 		worker.summaries = nextSummaries;
 		for (const summary of summaries) {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
@@ -4291,6 +4345,7 @@ export class DaemonSupervisor {
 					const observedSnapshotId =
 						match.worker.transcriptCaches.get(activeSessionId)?.snapshotId ??
 						match.worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id;
+					const selectionRevision = this.snapshotSelectionRevision(match.worker, activeSessionId);
 					loading = (async () => {
 						const workerClient = this.requireAvailableWorkerClient(match.worker);
 						const workerCapabilities: DaemonClientCapability[] = [
@@ -4319,7 +4374,10 @@ export class DaemonSupervisor {
 							SNAPSHOT_ATTEMPT_TIMEOUT_MS,
 						);
 						const loaded = attachResultFromResponse(response);
-						if (match.worker.snapshotLoads.get(snapshotLoadKey) !== loading) {
+						if (
+							match.worker.snapshotLoads.get(snapshotLoadKey) !== loading ||
+							this.snapshotSelectionRevision(match.worker, activeSessionId) !== selectionRevision
+						) {
 							throw new SnapshotLoadInvalidatedError("Session snapshot changed during attach");
 						}
 						return this.cacheLoadedSnapshot(match.worker, activeSessionId, loaded, observedSnapshotId);
@@ -4521,6 +4579,26 @@ export class DaemonSupervisor {
 		return loaded;
 	}
 
+	private snapshotSelectionRevision(worker: ResidentWorker, activeSessionId: string): number {
+		return this.snapshotSelectionRevisions?.get(worker)?.get(activeSessionId) ?? 0;
+	}
+
+	private invalidateSnapshotSelection(worker: ResidentWorker, activeSessionId: string, reason: Error): void {
+		this.snapshotSelectionRevisions ??= new WeakMap();
+		let revisions = this.snapshotSelectionRevisions.get(worker);
+		if (!revisions) {
+			revisions = new Map();
+			this.snapshotSelectionRevisions.set(worker, revisions);
+		}
+		revisions.set(activeSessionId, this.snapshotSelectionRevision(worker, activeSessionId) + 1);
+		const preparations = this.transcriptPreparations?.get(worker);
+		const preparation = preparations?.get(activeSessionId);
+		if (preparation) {
+			preparations?.delete(activeSessionId);
+			preparation.controller.abort(reason);
+		}
+	}
+
 	private abortTranscriptPreparations(worker: ResidentWorker, reason: Error): void {
 		const preparations = this.transcriptPreparations?.get(worker);
 		if (!preparations) return;
@@ -4538,6 +4616,17 @@ export class DaemonSupervisor {
 			const existingGeneration = existing
 				? this.snapshotGeneration(worker, activeSessionId, existing.snapshotId)
 				: undefined;
+			const selectedResult = worker.snapshotCache.get(activeSessionId);
+			if (
+				selectedResult !== result &&
+				!(
+					existingGeneration &&
+					existingGeneration.result === selectedResult &&
+					existingGeneration.materializedFrom === result
+				)
+			) {
+				throw new SnapshotLoadInvalidatedError("Session snapshot changed before transcript preparation");
+			}
 			if (
 				existing &&
 				(result.snapshotStream
@@ -4567,6 +4656,7 @@ export class DaemonSupervisor {
 			const controller = new AbortController();
 			const workerClient = worker.client;
 			const stopRevision = worker.stopRevision;
+			const selectionRevision = this.snapshotSelectionRevision(worker, activeSessionId);
 			const promise = prepareSnapshotTranscriptCache({
 				activeSessionId,
 				snapshotId,
@@ -4581,23 +4671,39 @@ export class DaemonSupervisor {
 				controller,
 				workerClient,
 				stopRevision,
+				selectionRevision,
 			};
 			preparations.set(activeSessionId, preparation);
 			let transcript: SnapshotTranscriptCache;
 			try {
 				transcript = await promise;
+			} catch (error) {
+				if (
+					this.snapshotSelectionRevision(worker, activeSessionId) !== selectionRevision ||
+					worker.snapshotCache.get(activeSessionId) !== result
+				) {
+					throw new SnapshotLoadInvalidatedError("Session snapshot changed during transcript preparation");
+				}
+				throw error;
 			} finally {
 				if (preparations.get(activeSessionId) === preparation) preparations.delete(activeSessionId);
 			}
 			const registeredWorker = this.workers?.get(worker.descriptor.workerId);
+			const selectionChanged =
+				this.snapshotSelectionRevision(worker, activeSessionId) !== selectionRevision ||
+				worker.snapshotCache.get(activeSessionId) !== result;
 			if (
+				selectionChanged ||
 				controller.signal.aborted ||
 				this.shuttingDown ||
-				(registeredWorker !== undefined && registeredWorker !== worker) ||
+				(this.workers !== undefined && registeredWorker !== worker) ||
 				worker.client !== workerClient ||
 				worker.stopRevision !== stopRevision
 			) {
 				transcript.dispose();
+				if (selectionChanged) {
+					throw new SnapshotLoadInvalidatedError("Session snapshot changed during transcript preparation");
+				}
 				throw new Error("Session worker changed during snapshot transcript preparation");
 			}
 			const cachedResult = {
@@ -4927,8 +5033,16 @@ export class DaemonSupervisor {
 			snapshotPurpose,
 		} = frame.header;
 		if (outboundType === "heartbeats_changed") {
+			if (activeSessionId) {
+				this.rejectWorkerFrame(worker, new Error("Worker heartbeat frame was unexpectedly session-scoped"));
+				return;
+			}
 			worker.heartbeatSnapshotStale = true;
 			this.broadcastHeartbeatsChanged();
+			return;
+		}
+		if (activeSessionId && !this.workerOwnsActiveSessionId(worker, activeSessionId)) {
+			this.rejectWorkerFrame(worker, new Error(`Worker emitted an unauthorized active session ${activeSessionId}`));
 			return;
 		}
 		if (
@@ -5365,7 +5479,7 @@ export class DaemonSupervisor {
 			return;
 		}
 		let publicPayload = frame.payload;
-		let decodedOutbound: DaemonOutbound | undefined;
+		let decodedOutbound: DaemonOutbound;
 		if (payloadEncoding === "assistant-delta") {
 			let compactValue: unknown;
 			try {
@@ -5374,8 +5488,12 @@ export class DaemonSupervisor {
 				this.scheduleCompactCatchup(worker, activeSessionId);
 				return;
 			}
-			if (!isCompactAssistantDelta(compactValue) || compactValue.activeSessionId !== activeSessionId) {
+			if (!isCompactAssistantDelta(compactValue)) {
 				this.scheduleCompactCatchup(worker, activeSessionId);
+				return;
+			}
+			if (compactValue.activeSessionId !== activeSessionId) {
+				this.rejectWorkerFrame(worker, new Error("Worker compact payload did not match its active-session header"));
 				return;
 			}
 			const reconstructed = this.streamReconstructor.reconstruct(compactValue);
@@ -5385,25 +5503,35 @@ export class DaemonSupervisor {
 			}
 			decodedOutbound = reconstructed;
 			publicPayload = Buffer.from(serializeJsonLine(reconstructed));
-		} else if (
-			sessionEventType === "message_start" ||
-			sessionEventType === "message_end" ||
-			outboundType === "session_replaced" ||
-			outboundType === "session_resynced" ||
-			outboundType === "session_closed" ||
-			[...this.clients].some(
-				(client) =>
-					client.attachedActiveSessionIds.has(activeSessionId) &&
-					!client.capabilities.has("correlated_prompt_lifecycle_v1"),
-			)
-		) {
+		} else {
 			try {
 				decodedOutbound = JSON.parse(frame.payload.toString("utf8")) as DaemonOutbound;
-				this.streamReconstructor.observe(decodedOutbound);
 			} catch {
-				// A malformed worker event is still isolated to this worker connection.
+				this.rejectWorkerFrame(worker, new Error("Worker returned malformed session-scoped JSON"));
+				return;
 			}
 		}
+		if (
+			decodedOutbound.type !== outboundType ||
+			(decodedOutbound as { activeSessionId?: unknown }).activeSessionId !== activeSessionId
+		) {
+			this.rejectWorkerFrame(worker, new Error("Worker payload did not match its routed frame header"));
+			return;
+		}
+		this.streamReconstructor.observe(decodedOutbound);
+		if (
+			decodedOutbound.type === "session_event" &&
+			decodedOutbound.event.type === "rlm_child_update" &&
+			decodedOutbound.event.child.activeSessionId
+		) {
+			try {
+				this.bindWorkerActiveSessionIds(worker, [decodedOutbound.event.child.activeSessionId]);
+			} catch (error) {
+				this.rejectWorkerFrame(worker, error instanceof Error ? error : new Error(String(error)));
+				return;
+			}
+		}
+
 		const replacementSnapshotFollows =
 			decodedOutbound?.type === "session_replaced" && decodedOutbound.snapshotFollows === true;
 		const reencodeLegacyWorkerReplacement =
@@ -5489,6 +5617,11 @@ export class DaemonSupervisor {
 		transcriptChanged = true,
 		invalidateLoad = transcriptChanged,
 	): void {
+		this.invalidateSnapshotSelection(
+			worker,
+			activeSessionId,
+			new SnapshotLoadInvalidatedError("Session snapshot changed during selection"),
+		);
 		worker.snapshotCache.delete(activeSessionId);
 		if (invalidateLoad) {
 			this.invalidateSnapshotLoads(worker, activeSessionId);
