@@ -1669,6 +1669,219 @@ describe("DaemonAgentConnection", () => {
 		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
 	});
 
+	it("retires a header-only chunked replacement before reattaching to a new route", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.switchSessionActiveSessionId = "active-b";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-a-replacement"),
+			messages: [],
+			snapshotFollows: true,
+		});
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-a",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 99, steering: [], followUps: [] },
+				promptCorrelationId: null,
+			},
+			attribution: { scope: "session" },
+		});
+		let releaseReattach!: () => void;
+		fakeClient.reattachGate = new Promise<void>((resolve) => {
+			releaseReattach = resolve;
+		});
+		const switching = connection.switchSession("/tmp/session-b.jsonl");
+		await vi.waitFor(() => expect(fakeClient.requests.some((request) => request.type === "reattach")).toBe(true));
+		const staleSnapshot = createAttachResult("active-a", "client-1", undefined, 12, {
+			state: createConnectionState("active-a", "session-a-replacement"),
+		}).snapshot;
+		const { messages: _staleMessages, ...staleHeader } = staleSnapshot;
+		fakeClient.emitMessage({
+			type: "session_snapshot_begin",
+			activeSessionId: "active-a",
+			snapshotId: "stale-after-b-admission",
+			snapshot: staleHeader,
+			messageCount: 0,
+			targetChunkBytes: 512 * 1024,
+			purpose: "replacement",
+		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_end",
+			activeSessionId: "active-a",
+			snapshotId: "stale-after-b-admission",
+			chunkCount: 0,
+			lastEventSequence: staleSnapshot.lastEventSequence,
+			lastEventCursor: staleSnapshot.lastEventCursor,
+		});
+		await Promise.resolve();
+		expect(events.filter((event) => event.type === "session_replaced")).toEqual([]);
+		releaseReattach();
+		await expect(switching).resolves.toEqual({ cancelled: false });
+		const fence = connection as unknown as { pendingChunkedReplacement?: unknown };
+		expect(fence.pendingChunkedReplacement).toBeUndefined();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-b",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
+				promptCorrelationId: null,
+			},
+			attribution: { scope: "session" },
+		});
+		await vi.waitFor(() =>
+			expect(events.filter((event) => event.type === "session_event")).toEqual([
+				expect.objectContaining({
+					type: "session_event",
+					event: expect.objectContaining({ actions: expect.objectContaining({ queuedCount: 0 }) }),
+				}),
+			]),
+		);
+
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-b", reason: "killed" });
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await vi.waitFor(() => expect(events.some((event) => event.type === "closed")).toBe(true));
+	});
+
+	it("retires a header-only chunked replacement across socket recovery", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const recoverDaemon = vi.fn(async () => {});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a", { recoverDaemon });
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-a-replacement"),
+			messages: [],
+			snapshotFollows: true,
+		});
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-a",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 99, steering: [], followUps: [] },
+				promptCorrelationId: null,
+			},
+			attribution: { scope: "session" },
+		});
+
+		fakeClient.emitClose(new Error("transport lost"));
+		await vi.waitFor(() =>
+			expect(events.some((event) => event.type === "connection_status" && event.status === "connected")).toBe(true),
+		);
+		const fence = connection as unknown as { pendingChunkedReplacement?: unknown };
+		expect(fence.pendingChunkedReplacement).toBeUndefined();
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-a",
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
+				promptCorrelationId: null,
+			},
+			attribution: { scope: "session" },
+		});
+		await vi.waitFor(() =>
+			expect(events.filter((event) => event.type === "session_event")).toEqual([
+				expect.objectContaining({
+					type: "session_event",
+					event: expect.objectContaining({ actions: expect.objectContaining({ queuedCount: 0 }) }),
+				}),
+			]),
+		);
+
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-a", reason: "killed" });
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("bounds queued chunked-replacement frames by cumulative structural weight", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		const closed: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "closed") closed.push(event);
+		});
+		await connection.attach();
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-a-replacement"),
+			messages: [],
+			snapshotFollows: true,
+		});
+		const canary = `chunk-fence-private-canary:${"x".repeat(80 * 1024)}`;
+		const emitLargeFrame = (id: string) => {
+			fakeClient.emitMessage({
+				type: "extension_ui_request",
+				activeSessionId: "active-a",
+				id,
+				method: "render",
+				payload: { value: canary },
+				attribution: { scope: "session" },
+			});
+		};
+
+		emitLargeFrame("large-1");
+		const fence = connection as unknown as {
+			pendingChunkedReplacement?: { queuedMessages: unknown[]; queuedMessageWeight: number };
+		};
+		expect(fence.pendingChunkedReplacement?.queuedMessages).toHaveLength(1);
+		expect(fence.pendingChunkedReplacement?.queuedMessageWeight).toBeGreaterThan(0);
+		emitLargeFrame("large-2");
+		await vi.waitFor(() => expect(closed).toHaveLength(1));
+
+		expect(fence.pendingChunkedReplacement).toBeUndefined();
+		expect(closed).toEqual([
+			{ type: "closed", error: "Daemon replacement lifecycle state could not be reconciled." },
+		]);
+		expect(JSON.stringify(closed)).not.toContain("chunk-fence-private-canary");
+	});
+
+	it("lets session close retire a header-only chunked replacement fence", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		const closed: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "closed") closed.push(event);
+		});
+		await connection.attach();
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-a-replacement"),
+			messages: [],
+			snapshotFollows: true,
+		});
+
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-a", reason: "killed" });
+
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+		await vi.waitFor(() => expect(closed).toHaveLength(1));
+		expect(
+			(connection as unknown as { pendingChunkedReplacement?: unknown }).pendingChunkedReplacement,
+		).toBeUndefined();
+	});
+
 	it("discards an old replacement query after the same connection reattaches to a new route", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
