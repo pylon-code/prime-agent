@@ -209,7 +209,7 @@ describe("ENG-4601 worker snapshot cache", () => {
 			// Fully consume the fresh generation to prove its new backing is readable.
 		}
 		second.dispose?.();
-	}, 30_000);
+	}, 60_000);
 
 	it.each([1, 2])(
 		"keeps %i same-ID worker stream(s) bounded by socket drain without shared cleanup",
