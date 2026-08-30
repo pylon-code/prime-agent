@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -19,6 +19,7 @@ const currentCli = resolve(__dirname, "../dist/bundle/cli.js");
 const compiledCli = process.env.PRIME_AGENT_COMPILED_CLI;
 const processTests = historicalCli ? describe : describe.skip;
 const children = new Set<ChildProcess>();
+const workerPids = new Set<number>();
 const roots: string[] = [];
 
 function scrubbedEnvironment(agentDir: string): NodeJS.ProcessEnv {
@@ -66,16 +67,20 @@ async function connectEventually(socketPath: string, process?: ChildProcess): Pr
 	throw new Error(`Compatibility supervisor did not become ready: ${String(lastError)}`);
 }
 
-async function stopSupervisor(child: ChildProcess): Promise<void> {
+async function waitForSupervisorExit(child: ChildProcess, timeoutMs: number): Promise<void> {
 	if (child.exitCode !== null || child.signalCode !== null) return;
-	child.kill("SIGTERM");
 	await new Promise<void>((resolveExit, reject) => {
-		const timeout = setTimeout(() => reject(new Error("Compatibility supervisor did not exit")), 10_000);
+		const timeout = setTimeout(() => reject(new Error("Compatibility supervisor did not exit")), timeoutMs);
 		child.once("exit", () => {
 			clearTimeout(timeout);
 			resolveExit();
 		});
 	});
+}
+
+async function stopSupervisor(child: ChildProcess): Promise<void> {
+	if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+	await waitForSupervisorExit(child, 10_000);
 	children.delete(child);
 }
 
@@ -86,11 +91,75 @@ function summaries(data: unknown): SessionSummary[] {
 	return sessions as SessionSummary[];
 }
 
-afterEach(() => {
-	for (const child of children) {
-		if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+function workerDescriptorFiles(agentDir: string): string[] {
+	const workersRoot = join(agentDir, "daemon-workers");
+	if (!existsSync(workersRoot)) return [];
+	return readdirSync(workersRoot, { recursive: true })
+		.map(String)
+		.filter((path) => path.endsWith(".json"));
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		throw error;
+	}
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (isProcessAlive(pid)) {
+		if (Date.now() >= deadline) throw new Error(`Compatibility worker ${pid} did not exit`);
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+	}
+}
+
+async function stopWorkerProcess(pid: number): Promise<void> {
+	try {
+		await waitForProcessExit(pid, 250);
+		return;
+	} catch {
+		// Test-only fallback after the natural shutdown assertion has already failed or been skipped.
+	}
+	try {
+		process.kill(-pid, "SIGTERM");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+		try {
+			process.kill(pid, "SIGTERM");
+		} catch (pidError) {
+			if ((pidError as NodeJS.ErrnoException).code === "ESRCH") return;
+			throw pidError;
+		}
+	}
+	try {
+		await waitForProcessExit(pid, 2_000);
+		return;
+	} catch {
+		try {
+			process.kill(-pid, "SIGKILL");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+			process.kill(pid, "SIGKILL");
+		}
+		await waitForProcessExit(pid, 2_000);
+	}
+}
+
+afterEach(async () => {
+	for (const child of [...children]) {
+		try {
+			await stopSupervisor(child);
+		} catch {
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+		}
 	}
 	children.clear();
+	for (const pid of workerPids) await stopWorkerProcess(pid);
+	workerPids.clear();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -121,6 +190,7 @@ processTests("stock v0.8.1 daemon entrypoint compatibility", () => {
 			const createdSummary = created.data as SessionSummary;
 			if (!createdSummary.activeSessionId || !createdSummary.workerPid)
 				throw new Error("Compatibility worker was incomplete");
+			workerPids.add(createdSummary.workerPid);
 			firstClient.close();
 			await stopSupervisor(firstSupervisor);
 
@@ -141,7 +211,11 @@ processTests("stock v0.8.1 daemon entrypoint compatibility", () => {
 			await connection.dispose();
 			await client.request({ type: "shutdown" });
 			client.close();
-			await stopSupervisor(replacement);
+			await waitForSupervisorExit(replacement, 10_000);
+			children.delete(replacement);
+			await waitForProcessExit(createdSummary.workerPid, 10_000);
+			expect(workerDescriptorFiles(agentDir)).toEqual([]);
+			workerPids.delete(createdSummary.workerPid);
 		},
 		60_000,
 	);
