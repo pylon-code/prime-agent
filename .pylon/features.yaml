@@ -226,3 +226,20 @@ decisions:
     revisit_when:
       - Prime upstream exposes an equivalent privacy-safe, capability-negotiated cleanup proof with durable descriptor-last retries.
       - Comet and Pylon can remove the fork capability without weakening crash cleanup or stock-Prime fallback behavior.
+
+  bounded-public-daemon-ingress:
+    area: runtime-reliability
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/13
+      - https://github.com/pylon-code/pylon/issues/114
+      - https://github.com/rynfar/comet/issues/5
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/480
+    fork_change: bounded-daemon-ingress-v1
+    upstream_support: Prime through a903d4b6768f has an optional decoded-character JSONL line limit with prefix callbacks and discard/resume behavior, but its public DaemonClient does not bound raw inbound frames or terminally reject recovery state before decode and parse.
+    revisit_when:
+      - Prime upstream exposes an equivalent public-root SDK proof, finite raw-byte default and override, privacy-safe typed terminal error, and no-replay reconnect semantics.
+      - Comet and Pylon can remove the fork token without weakening stock-package fail-closed detection or host memory bounds.

@@ -317,6 +317,7 @@ export {
 	type DaemonClientCapability,
 	type DaemonClientId,
 	type DaemonClientMessageListener,
+	type DaemonClientOptions,
 	type DaemonCommand,
 	type DaemonCommandEnvelope,
 	type DaemonCommandId,
@@ -324,6 +325,7 @@ export {
 	type DaemonEventId,
 	type DaemonEventMeta,
 	type DaemonEventSequence,
+	DaemonInboundFrameTooLargeError,
 	type DaemonModeOptions,
 	type DaemonOutbound,
 	type DaemonOwnedSessionCleanupResult,
@@ -336,6 +338,7 @@ export {
 	type DaemonResponse,
 	type DaemonResumeCursor,
 	type DaemonSessionSnapshot,
+	DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES,
 	defaultDaemonSocketPath,
 	type InteractiveInitialPrompt,
 	InteractiveMode,
@@ -410,6 +413,7 @@ export {
 	Theme,
 	type ThemeColor,
 } from "./modes/interactive/theme/theme.js";
+export { PRIME_AGENT_SDK_FEATURES, type PrimeAgentSdkFeature } from "./sdk-features.js";
 // Clipboard utilities
 export { copyToClipboard } from "./utils/clipboard.js";
 export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.js";

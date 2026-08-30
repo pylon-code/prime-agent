@@ -115,3 +115,142 @@ export function attachJsonlLineReader(
 		stream.off("end", onEnd);
 	};
 }
+
+export interface BoundedJsonlByteReaderOptions {
+	/** Maximum bytes before LF in one frame. LF is excluded; a preceding CR counts. */
+	maxFrameBytes: number;
+	/** Called once after the reader becomes permanently terminal. */
+	onFrameTooLarge: () => void;
+}
+
+const BOUNDED_JSONL_PAGE_BYTES = 64 * 1024;
+
+/**
+ * Attach a terminal, raw-byte-bounded JSONL reader.
+ *
+ * The stream must remain in byte mode. Bytes are copied into fixed-size owned
+ * pages before UTF-8 decoding so pending storage is bounded without retaining
+ * arbitrary caller buffers. Unlike `maxLineLength`, overflow never resumes at
+ * a later record: the caller must permanently close this transport epoch.
+ */
+export function attachBoundedJsonlByteReader(
+	stream: Readable,
+	onLine: (line: string) => void,
+	options: BoundedJsonlByteReaderOptions,
+): () => void {
+	if (!Number.isSafeInteger(options.maxFrameBytes) || options.maxFrameBytes <= 0) {
+		throw new RangeError("maxFrameBytes must be a positive safe integer");
+	}
+
+	let pages: Buffer[] = [];
+	let pageLengths: number[] = [];
+	let allocatedBytes = 0;
+	let pendingBytes = 0;
+	let terminal = false;
+	let attached = true;
+
+	const resetPending = () => {
+		pages = [];
+		pageLengths = [];
+		allocatedBytes = 0;
+		pendingBytes = 0;
+	};
+
+	const detach = () => {
+		if (!attached) return;
+		attached = false;
+		stream.off("data", onData);
+		stream.off("end", onEnd);
+	};
+
+	const failTooLarge = () => {
+		if (terminal) return;
+		terminal = true;
+		detach();
+		resetPending();
+		options.onFrameTooLarge();
+	};
+
+	const appendPending = (segment: Buffer): boolean => {
+		if (segment.length === 0) return true;
+		if (segment.length > options.maxFrameBytes - pendingBytes) {
+			failTooLarge();
+			return false;
+		}
+
+		let offset = 0;
+		while (offset < segment.length) {
+			let page = pages.at(-1);
+			let pageLength = pageLengths.at(-1) ?? 0;
+			if (!page || pageLength === page.length) {
+				const capacity = Math.min(BOUNDED_JSONL_PAGE_BYTES, options.maxFrameBytes - allocatedBytes);
+				page = Buffer.allocUnsafe(capacity);
+				pages.push(page);
+				pageLengths.push(0);
+				allocatedBytes += capacity;
+				pageLength = 0;
+			}
+			const copied = Math.min(page.length - pageLength, segment.length - offset);
+			segment.copy(page, pageLength, offset, offset + copied);
+			pageLengths[pageLengths.length - 1] = pageLength + copied;
+			offset += copied;
+			pendingBytes += copied;
+		}
+		return true;
+	};
+
+	const emitPending = () => {
+		const decoder = new StringDecoder("utf8");
+		const decoded: string[] = [];
+		for (let i = 0; i < pages.length; i++) {
+			const length = pageLengths[i] ?? 0;
+			if (length > 0) {
+				decoded.push(decoder.write(pages[i]!.subarray(0, length)));
+			}
+		}
+		decoded.push(decoder.end());
+		let line = decoded.join("");
+		if (line.endsWith("\r")) {
+			line = line.slice(0, -1);
+		}
+		resetPending();
+		onLine(line);
+	};
+
+	function onData(chunk: string | Buffer): void {
+		if (terminal) return;
+		const bytes = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+		let start = 0;
+		while (start <= bytes.length && !terminal) {
+			const newline = bytes.indexOf(0x0a, start);
+			if (newline === -1) {
+				appendPending(bytes.subarray(start));
+				return;
+			}
+			if (!appendPending(bytes.subarray(start, newline))) {
+				return;
+			}
+			emitPending();
+			start = newline + 1;
+		}
+	}
+
+	function onEnd(): void {
+		if (terminal) return;
+		detach();
+		if (pendingBytes > 0) {
+			emitPending();
+		} else {
+			resetPending();
+		}
+	}
+
+	stream.on("data", onData);
+	stream.on("end", onEnd);
+
+	return () => {
+		terminal = true;
+		detach();
+		resetPending();
+	};
+}

@@ -1,5 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import type {
+	DaemonClientOptions as RootDaemonClientOptions,
+	PrimeAgentSdkFeature as RootPrimeAgentSdkFeature,
+} from "../src/index.js";
+import * as publicSdk from "../src/index.js";
+import {
+	DaemonClient,
+	DaemonInboundFrameTooLargeError,
+	DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES,
+	getDaemonSocketCloseReason,
+} from "../src/modes/daemon/daemon-client.js";
 import {
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_PROTOCOL_VERSION,
@@ -119,6 +129,212 @@ describe("DaemonClient", () => {
 
 	afterEach(() => {
 		vi.useRealTimers();
+	});
+
+	it("exports the bounded-ingress SDK proof and validates finite byte limits", () => {
+		const rootOptions: RootDaemonClientOptions = { maxInboundFrameBytes: 1 };
+		const rootFeature: RootPrimeAgentSdkFeature = "bounded_daemon_ingress_v1";
+		expect(Array.isArray(publicSdk.PRIME_AGENT_SDK_FEATURES)).toBe(true);
+		expect(publicSdk.PRIME_AGENT_SDK_FEATURES).toEqual([rootFeature]);
+		expect(Object.isFrozen(publicSdk.PRIME_AGENT_SDK_FEATURES)).toBe(true);
+		expect(publicSdk.DaemonClient).toBe(DaemonClient);
+		expect(publicSdk.DaemonInboundFrameTooLargeError).toBe(DaemonInboundFrameTooLargeError);
+		expect(publicSdk.DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES).toBe(
+			DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES,
+		);
+		expect(DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES).toBe(128 * 1024 * 1024);
+		expect(() => new publicSdk.DaemonClient("/tmp/prime-agent.sock", rootOptions)).not.toThrow();
+
+		for (const invalid of [
+			0,
+			-1,
+			1.5,
+			Number.NaN,
+			Number.POSITIVE_INFINITY,
+			Number.MAX_SAFE_INTEGER + 1,
+			null,
+			"128",
+			true,
+		]) {
+			expect(
+				() =>
+					new DaemonClient("/tmp/prime-agent.sock", {
+						maxInboundFrameBytes: invalid as unknown as number,
+					}),
+			).toThrow(RangeError);
+		}
+		expect(() => new DaemonClient("/tmp/prime-agent.sock")).not.toThrow();
+		expect(() => new DaemonClient("/tmp/prime-agent.sock", { maxInboundFrameBytes: 1 })).not.toThrow();
+	});
+
+	it("fails an oversized transport during connect with one privacy-safe typed close", async () => {
+		const marker = "raw-secret-marker";
+		const client = new DaemonClient("/tmp/private-prime-agent.sock", { maxInboundFrameBytes: 256 });
+		const closed: Error[] = [];
+		client.onClose(() => {
+			throw new Error("broken close consumer");
+		});
+		client.onClose((error) => closed.push(error));
+
+		const connectionError = captureRejection(client.connect());
+		const socket = netMock.sockets[0]!;
+		socket.emit("data", Buffer.from(marker.repeat(20)));
+		const error = await connectionError;
+
+		expect(error).toBeInstanceOf(DaemonInboundFrameTooLargeError);
+		expect(error).toMatchObject({
+			code: "daemon_inbound_frame_too_large",
+			maxInboundFrameBytes: 256,
+		});
+		expect(error.message).not.toContain(marker);
+		expect(error.message).not.toContain("/tmp/private-prime-agent.sock");
+		expect(error.message).not.toContain("Daemon log");
+		expect(closed).toEqual([error]);
+		expect(client.hello).toBeUndefined();
+		await expect(client.waitForHello()).rejects.toBe(error);
+		await expect(client.request({ type: "list" })).rejects.toBe(error);
+		expect(client.isConnected).toBe(false);
+		expect(socket.destroyed).toBe(true);
+
+		socket.emit("error", new Error("late socket error"));
+		socket.emit("close");
+		socket.emit("data", Buffer.from('{"type":"late"}\n'));
+		expect(closed).toEqual([error]);
+	});
+
+	it("rejects preserved requests and hello waiters without replay after overflow", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock", { maxInboundFrameBytes: 512 });
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket);
+
+		const firstResponse = client.request({ type: "list" });
+		const secondResponse = client.request({ type: "list", all: true });
+		expect(firstSocket.writes).toHaveLength(2);
+		firstSocket.emit("close");
+
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		const hello = client.waitForHello();
+		const closed: Error[] = [];
+		client.onClose((error) => closed.push(error));
+		secondSocket.emit("data", Buffer.alloc(513, 0x78));
+
+		const [helloError, firstError, secondError] = await Promise.all([
+			captureRejection(hello),
+			captureRejection(firstResponse),
+			captureRejection(secondResponse),
+		]);
+		expect(helloError).toBeInstanceOf(DaemonInboundFrameTooLargeError);
+		expect(firstError).toBe(helloError);
+		expect(secondError).toBe(helloError);
+		expect(closed).toEqual([helloError]);
+		expect(client.hello).toBeUndefined();
+		expect(secondSocket.writes).toEqual([]);
+
+		const thirdConnect = client.connect();
+		const thirdSocket = netMock.sockets[2]!;
+		thirdSocket.emit("connect");
+		await thirdConnect;
+		emitHello(thirdSocket);
+		expect(thirdSocket.writes).toEqual([]);
+		await expect(client.waitForHello()).resolves.toMatchObject({ type: "daemon_hello" });
+		client.close();
+	});
+
+	it("suppresses automatic recovery after an inbound framing violation", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock", { maxInboundFrameBytes: 256 });
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+		const recoverDaemon = vi.fn(async () => {});
+		client.enableAutoReconnect({ recoverDaemon });
+
+		socket.emit("data", Buffer.alloc(257, 0x78));
+		await Promise.resolve();
+		expect(recoverDaemon).not.toHaveBeenCalled();
+		expect(netMock.sockets).toHaveLength(1);
+		expect(client.hello).toBeUndefined();
+		expect(client.isConnected).toBe(false);
+		client.close();
+	});
+
+	it("does not let an old automatic attempt destroy an explicit reconnect after overflow", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock", { maxInboundFrameBytes: 256 });
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket);
+
+		const recoverDaemon = vi.fn(async () => {});
+		let explicitReconnect: Promise<void> | undefined;
+		client.onClose((error) => {
+			if (error instanceof DaemonInboundFrameTooLargeError) {
+				explicitReconnect = client.reconnect();
+			}
+		});
+		client.enableAutoReconnect({ recoverDaemon });
+		firstSocket.emit("close");
+		await vi.waitFor(() => expect(netMock.sockets).toHaveLength(2));
+
+		const automaticSocket = netMock.sockets[1]!;
+		automaticSocket.emit("data", Buffer.alloc(257, 0x78));
+		expect(explicitReconnect).toBeDefined();
+		expect(netMock.sockets).toHaveLength(3);
+		const explicitSocket = netMock.sockets[2]!;
+		explicitSocket.emit("connect");
+		await explicitReconnect;
+		emitHello(explicitSocket);
+		await expect(client.waitForHello()).resolves.toMatchObject({ type: "daemon_hello" });
+		await Promise.resolve();
+
+		expect(recoverDaemon).toHaveBeenCalledOnce();
+		expect(explicitSocket.destroyed).toBe(false);
+		expect(client.isConnected).toBe(true);
+
+		const freshRecoverDaemon = vi.fn(async () => {});
+		client.enableAutoReconnect({ recoverDaemon: freshRecoverDaemon });
+		explicitSocket.emit("close");
+		await vi.waitFor(() => expect(netMock.sockets).toHaveLength(4));
+		const freshAutomaticSocket = netMock.sockets[3]!;
+		freshAutomaticSocket.emit("connect");
+		await Promise.resolve();
+		emitHello(freshAutomaticSocket);
+		await vi.waitFor(() => expect(client.isConnected).toBe(true));
+		expect(freshRecoverDaemon).toHaveBeenCalledOnce();
+		client.close();
+	});
+
+	it("accepts cumulative snapshot chunks when every raw frame is within the bound", async () => {
+		const records = Array.from({ length: 12 }, (_, index) =>
+			Buffer.from(`${JSON.stringify({ type: "session_snapshot_chunk", index, data: "x".repeat(128) })}\n`),
+		);
+		const maxFrameBytes = Math.max(...records.map((record) => record.length - 1));
+		const client = new DaemonClient("/tmp/prime-agent.sock", { maxInboundFrameBytes: maxFrameBytes });
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		const received: number[] = [];
+		client.onMessage((message) => received.push((message as unknown as { index: number }).index));
+
+		for (const record of records) {
+			for (let offset = 0; offset < record.length; offset += 7) {
+				socket.emit("data", record.subarray(offset, offset + 7));
+			}
+		}
+
+		expect(received).toEqual(Array.from({ length: 12 }, (_, index) => index));
+		expect(records.reduce((total, record) => total + record.length, 0)).toBeGreaterThan(maxFrameBytes);
+		client.close();
 	});
 
 	it("allows connect retry after the socket emits an error before connecting", async () => {
@@ -976,7 +1192,7 @@ describe("DaemonClient", () => {
 	});
 });
 
-async function captureRejection(promise: Promise<void>): Promise<Error> {
+async function captureRejection(promise: Promise<unknown>): Promise<Error> {
 	try {
 		await promise;
 	} catch (error) {
