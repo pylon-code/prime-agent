@@ -1072,6 +1072,7 @@ export class AgentSession {
 	private readonly _pendingCorrelatedPromptAdmissions = new Map<string, AbortController>();
 	private readonly _promptEventContext = new AsyncLocalStorage<string>();
 	private readonly _deferredPromptLifecycleSettlements = new Map<Promise<void>, string>();
+	private readonly _promptEventQueueFailures = new Set<string>();
 	private readonly _postCompactionPromptOwners = new WeakMap<PostCompactionContinuationSettlement, string>();
 	private readonly _agentEventPromptCorrelations = new WeakMap<AgentEvent, string>();
 	private readonly _postCompactionPromptScheduleRevisions = new Map<string, number>();
@@ -1550,10 +1551,13 @@ export class AgentSession {
 		phase: "completed" | "cancelled" | "failed",
 	): void {
 		if (correlationId === undefined) return;
+		const eventQueueFailed = this._promptEventQueueFailures.delete(correlationId);
 		const current = this._promptLifecycles.get(correlationId);
 		if (!current || isPromptLifecycleTerminal(current.phase)) return;
 		this._postCompactionPromptScheduleRevisions.delete(correlationId);
-		this._transitionPromptLifecycle(correlationId, phase);
+		// Later agent events intentionally recover the shared queue. A recovered tail must
+		// not turn an earlier correlated persistence failure into false completion.
+		this._transitionPromptLifecycle(correlationId, phase === "completed" && eventQueueFailed ? "failed" : phase);
 	}
 
 	private _isDeliveredPromptLifecycleActive(correlationId: string | undefined): correlationId is string {
@@ -1599,12 +1603,18 @@ export class AgentSession {
 		settlement: PostCompactionContinuationSettlement,
 	): void {
 		const settle = async (phase: "completed" | "failed") => {
+			let queueTailFailed = false;
 			try {
 				await this._agentEventQueue;
 			} catch {
+				queueTailFailed = true;
 				phase = "failed";
 			}
+			const recoveredEventFailure = this._promptEventQueueFailures.has(correlationId);
 			this._settlePromptLifecycle(correlationId, phase);
+			if (queueTailFailed || recoveredEventFailure) {
+				throw new Error("Correlated prompt event processing failed");
+			}
 		};
 		const operation = settlement.promise.then(
 			() => {
@@ -3657,6 +3667,11 @@ export class AgentSession {
 				} else {
 					await this._promptEventContext.run(eventCorrelationId, () => this._processAgentEvent(event));
 				}
+			} catch (error) {
+				if (this._isDeliveredPromptLifecycleActive(eventCorrelationId)) {
+					this._promptEventQueueFailures.add(eventCorrelationId);
+				}
+				throw error;
 			} finally {
 				this._agentEventPromptCorrelations.delete(event);
 			}
@@ -6498,6 +6513,12 @@ export class AgentSession {
 			if (executionPolicy.completionIncludesRetryChain) await this.waitForRetry();
 			if (!this._hasCancelledDispatchCapture()) await this._agentEventQueue;
 			if (
+				firstTurn.promptCorrelationId !== undefined &&
+				this._promptEventQueueFailures.has(firstTurn.promptCorrelationId)
+			) {
+				throw new Error("Correlated prompt event processing failed");
+			}
+			if (
 				turns.some(
 					(action) =>
 						action.lifecycle.state !== "cancelled" &&
@@ -7318,7 +7339,7 @@ export class AgentSession {
 		}
 	}
 
-	/** Waits out any owned post-compaction continuation and rejects when one cannot start; {@link waitForIdle} never rejects. */
+	/** Waits out owned post-compaction work and rejects when it cannot start or correlated event processing fails. */
 	async waitForHeadlessIdle(): Promise<void> {
 		while (true) {
 			await this.waitForIdle();

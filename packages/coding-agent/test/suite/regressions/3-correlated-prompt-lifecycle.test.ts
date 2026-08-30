@@ -65,6 +65,50 @@ describe("issue #3 correlated prompt lifecycle", () => {
 		expect(firstOwnedPayloadIndex).toBeGreaterThan(deliveredIndex);
 	});
 
+	it("fails an ordinary correlated turn when a recovered event persistence step rejects", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("ordinary persistence failure"),
+			fauxAssistantMessage("subsequent prompt succeeds"),
+		]);
+		const appendMessage = harness.session.sessionManager.appendMessage.bind(harness.session.sessionManager);
+		let persistenceFailed = false;
+		vi.spyOn(harness.session.sessionManager, "appendMessage").mockImplementation((message) => {
+			if (!persistenceFailed && message.role === "assistant") {
+				persistenceFailed = true;
+				throw new Error("synthetic ordinary persistence failure");
+			}
+			return appendMessage(message);
+		});
+
+		await expect(
+			harness.session.prompt("foreground", { promptCorrelationId: "ordinary-persistence-failure" }),
+		).rejects.toThrow("Correlated prompt event processing failed");
+
+		expect(persistenceFailed).toBe(true);
+		expect(harness.session.getPromptLifecycle("ordinary-persistence-failure")).toMatchObject({
+			phase: "failed",
+			deliveryCrossed: true,
+		});
+		expect(
+			harness
+				.eventsOfType("prompt_lifecycle")
+				.flatMap((event) =>
+					event.promptCorrelationId === "ordinary-persistence-failure" &&
+					(event.phase === "completed" || event.phase === "failed")
+						? [event.phase]
+						: [],
+				),
+		).toEqual(["failed"]);
+
+		await harness.session.prompt("subsequent", { promptCorrelationId: "ordinary-persistence-recovery" });
+		expect(harness.session.getPromptLifecycle("ordinary-persistence-recovery")).toMatchObject({
+			phase: "completed",
+			deliveryCrossed: true,
+		});
+	});
+
 	it("does not admit a correlated prompt after session replacement is fenced", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

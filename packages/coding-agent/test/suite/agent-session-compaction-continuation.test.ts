@@ -522,7 +522,50 @@ describe("compaction continuation", () => {
 		releaseContinue();
 	});
 
-	it("fails rather than orphaning a lifecycle when the continuation event queue rejects", async () => {
+	it("fails rather than completing when continuation message persistence rejects", async () => {
+		vi.useFakeTimers();
+		const harness = await createCompactingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("final continuation answer"),
+		]);
+		const appendMessage = harness.session.sessionManager.appendMessage.bind(harness.session.sessionManager);
+		let persistenceFailed = false;
+		vi.spyOn(harness.session.sessionManager, "appendMessage").mockImplementation((message) => {
+			const text =
+				message.role === "assistant"
+					? message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("")
+					: "";
+			if (!persistenceFailed && text.includes("final continuation answer")) {
+				persistenceFailed = true;
+				throw new Error("synthetic assistant persistence failure");
+			}
+			return appendMessage(message);
+		});
+
+		await harness.session.prompt("foreground", { promptCorrelationId: "failed-event-persistence" });
+		const headlessIdle = harness.session.waitForHeadlessIdle();
+		const rejectedIdle = expect(headlessIdle).rejects.toThrow("Correlated prompt event processing failed");
+		await vi.advanceTimersByTimeAsync(100);
+		await rejectedIdle;
+
+		expect(persistenceFailed).toBe(true);
+		expect(harness.session.getPromptLifecycle("failed-event-persistence")).toMatchObject({ phase: "failed" });
+		expect(
+			harness
+				.eventsOfType("prompt_lifecycle")
+				.flatMap((event) =>
+					event.promptCorrelationId === "failed-event-persistence" &&
+					(event.phase === "completed" || event.phase === "failed")
+						? [event.phase]
+						: [],
+				),
+		).toEqual(["failed"]);
+		expect(harness.session.hasNonterminalPromptLifecycle).toBe(false);
+	});
+
+	it("fails a deferred lifecycle when the current event queue tail rejects", async () => {
 		vi.useFakeTimers();
 		const harness = await createCompactingHarness();
 		harnesses.push(harness);
@@ -533,7 +576,7 @@ describe("compaction continuation", () => {
 		});
 		const continueSpy = vi.spyOn(harness.session.agent, "continue").mockReturnValue(pendingContinue);
 
-		await harness.session.prompt("foreground", { promptCorrelationId: "failed-event-queue" });
+		await harness.session.prompt("foreground", { promptCorrelationId: "failed-event-queue-tail" });
 		await vi.advanceTimersByTimeAsync(100);
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		const internals = harness.session as unknown as { _agentEventQueue: Promise<void> };
@@ -542,7 +585,7 @@ describe("compaction continuation", () => {
 		internals._agentEventQueue = failedQueue;
 		releaseContinue();
 		await vi.waitFor(() => {
-			expect(harness.session.getPromptLifecycle("failed-event-queue")).toMatchObject({ phase: "failed" });
+			expect(harness.session.getPromptLifecycle("failed-event-queue-tail")).toMatchObject({ phase: "failed" });
 		});
 		expect(harness.session.hasNonterminalPromptLifecycle).toBe(false);
 	});
