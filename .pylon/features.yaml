@@ -6,8 +6,8 @@ fork:
   mirror_branch: main
   product_branch: pylon
   tracking_issue: https://github.com/pylon-code/prime-agent/issues/1
-  reviewed_upstream_commit: d60fab8a76d9c169f945341f0ee3bde21903bb55
-  reviewed_at: 2026-08-29
+  reviewed_upstream_commit: a903d4b6768f484bd6d459b7b0aa7dee38e461e2
+  reviewed_at: 2026-08-30
 
 decisions:
   managed-plan-daemon:
@@ -58,8 +58,13 @@ decisions:
     pylon_refs:
       - https://github.com/pylon-code/pylon/issues/114
       - https://github.com/pylon-code/pylon/issues/126
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1700
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1845
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1847
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1859
     fork_change: possible-capability
-    upstream_support: Prime exposes subagent lifecycle separately from root plan state.
+    upstream_support: Prime exposes separate subagent lifecycle with unified legacy recovery, one child projection, activity-driven quiescence, and single-send remote-message failure containment, but not Pylon's provider-neutral root progress model.
     revisit_when:
       - Root progress can summarize delegated phases without creating one plan row per worker.
       - Prime exposes a stable aggregate delegated-work status where Pylon lacks one.
@@ -71,28 +76,35 @@ decisions:
     decision: hybridize
     pylon_refs:
       - https://github.com/pylon-code/pylon/issues/114
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1858
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1882
     fork_change: candidate
-    upstream_support: Prime has native background execution, but Pylon lacks complete public lifecycle and ownership mapping.
+    upstream_support: Prime has native background execution, per-command abort ownership, and daemon-close bash draining, but Pylon lacks complete public lifecycle and ownership mapping.
     revisit_when:
       - Prime publishes list, correlation, cancellation, and terminal lifecycle events.
 
 
   correlated-prompt-lifecycle:
     area: prompt-ownership
-    state: candidate
+    state: shipped
     owner: shared
     decision: hybridize
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/3
       - https://github.com/pylon-code/prime-agent/pull/9
+      - https://github.com/pylon-code/prime-agent/pull/12
       - https://github.com/pylon-code/pylon/issues/114
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/800
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1239
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1700
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1756
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1859
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1861
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1864
     fork_change: negotiated-correlated-prompt-lifecycle-v1
-    upstream_support: Prime has queue, background, cancellation, reconnect, and event primitives, but no optional contract proving per-prompt ownership, delivery, provenance, terminal usage, and durable generation-scoped recovery together.
+    upstream_support: Prime through a903d4b6768f has queue, background, cancellation, reconnect, single-send remote messages, recovery-aware reuse, activity-fenced continuations, owner-checked opens, and event primitives, but no optional contract proving per-prompt ownership, delivery, provenance, terminal usage, and durable generation-scoped recovery together.
     revisit_when:
       - Prime upstream ships an equivalent negotiated lifecycle with exact delivery, provenance, scoped cancellation, recovery, and per-prompt usage guarantees.
       - Pylon can remove the fork contract without weakening stock-Prime fallback behavior.
@@ -104,8 +116,10 @@ decisions:
     decision: hybridize
     pylon_refs:
       - https://github.com/pylon-code/pylon/issues/114
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1857
     fork_change: none-yet
-    upstream_support: Prime exposes heartbeat list, management, and change APIs.
+    upstream_support: Prime exposes heartbeat list, management, and change APIs and now derives scoped heartbeat state at render time.
     blocker: Pylon needs canonical autonomous occurrence, turn, checkpoint, and active-run ownership.
     revisit_when:
       - The provider-neutral autonomous-work ownership model is implemented.
@@ -157,7 +171,7 @@ decisions:
 
   kernel-protocol-test-fixtures:
     area: runtime-reliability
-    state: adopted-ahead-of-upstream
+    state: shipped
     owner: upstream
     decision: adopt
     pylon_refs:
@@ -165,41 +179,50 @@ decisions:
       - https://github.com/pylon-code/prime-agent/pull/5
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1839
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1882
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1886
-    fork_change: exact-upstream-pr-1886
-    upstream_support: "Prime PR #1886 repairs protocol fixtures regressed by the #1839 merge commit, but is not yet on main."
+    fork_change: none
+    upstream_support: "Prime PR #1882 landed the same protocol-3 fixture repair that Pylon had adopted ahead from PR #1886; there is no remaining behavioral fork."
     revisit_when:
-      - "Prime merges PR #1886 and the exact fix reaches the mirrored main branch."
+      - "Prime changes the kernel protocol or its real-process fixture contract again."
 
   snapshot-recovery-integrity:
     area: runtime-reliability
-    state: candidate
+    state: shipped
     owner: shared
     decision: hybridize
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/11
+      - https://github.com/pylon-code/prime-agent/pull/14
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/issues/1229
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1845
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1847
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1756
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1864
     fork_change: immutable-snapshot-transfer-and-isolated-retry
-    upstream_support: Prime now provides one RLM child projection, recovery-aware session reuse, and ownership checks for in-flight opens, but still reuses the event cursor as snapshot transfer identity, serializes selected message objects lazily, and closes a healthy worker on an isolated duplicate-transfer mismatch.
+    upstream_support: Prime now provides one RLM child projection, tolerant legacy topology recovery, recovery-aware session reuse, and ownership checks for in-flight opens, but still reuses the event cursor as snapshot transfer identity, serializes selected message objects lazily, and closes a healthy worker on an isolated duplicate-transfer mismatch.
     revisit_when:
       - Prime gives each transfer immutable bytes and a unique identity while preserving the event cursor as ordering metadata.
       - Prime retries an isolated bad snapshot generation without closing the resident worker control channel.
 
   authoritative-owned-session-cleanup:
     area: runtime-reliability
-    state: candidate
+    state: shipped
     owner: shared
     decision: hybridize
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/11
+      - https://github.com/pylon-code/prime-agent/pull/14
       - https://github.com/pylon-code/pylon/issues/114
       - https://github.com/rynfar/comet/issues/5
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1756
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1858
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1864
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1882
     fork_change: negotiated-authoritative-owned-session-cleanup-v1
-    upstream_support: Prime v0.8.1 supports client-owned sessions and best-effort owner cleanup, but another host process cannot prove exact worker-generation and durable-descriptor absence after the owner connection disappears.
+    upstream_support: Prime through a903d4b6768f has recovery-aware reuse, owner-checked opens, bounded daemon-close bash draining, per-command abort ownership, client-owned sessions, and best-effort owner cleanup, but another host process cannot prove exact worker-generation and durable-descriptor absence after the owner connection disappears.
     revisit_when:
       - Prime upstream exposes an equivalent privacy-safe, capability-negotiated cleanup proof with durable descriptor-last retries.
       - Comet and Pylon can remove the fork capability without weakening crash cleanup or stock-Prime fallback behavior.
