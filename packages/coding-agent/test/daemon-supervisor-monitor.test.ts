@@ -150,6 +150,13 @@ interface DeferredRecoveryWorker {
 	stopRevision: number;
 }
 
+interface TestStopFinalization {
+	pid: number;
+	processStartId?: string;
+	stopRevision: number;
+	promise: Promise<void>;
+}
+
 interface DeferredRecoveryHarness {
 	workers: Map<string, DeferredRecoveryWorker>;
 	shuttingDown: boolean;
@@ -580,6 +587,51 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(workers.size).toBe(0);
 	});
 
+	it("cancels an existing recovery at the final pre-spawn generation fence", async () => {
+		workerLaunchTestState.capture = true;
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-recovery-pre-spawn-test-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		const existing = createExistingLaunchWorker(root, descriptorDir);
+		const workers = new Map([[existing.descriptor.workerId, existing]]);
+		const gateReached = createDeferred<void>();
+		const releaseGate = createDeferred<void>();
+		let assertionCount = 0;
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => {
+				assertionCount++;
+				if (assertionCount === 2) {
+					gateReached.resolve();
+					await releaseGate.promise;
+				}
+			}),
+			log: vi.fn(),
+		}) as {
+			launchWorker(
+				command: { type: "create"; config: { cwd: string; agentDir: string } },
+				worker: object,
+			): Promise<unknown>;
+		};
+
+		const launch = supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } }, existing);
+		await gateReached.promise;
+		existing.stopRevision++;
+		existing.intentionalStop = true;
+		existing.descriptor.stopRequestedAt = new Date().toISOString();
+		releaseGate.resolve();
+
+		await expect(launch).rejects.toMatchObject({ code: "supervisor_recovery_cancelled" });
+		expect(workerLaunchTestState.spawned).toHaveLength(0);
+		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toEqual([]);
+	});
+
 	it("rolls back promptly when the child closes its startup gate before commit", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-closed-gate-test-"));
 		const descriptorDir = join(root, "descriptors");
@@ -958,8 +1010,7 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
-	it("completes shutdown without awaiting an unsignalable worker finalizer", async () => {
-		vi.useFakeTimers();
+	it("keeps shutdown cleanup retries active before releasing daemon ownership", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-shutdown-finalization-test-"));
 		supervisorRegistryDirs.add(root);
 		const worker = {
@@ -978,28 +1029,36 @@ describe("daemon worker supervisor monitoring", () => {
 			snapshotLoads: new Map(),
 			intentionalStop: true,
 			stopRevision: 1,
-			stopFinalization: new Promise<void>(() => {}),
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const cleanupStarted = createDeferred<void>();
+		const releaseCleanup = createDeferred<void>();
+		const stopWorker = vi
+			.fn(async () => {
+				cleanupStarted.resolve();
+				await releaseCleanup.promise;
+				workers.delete(worker.descriptor.workerId);
+			})
+			.mockRejectedValueOnce(new Error("descriptor unlink failed"));
 		const exit = vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
 			throw new Error(`exit ${code}`);
 		}) as typeof process.exit);
-		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
-		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
-		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
 		const catalogStop = vi.fn(async () => undefined);
-		const log = vi.fn();
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			shuttingDown: false,
 			signalCleanupHandlers: [],
 			workers,
 			clients: new Set(),
-			persistWorkerStopTombstone: vi.fn(),
-			hasPersistedWorkerDescriptors: vi.fn(() => true),
+			stopWorker,
+			persistWorker: vi.fn(),
+			hasPersistedWorkerDescriptors: vi.fn(() => false),
+			supervisorConfigPath: join(root, "supervisor-config"),
 			catalog: { stop: catalogStop },
 			cleanupSocket: vi.fn(),
 			snapshotCacheRoot: join(root, "cache"),
-			log,
+			log: vi.fn(),
 		}) as {
 			shutdown(exitCode: number, stopWorkers: boolean, relaunch?: boolean, forceWorkers?: boolean): Promise<never>;
 		};
@@ -1009,19 +1068,18 @@ describe("daemon worker supervisor monitoring", () => {
 				() => undefined,
 				(error: unknown) => error,
 			);
-			await vi.advanceTimersByTimeAsync(2000);
-			await expect(shutdown).resolves.toEqual(new Error("exit 0"));
+			await cleanupStarted.promise;
+			expect(catalogStop).not.toHaveBeenCalled();
+			expect(exit).not.toHaveBeenCalled();
 
-			expect(workers.has(worker.descriptor.workerId)).toBe(true);
-			expect(killSpy).not.toHaveBeenCalled();
+			releaseCleanup.resolve();
+			await expect(shutdown).resolves.toEqual(new Error("exit 0"));
+			expect(stopWorker).toHaveBeenCalledTimes(2);
 			expect(catalogStop).toHaveBeenCalledOnce();
-			expect(log).toHaveBeenCalledWith(expect.stringContaining("remains tombstoned for recovery"));
 			expect(exit).toHaveBeenCalledWith(0);
 		} finally {
 			exit.mockRestore();
-			killSpy.mockRestore();
 			existsSpy.mockRestore();
-			aliveSpy.mockRestore();
 		}
 	});
 
@@ -1324,6 +1382,7 @@ describe("daemon worker supervisor monitoring", () => {
 				archiveOnStop?: boolean;
 			};
 			intentionalStop: boolean;
+			stopRevision: number;
 			summaries: Map<string, SessionSummary>;
 		};
 		type RetryHarness = {
@@ -1346,9 +1405,11 @@ describe("daemon worker supervisor monitoring", () => {
 				archiveOnStop: true,
 			},
 			intentionalStop: true,
+			stopRevision: 0,
 			summaries: new Map(),
 		};
 		const persistWorker = vi.fn(() => {
+			expect(worker.stopRevision).toBe(1);
 			expect(worker.intentionalStop).toBe(false);
 			expect(worker.descriptor.stopRequestedAt).toBeUndefined();
 			expect(worker.descriptor.archiveOnStop).toBeUndefined();
@@ -1780,8 +1841,12 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			summaries: new Map([[root.activeSessionId, root as SessionSummary]]),
 			intentionalStop: false,
+			stopRevision: 0,
 		};
-		const supervisor = Object.create(DaemonSupervisor.prototype) as {
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+		}) as {
 			refreshWorkerSummaries(target: typeof worker, recovery: boolean): Promise<void>;
 		};
 
@@ -2043,6 +2108,7 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 		const stopWorker = vi.fn(async () => {});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			stopWorker,
 			log: vi.fn(),
@@ -2067,10 +2133,17 @@ describe("daemon worker supervisor monitoring", () => {
 				pid: process.pid,
 				stopRequestedAt: new Date().toISOString(),
 				archiveOnStop: false,
-			} as { processStartId?: string },
+			} as {
+				workerId: string;
+				pid: number;
+				stopRequestedAt: string;
+				archiveOnStop: boolean;
+				processStartId?: string;
+			},
 		};
 		const stopOrder: string[] = [];
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker: vi.fn(async () => {
 				stopOrder.push("connect");
@@ -2101,11 +2174,18 @@ describe("daemon worker supervisor monitoring", () => {
 				pid: process.pid,
 				stopRequestedAt: new Date().toISOString(),
 				archiveOnStop: false,
-			} as { processStartId?: string },
+			} as {
+				workerId: string;
+				pid: number;
+				stopRequestedAt: string;
+				archiveOnStop: boolean;
+				processStartId?: string;
+			},
 		};
 		const persistWorker = vi.fn();
 		const stopWorker = vi.fn(async () => {});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker: vi.fn(async () => {
 				throw new Error("connect refused");
@@ -2137,12 +2217,15 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		let alive = true;
-		const stopWorker = vi.fn(async () => {});
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const stopWorker = vi.fn(async () => {
+			workers.delete(worker.descriptor.workerId);
+		});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-			workers: new Map([[worker.descriptor.workerId, worker]]),
+			workers,
 			shuttingDown: false,
 			stopWorker,
 			persistWorker: vi.fn(),
@@ -2163,7 +2246,7 @@ describe("daemon worker supervisor monitoring", () => {
 
 			alive = false;
 			await vi.advanceTimersByTimeAsync(500);
-			await finalization;
+			await finalization?.promise;
 
 			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false);
 			expect(worker.stopFinalization).toBeUndefined();
@@ -2189,12 +2272,15 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		let alive = true;
-		const stopWorker = vi.fn(async () => {});
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const stopWorker = vi.fn(async () => {
+			workers.delete(worker.descriptor.workerId);
+		});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-			workers: new Map([[worker.descriptor.workerId, worker]]),
+			workers,
 			shuttingDown: false,
 			stopWorker,
 			persistWorker: vi.fn(),
@@ -2215,7 +2301,7 @@ describe("daemon worker supervisor monitoring", () => {
 			const finalization = worker.stopFinalization;
 
 			await vi.advanceTimersByTimeAsync(10_000);
-			await finalization;
+			await finalization?.promise;
 
 			expect(killSpy).toHaveBeenCalledWith(worker.descriptor.pid, "SIGKILL");
 			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, true);
@@ -2236,7 +2322,7 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 3,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const stopWorker = vi.fn(async () => {});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -2265,7 +2351,7 @@ describe("daemon worker supervisor monitoring", () => {
 			worker.descriptor.pid = 222_222;
 
 			await vi.advanceTimersByTimeAsync(20_000);
-			await finalization;
+			await finalization?.promise;
 
 			// The healthy relaunched worker must never be signalled or stopped.
 			expect(killSpy).not.toHaveBeenCalledWith(222_222, "SIGKILL");
@@ -2290,11 +2376,14 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
-		const stopWorker = vi.fn(async () => {});
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const stopWorker = vi.fn(async () => {
+			workers.delete(worker.descriptor.workerId);
+		});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-			workers: new Map([[worker.descriptor.workerId, worker]]),
+			workers,
 			shuttingDown: false,
 			stopWorker,
 			persistWorker: vi.fn(),
@@ -2315,7 +2404,7 @@ describe("daemon worker supervisor monitoring", () => {
 			const finalization = worker.stopFinalization;
 
 			await vi.advanceTimersByTimeAsync(20_000);
-			await finalization;
+			await finalization?.promise;
 
 			// The original worker is gone, so the stop is finalized without ever
 			// signalling the unrelated pid owner.
@@ -2327,6 +2416,186 @@ describe("daemon worker supervisor monitoring", () => {
 			killSpy.mockRestore();
 			startIdSpy.mockRestore();
 		}
+	});
+
+	it("arms owner cleanup after a client-owned create registers without its disconnected client", async () => {
+		const client = { id: "owner-create-race" } as DaemonSocketClient;
+		const worker = {
+			descriptor: {
+				workerId: "owner-create-race-worker",
+				ownerClientId: client.id,
+				rootActiveSessionId: "owner-create-race-active",
+			},
+			summaries: new Map<string, SessionSummary>([
+				[
+					"owner-create-race-active",
+					{
+						id: "owner-create-race-active",
+						activeSessionId: "owner-create-race-active",
+						sessionId: "owner-create-race-session",
+					} as SessionSummary,
+				],
+			]),
+			ownerCleanupTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+		};
+		const opening = createDeferred<typeof worker>();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients: new Set<DaemonSocketClient>(),
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			protocolClientIds: new WeakMap(),
+			createOrReuseWorker: vi.fn(() => opening.promise),
+			publicSummary: vi.fn((_worker, summary) => summary),
+			stopWorker: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as {
+			handleCommand(
+				requestClient: DaemonSocketClient,
+				command: { type: "create"; lifecycle: "client_owned" },
+			): Promise<unknown>;
+		};
+
+		const creating = supervisor.handleCommand(client, { type: "create", lifecycle: "client_owned" });
+		opening.resolve(worker);
+		await creating;
+
+		expect(worker.ownerCleanupTimer).toBeDefined();
+		if (worker.ownerCleanupTimer) clearTimeout(worker.ownerCleanupTimer);
+	});
+
+	it("joins an admitted recovery before proving exact cleanup settled", async () => {
+		const recoveryGate = createDeferred<void>();
+		let staleRecoveryRejected = false;
+		const worker = {
+			descriptor: {
+				workerId: "owned-cleanup-recovery-worker",
+				pid: 111_124,
+				processStartId: "proc:owned-cleanup-recovery",
+				rootActiveSessionId: "active-owned-cleanup-recovery",
+				stopRequestedAt: undefined as string | undefined,
+			},
+			client: undefined,
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+			recovery: undefined as Promise<void> | undefined,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const deleteWorkerDescriptor = vi.fn();
+		let supervisor!: {
+			stopWorker(target: typeof worker, removeDescriptor: boolean, force?: boolean): Promise<void>;
+			assertWorkerRecoveryCurrent(target: typeof worker, stopRevision: number): void;
+		};
+		worker.recovery = recoveryGate.promise.then(() => {
+			try {
+				supervisor.assertWorkerRecoveryCurrent(worker, 0);
+			} catch {
+				staleRecoveryRejected = true;
+			}
+		});
+		supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			shuttingDown: false,
+			persistWorkerStopTombstone: vi.fn(() => {
+				worker.intentionalStop = true;
+				worker.descriptor.stopRequestedAt = new Date().toISOString();
+			}),
+			abortTranscriptPreparations: vi.fn(),
+			deleteWorkerDescriptor,
+			invalidateWorkerSessionInputPauses: vi.fn(),
+			broadcastHeartbeatsChanged: vi.fn(),
+			log: vi.fn(),
+		});
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
+		try {
+			const stopping = supervisor.stopWorker(worker, true, true);
+			await Promise.resolve();
+			expect(worker.descriptor.stopRequestedAt).toBeDefined();
+			expect(deleteWorkerDescriptor).not.toHaveBeenCalled();
+			expect(workers.get(worker.descriptor.workerId)).toBe(worker);
+
+			recoveryGate.resolve();
+			await stopping;
+			expect(staleRecoveryRejected).toBe(true);
+			expect(deleteWorkerDescriptor).toHaveBeenCalledOnce();
+			expect(workers.has(worker.descriptor.workerId)).toBe(false);
+		} finally {
+			existsSpy.mockRestore();
+		}
+	});
+
+	it("single-flights concurrent exact-generation completion stops", async () => {
+		const worker = {
+			descriptor: { workerId: "owned-cleanup-concurrent-worker", rootActiveSessionId: "active-concurrent" },
+		};
+		const stopStarted = createDeferred<void>();
+		const releaseStop = createDeferred<void>();
+		const stopWorkerUntracked = vi.fn(async () => {
+			stopStarted.resolve();
+			await releaseStop.promise;
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			workerStopCounts: new Map(),
+			stopWorkerUntracked,
+		}) as {
+			stopWorker(target: typeof worker, removeDescriptor: boolean): Promise<void>;
+		};
+
+		const first = supervisor.stopWorker(worker, true);
+		await stopStarted.promise;
+		const second = supervisor.stopWorker(worker, true);
+		expect(stopWorkerUntracked).toHaveBeenCalledOnce();
+		releaseStop.resolve();
+		await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+		expect(stopWorkerUntracked).toHaveBeenCalledOnce();
+	});
+
+	it("keeps a newer stop generation finalizer when the old generation retires", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "owned-cleanup-finalizer-generation-worker",
+				pid: 111_125,
+				processStartId: "proc:owned-cleanup-finalizer",
+				rootActiveSessionId: "active-owned-cleanup-finalizer",
+				stopRequestedAt: new Date().toISOString(),
+			},
+			intentionalStop: true,
+			stopRevision: 1,
+			stopFinalization: undefined as TestStopFinalization | undefined,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const oldGeneration = createDeferred<void>();
+		const newGeneration = createDeferred<void>();
+		const finalizeTimedOutWorkerStop = vi.fn(
+			(_target: typeof worker, _pid: number, _startId: string | undefined, revision: number) =>
+				revision === 1 ? oldGeneration.promise : newGeneration.promise,
+		);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			finalizeTimedOutWorkerStop,
+		}) as {
+			scheduleWorkerStopFinalization(target: typeof worker): void;
+		};
+
+		supervisor.scheduleWorkerStopFinalization(worker);
+		const oldFinalization = worker.stopFinalization;
+		worker.stopRevision = 2;
+		supervisor.scheduleWorkerStopFinalization(worker);
+		const currentFinalization = worker.stopFinalization;
+		expect(currentFinalization).not.toBe(oldFinalization);
+
+		oldGeneration.resolve();
+		await oldFinalization?.promise;
+		expect(worker.stopFinalization).toBe(currentFinalization);
+
+		workers.delete(worker.descriptor.workerId);
+		newGeneration.resolve();
+		await currentFinalization?.promise;
+		expect(worker.stopFinalization).toBeUndefined();
 	});
 
 	it("reports exact privacy-safe owned cleanup states", () => {
@@ -2484,7 +2753,7 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const workers = new Map([[worker.descriptor.workerId, worker]]);
 		const persistWorker = vi.fn<() => void>().mockImplementationOnce(() => {
@@ -2509,7 +2778,7 @@ describe("daemon worker supervisor monitoring", () => {
 			supervisor.scheduleWorkerStopFinalization(worker);
 			expect(stopWorker).not.toHaveBeenCalled();
 			await vi.advanceTimersByTimeAsync(20_000);
-			await worker.stopFinalization;
+			await worker.stopFinalization?.promise;
 
 			expect(persistWorker).toHaveBeenCalledTimes(2);
 			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false);
@@ -2698,7 +2967,7 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const workers = new Map([[worker.descriptor.workerId, worker]]);
 		const stopWorker = vi.fn(async () => {
@@ -2750,7 +3019,7 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const workers = new Map([[worker.descriptor.workerId, worker]]);
 		const stopWorker = vi.fn(async () => {
@@ -2788,7 +3057,7 @@ describe("daemon worker supervisor monitoring", () => {
 			// ...but once identity is observable again, escalation still fires.
 			startIdSpy.mockReturnValue("proc:original");
 			await vi.advanceTimersByTimeAsync(5000);
-			await finalization;
+			await finalization?.promise;
 			expect(killSpy).toHaveBeenCalledWith(worker.descriptor.pid, "SIGKILL");
 			expect(stopWorker).toHaveBeenCalled();
 		} finally {
@@ -2811,7 +3080,7 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const stopWorker = vi.fn(async () => {});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -2859,7 +3128,7 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const stopWorker = vi.fn(async () => {});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -2905,7 +3174,7 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const workers = new Map([[worker.descriptor.workerId, worker]]);
 		const stopWorker = vi
@@ -2932,7 +3201,7 @@ describe("daemon worker supervisor monitoring", () => {
 			const finalization = worker.stopFinalization;
 
 			await vi.advanceTimersByTimeAsync(20_000);
-			await finalization;
+			await finalization?.promise;
 
 			// The first attempt failed transiently; the registration is still
 			// cleaned up by a retry instead of being stranded forever.
@@ -2954,7 +3223,7 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		let alive = true;
 		const stopWorker = vi.fn(async () => {});
@@ -2979,7 +3248,7 @@ describe("daemon worker supervisor monitoring", () => {
 			worker.intentionalStop = false;
 			alive = false;
 			await vi.advanceTimersByTimeAsync(500);
-			await finalization;
+			await finalization?.promise;
 
 			expect(stopWorker).not.toHaveBeenCalled();
 		} finally {
@@ -3076,16 +3345,21 @@ describe("daemon worker supervisor monitoring", () => {
 			recovery: undefined,
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const workers = new Map([[worker.descriptor.workerId, worker]]);
 		let releaseFinalization!: () => void;
-		worker.stopFinalization = new Promise<void>((resolveFinalization) => {
+		const finalizationPromise = new Promise<void>((resolveFinalization) => {
 			releaseFinalization = () => {
 				workers.delete(worker.descriptor.workerId);
 				resolveFinalization();
 			};
 		});
+		worker.stopFinalization = {
+			pid: worker.descriptor.pid,
+			stopRevision: worker.stopRevision,
+			promise: finalizationPromise,
+		};
 		const stopWorker = vi.fn(async () => {});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
@@ -3124,7 +3398,7 @@ describe("daemon worker supervisor monitoring", () => {
 			recovery: undefined,
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
@@ -3166,7 +3440,7 @@ describe("daemon worker supervisor monitoring", () => {
 			recovery: undefined,
 			intentionalStop: true,
 			stopRevision: 0,
-			stopFinalization: undefined as Promise<void> | undefined,
+			stopFinalization: undefined as TestStopFinalization | undefined,
 		};
 		const workers = new Map([[worker.descriptor.workerId, worker]]);
 		const stopWorker = vi.fn(async () => {

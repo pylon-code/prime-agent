@@ -16,6 +16,7 @@ import {
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import { createDaemonCommandEnvelope } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
 
@@ -812,6 +813,94 @@ describe("daemon supervisor resident workers", () => {
 				}
 				workerPids.delete(summary.workerPid);
 			}
+		}
+	}, 75_000);
+
+	it("cleans up a client-owned create whose owner disconnects before registration", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-owned-opening-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(projectDir, { recursive: true });
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const readiness = await connectEventually(socketPath, supervisor);
+		readiness.close();
+		const openingOwner = createConnection(socketPath);
+		openingOwner.on("error", () => undefined);
+		await new Promise<void>((resolveConnect, rejectConnect) => {
+			openingOwner.once("connect", resolveConnect);
+			openingOwner.once("error", rejectConnect);
+		});
+		const commandId = `opening-${randomUUID()}`;
+		const wire = `${JSON.stringify(
+			createDaemonCommandEnvelope(
+				{
+					type: "create",
+					lifecycle: "client_owned",
+					noSession: true,
+					launchEnv: { TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json") },
+					config: { cwd: projectDir, agentDir, noTools: true, noExtensions: true },
+				},
+				commandId,
+				"opening-owner",
+			),
+		)}\n`;
+		const closed = new Promise<void>((resolveClose) => openingOwner.once("close", resolveClose));
+		await new Promise<void>((resolveWrite, rejectWrite) => {
+			openingOwner.end(wire, (error?: Error | null) => (error ? rejectWrite(error) : resolveWrite()));
+		});
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+		expect(countWorkerDescriptors(agentDir)).toBe(0);
+		openingOwner.destroy();
+		// The command bytes are committed to the socket, but the client is gone
+		// before launchWorker can publish the new resident registration.
+		await closed;
+
+		let descriptor: DaemonWorkerDescriptor | undefined;
+		const descriptorDeadline = Date.now() + 15_000;
+		while (!descriptor && Date.now() < descriptorDeadline) {
+			try {
+				descriptor = readWorkerDescriptor(agentDir);
+			} catch {
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+			}
+		}
+		if (!descriptor) throw new Error(`Opening client-owned create was not registered\n${readDaemonLogs(agentDir)}`);
+		expect(descriptor.ownerClientId).toBe("opening-owner");
+		workerPids.add(descriptor.pid);
+
+		const observer = await connectEventually(socketPath, supervisor);
+		try {
+			let sawStopping = false;
+			let settled = false;
+			const deadline = Date.now() + 50_000;
+			while (Date.now() < deadline) {
+				const response = await observer.request({
+					type: "get_owned_session_cleanup",
+					activeSessionId: descriptor.rootActiveSessionId,
+				});
+				if (!response.success) throw new Error(response.error);
+				const status = (response.data as { status?: string } | undefined)?.status;
+				if (status === "stopping") sawStopping = true;
+				if (status === "settled") {
+					settled = true;
+					break;
+				}
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+			}
+			expect(sawStopping).toBe(true);
+			expect(settled).toBe(true);
+			await waitForProcessGone(descriptor.pid);
+			workerPids.delete(descriptor.pid);
+			expect(countWorkerDescriptors(agentDir)).toBe(0);
+			await observer.request({ type: "shutdown" });
+			await waitForSocketGone(socketPath);
+		} finally {
+			observer.close();
 		}
 	}, 75_000);
 

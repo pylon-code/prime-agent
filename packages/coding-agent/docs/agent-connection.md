@@ -119,6 +119,8 @@ The `AgentConnection` method promise is a client convenience. It should not be t
 
 The query returns only `{ status: "active" | "stopping" | "settled" }`. It does not expose process IDs, worker or owner IDs, filesystem paths, tokens, descriptor contents, or diagnostics. Stock v0.8.1 does not offer this capability, so `DaemonClient` rejects the query locally without sending an unknown command. The proof applies to registrations created or durably adopted by a capable supervisor; it cannot retroactively certify a descriptorless orphan created before that supervisor observed it.
 
+Cleanup closes and joins any admitted recovery before it can publish a successor. Concurrent completion requests for the same resident generation share one stop operation. Finalizers are keyed by process identity and stop revision, and daemon shutdown keeps registry ownership and retry services alive until every requested worker cleanup settles. A client-owned create rechecks owner liveness after registration, so a disconnect while daemon readiness or process launch is still pending cannot miss its cleanup timer.
+
 ## Session Replacement
 
 New, switch, fork, import, and tree-navigation operations may replace the runtime behind an active connection. The adapter owns rebinding and emits a replacement snapshot. The UI applies the new state and transcript; it does not rewire `AgentSession` listeners directly.

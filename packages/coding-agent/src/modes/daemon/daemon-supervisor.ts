@@ -326,7 +326,13 @@ interface ResidentWorker {
 	stopRevision: number;
 	launchEnv?: Record<string, string>;
 	transientCreateCommand?: DaemonCreateCommand;
-	stopFinalization?: Promise<void>;
+	stopOperation?: Promise<void>;
+	stopFinalization?: {
+		pid: number;
+		processStartId?: string;
+		stopRevision: number;
+		promise: Promise<void>;
+	};
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
 	updateRestartPrepareClient?: DaemonWorkerClient;
@@ -1596,7 +1602,9 @@ export class DaemonSupervisor {
 			this.protocolClientIds.set(client, envelopeClientId);
 			client.id = envelopeClientId;
 		}
-		this.cancelOwnedWorkerCleanup(client.id);
+		if (this.clients?.has(client)) {
+			this.cancelOwnedWorkerCleanup(client.id);
+		}
 		if (!DAEMON_COMMAND_TYPES.has(command.type)) {
 			correlatedOrder?.release();
 			this.write(client, failure(command.id, command.type, `Unknown daemon command: ${command.type}`));
@@ -1860,6 +1868,10 @@ export class DaemonSupervisor {
 				return this.handleSavedSessionList(client, command);
 			case "create": {
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), command);
+				// The owner may disconnect while creation is waiting for daemon readiness,
+				// process launch, or session materialization. Re-evaluate ownership only
+				// after the worker is registered so the disconnect edge cannot be missed.
+				this.scheduleOwnedWorkerCleanup(worker);
 				const requestedSummary = command.sessionPath
 					? this.findSummaryInWorker(worker, command.sessionPath)
 					: undefined;
@@ -2128,6 +2140,7 @@ export class DaemonSupervisor {
 				if ((this.workerStopCounts?.get(worker) ?? 0) > 0) {
 					throw new Error("Session worker is stopping; retry after it finishes");
 				}
+				worker.stopRevision++;
 				worker.intentionalStop = false;
 				worker.descriptor.stopRequestedAt = undefined;
 				worker.descriptor.archiveOnStop = undefined;
@@ -2779,7 +2792,7 @@ export class DaemonSupervisor {
 		this.scheduleWorkerStopFinalization(worker);
 		const finalization = worker.stopFinalization;
 		if (finalization) {
-			await Promise.race([finalization.catch(() => undefined), unrefDelay(STALE_RECLAIM_WAIT_MS)]);
+			await Promise.race([finalization.promise.catch(() => undefined), unrefDelay(STALE_RECLAIM_WAIT_MS)]);
 		}
 		if (this.workers.get(worker.descriptor.workerId) === worker) {
 			// The process is confirmed dead, so the registration must never be
@@ -2824,10 +2837,13 @@ export class DaemonSupervisor {
 		promptLifecycleRecovery?: ReadonlyMap<string, WorkerSessionRecovery>,
 	): Promise<ResidentWorker> {
 		await this.assertRecoveryAllowed();
-		if (existing && this.isWorkerRecoveryCancelled(existing)) {
-			throw new Error(`Session worker ${existing.descriptor.workerId} recovery was cancelled`);
-		}
 		const recoveryStopRevision = existing?.stopRevision;
+		const assertLaunchCurrent = () => {
+			if (existing && recoveryStopRevision !== undefined) {
+				this.assertWorkerRecoveryCurrent(existing, recoveryStopRevision);
+			}
+		};
+		assertLaunchCurrent();
 		const launchEnv = command.launchEnv ?? existing?.launchEnv;
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
@@ -2859,6 +2875,7 @@ export class DaemonSupervisor {
 		});
 		delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
+		assertLaunchCurrent();
 		const child: ChildProcess = spawn(launch.command, launch.args, {
 			cwd: createCommand.config?.cwd ?? process.cwd(),
 			detached: true,
@@ -2895,6 +2912,7 @@ export class DaemonSupervisor {
 			childPid = child.pid;
 			childProcessStartId = getProcessStartId(childPid);
 			await this.assertRecoveryAllowed();
+			assertLaunchCurrent();
 
 			const descriptor: DaemonWorkerDescriptor = {
 				version: 2,
@@ -2932,6 +2950,7 @@ export class DaemonSupervisor {
 				transientCreateCommand: ownerClientId ? createCommand : undefined,
 			};
 			await this.assertRecoveryAllowed();
+			assertLaunchCurrent();
 			worker.descriptor = descriptor;
 			worker.launchEnv = launchEnv;
 			worker.transientCreateCommand = descriptor.ownerClientId ? createCommand : undefined;
@@ -2962,7 +2981,9 @@ export class DaemonSupervisor {
 
 		try {
 			try {
+				assertLaunchCurrent();
 				await commitWorkerStartupGate(startupGate);
+				assertLaunchCurrent();
 			} catch (error) {
 				startupGate.destroy();
 				await childClosed;
@@ -2970,8 +2991,10 @@ export class DaemonSupervisor {
 			} finally {
 				child.unref();
 			}
-			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
+			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS, assertLaunchCurrent);
+			assertLaunchCurrent();
 			const response = await client.request(withoutCommandId(createCommand), WORKER_REQUEST_TIMEOUT_MS);
+			assertLaunchCurrent();
 			if (!response.success) {
 				throw deserializeDaemonError(response);
 			}
@@ -2986,14 +3009,15 @@ export class DaemonSupervisor {
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
 			await this.subscribeWorker(worker, rootActiveSessionId);
-			await this.refreshWorkerSummaries(worker, true);
+			assertLaunchCurrent();
+			await this.refreshWorkerSummaries(worker, true, recoveryStopRevision);
+			assertLaunchCurrent();
 			if (promptLifecycleRecovery !== undefined) {
 				await this.restoreWorkerPromptLifecycles(worker, promptLifecycleRecovery);
-			}
-			if (existing && (this.isWorkerRecoveryCancelled(worker) || worker.stopRevision !== recoveryStopRevision)) {
-				throw new Error(`Session worker ${workerId} recovery was cancelled`);
+				assertLaunchCurrent();
 			}
 			await this.assertRecoveryAllowed();
+			assertLaunchCurrent();
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
 			worker.descriptor.lastError = undefined;
@@ -3066,11 +3090,17 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async connectWorker(worker: ResidentWorker, timeoutMs: number): Promise<DaemonWorkerClient> {
+	private async connectWorker(
+		worker: ResidentWorker,
+		timeoutMs: number,
+		assertCurrent?: () => void,
+	): Promise<DaemonWorkerClient> {
 		const deadline = Date.now() + timeoutMs;
 		let lastError: unknown;
 		while (Date.now() < deadline) {
+			assertCurrent?.();
 			await this.assertRecoveryAllowed();
+			assertCurrent?.();
 			const client = new DaemonWorkerClient(worker.descriptor.socketPath);
 			try {
 				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
@@ -3081,6 +3111,7 @@ export class DaemonSupervisor {
 					1000,
 				);
 				await this.assertRecoveryAllowed();
+				assertCurrent?.();
 				client.onFrame((frame) => this.handleWorkerFrame(worker, frame, client));
 				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
 				worker.client?.close();
@@ -3131,7 +3162,23 @@ export class DaemonSupervisor {
 
 	private async adoptOrRecoverWorker(worker: ResidentWorker): Promise<void> {
 		await this.assertRecoveryAllowed();
+		const adoptionRevision = worker.stopRevision;
 		if (worker.descriptor.stopRequestedAt) {
+			const stopPid = worker.descriptor.pid;
+			let stopProcessStartId = worker.descriptor.processStartId;
+			const assertStopAdoptionCurrent = () => {
+				if (
+					this.workers.get(worker.descriptor.workerId) !== worker ||
+					worker.stopRevision !== adoptionRevision ||
+					worker.descriptor.stopRequestedAt === undefined ||
+					worker.descriptor.pid !== stopPid ||
+					worker.descriptor.processStartId !== stopProcessStartId
+				) {
+					throw new SupervisorRecoveryCancelledError(
+						`Session worker ${worker.descriptor.workerId} stop adoption was cancelled`,
+					);
+				}
+			};
 			try {
 				// A descriptor persisted before identity tracking has no
 				// processStartId, so stopWorker could neither signal the live
@@ -3142,9 +3189,11 @@ export class DaemonSupervisor {
 				if (worker.descriptor.processStartId === undefined && isProcessAlive(worker.descriptor.pid)) {
 					const observedProcessStartId = getProcessStartId(worker.descriptor.pid);
 					try {
-						await this.connectWorker(worker, 2000);
+						await this.connectWorker(worker, 2000, assertStopAdoptionCurrent);
+						assertStopAdoptionCurrent();
 						if (observedProcessStartId) {
 							worker.descriptor.processStartId = observedProcessStartId;
+							stopProcessStartId = observedProcessStartId;
 							this.persistWorker(worker);
 						}
 					} catch {
@@ -3153,9 +3202,11 @@ export class DaemonSupervisor {
 						// waiting rather than signalling a possibly-recycled pid.
 					}
 				}
+				assertStopAdoptionCurrent();
 				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
 				this.log(`Completed intentional stop for worker ${worker.descriptor.workerId} during supervisor adoption`);
 			} catch (error) {
+				if (this.workers.get(worker.descriptor.workerId) !== worker) return;
 				worker.descriptor.lifecycle = "failed";
 				worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
 				try {
@@ -3168,24 +3219,32 @@ export class DaemonSupervisor {
 			}
 			return;
 		}
+		const assertAdoptionCurrent = () => this.assertWorkerRecoveryCurrent(worker, adoptionRevision);
 		try {
+			assertAdoptionCurrent();
 			if (!isProcessAlive(worker.descriptor.pid)) {
 				throw new Error("Session worker process is no longer running");
 			}
 			const observedProcessStartId = getProcessStartId(worker.descriptor.pid);
-			await this.connectWorker(worker, 2000);
+			await this.connectWorker(worker, 2000, assertAdoptionCurrent);
+			assertAdoptionCurrent();
 			await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
-			await this.refreshWorkerSummaries(worker, true);
+			assertAdoptionCurrent();
+			await this.refreshWorkerSummaries(worker, true, adoptionRevision);
+			assertAdoptionCurrent();
 			if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
 				worker.descriptor.processStartId = observedProcessStartId;
 			}
 			await this.assertRecoveryAllowed();
+			assertAdoptionCurrent();
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
 			this.persistWorker(worker);
 			this.broadcastHeartbeatsChanged();
 		} catch (error) {
 			if (isSupervisorRecoveryCancelled(error)) {
+				worker.client?.close();
+				worker.client = undefined;
 				return;
 			}
 			this.log(`Could not adopt worker ${worker.descriptor.workerId}: ${String(error)}`);
@@ -3667,23 +3726,25 @@ export class DaemonSupervisor {
 		if (this.isWorkerRecoveryCancelled(worker)) {
 			return;
 		}
+		if (worker.recovery) {
+			return worker.recovery;
+		}
+		const recoveryRevision = worker.stopRevision;
+		const assertCurrent = () => this.assertWorkerRecoveryCurrent(worker, recoveryRevision);
 		if (worker.descriptor.ownerClientId && !worker.launchEnv && !isProcessAlive(worker.descriptor.pid)) {
+			assertCurrent();
 			worker.descriptor.lifecycle = "failed";
 			worker.descriptor.lastError = "Waiting for the owning client to reconnect";
 			this.persistWorker(worker);
 			return;
 		}
-		if (worker.recovery) {
-			return worker.recovery;
-		}
 		worker.recovery = (async () => {
 			for (const [retryIndex, retryDelay] of WORKER_RETRY_DELAYS_MS.entries()) {
 				await delay(retryDelay);
-				if (this.isWorkerRecoveryCancelled(worker)) {
-					return;
-				}
 				try {
+					assertCurrent();
 					await this.assertRecoveryAllowed();
+					assertCurrent();
 					const processAlive = isProcessAlive(worker.descriptor.pid);
 					const observedProcessStartId = processAlive ? getProcessStartId(worker.descriptor.pid) : undefined;
 					const processIdentityMatches =
@@ -3691,16 +3752,15 @@ export class DaemonSupervisor {
 						observedProcessStartId === worker.descriptor.processStartId;
 					if (processAlive && processIdentityMatches) {
 						try {
-							await this.connectWorker(worker, 1500);
+							await this.connectWorker(worker, 1500, assertCurrent);
+							assertCurrent();
 							await this.subscribeWorker(worker, worker.descriptor.rootActiveSessionId);
-							await this.refreshWorkerSummaries(worker, true);
-							if (this.isWorkerRecoveryCancelled(worker)) {
-								return;
-							}
+							assertCurrent();
+							await this.refreshWorkerSummaries(worker, true, recoveryRevision);
+							assertCurrent();
 							if (worker.descriptor.processStartId === undefined && observedProcessStartId) {
 								worker.descriptor.processStartId = observedProcessStartId;
 							}
-							await this.assertRecoveryAllowed();
 							worker.descriptor.lifecycle = "ready";
 							worker.descriptor.consecutiveFailures = 0;
 							this.persistWorker(worker);
@@ -3711,6 +3771,7 @@ export class DaemonSupervisor {
 								throw error;
 							}
 							await this.assertRecoveryAllowed();
+							assertCurrent();
 							worker.client?.close();
 							worker.client = undefined;
 							if (retryIndex < WORKER_RETRY_DELAYS_MS.length - 1) {
@@ -3729,6 +3790,7 @@ export class DaemonSupervisor {
 					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
 					if (!recoveryCommand || !worker.launchEnv) {
 						await this.recoverUncertainWorkerOperations(worker, false);
+						assertCurrent();
 						worker.descriptor.lifecycle = "failed";
 						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
 						this.persistWorker(worker);
@@ -3740,15 +3802,14 @@ export class DaemonSupervisor {
 						worker,
 						safeToKillWorkerProcess,
 					);
-					if (this.isWorkerRecoveryCancelled(worker)) {
-						return;
-					}
+					assertCurrent();
 					await this.launchWorker(
 						recoveryCommand,
 						worker,
 						worker.descriptor.ownerClientId,
 						promptLifecycleRecovery,
 					);
+					assertCurrent();
 					return;
 				} catch (error) {
 					if (isSupervisorRecoveryCancelled(error) || this.isWorkerRecoveryCancelled(worker)) {
@@ -3756,6 +3817,7 @@ export class DaemonSupervisor {
 					}
 					try {
 						await this.assertRecoveryAllowed();
+						assertCurrent();
 					} catch {
 						return;
 					}
@@ -3769,6 +3831,7 @@ export class DaemonSupervisor {
 			}
 			try {
 				await this.assertRecoveryAllowed();
+				assertCurrent();
 			} catch {
 				return;
 			}
@@ -3788,6 +3851,14 @@ export class DaemonSupervisor {
 			worker.descriptor.stopRequestedAt !== undefined ||
 			this.workers.get(worker.descriptor.workerId) !== worker
 		);
+	}
+
+	private assertWorkerRecoveryCurrent(worker: ResidentWorker, stopRevision: number): void {
+		if (worker.stopRevision !== stopRevision || this.isWorkerRecoveryCancelled(worker)) {
+			throw new SupervisorRecoveryCancelledError(
+				`Session worker ${worker.descriptor.workerId} recovery was cancelled`,
+			);
+		}
 	}
 
 	private async restoreWorkerPromptLifecycles(
@@ -3953,8 +4024,14 @@ export class DaemonSupervisor {
 		workerClient.close();
 	}
 
-	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
-		if (this.isWorkerStopping(worker)) {
+	private async refreshWorkerSummaries(
+		worker: ResidentWorker,
+		recovery = false,
+		expectedRecoveryRevision = worker.stopRevision,
+	): Promise<void> {
+		if (recovery) {
+			this.assertWorkerRecoveryCurrent(worker, expectedRecoveryRevision);
+		} else if (this.isWorkerStopping(worker)) {
 			throw new Error("Session worker is stopping");
 		}
 		const workerClient = worker.client;
@@ -3970,6 +4047,9 @@ export class DaemonSupervisor {
 			(this.workers && this.workers.get(worker.descriptor.workerId) !== worker)
 		) {
 			throw new Error("Session worker authority changed during roster refresh");
+		}
+		if (recovery) {
+			this.assertWorkerRecoveryCurrent(worker, expectedRecoveryRevision);
 		}
 		const summaries = sessionSummariesFromResponse(response);
 		const nextSummaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
@@ -3991,6 +4071,7 @@ export class DaemonSupervisor {
 		if (root) {
 			if (recovery) {
 				await this.assertRecoveryAllowed();
+				this.assertWorkerRecoveryCurrent(worker, expectedRecoveryRevision);
 			}
 			worker.descriptor.rootSessionId = root.sessionId;
 			worker.descriptor.sessionFile = root.sessionFile;
@@ -6179,6 +6260,41 @@ export class DaemonSupervisor {
 		recoveryCleanup = false,
 		directChild?: { child: ChildProcess; closed: Promise<void> },
 	): Promise<void> {
+		if (removeDescriptor && !directChild) {
+			const pending = worker.stopOperation;
+			if (pending) {
+				if (archiveSession && !worker.descriptor.archiveOnStop) {
+					this.persistWorkerStopTombstone(worker, true);
+				}
+				return pending;
+			}
+			const operation = this.performWorkerStop(
+				worker,
+				removeDescriptor,
+				force,
+				archiveSession,
+				recoveryCleanup,
+				directChild,
+			);
+			worker.stopOperation = operation;
+			try {
+				await operation;
+			} finally {
+				if (worker.stopOperation === operation) worker.stopOperation = undefined;
+			}
+			return;
+		}
+		await this.performWorkerStop(worker, removeDescriptor, force, archiveSession, recoveryCleanup, directChild);
+	}
+
+	private async performWorkerStop(
+		worker: ResidentWorker,
+		removeDescriptor: boolean,
+		force: boolean,
+		archiveSession: boolean,
+		recoveryCleanup: boolean,
+		directChild?: { child: ChildProcess; closed: Promise<void> },
+	): Promise<void> {
 		const releaseStopOwnership = this.acquireWorkerStopOwnership(worker);
 		try {
 			await this.stopWorkerUntracked(worker, removeDescriptor, force, archiveSession, recoveryCleanup, directChild);
@@ -6246,6 +6362,13 @@ export class DaemonSupervisor {
 				throw error;
 			}
 			this.reportCleanupFailure(`worker rollback state ${worker.descriptor.workerId}`, error);
+		}
+		if (!recoveryCleanup && !directChild) {
+			// The tombstone/revision above closes recovery admission. Join every
+			// recovery task that could already have passed an earlier async gate
+			// before proving the process and durable registration absent.
+			await Promise.all([worker.recovery, worker.deferredRecovery].flatMap((task) => (task ? [task] : [])));
+			assertStopStillApplies();
 		}
 		const transferError = new Error("Session worker stopped during snapshot transfer");
 		const generationTranscripts = new Set<SnapshotTranscriptCache>();
@@ -6359,28 +6482,51 @@ export class DaemonSupervisor {
 	 * interrupted cleanup instead of leaving a dead worker registered forever.
 	 */
 	private scheduleWorkerStopFinalization(worker: ResidentWorker): void {
-		if (worker.stopFinalization) {
-			return;
-		}
-		worker.stopFinalization = this.finalizeTimedOutWorkerStop(worker).finally(() => {
-			worker.stopFinalization = undefined;
-		});
-	}
-
-	private async finalizeTimedOutWorkerStop(worker: ResidentWorker): Promise<void> {
-		// Bind to the exact process generation being stopped: a retry can rescind
-		// the stop and relaunch with a new pid, and the OS can recycle the old
-		// pid. The finalizer must never follow either successor.
 		const pid = worker.descriptor.pid;
 		const processStartId = worker.descriptor.processStartId;
+		const stopRevision = worker.stopRevision;
+		const existing = worker.stopFinalization;
+		if (
+			existing?.pid === pid &&
+			existing.processStartId === processStartId &&
+			existing.stopRevision === stopRevision
+		) {
+			return;
+		}
+		let promise!: Promise<void>;
+		promise = this.finalizeTimedOutWorkerStop(worker, pid, processStartId, stopRevision).finally(() => {
+			if (worker.stopFinalization?.promise !== promise) return;
+			worker.stopFinalization = undefined;
+			if (
+				this.workers.get(worker.descriptor.workerId) === worker &&
+				worker.descriptor.stopRequestedAt !== undefined
+			) {
+				this.scheduleWorkerStopFinalization(worker);
+			}
+		});
+		worker.stopFinalization = { pid, processStartId, stopRevision, promise };
+		void promise.catch(() => undefined);
+	}
+
+	private async finalizeTimedOutWorkerStop(
+		worker: ResidentWorker,
+		pid: number,
+		processStartId: string | undefined,
+		stopRevision: number,
+	): Promise<void> {
+		// Bind to the exact process generation and stop intent being finalized.
+		// A retry may rescind this stop without changing pid, and the OS may
+		// recycle the pid after exit; neither case may inherit this finalizer.
 		const isStopGenerationCurrent = () =>
 			this.workers.get(worker.descriptor.workerId) === worker &&
+			worker.stopRevision === stopRevision &&
 			worker.descriptor.stopRequestedAt !== undefined &&
 			worker.descriptor.pid === pid &&
 			worker.descriptor.processStartId === processStartId;
-		// Do not signal or remove anything until stop intent is durable. A failed
-		// first tombstone write is retried here without losing the registration.
-		while (!this.shuttingDown && isStopGenerationCurrent()) {
+		// Do not signal or remove anything until stop intent is durable. This
+		// remains active during supervisor shutdown so shutdown cannot outrun a
+		// failed tombstone write and leave an adoptable live registration.
+		while (isStopGenerationCurrent()) {
 			try {
 				this.persistWorkerStopTombstone(worker, worker.descriptor.archiveOnStop === true);
 				break;
@@ -6389,7 +6535,7 @@ export class DaemonSupervisor {
 				await unrefDelay(STOP_FINALIZATION_RETRY_MS);
 			}
 		}
-		if (this.shuttingDown || !isStopGenerationCurrent()) return;
+		if (!isStopGenerationCurrent()) return;
 		// A replaced pid counts as gone (never SIGKILL a recycled pid); an
 		// unobservable identity counts as alive (never clean up a possibly-live
 		// worker). kill(0) probes every poll; ps-backed checks are throttled.
@@ -6422,7 +6568,7 @@ export class DaemonSupervisor {
 		};
 		const sigkillDeadline = Date.now() + STOP_FINALIZATION_SIGKILL_GRACE_MS;
 		let killed = false;
-		while (!this.shuttingDown) {
+		while (true) {
 			if (!isStopGenerationCurrent()) {
 				return;
 			}
@@ -6444,15 +6590,10 @@ export class DaemonSupervisor {
 			await unrefDelay(STOP_FINALIZATION_RECHECK_MS);
 		}
 		// Retry transient cleanup failures (for example catalog archival) so a
-		// dead worker's registration is never stranded permanently. Each attempt
-		// bumps the worker's stopRevision, so rescission is detected through the
-		// registration and tombstone instead of the waiting-phase snapshot.
-		const isCleanupStillWanted = () =>
-			this.workers.get(worker.descriptor.workerId) === worker &&
-			worker.descriptor.stopRequestedAt !== undefined &&
-			worker.descriptor.pid === pid &&
-			worker.descriptor.processStartId === processStartId;
-		while (!this.shuttingDown && isCleanupStillWanted()) {
+		// dead worker's registration is never stranded permanently. A failed
+		// attempt advances stopRevision and installs a generation-keyed successor
+		// finalizer; this exact finalizer then retires without clearing it.
+		while (isStopGenerationCurrent()) {
 			try {
 				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
 				this.log(`Finalized timed-out stop for worker ${worker.descriptor.workerId}`);
@@ -6683,12 +6824,30 @@ export class DaemonSupervisor {
 					try {
 						await this.stopWorker(worker, true, forceWorkers, true);
 					} catch (error) {
-						if (!(error instanceof WorkerStopTimeoutError)) {
-							throw error;
-						}
 						this.log(
-							`Worker ${worker.descriptor.workerId} remains tombstoned for recovery after shutdown: ${error.message}`,
+							`Worker ${worker.descriptor.workerId} remains tombstoned while shutdown drains cleanup: ${String(error)}`,
 						);
+					}
+					// Shutdown may not disable the only retry path after its public
+					// response succeeds. Keep ownership, catalog, and the server alive
+					// until this supervisor has proved the exact registration absent.
+					while (this.workers.get(worker.descriptor.workerId) === worker) {
+						if (worker.descriptor.stopRequestedAt === undefined) {
+							try {
+								this.persistWorkerStopTombstone(worker, true);
+							} catch (error) {
+								this.reportCleanupFailure(`shutdown worker tombstone ${worker.descriptor.workerId}`, error);
+							}
+						}
+						this.scheduleWorkerStopFinalization(worker);
+						const finalization = worker.stopFinalization;
+						if (finalization) {
+							await finalization.promise.catch((error) =>
+								this.reportCleanupFailure(`shutdown worker ${worker.descriptor.workerId}`, error),
+							);
+						} else {
+							await unrefDelay(STOP_FINALIZATION_RECHECK_MS);
+						}
 					}
 				}),
 			);
