@@ -123,12 +123,35 @@ interface DaemonSnapshotAssembly {
 	timeout: ReturnType<typeof setTimeout>;
 }
 
+interface DaemonSnapshotExpectation {
+	id: string;
+	activeSessionId: string;
+	sessionId: string;
+	messageCount: number;
+	targetChunkBytes: number;
+	purpose: DaemonSnapshotPurpose;
+	lastEventSequence: number;
+	lastEventCursor?: DaemonEventCursor;
+}
+
 interface DaemonSnapshotRequestAttempt {
 	id: number;
 	activeSessionId: string;
 	attachmentEpoch: number;
 	candidateSnapshotIds: Set<string>;
-	expectedSnapshotId?: string;
+	logicalPurpose: DaemonSnapshotPurpose;
+	wirePurpose: DaemonSnapshotPurpose;
+	state: "requesting" | "receiving" | "succeeded" | "failed";
+	expected?: DaemonSnapshotExpectation;
+}
+
+interface DaemonRuntimeSnapshotAttempt {
+	activeSessionId: string;
+	attachmentEpoch: number;
+	purpose: "replacement" | "resync";
+	state: "receiving" | "retrying" | "succeeded" | "terminal";
+	snapshotIds: Set<string>;
+	recovery?: Promise<void>;
 }
 
 interface CorrelatedPromptRoute {
@@ -328,7 +351,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly completedSnapshots = new Map<string, DaemonSessionSnapshot>();
 	private readonly completedSnapshotAttemptIds = new Map<string, number | undefined>();
 	private readonly pendingReattachActiveSessionIds = new Set<string>();
-	private readonly snapshotRecoveryPromises = new Map<string, Promise<void>>();
+	private runtimeSnapshotAttempt: DaemonRuntimeSnapshotAttempt | undefined;
 	private readonly ignoredSnapshotIds = new Set<string>();
 	private readonly snapshotRequestAttempts = new Map<number, DaemonSnapshotRequestAttempt>();
 	private snapshotRequestAttemptSequence = 0;
@@ -398,7 +421,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			const invalidatedInputPause = this.sessionInputPauses.size > 0;
 			this.sessionInputPauses.clear();
 			this.sessionInputPauseGeneration++;
-			this.rejectSnapshotAssemblies(error);
+			this.rejectSnapshotAssemblies(error, true);
 			if (this.disposed || this.terminalCloseEmitted) {
 				return;
 			}
@@ -454,17 +477,24 @@ export class DaemonAgentConnection implements AgentConnection {
 		resumeCursor: DaemonEventCursor | undefined,
 		resetEventProgress: boolean,
 		maxAttempts = 2,
+		logicalPurpose: DaemonSnapshotPurpose = "attach",
 	): Promise<void> {
 		const supportsExtensionUi = this.options.supportsExtensionUi !== false;
 		const attachmentEpoch = this.advanceAttachmentEpoch();
 		let result!: SessionSummary | DaemonAttachResult;
 		let streamedSnapshot: DaemonSessionSnapshot | undefined;
 		for (let attemptIndex = 0; attemptIndex < maxAttempts; attemptIndex++) {
-			const requestAttempt = this.startSnapshotRequestAttempt(requestedActiveSessionId, attachmentEpoch);
+			const requestAttempt = this.startSnapshotRequestAttempt(
+				requestedActiveSessionId,
+				attachmentEpoch,
+				logicalPurpose,
+				"attach",
+			);
 			try {
 				result = await this.requestData<SessionSummary | DaemonAttachResult>({
 					type: "attach",
 					activeSessionId: requestedActiveSessionId,
+					snapshotGenerationNonce: randomUUID(),
 					supportsExtensionUi,
 					clientId: this.clientId,
 					capabilities: [
@@ -493,13 +523,16 @@ export class DaemonAgentConnection implements AgentConnection {
 					throw new Error("Daemon connection attachment changed during attach");
 				}
 				if ("snapshot" in result && result.snapshotStream) {
-					requestAttempt.expectedSnapshotId = result.snapshotStream.id;
+					this.bindSnapshotExpectation(requestAttempt, result);
+					requestAttempt.state = "receiving";
 					streamedSnapshot = await this.waitForSnapshot(result.snapshotStream.id, requestAttempt);
 				} else {
 					streamedSnapshot = undefined;
 				}
+				requestAttempt.state = "succeeded";
 				break;
 			} catch (error) {
+				requestAttempt.state = "failed";
 				if (attemptIndex === maxAttempts - 1 || this.disposed || this.attachmentEpoch !== attachmentEpoch) {
 					throw error;
 				}
@@ -568,6 +601,8 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getInitialSnapshot(): Promise<AgentConnectionSnapshot> {
+		const snapshotRecovery = this.runtimeSnapshotAttempt?.recovery;
+		if (snapshotRecovery) await snapshotRecovery;
 		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
 			return this.latestSnapshot;
 		}
@@ -1592,7 +1627,12 @@ export class DaemonAgentConnection implements AgentConnection {
 			let result!: DaemonAttachResult;
 			let snapshot!: DaemonSessionSnapshot;
 			for (let attemptIndex = 0; attemptIndex < 2; attemptIndex++) {
-				const requestAttempt = this.startSnapshotRequestAttempt(targetActiveSessionId, attachmentEpoch);
+				const requestAttempt = this.startSnapshotRequestAttempt(
+					targetActiveSessionId,
+					attachmentEpoch,
+					"replacement",
+					attemptIndex === 0 ? "replacement" : "attach",
+				);
 				try {
 					result = await this.requestData<DaemonAttachResult>(
 						attemptIndex === 0
@@ -1610,6 +1650,7 @@ export class DaemonAgentConnection implements AgentConnection {
 							: {
 									type: "attach",
 									activeSessionId: targetActiveSessionId,
+									snapshotGenerationNonce: randomUUID(),
 									supportsExtensionUi,
 									clientId: this.clientId,
 									capabilities,
@@ -1622,14 +1663,19 @@ export class DaemonAgentConnection implements AgentConnection {
 						throw new Error("Daemon returned an invalid session snapshot");
 					}
 					if (result.snapshotStream) {
-						requestAttempt.expectedSnapshotId = result.snapshotStream.id;
+						this.bindSnapshotExpectation(requestAttempt, result);
+						requestAttempt.state = "receiving";
 						snapshot = await this.waitForSnapshot(result.snapshotStream.id, requestAttempt);
 					} else {
 						snapshot = result.snapshot;
 					}
+					requestAttempt.state = "succeeded";
 					break;
 				} catch (error) {
-					if (attemptIndex === 1 || this.disposed || this.attachmentEpoch !== attachmentEpoch) throw error;
+					requestAttempt.state = "failed";
+					if (attemptIndex === 1 || !reattached || this.disposed || this.attachmentEpoch !== attachmentEpoch) {
+						throw error;
+					}
 				} finally {
 					this.finishSnapshotRequestAttempt(requestAttempt);
 				}
@@ -1919,17 +1965,32 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (message.type === "session_snapshot_begin") {
+			const terminalRuntimeAttempt = this.runtimeSnapshotAttempt;
+			if (
+				terminalRuntimeAttempt?.state === "terminal" &&
+				terminalRuntimeAttempt.attachmentEpoch === this.attachmentEpoch &&
+				terminalRuntimeAttempt.activeSessionId === message.activeSessionId
+			) {
+				this.ignoreSnapshotId(message.snapshotId);
+				return;
+			}
 			const pendingReplacement = this.pendingChunkedReplacement;
 			const requestAttempt = this.latestSnapshotRequestAttempt(message.activeSessionId);
+			const retryingReplacement =
+				pendingReplacement !== undefined &&
+				requestAttempt?.logicalPurpose === "replacement" &&
+				requestAttempt.wirePurpose === "attach";
 			const acceptsUnsolicitedRuntimeSnapshot =
-				this.attachedSessionId !== undefined &&
-				(message.purpose === "resync" ||
-					(message.purpose === "replacement" && !this.supportsCorrelatedPromptLifecycle()));
+				this.attachedSessionId !== undefined && (message.purpose === "resync" || message.purpose === "replacement");
 			if (!pendingReplacement && !requestAttempt && !acceptsUnsolicitedRuntimeSnapshot) return;
 			this.ignoredSnapshotIds.delete(message.snapshotId);
 			if (pendingReplacement) {
-				if (message.purpose !== "replacement") {
-					this.failClosedReplacementReconciliation();
+				if (message.purpose !== "replacement" && !retryingReplacement) {
+					void this.transitionRuntimeSnapshotFailure(
+						"replacement",
+						new Error("Daemon returned an invalid replacement snapshot purpose"),
+						message.snapshotId,
+					);
 					return;
 				}
 				if (pendingReplacement.snapshotId && pendingReplacement.snapshotId !== message.snapshotId) {
@@ -1960,12 +2021,14 @@ export class DaemonAgentConnection implements AgentConnection {
 			}
 			try {
 				validateDaemonSnapshotBegin(message);
+				if (requestAttempt) this.validateSnapshotAttemptBegin(requestAttempt, message);
 			} catch (error) {
 				await this.rejectInvalidSnapshotAssembly(
 					message.snapshotId,
 					assembly,
 					error instanceof Error ? error : new Error(String(error)),
 					message.activeSessionId,
+					message.purpose,
 				);
 				return;
 			}
@@ -1974,6 +2037,9 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.completedSnapshots.delete(message.snapshotId);
 			this.completedSnapshotAttemptIds.delete(message.snapshotId);
 			assembly.begin = message;
+			if (!requestAttempt && (message.purpose === "replacement" || message.purpose === "resync")) {
+				this.startRuntimeSnapshotAttempt(message.purpose, message.activeSessionId, message.snapshotId);
+			}
 			return;
 		}
 		if (message.type === "session_snapshot_chunk") {
@@ -2007,30 +2073,23 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		if (message.type === "session_snapshot_failed") {
 			const existingAssembly = this.snapshotAssemblies.get(message.snapshotId);
+			const explicitPurpose = message.purpose;
 			const assembly =
 				existingAssembly ??
-				(this.pendingChunkedReplacement ? this.getSnapshotAssembly(message.snapshotId) : undefined);
+				(this.pendingChunkedReplacement || explicitPurpose
+					? this.getSnapshotAssembly(message.snapshotId)
+					: undefined);
 			if (!assembly || assembly.settled || assembly.attachmentEpoch !== this.attachmentEpoch) return;
-			const purpose = assembly.begin?.purpose ?? (this.pendingChunkedReplacement ? "replacement" : "attach");
-			const snapshotError = new Error(message.error);
-			const pendingReattach = this.pendingReattachActiveSessionIds.has(message.activeSessionId);
-			const recoveryPromise =
-				!pendingReattach && (purpose === "replacement" || purpose === "resync")
-					? this.recoverFailedSnapshot(purpose, snapshotError)
-					: undefined;
-			if (recoveryPromise) {
-				this.snapshotRecoveryPromises.set(message.snapshotId, recoveryPromise);
-			}
-			this.rejectSnapshotAssembly(message.snapshotId, assembly, snapshotError);
-			this.ignoreSnapshotId(message.snapshotId);
-			if (recoveryPromise) {
-				try {
-					await recoveryPromise;
-				} finally {
-					this.snapshotRecoveryPromises.delete(message.snapshotId);
-				}
-				if (!this.terminalCloseEmitted) this.releaseChunkedReplacementFence();
-			}
+			const purpose =
+				explicitPurpose ?? assembly.begin?.purpose ?? (this.pendingChunkedReplacement ? "replacement" : "attach");
+			const recovery = this.transitionSnapshotFailure(
+				message.snapshotId,
+				assembly,
+				new Error(message.error),
+				message.activeSessionId,
+				purpose,
+			);
+			if (recovery) await recovery;
 			return;
 		}
 		if (this.isStaleSequencedMessage(message)) {
@@ -2369,12 +2428,64 @@ export class DaemonAgentConnection implements AgentConnection {
 		return nextEpoch;
 	}
 
-	private startSnapshotRequestAttempt(activeSessionId: string, attachmentEpoch: number): DaemonSnapshotRequestAttempt {
+	private bindSnapshotExpectation(attempt: DaemonSnapshotRequestAttempt, result: DaemonAttachResult): void {
+		attempt.expected = this.snapshotExpectation(result, attempt.wirePurpose);
+		for (const snapshotId of attempt.candidateSnapshotIds) {
+			const begin = this.snapshotAssemblies.get(snapshotId)?.begin;
+			if (begin) this.validateSnapshotAttemptBegin(attempt, begin);
+		}
+	}
+
+	private snapshotExpectation(result: DaemonAttachResult, purpose: DaemonSnapshotPurpose): DaemonSnapshotExpectation {
+		const stream = result.snapshotStream;
+		if (!stream) throw new Error("Daemon snapshot response omitted its stream descriptor");
+		return {
+			id: stream.id,
+			activeSessionId: result.activeSessionId,
+			sessionId: result.snapshot.state.sessionId,
+			messageCount: stream.messageCount,
+			targetChunkBytes: stream.targetChunkBytes,
+			purpose,
+			lastEventSequence: result.snapshot.lastEventSequence,
+			lastEventCursor: result.snapshot.lastEventCursor,
+		};
+	}
+
+	private validateSnapshotAttemptBegin(attempt: DaemonSnapshotRequestAttempt, begin: DaemonSnapshotBegin): void {
+		const expected = attempt.expected;
+		if (!expected) return;
+		const cursor = begin.snapshot.lastEventCursor;
+		if (
+			begin.snapshotId !== expected.id ||
+			begin.activeSessionId !== expected.activeSessionId ||
+			begin.snapshot.activeSessionId !== expected.activeSessionId ||
+			begin.snapshot.state.sessionId !== expected.sessionId ||
+			begin.snapshot.summary.sessionId !== expected.sessionId ||
+			begin.messageCount !== expected.messageCount ||
+			begin.targetChunkBytes !== expected.targetChunkBytes ||
+			(begin.purpose ?? "attach") !== expected.purpose ||
+			begin.snapshot.lastEventSequence !== expected.lastEventSequence ||
+			cursor?.generation !== expected.lastEventCursor?.generation ||
+			cursor?.sequence !== expected.lastEventCursor?.sequence
+		) {
+			throw new Error(`Snapshot ${begin.snapshotId} did not match its response descriptor`);
+		}
+	}
+
+	private startSnapshotRequestAttempt(
+		activeSessionId: string,
+		attachmentEpoch: number,
+		logicalPurpose: DaemonSnapshotPurpose,
+		wirePurpose: DaemonSnapshotPurpose,
+	): DaemonSnapshotRequestAttempt {
 		const attempt: DaemonSnapshotRequestAttempt = {
 			id: ++this.snapshotRequestAttemptSequence,
 			activeSessionId,
 			attachmentEpoch,
 			candidateSnapshotIds: new Set(),
+			logicalPurpose,
+			wirePurpose,
+			state: "requesting",
 		};
 		this.snapshotRequestAttempts.set(attempt.id, attempt);
 		return attempt;
@@ -2440,16 +2551,15 @@ export class DaemonAgentConnection implements AgentConnection {
 		const timeout = setTimeout(() => {
 			const current = this.snapshotAssemblies.get(snapshotId);
 			if (current && !current.settled) {
-				current.reject(new Error(`Timed out waiting for snapshot ${snapshotId}`));
-				this.snapshotAssemblies.delete(snapshotId);
-				this.ignoreSnapshotId(snapshotId);
-				if (
-					this.pendingChunkedReplacement ||
-					(current.begin?.purpose === "replacement" &&
-						!this.pendingReattachActiveSessionIds.has(current.begin.activeSessionId))
-				) {
-					this.failClosedReplacementReconciliation();
-				}
+				const activeSessionId =
+					current.begin?.activeSessionId ?? requestAttempt?.activeSessionId ?? this.activeSessionId;
+				void this.transitionSnapshotFailure(
+					snapshotId,
+					current,
+					new Error(`Timed out waiting for snapshot ${snapshotId}`),
+					activeSessionId,
+					current.begin?.purpose,
+				);
 			}
 		}, this.options.snapshotTimeoutMs ?? DAEMON_SNAPSHOT_TIMEOUT_MS);
 		timeout.unref();
@@ -2475,17 +2585,27 @@ export class DaemonAgentConnection implements AgentConnection {
 		return assembly;
 	}
 
-	private rejectSnapshotAssemblies(error: Error): void {
-		for (const assembly of this.snapshotAssemblies.values()) {
+	private rejectSnapshotAssemblies(error: Error, recoverRuntime = false): void {
+		for (const [snapshotId, assembly] of [...this.snapshotAssemblies]) {
 			clearTimeout(assembly.timeout);
-			assembly.reject(error);
+			if (recoverRuntime) {
+				void this.transitionSnapshotFailure(
+					snapshotId,
+					assembly,
+					error,
+					assembly.begin?.activeSessionId ?? this.activeSessionId,
+					assembly.begin?.purpose,
+				);
+			} else {
+				assembly.reject(error);
+			}
 		}
 		this.snapshotAssemblies.clear();
 		this.completedSnapshots.clear();
 		this.completedSnapshotAttemptIds.clear();
 		this.snapshotRequestAttempts.clear();
-		this.snapshotRecoveryPromises.clear();
 		this.ignoredSnapshotIds.clear();
+		if (!recoverRuntime) this.runtimeSnapshotAttempt = undefined;
 	}
 
 	private ignoreSnapshotId(snapshotId: string): void {
@@ -2512,41 +2632,138 @@ export class DaemonAgentConnection implements AgentConnection {
 		assembly: DaemonSnapshotAssembly,
 		error: Error,
 		activeSessionId: string,
+		explicitPurpose?: DaemonSnapshotPurpose,
 	): Promise<void> {
-		this.rejectSnapshotAssembly(snapshotId, assembly, error);
-		this.snapshotAssemblies.delete(snapshotId);
-		this.ignoreSnapshotId(snapshotId);
-		if (
-			this.pendingChunkedReplacement ||
-			(assembly.begin?.purpose === "replacement" && !this.pendingReattachActiveSessionIds.has(activeSessionId))
-		) {
-			this.failClosedReplacementReconciliation();
-		}
+		const recovery = this.transitionSnapshotFailure(
+			snapshotId,
+			assembly,
+			error,
+			activeSessionId,
+			explicitPurpose ?? assembly.begin?.purpose ?? (this.pendingChunkedReplacement ? "replacement" : undefined),
+		);
 		if (this.supportsCorrelatedPromptLifecycle()) {
 			await this.emit({ type: "correlated_prompt_protocol_violation" });
 		}
+		if (recovery) await recovery;
 	}
 
-	private async recoverFailedSnapshot(purpose: "replacement" | "resync", snapshotError: Error): Promise<void> {
+	private startRuntimeSnapshotAttempt(
+		purpose: "replacement" | "resync",
+		activeSessionId: string,
+		snapshotId: string,
+	): DaemonRuntimeSnapshotAttempt {
+		const current = this.runtimeSnapshotAttempt;
+		if (
+			current &&
+			current.attachmentEpoch === this.attachmentEpoch &&
+			current.activeSessionId === activeSessionId &&
+			current.state !== "succeeded"
+		) {
+			for (const previousId of current.snapshotIds) {
+				if (previousId === snapshotId) continue;
+				const previous = this.snapshotAssemblies.get(previousId);
+				if (previous && !previous.settled) {
+					this.rejectSnapshotAssembly(
+						previousId,
+						previous,
+						new Error(`Snapshot ${previousId} was superseded by ${snapshotId}`),
+					);
+					this.snapshotAssemblies.delete(previousId);
+					this.ignoreSnapshotId(previousId);
+				}
+			}
+			current.snapshotIds.add(snapshotId);
+			return current;
+		}
+		const attempt: DaemonRuntimeSnapshotAttempt = {
+			activeSessionId,
+			attachmentEpoch: this.attachmentEpoch,
+			purpose,
+			state: "receiving",
+			snapshotIds: new Set([snapshotId]),
+		};
+		this.runtimeSnapshotAttempt = attempt;
+		return attempt;
+	}
+
+	private transitionSnapshotFailure(
+		snapshotId: string,
+		assembly: DaemonSnapshotAssembly,
+		error: Error,
+		activeSessionId: string,
+		explicitPurpose?: DaemonSnapshotPurpose,
+	): Promise<void> | undefined {
+		this.rejectSnapshotAssembly(snapshotId, assembly, error);
+		this.ignoreSnapshotId(snapshotId);
+		const requestAttempt =
+			assembly.requestAttemptId === undefined
+				? undefined
+				: this.snapshotRequestAttempts.get(assembly.requestAttemptId);
+		if (requestAttempt) {
+			// Keep the settled assembly until the command response binds its descriptor.
+			// This covers begin/failed frames that beat the attach response continuation.
+			this.snapshotAssemblies.set(snapshotId, assembly);
+			requestAttempt.state = "failed";
+			return undefined;
+		}
+		this.snapshotAssemblies.delete(snapshotId);
+		const purpose = explicitPurpose ?? assembly.begin?.purpose ?? "attach";
+		if (
+			(purpose === "replacement" || purpose === "resync") &&
+			!this.pendingReattachActiveSessionIds.has(activeSessionId)
+		) {
+			return this.transitionRuntimeSnapshotFailure(purpose, error, snapshotId, activeSessionId);
+		}
+		return undefined;
+	}
+
+	private transitionRuntimeSnapshotFailure(
+		purpose: "replacement" | "resync",
+		snapshotError: Error,
+		snapshotId: string,
+		activeSessionId = this.activeSessionId,
+	): Promise<void> {
+		const attempt = this.startRuntimeSnapshotAttempt(purpose, activeSessionId, snapshotId);
+		if (attempt.state === "terminal" || attempt.state === "succeeded") return Promise.resolve();
+		if (attempt.recovery) return attempt.recovery;
+		attempt.state = "retrying";
 		this.latestSnapshotIsFresh = false;
-		try {
-			await this.attachSession(this.activeSessionId, this.lastEventCursor, false, 1);
-			const snapshot = await this.getInitialSnapshot();
-			if (this.disposed) return;
-			if (purpose === "replacement") {
-				await this.emit({ type: "session_replaced", state: snapshot.state, messages: snapshot.messages });
-			} else {
-				await this.emit({ type: "session_resynced", snapshot });
-			}
-		} catch (recoveryError) {
-			if (this.disposed) {
-				return;
-			}
-			this.terminalCloseEmitted = true;
-			await this.emit({
-				type: "closed",
-				error: `Failed to recover from a ${purpose} snapshot transfer. Snapshot error: ${formatErrorSentence(snapshotError)} Recovery error: ${formatErrorSentence(recoveryError)} ${this.formatDaemonDiagnosticContext()}`,
-			});
+		const recovery = this.recoverFailedSnapshot(attempt.purpose).then(
+			async () => {
+				if (this.runtimeSnapshotAttempt !== attempt || attempt.state === "terminal") return;
+				attempt.state = "succeeded";
+				if (attempt.purpose === "replacement") this.releaseChunkedReplacementFence();
+				this.runtimeSnapshotAttempt = undefined;
+			},
+			async (recoveryError: unknown) => {
+				if (this.disposed || this.runtimeSnapshotAttempt !== attempt || attempt.state === "terminal") return;
+				attempt.state = "terminal";
+				for (const failedId of attempt.snapshotIds) this.ignoreSnapshotId(failedId);
+				if (attempt.purpose === "replacement") {
+					this.replacementReconciliationFailed = true;
+					this.pendingChunkedReplacement = undefined;
+				}
+				if (this.terminalCloseEmitted) return;
+				this.terminalCloseEmitted = true;
+				await this.emit({
+					type: "closed",
+					error: `Failed to recover from a ${attempt.purpose} snapshot transfer. Snapshot error: ${formatErrorSentence(snapshotError)} Recovery error: ${formatErrorSentence(recoveryError)} ${this.formatDaemonDiagnosticContext()}`,
+				});
+			},
+		);
+		attempt.recovery = recovery;
+		return recovery;
+	}
+
+	private async recoverFailedSnapshot(purpose: "replacement" | "resync"): Promise<void> {
+		await this.attachSession(this.activeSessionId, this.lastEventCursor, false, 1, purpose);
+		const snapshot = this.latestSnapshot;
+		if (!snapshot) throw new Error("Daemon snapshot retry returned no snapshot");
+		if (this.disposed) return;
+		if (purpose === "replacement") {
+			await this.emit({ type: "session_replaced", state: snapshot.state, messages: snapshot.messages });
+		} else {
+			await this.emit({ type: "session_resynced", snapshot });
 		}
 	}
 
@@ -2565,6 +2782,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (requestAttempt) {
 			requestAttempt.candidateSnapshotIds.add(snapshotId);
 			assembly.requestAttemptId = requestAttempt.id;
+			if (assembly.begin) this.validateSnapshotAttemptBegin(requestAttempt, assembly.begin);
 		}
 		try {
 			return await assembly.promise;
@@ -2802,6 +3020,11 @@ export class DaemonAgentConnection implements AgentConnection {
 			assembly.resolve(snapshot);
 			clearTimeout(assembly.timeout);
 			this.snapshotAssemblies.delete(message.snapshotId);
+			const runtimeAttempt = this.runtimeSnapshotAttempt;
+			if (runtimeAttempt?.snapshotIds.has(message.snapshotId) && runtimeAttempt.state === "receiving") {
+				runtimeAttempt.state = "succeeded";
+				this.runtimeSnapshotAttempt = undefined;
+			}
 			if (purpose === "replacement") {
 				await this.emit({ type: "session_replaced", state: snapshot.state, messages });
 			} else {

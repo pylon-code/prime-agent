@@ -143,6 +143,7 @@ import {
 	prepareSnapshotTranscriptCache,
 	SNAPSHOT_TARGET_CHUNK_BYTES,
 	SnapshotTranscriptCache,
+	type SnapshotTranscriptWireChunk,
 } from "./snapshot-transcript-cache.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
@@ -154,6 +155,20 @@ const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const SNAPSHOT_ATTEMPT_TIMEOUT_MS = 30_000;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
+
+function createPublicSnapshotTransferId(): string {
+	return `snapshot-${randomUUID()}`;
+}
+
+function waitForAbortable<T>(promise: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) return Promise.reject(new Error(message));
+	return new Promise((resolve, reject) => {
+		const onAbort = () => reject(new Error(message));
+		signal.addEventListener("abort", onAbort, { once: true });
+		void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+	});
+}
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // The whole pre-commit prepare (drain + worker fencing) must finish inside the
@@ -355,6 +370,14 @@ interface WorkerAttachData {
 	worker: ResidentWorker;
 	transcript?: SnapshotTranscriptCache;
 	releaseTranscript?: () => void;
+}
+
+interface SupervisorTranscriptPreparation {
+	result: DaemonAttachResult;
+	promise: Promise<SnapshotTranscriptCache>;
+	controller: AbortController;
+	workerClient: DaemonWorkerClient | undefined;
+	stopRevision: number;
 }
 
 interface SupervisorPromptAdmission {
@@ -708,10 +731,7 @@ export class DaemonSupervisor {
 	private commandJournal!: CommandRecoveryJournal;
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
-	private transcriptPreparations?: WeakMap<
-		ResidentWorker,
-		Map<string, { result: DaemonAttachResult; promise: Promise<SnapshotTranscriptCache> }>
-	>;
+	private transcriptPreparations?: WeakMap<ResidentWorker, Map<string, SupervisorTranscriptPreparation>>;
 	private readonly pendingSessionNames = new Set<string>();
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
@@ -1794,7 +1814,7 @@ export class DaemonSupervisor {
 			case "attach": {
 				const attachmentEpoch = this.advanceAttachmentEpoch(client, command.activeSessionId);
 				const requestedCapabilities = normalizeCapabilities(command.capabilities, command.supportsExtensionUi);
-				const releaseSnapshotReservation = requestedCapabilities.has("chunked_snapshot")
+				let releaseSnapshotReservation = requestedCapabilities.has("chunked_snapshot")
 					? this.reserveSnapshotStream(client, command.activeSessionId)
 					: undefined;
 				try {
@@ -1803,6 +1823,14 @@ export class DaemonSupervisor {
 						epoch: attachmentEpoch,
 					});
 					if (client.capabilities.has("chunked_snapshot")) {
+						if (releaseSnapshotReservation) {
+							releaseSnapshotReservation = this.remapSnapshotStreamReservation(
+								client,
+								command.activeSessionId,
+								attached.result.activeSessionId,
+								releaseSnapshotReservation,
+							);
+						}
 						const transcript = attached.transcript;
 						if (!transcript) {
 							throw new Error("Session worker did not provide a snapshot transcript");
@@ -3087,6 +3115,7 @@ export class DaemonSupervisor {
 		if (worker.client !== client) {
 			return;
 		}
+		this.abortTranscriptPreparations(worker, error);
 		worker.client = undefined;
 		this.invalidateWorkerSessionInputPauses(worker, "Session worker disconnected while input was paused");
 		const interrupted = new Map<string, Set<string>>();
@@ -3277,30 +3306,64 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private deliverPurposeBearingSnapshotFailure(
+		activeSessionId: string,
+		purpose: "replacement" | "catchup" | "resync",
+		error: Error,
+	): void {
+		for (const client of this.clients) {
+			if (!client.attachedActiveSessionIds.has(activeSessionId) || !client.capabilities.has("chunked_snapshot")) {
+				continue;
+			}
+			void this.writeSnapshotRecord(
+				client,
+				{
+					type: "session_snapshot_failed",
+					activeSessionId,
+					snapshotId: createPublicSnapshotTransferId(),
+					error: error.message,
+					purpose: purpose === "replacement" ? "replacement" : "resync",
+				},
+				AbortSignal.timeout(1_000),
+			);
+		}
+	}
+
 	private async deliverWorkerSnapshotFailure(
 		client: DaemonSocketClient,
 		result: DaemonAttachResult,
-		snapshotId: string,
+		_payloadSnapshotId: string,
 		purpose: "replacement" | "catchup" | "resync",
 		error: Error,
 	): Promise<void> {
 		if (client.socket.destroyed || !client.attachedActiveSessionIds.has(result.activeSessionId)) return;
+		const transferId = createPublicSnapshotTransferId();
 		const { messages: _messages, ...snapshot } = result.snapshot;
-		await this.writeSnapshotRecord(client, {
-			type: "session_snapshot_begin",
-			activeSessionId: result.activeSessionId,
-			snapshotId,
-			snapshot,
-			messageCount: result.snapshotStream?.messageCount ?? result.snapshot.summary.messageCount,
-			targetChunkBytes: result.snapshotStream?.targetChunkBytes ?? SNAPSHOT_TARGET_CHUNK_BYTES,
-			purpose: purpose === "replacement" ? "replacement" : "resync",
-		});
-		await this.writeSnapshotRecord(client, {
-			type: "session_snapshot_failed",
-			activeSessionId: result.activeSessionId,
-			snapshotId,
-			error: error.message,
-		});
+		const terminalSignal = AbortSignal.timeout(1_000);
+		await this.writeSnapshotRecord(
+			client,
+			{
+				type: "session_snapshot_begin",
+				activeSessionId: result.activeSessionId,
+				snapshotId: transferId,
+				snapshot,
+				messageCount: result.snapshotStream?.messageCount ?? result.snapshot.summary.messageCount,
+				targetChunkBytes: result.snapshotStream?.targetChunkBytes ?? SNAPSHOT_TARGET_CHUNK_BYTES,
+				purpose: purpose === "replacement" ? "replacement" : "resync",
+			},
+			terminalSignal,
+		);
+		await this.writeSnapshotRecord(
+			client,
+			{
+				type: "session_snapshot_failed",
+				activeSessionId: result.activeSessionId,
+				snapshotId: transferId,
+				error: error.message,
+				purpose: purpose === "replacement" ? "replacement" : "resync",
+			},
+			terminalSignal,
+		);
 	}
 
 	private failCorrelatedSnapshotAttempt(
@@ -3336,6 +3399,10 @@ export class DaemonSupervisor {
 			}
 			return;
 		}
+		if (snapshotPurpose === "replacement" || snapshotPurpose === "catchup" || snapshotPurpose === "resync") {
+			this.deliverPurposeBearingSnapshotFailure(activeSessionId, snapshotPurpose, error);
+			return;
+		}
 		this.log(`Ignored stale snapshot ${snapshotId} failure for ${activeSessionId}: ${error.message}`);
 	}
 
@@ -3356,11 +3423,14 @@ export class DaemonSupervisor {
 			return;
 		}
 		generation.retired = true;
-		this.clearSnapshotGenerationDeadline(generation);
 		this.settleSnapshotDuplicateValidation(generation);
 		if (generation.incoming) {
+			// A superseding generation cannot remove the only liveness deadline from
+			// an older begin that may never receive its end frame.
+			this.armSnapshotGenerationDeadline(worker, activeSessionId, generation);
 			return;
 		}
+		this.clearSnapshotGenerationDeadline(generation);
 		this.deleteSnapshotGeneration(worker, activeSessionId, generation);
 		expectedTranscript.dispose();
 	}
@@ -4227,8 +4297,10 @@ export class DaemonSupervisor {
 							"attach_snapshot",
 							"event_sequence",
 							"slim_attach",
-							"correlated_prompt_lifecycle_v1",
 						];
+						if (workerClient.supportsServerCapability?.("correlated_prompt_lifecycle_v1")) {
+							workerCapabilities.push("correlated_prompt_lifecycle_v1");
+						}
 						if (
 							client.capabilities.has("chunked_snapshot") &&
 							workerClient.supportsServerCapability?.("immutable_snapshot_transfer_v1")
@@ -4239,6 +4311,7 @@ export class DaemonSupervisor {
 							{
 								type: "attach",
 								activeSessionId,
+								snapshotGenerationNonce: randomUUID(),
 								capabilities: workerCapabilities,
 								supportsExtensionUi: false,
 								env: command.env ?? collectDaemonClientEnv(),
@@ -4311,7 +4384,14 @@ export class DaemonSupervisor {
 				if (client.socket.destroyed) {
 					throw new Error("Daemon client disconnected during snapshot preparation");
 				}
-				transcript = await this.getOrCreateTranscriptCache(match.worker, result);
+				const preparationSignal = attachmentFence
+					? this.attachmentAbortSignal(client, attachmentFence.selector, attachmentFence.epoch)
+					: undefined;
+				transcript = await waitForAbortable(
+					this.getOrCreateTranscriptCache(match.worker, result),
+					preparationSignal,
+					`Attachment changed while preparing snapshot for ${activeSessionId}`,
+				);
 				assertAttachmentCurrent();
 				if (client.socket.destroyed) {
 					throw new Error("Daemon client disconnected during snapshot preparation");
@@ -4336,7 +4416,9 @@ export class DaemonSupervisor {
 				}
 			}
 			const snapshot = client.capabilities.has("correlated_prompt_lifecycle_v1")
-				? result.snapshot
+				? result.snapshot.promptLifecycles
+					? result.snapshot
+					: { ...result.snapshot, promptLifecycles: { records: [], expired: [] } }
 				: withoutCorrelatedPromptLifecycleSnapshot(result.snapshot);
 			const publicResult: DaemonAttachResult = {
 				...result,
@@ -4439,6 +4521,13 @@ export class DaemonSupervisor {
 		return loaded;
 	}
 
+	private abortTranscriptPreparations(worker: ResidentWorker, reason: Error): void {
+		const preparations = this.transcriptPreparations?.get(worker);
+		if (!preparations) return;
+		for (const preparation of preparations.values()) preparation.controller.abort(reason);
+		preparations.clear();
+	}
+
 	private async getOrCreateTranscriptCache(
 		worker: ResidentWorker,
 		result: DaemonAttachResult,
@@ -4475,22 +4564,41 @@ export class DaemonSupervisor {
 				this.retireWorkerSnapshotCache(worker, activeSessionId, existing);
 			}
 			const snapshotId = `snapshot-${randomUUID()}`;
+			const controller = new AbortController();
+			const workerClient = worker.client;
+			const stopRevision = worker.stopRevision;
 			const promise = prepareSnapshotTranscriptCache({
 				activeSessionId,
 				snapshotId,
 				messages: result.snapshot.messages,
 				cacheRoot: this.snapshotCacheRoot,
 				targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
-				signal: AbortSignal.timeout(SNAPSHOT_ATTEMPT_TIMEOUT_MS),
+				signal: AbortSignal.any([controller.signal, AbortSignal.timeout(SNAPSHOT_ATTEMPT_TIMEOUT_MS)]),
 			});
-			preparations.set(activeSessionId, { result, promise });
+			const preparation: SupervisorTranscriptPreparation = {
+				result,
+				promise,
+				controller,
+				workerClient,
+				stopRevision,
+			};
+			preparations.set(activeSessionId, preparation);
 			let transcript: SnapshotTranscriptCache;
 			try {
 				transcript = await promise;
 			} finally {
-				if (preparations.get(activeSessionId)?.promise === promise) {
-					preparations.delete(activeSessionId);
-				}
+				if (preparations.get(activeSessionId) === preparation) preparations.delete(activeSessionId);
+			}
+			const registeredWorker = this.workers?.get(worker.descriptor.workerId);
+			if (
+				controller.signal.aborted ||
+				this.shuttingDown ||
+				(registeredWorker !== undefined && registeredWorker !== worker) ||
+				worker.client !== workerClient ||
+				worker.stopRevision !== stopRevision
+			) {
+				transcript.dispose();
+				throw new Error("Session worker changed during snapshot transcript preparation");
 			}
 			const cachedResult = {
 				...result,
@@ -4513,13 +4621,14 @@ export class DaemonSupervisor {
 	private createStreamedAttachResult(
 		result: DaemonAttachResult,
 		transcript: SnapshotTranscriptCache,
+		transferId = createPublicSnapshotTransferId(),
 	): DaemonAttachResult {
 		return {
 			...result,
 			messages: result.messages ? [] : undefined,
 			snapshot: { ...result.snapshot, messages: [] },
 			snapshotStream: {
-				id: transcript.snapshotId,
+				id: transferId,
 				messageCount: result.snapshot.summary.messageCount,
 				targetChunkBytes: transcript.targetChunkBytes,
 			},
@@ -4548,6 +4657,8 @@ export class DaemonSupervisor {
 			attachmentFence?.selector ?? result.activeSessionId,
 			attachmentFence?.epoch ?? attachmentEpoch,
 		);
+		const deadlineSignal = AbortSignal.timeout(SNAPSHOT_ATTEMPT_TIMEOUT_MS);
+		const attemptSignal = attachmentSignal ? AbortSignal.any([attachmentSignal, deadlineSignal]) : deadlineSignal;
 		if (!stream || client.socket.destroyed || !isAttachmentCurrent()) {
 			releaseSnapshotReservation();
 			releaseTranscript();
@@ -4556,77 +4667,77 @@ export class DaemonSupervisor {
 		const { messages: _messages, ...snapshotHeader } = result.snapshot;
 		try {
 			if (
-				!(await this.writeSnapshotRecord(client, {
-					type: "session_snapshot_begin",
-					activeSessionId: result.activeSessionId,
-					snapshotId: stream.id,
-					snapshot: snapshotHeader,
-					messageCount: stream.messageCount,
-					targetChunkBytes: stream.targetChunkBytes,
-					purpose,
-				}))
+				!(await this.writeSnapshotRecord(
+					client,
+					{
+						type: "session_snapshot_begin",
+						activeSessionId: result.activeSessionId,
+						snapshotId: stream.id,
+						snapshot: snapshotHeader,
+						messageCount: stream.messageCount,
+						targetChunkBytes: stream.targetChunkBytes,
+						purpose,
+					},
+					attemptSignal,
+				))
 			) {
 				return;
 			}
 			let chunkCount = 0;
 			while (true) {
-				if (!isAttachmentCurrent() || attachmentSignal?.aborted) return;
-				let chunk: Buffer | undefined;
+				if (!isAttachmentCurrent() || attemptSignal.aborted) return;
+				let chunk: SnapshotTranscriptWireChunk | undefined;
 				try {
-					if (!attachmentSignal) {
-						chunk = await transcript.waitForChunk(chunkCount);
-					} else {
-						chunk = await new Promise<Buffer | undefined>((resolveChunk, rejectChunk) => {
-							const onAbort = () => resolveChunk(undefined);
-							attachmentSignal.addEventListener("abort", onAbort, { once: true });
-							void transcript
-								.waitForChunk(chunkCount)
-								.then(resolveChunk, rejectChunk)
-								.finally(() => {
-									attachmentSignal.removeEventListener("abort", onAbort);
-								});
-						});
-					}
+					chunk = await this.waitForSnapshotTransferChunk(transcript, stream.id, chunkCount, attemptSignal);
 				} catch (error) {
 					const streamError = error instanceof Error ? error : new Error(String(error));
-					this.failCorrelatedSnapshotAttempt(
-						worker,
-						result.activeSessionId,
-						stream.id,
-						streamError,
-						purpose,
-						false,
-					);
+					const cacheGeneration = this.currentSnapshotGeneration(worker, result.activeSessionId);
+					if (cacheGeneration?.transcript === transcript) {
+						this.failCorrelatedSnapshotAttempt(
+							worker,
+							result.activeSessionId,
+							transcript.snapshotId,
+							streamError,
+							purpose,
+							false,
+						);
+					}
 					throw streamError;
 				}
 				if (!isAttachmentCurrent() || attachmentSignal?.aborted) return;
-				if (!chunk) {
-					break;
-				}
-				if (!(await this.writeSnapshotBuffer(client, chunk))) {
-					return;
-				}
+				if (attemptSignal.aborted) throw new Error(`Snapshot ${stream.id} timed out`);
+				if (!chunk) break;
+				if (!(await this.writeSnapshotBuffer(client, chunk, attemptSignal))) return;
 				chunkCount++;
 			}
-			const completed = await this.writeSnapshotRecord(client, {
-				type: "session_snapshot_end",
-				activeSessionId: result.activeSessionId,
-				snapshotId: stream.id,
-				chunkCount,
-				lastEventSequence: result.lastEventSequence,
-				lastEventCursor: result.lastEventCursor,
-			});
+			const completed = await this.writeSnapshotRecord(
+				client,
+				{
+					type: "session_snapshot_end",
+					activeSessionId: result.activeSessionId,
+					snapshotId: stream.id,
+					chunkCount,
+					lastEventSequence: result.lastEventSequence,
+					lastEventCursor: result.lastEventCursor,
+				},
+				attemptSignal,
+			);
 			if (!completed) return;
 		} catch (error) {
 			const streamError = error instanceof Error ? error : new Error(String(error));
 			if (!client.socket.destroyed && isAttachmentCurrent()) {
 				try {
-					const delivered = await this.writeSnapshotRecord(client, {
-						type: "session_snapshot_failed",
-						activeSessionId: result.activeSessionId,
-						snapshotId: stream.id,
-						error: streamError.message,
-					});
+					const delivered = await this.writeSnapshotRecord(
+						client,
+						{
+							type: "session_snapshot_failed",
+							activeSessionId: result.activeSessionId,
+							snapshotId: stream.id,
+							error: streamError.message,
+							purpose,
+						},
+						AbortSignal.timeout(1_000),
+					);
 					if (!delivered && !client.socket.destroyed) {
 						client.socket.destroy(streamError);
 					} else if (delivered) {
@@ -4641,6 +4752,18 @@ export class DaemonSupervisor {
 			releaseSnapshotReservation();
 			releaseTranscript();
 		}
+	}
+
+	private remapSnapshotStreamReservation(
+		client: DaemonSocketClient,
+		selector: string,
+		activeSessionId: string,
+		releaseSelector: () => void,
+	): () => void {
+		if (selector === activeSessionId) return releaseSelector;
+		const releaseCanonical = this.reserveSnapshotStream(client, activeSessionId);
+		releaseSelector();
+		return releaseCanonical;
 	}
 
 	private reserveSnapshotStream(client: DaemonSocketClient, activeSessionId: string): () => void {
@@ -4677,34 +4800,57 @@ export class DaemonSupervisor {
 		};
 	}
 
-	private writeSnapshotRecord(client: DaemonSocketClient, message: DaemonOutbound): Promise<boolean> {
-		return this.writeSnapshotBuffer(client, Buffer.from(serializeJsonLine(message)));
+	private waitForSnapshotTransferChunk(
+		transcript: SnapshotTranscriptCache,
+		transferId: string,
+		index: number,
+		signal: AbortSignal,
+	): Promise<SnapshotTranscriptWireChunk | undefined> {
+		if (signal.aborted) return Promise.resolve(undefined);
+		return new Promise((resolve, reject) => {
+			const onAbort = () => resolve(undefined);
+			signal.addEventListener("abort", onAbort, { once: true });
+			void transcript
+				.waitForTransferChunk(transferId, index)
+				.then(resolve, reject)
+				.finally(() => signal.removeEventListener("abort", onAbort));
+		});
 	}
 
-	private async writeSnapshotBuffer(client: DaemonSocketClient, buffer: Uint8Array): Promise<boolean> {
-		if (client.socket.destroyed) {
-			return false;
-		}
-		if (this.writeSerialized(client, buffer)) {
-			return true;
-		}
+	private writeSnapshotRecord(
+		client: DaemonSocketClient,
+		message: DaemonOutbound,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		return this.writeSnapshotBuffer(client, Buffer.from(serializeJsonLine(message)), signal);
+	}
+
+	private async writeSnapshotBuffer(
+		client: DaemonSocketClient,
+		buffer: SnapshotTranscriptWireChunk,
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		if (signal?.aborted || client.socket.destroyed) return false;
+		if (this.writeSerialized(client, buffer)) return true;
 		return new Promise<boolean>((resolveDrain) => {
 			let settled = false;
 			const finish = (value: boolean) => {
-				if (settled) {
-					return;
-				}
+				if (settled) return;
 				settled = true;
 				client.socket.off("drain", onDrain);
 				client.socket.off("close", onClose);
 				client.socket.off("error", onClose);
+				signal?.removeEventListener("abort", onAbort);
 				resolveDrain(value);
 			};
 			const onDrain = () => finish(true);
 			const onClose = () => finish(false);
+			const onAbort = () => finish(false);
 			client.socket.once("drain", onDrain);
 			client.socket.once("close", onClose);
 			client.socket.once("error", onClose);
+			signal?.addEventListener("abort", onAbort, { once: true });
+			if (signal?.aborted || client.socket.destroyed) finish(false);
 		});
 	}
 
@@ -4953,7 +5099,7 @@ export class DaemonSupervisor {
 					this.snapshotGenerationsFor(worker, activeSessionId).set(begin.snapshotId, generation);
 				}
 				generation.result = result;
-				generation.begin = Buffer.from(frame.payload);
+				generation.begin = frame.payload;
 				generation.end = undefined;
 				generation.incoming = true;
 				generation.receivedMessageCount = 0;
@@ -5034,10 +5180,10 @@ export class DaemonSupervisor {
 					if (receivedMessageCount > (generation.result.snapshotStream?.messageCount ?? Number.MAX_SAFE_INTEGER)) {
 						throw new Error(`Snapshot ${generation.transcript.snapshotId} exceeded its declared message count`);
 					}
-					generation.transcript.appendEncodedChunk(Buffer.from(frame.payload));
+					generation.transcript.appendEncodedChunk(frame.payload);
 					generation.receivedMessageCount = receivedMessageCount;
 				} else {
-					if (!generation.transcript.readChunk(duplicateIndex).equals(Buffer.from(frame.payload))) {
+					if (!generation.transcript.readChunk(duplicateIndex).equals(frame.payload)) {
 						throw new Error(`Duplicate snapshot ${generation.transcript.snapshotId} did not match cached bytes`);
 					}
 					generation.duplicateChunkIndex = duplicateIndex + 1;
@@ -5115,7 +5261,7 @@ export class DaemonSupervisor {
 					) {
 						throw new Error(`Snapshot ${transcript.snapshotId} ended with the wrong message count`);
 					}
-					generation.end = Buffer.from(frame.payload);
+					generation.end = frame.payload;
 					transcript.markComplete();
 				} else {
 					if (end.chunkCount !== duplicateChunkCount || !generation.end?.equals(frame.payload)) {
@@ -5508,12 +5654,17 @@ export class DaemonSupervisor {
 						);
 					}
 				} else if (client.attachedActiveSessionIds.has(activeSessionId)) {
-					await this.writeSnapshotRecord(client, {
-						type: "session_snapshot_failed",
-						activeSessionId,
-						snapshotId: `snapshot-${randomUUID()}`,
-						error: snapshotError.message,
-					});
+					await this.writeSnapshotRecord(
+						client,
+						{
+							type: "session_snapshot_failed",
+							activeSessionId,
+							snapshotId: createPublicSnapshotTransferId(),
+							error: snapshotError.message,
+							purpose,
+						},
+						AbortSignal.timeout(1_000),
+					);
 				}
 				this.log(`Failed to catch up client ${client.id} for ${activeSessionId}: ${String(error)}`);
 			}
@@ -5785,6 +5936,7 @@ export class DaemonSupervisor {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
 		}
+		this.abortTranscriptPreparations(worker, new Error("Session worker stopped during snapshot preparation"));
 		if (!recoveryCleanup) {
 			worker.stopRevision++;
 		}
@@ -6079,14 +6231,17 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private writeSerialized(client: DaemonSocketClient, line: string | Uint8Array): boolean {
-		if (client.socket.destroyed) {
-			return false;
+	private writeSerialized(client: DaemonSocketClient, line: string | SnapshotTranscriptWireChunk): boolean {
+		if (client.socket.destroyed) return false;
+		const parts = typeof line === "string" || Buffer.isBuffer(line) ? [line] : [...line];
+		let accepted = true;
+		if (parts.length > 1) client.socket.cork?.();
+		try {
+			for (const part of parts) accepted = client.socket.write(part) && accepted;
+		} finally {
+			if (parts.length > 1) client.socket.uncork?.();
 		}
-		const accepted = client.socket.write(line);
-		if (!accepted) {
-			client.backpressured = true;
-		}
+		if (!accepted) client.backpressured = true;
 		return accepted;
 	}
 
@@ -6153,6 +6308,7 @@ export class DaemonSupervisor {
 		}
 		this.clients.clear();
 		for (const worker of this.workers.values()) {
+			this.abortTranscriptPreparations(worker, new Error("Daemon supervisor stopped during snapshot preparation"));
 			if (worker.ownerCleanupTimer) {
 				clearTimeout(worker.ownerCleanupTimer);
 				worker.ownerCleanupTimer = undefined;

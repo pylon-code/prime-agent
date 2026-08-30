@@ -949,12 +949,19 @@ describe("ENG-4602 snapshot transfer containment", () => {
 
 		expect(attachClient).toHaveBeenCalledOnce();
 		expect(records.map((record) => record.type)).toEqual(["session_snapshot_begin", "session_snapshot_failed"]);
-		expect(records[1]).toEqual({
+		expect(records[0]).toMatchObject({ type: "session_snapshot_begin", purpose: "replacement" });
+		expect(records[1]).toMatchObject({
 			type: "session_snapshot_failed",
 			activeSessionId,
-			snapshotId: firstSnapshotId,
 			error: firstError.message,
+			purpose: "replacement",
 		});
+		expect("snapshotId" in records[0]! && "snapshotId" in records[1]! && records[1].snapshotId).toBe(
+			(records[0] as Extract<DaemonOutbound, { type: "session_snapshot_begin" }>).snapshotId,
+		);
+		expect((records[0] as Extract<DaemonOutbound, { type: "session_snapshot_begin" }>).snapshotId).not.toBe(
+			firstSnapshotId,
+		);
 		socket.destroy();
 		for (const transcript of transcripts) transcript.dispose();
 	});

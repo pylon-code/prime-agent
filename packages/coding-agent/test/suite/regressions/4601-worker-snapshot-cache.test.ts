@@ -154,6 +154,58 @@ describe("ENG-4601 worker snapshot cache", () => {
 		expect(existsSync(cacheDirectory)).toBe(false);
 	});
 
+	it("evicts an exact failed spill generation before a fresh nonce re-encodes it", async () => {
+		const root = tempDirectory();
+		const daemon = new AgentDaemon(join(root, "worker.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const internals = daemon as unknown as {
+			snapshotPayloadGenerations: Map<string, object>;
+			prepareWorkerSnapshotTranscript(options: {
+				activeSessionId: string;
+				snapshotId: string;
+				generationKey: string;
+				messages: readonly AgentMessage[];
+			}): Promise<SnapshotTranscriptChunkSource>;
+		};
+		const source: AgentMessage[] = [{ role: "user", content: "x".repeat(5 * 1024 * 1024), timestamp: 1 }];
+		const first = await internals.prepareWorkerSnapshotTranscript({
+			activeSessionId,
+			snapshotId: "generation-one",
+			generationKey: "stable:nonce-one",
+			messages: source,
+		});
+		const firstGeneration = internals.snapshotPayloadGenerations.get(activeSessionId);
+		const firstIterator = (first as AsyncIterable<readonly Buffer[]>)[Symbol.asyncIterator]();
+		const firstChunk = await firstIterator.next();
+		first.markFailed?.(new Error("corrupted generation one"));
+		await firstIterator.return?.();
+		expect(internals.snapshotPayloadGenerations.has(activeSessionId)).toBe(false);
+
+		const second = await internals.prepareWorkerSnapshotTranscript({
+			activeSessionId,
+			snapshotId: "generation-two",
+			generationKey: "stable:nonce-two",
+			messages: source,
+		});
+		const secondGeneration = internals.snapshotPayloadGenerations.get(activeSessionId);
+		const secondIterator = (second as AsyncIterable<readonly Buffer[]>)[Symbol.asyncIterator]();
+		const secondChunk = await secondIterator.next();
+		expect(secondGeneration).not.toBe(firstGeneration);
+		expect(secondChunk.value?.[1]).not.toBe(firstChunk.value?.[1]);
+		expect(JSON.parse(Buffer.concat(secondChunk.value ?? []).toString("utf8"))).toMatchObject({
+			type: "session_snapshot_chunk",
+			snapshotId: "generation-two",
+		});
+		while (!(await secondIterator.next()).done) {
+			// Fully consume the fresh generation to prove its new backing is readable.
+		}
+		second.dispose?.();
+	});
+
 	it.each([1, 2])(
 		"keeps %i same-ID worker stream(s) bounded by socket drain without shared cleanup",
 		async (count) => {
@@ -396,6 +448,7 @@ describe("ENG-4601 worker snapshot cache", () => {
 			activeSessionId,
 			snapshotId,
 			error: `Snapshot ${snapshotId} was aborted`,
+			purpose: "attach",
 		});
 		expect(written).toContainEqual(
 			expect.objectContaining({

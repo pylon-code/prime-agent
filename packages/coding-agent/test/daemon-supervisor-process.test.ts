@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -198,7 +199,114 @@ async function connectEventually(socketPath: string, child?: ChildProcess): Prom
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
 	}
-	throw new Error(`Timed out waiting for supervisor: ${String(lastError)}`);
+	const diagnostics = child ? childDiagnostics.get(child) : undefined;
+	throw new Error(
+		`Timed out waiting for supervisor: ${String(lastError)}\nstdout:\n${diagnostics?.stdout ?? ""}\nstderr:\n${diagnostics?.stderr ?? ""}`,
+	);
+}
+
+async function createSnapshotRetryProxy(
+	proxyPath: string,
+	targetPath: string,
+): Promise<{
+	server: Server;
+	attachRequests: () => number;
+	transferIds: () => string[];
+}> {
+	let attachCount = 0;
+	const observedTransferIds: string[] = [];
+	const server = createServer((downstream: Socket) => {
+		const upstream = createConnection(targetPath);
+		let requestBuffer = Buffer.alloc(0);
+		let responseBuffer = Buffer.alloc(0);
+		let firstTransferId: string | undefined;
+		let firstChunk: Buffer | undefined;
+		let firstEnd: Buffer | undefined;
+		downstream.on("data", (chunk: Buffer) => {
+			requestBuffer = Buffer.concat([requestBuffer, chunk]);
+			while (true) {
+				const newline = requestBuffer.indexOf(0x0a);
+				if (newline < 0) break;
+				const line = requestBuffer.subarray(0, newline);
+				requestBuffer = requestBuffer.subarray(newline + 1);
+				try {
+					const parsed = JSON.parse(line.toString("utf8")) as {
+						type?: unknown;
+						command?: { type?: unknown };
+					};
+					if (parsed.type === "attach" || parsed.command?.type === "attach") attachCount++;
+				} catch {
+					// The real daemon owns command validation.
+				}
+				upstream.write(Buffer.concat([line, Buffer.from("\n")]));
+			}
+		});
+		upstream.on("data", (chunk: Buffer) => {
+			responseBuffer = Buffer.concat([responseBuffer, chunk]);
+			while (true) {
+				const newline = responseBuffer.indexOf(0x0a);
+				if (newline < 0) break;
+				const original = Buffer.from(responseBuffer.subarray(0, newline + 1));
+				responseBuffer = responseBuffer.subarray(newline + 1);
+				let parsed: { type?: unknown; snapshotId?: unknown } | undefined;
+				try {
+					parsed = JSON.parse(original.toString("utf8")) as { type?: unknown; snapshotId?: unknown };
+				} catch {
+					downstream.write(original);
+					continue;
+				}
+				if (parsed.type === "session_snapshot_begin" && typeof parsed.snapshotId === "string") {
+					if (!observedTransferIds.includes(parsed.snapshotId)) observedTransferIds.push(parsed.snapshotId);
+					firstTransferId ??= parsed.snapshotId;
+				}
+				if (
+					parsed.type === "session_snapshot_chunk" &&
+					typeof parsed.snapshotId === "string" &&
+					parsed.snapshotId === firstTransferId &&
+					!firstChunk
+				) {
+					firstChunk = original;
+					parsed.snapshotId = `${parsed.snapshotId}-corrupted`;
+					downstream.write(`${JSON.stringify(parsed)}\n`);
+					continue;
+				}
+				if (
+					parsed.type === "session_snapshot_end" &&
+					typeof parsed.snapshotId === "string" &&
+					parsed.snapshotId === firstTransferId
+				) {
+					firstEnd = original;
+				}
+				downstream.write(original);
+				if (
+					parsed.type === "session_snapshot_end" &&
+					typeof parsed.snapshotId === "string" &&
+					parsed.snapshotId !== firstTransferId &&
+					firstChunk &&
+					firstEnd
+				) {
+					// Old-generation frames arrive after the fresh attempt's terminal end.
+					downstream.write(firstChunk);
+					downstream.write(firstEnd);
+					firstChunk = undefined;
+					firstEnd = undefined;
+				}
+			}
+		});
+		upstream.on("error", (error) => downstream.destroy(error));
+		downstream.on("error", () => upstream.destroy());
+		upstream.on("close", () => downstream.destroy());
+		downstream.on("close", () => upstream.destroy());
+	});
+	await new Promise<void>((resolveListen, reject) => {
+		server.once("error", reject);
+		server.listen(proxyPath, () => resolveListen());
+	});
+	return {
+		server,
+		attachRequests: () => attachCount,
+		transferIds: () => [...observedTransferIds],
+	};
 }
 
 async function waitForSocketGone(socketPath: string): Promise<void> {
@@ -446,6 +554,80 @@ describe("daemon supervisor resident workers", () => {
 
 		await client.request({ type: "shutdown" });
 		client.close();
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
+	it("retries one corrupted real worker snapshot with fresh transfer identity and ignores stale terminal frames", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const suffix = `${process.pid}-${randomUUID().slice(0, 8)}`;
+		const socketPath = join(tmpdir(), `prime-snapshot-retry-${suffix}.sock`);
+		const proxyPath = join(tmpdir(), `prime-snapshot-proxy-${suffix}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const sessionManager = SessionManager.create(projectDir, sessionDir);
+		sessionManager.appendMessage({ role: "user", content: "real snapshot retry fixture", timestamp: 1 });
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "fixture complete" }],
+			api: "openai-responses",
+			provider: "faux",
+			model: "faux",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 2,
+		});
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Snapshot retry fixture did not persist");
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const creator = await connectEventually(socketPath, supervisor);
+		const created = await creator.request({
+			type: "create",
+			sessionPath: sessionFile,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.activeSessionId || !summary.workerPid) throw new Error("Snapshot retry worker was incomplete");
+		workerPids.add(summary.workerPid);
+		creator.close();
+
+		const proxy = await createSnapshotRetryProxy(proxyPath, socketPath);
+		const client = new DaemonClient(proxyPath);
+		try {
+			await client.connect(3_000);
+			await client.waitForHello(3_000);
+			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
+				supportsExtensionUi: false,
+				snapshotTimeoutMs: 3_000,
+			});
+			const snapshot = await connection.getInitialSnapshot();
+			expect(snapshot.messages).toContainEqual(
+				expect.objectContaining({ role: "user", content: "real snapshot retry fixture" }),
+			);
+			expect(proxy.attachRequests()).toBe(2);
+			expect(proxy.transferIds()).toHaveLength(2);
+			expect(new Set(proxy.transferIds()).size).toBe(2);
+			await connection.dispose();
+		} finally {
+			client.close();
+			await new Promise<void>((resolveClose) => proxy.server.close(() => resolveClose()));
+		}
+
+		const shutdownClient = await connectEventually(socketPath);
+		await shutdownClient.request({ type: "shutdown" });
+		shutdownClient.close();
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 

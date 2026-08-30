@@ -3508,7 +3508,7 @@ describe("DaemonAgentConnection", () => {
 			state: createConnectionState("active-target", "session-target"),
 			messages: [{ role: "user", content: "target", timestamp: 1 }],
 		});
-		const emitTransfer = (snapshotId: string, fail: boolean) => {
+		const emitTransfer = (snapshotId: string, fail: boolean, purpose: "attach" | "replacement") => {
 			const { messages: _messages, ...snapshot } = target.snapshot;
 			setImmediate(() => {
 				fakeClient.emitMessage({
@@ -3518,7 +3518,7 @@ describe("DaemonAgentConnection", () => {
 					snapshot,
 					messageCount: 1,
 					targetChunkBytes: 512 * 1024,
-					purpose: "replacement",
+					purpose,
 				});
 				if (fail) {
 					fakeClient.emitMessage({
@@ -3551,8 +3551,8 @@ describe("DaemonAgentConnection", () => {
 				snapshotStream: { id: snapshotId, messageCount: 1, targetChunkBytes: 512 * 1024 },
 			};
 		};
-		fakeClient.reattachResultFactory = () => emitTransfer("reattach-g1", true);
-		fakeClient.attachResultFactory = () => emitTransfer("reattach-g2", false);
+		fakeClient.reattachResultFactory = () => emitTransfer("reattach-g1", true, "replacement");
+		fakeClient.attachResultFactory = () => emitTransfer("reattach-g2", false, "attach");
 		const events: AgentConnectionEvent[] = [];
 		connection.subscribe((event) => {
 			events.push(event);

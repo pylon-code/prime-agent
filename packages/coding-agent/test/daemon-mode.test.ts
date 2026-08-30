@@ -3115,7 +3115,7 @@ describe("daemon mode helpers", () => {
 		expect(client.catchupActiveSessionIds).toEqual(new Set());
 	});
 
-	it("automatically retries every pending catch-up after snapshot creation rejects", async () => {
+	it("terminates a failed catch-up attempt without an unbounded self-retry", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -3164,23 +3164,20 @@ describe("daemon mode helpers", () => {
 
 		await internals.catchUpBackpressuredClient(client);
 
-		expect(client.catchupActiveSessionIds).toEqual(
-			new Set([firstState.activeSessionId, secondState.activeSessionId]),
-		);
-		expect(client.catchupPurposes).toEqual(
-			new Map([
-				[firstState.activeSessionId, "replacement"],
-				[secondState.activeSessionId, "resync"],
-			]),
-		);
-		expect(createAttachResult).toHaveBeenCalledOnce();
-
-		await vi.waitFor(() => expect(createAttachResult).toHaveBeenCalledTimes(3));
-
 		expect(client.catchupActiveSessionIds).toEqual(new Set());
 		expect(client.catchupPurposes).toEqual(new Map());
-		const messages = write.mock.calls.map(([data]) => JSON.parse(String(data)) as { type: string });
-		expect(messages.map((message) => message.type)).toEqual(["session_replaced", "session_resynced"]);
+		expect(createAttachResult).toHaveBeenCalledTimes(2);
+		const messages = write.mock.calls.map(
+			([data]) => JSON.parse(String(data)) as { type: string; activeSessionId?: string; purpose?: string },
+		);
+		expect(messages).toEqual([
+			expect.objectContaining({
+				type: "session_snapshot_failed",
+				activeSessionId: firstState.activeSessionId,
+				purpose: "replacement",
+			}),
+			expect.objectContaining({ type: "session_resynced", activeSessionId: secondState.activeSessionId }),
+		]);
 	});
 
 	it("clears a scheduled catch-up retry when the client disconnects", async () => {
@@ -3220,10 +3217,8 @@ describe("daemon mode helpers", () => {
 
 		await internals.catchUpBackpressuredClient(client);
 
-		expect(client.catchupRetryTimer).toBeDefined();
 		socketState.destroyed = true;
 		socket.emit("close");
-		expect(client.catchupRetryTimer).toBeUndefined();
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		expect(createAttachResult).toHaveBeenCalledOnce();
 	});

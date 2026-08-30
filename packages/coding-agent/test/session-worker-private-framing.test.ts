@@ -46,6 +46,24 @@ describe("private worker framing", () => {
 		]);
 	});
 
+	it("coalesces a 36 MiB fragmented payload at most once", () => {
+		const payload = Buffer.alloc(36 * 1024 * 1024, 0x61);
+		const frame = encodePrivateFrame({ type: "snapshot", requestId: "large" }, payload);
+		const decoder = new PrivateFrameDecoder(isTestHeader);
+		const frames = [];
+		let peakBufferedBytes = 0;
+		for (let offset = 0; offset < frame.length; offset += 64 * 1024) {
+			frames.push(...decoder.push(frame.subarray(offset, offset + 64 * 1024)));
+			peakBufferedBytes = Math.max(peakBufferedBytes, decoder.bufferedBytes);
+		}
+		decoder.finish();
+
+		expect(frames).toHaveLength(1);
+		expect(frames[0]?.payload.equals(payload)).toBe(true);
+		expect(peakBufferedBytes).toBeLessThanOrEqual(payload.length);
+		expect(decoder.coalescedBytes).toBeLessThanOrEqual(frame.length);
+	});
+
 	it("keeps segmented new-worker payloads byte-compatible with the legacy decoder", () => {
 		const header = { type: "snapshot", requestId: "compat" };
 		const payloadParts = [Buffer.from('{"messages":['), Buffer.from('{"content":"ok"}'), Buffer.from("]}")];

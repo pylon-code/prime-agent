@@ -452,15 +452,12 @@ export class SnapshotTranscriptPayloadCache {
 		if (!chunk) throw new Error(`Unknown snapshot transcript chunk: ${index}`);
 		if (chunk.buffer) return chunk.buffer;
 		if (!chunk.path) throw new Error(`Snapshot transcript chunk ${index} has no backing storage`);
-		chunk.readPromise ??= this.io.readFile(chunk.path).then((buffer) => {
-			chunk.buffer = buffer;
-			return buffer;
-		});
+		chunk.readPromise ??= this.io.readFile(chunk.path);
+		const reading = chunk.readPromise;
 		try {
-			return await chunk.readPromise;
-		} catch (error) {
-			chunk.readPromise = undefined;
-			throw error;
+			return await reading;
+		} finally {
+			if (chunk.readPromise === reading) chunk.readPromise = undefined;
 		}
 	}
 
@@ -805,6 +802,27 @@ export class SnapshotTranscriptCache {
 			waiters.push({ resolve, reject });
 			this.chunkWaiters.set(index, waiters);
 		});
+	}
+
+	async waitForTransferChunk(snapshotId: string, index: number): Promise<SnapshotTranscriptWireChunk | undefined> {
+		const chunk = await this.waitForChunk(index);
+		if (!chunk || snapshotId === this.snapshotId) return chunk;
+		const messagesMarker = Buffer.from('"messages":[');
+		const markerIndex = chunk.indexOf(messagesMarker);
+		const payloadStart = markerIndex + messagesMarker.length;
+		const hasNewline = chunk.at(-1) === 0x0a;
+		const payloadEnd = chunk.length - (hasNewline ? 3 : 2);
+		if (
+			markerIndex < 0 ||
+			payloadEnd < payloadStart ||
+			chunk.subarray(payloadEnd, payloadEnd + 2).toString() !== "]}"
+		) {
+			throw new Error(`Snapshot transcript ${this.snapshotId} has an invalid chunk envelope`);
+		}
+		const prefix =
+			`{"type":"session_snapshot_chunk","activeSessionId":${JSON.stringify(this.activeSessionId)},` +
+			`"snapshotId":${JSON.stringify(snapshotId)},"index":${index},"messages":[`;
+		return Buffer.concat([Buffer.from(prefix), chunk.subarray(payloadStart, payloadEnd), Buffer.from("]}\n")]);
 	}
 
 	retain(): () => void {

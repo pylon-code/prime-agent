@@ -242,11 +242,26 @@ export { defaultDaemonSocketPath } from "./daemon-socket.js";
 const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const WORKER_SNAPSHOT_PREPARATION_TIMEOUT_MS = 30_000;
+const WORKER_PRIVATE_FRAME_WRITE_BYTES = 64 * 1024;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
 
 function createSnapshotTransferId(): string {
 	return `snapshot-${randomUUID()}`;
+}
+
+function createSnapshotAttemptSignal(attachmentSignal?: AbortSignal): AbortSignal {
+	const deadlineSignal = AbortSignal.timeout(WORKER_SNAPSHOT_PREPARATION_TIMEOUT_MS);
+	return attachmentSignal ? AbortSignal.any([attachmentSignal, deadlineSignal]) : deadlineSignal;
+}
+
+function waitForSnapshotAttempt<T>(promise: Promise<T>, signal: AbortSignal, snapshotId: string): Promise<T> {
+	if (signal.aborted) return Promise.reject(new Error(`Snapshot ${snapshotId} was aborted`));
+	return new Promise((resolve, reject) => {
+		const onAbort = () => reject(new Error(`Snapshot ${snapshotId} was aborted`));
+		signal.addEventListener("abort", onAbort, { once: true });
+		void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+	});
 }
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
@@ -355,7 +370,6 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 const DAEMON_CLIENT_CAPABILITY_SET: ReadonlySet<string> = new Set(DAEMON_SUPPORTED_CLIENT_CAPABILITIES);
-const CLIENT_CATCHUP_RETRY_MS = 250;
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
 const SUPERVISOR_FENCE_POLL_MS = 250;
 const UPDATE_RESTART_MARKER =
@@ -3259,7 +3273,6 @@ export class AgentDaemon {
 			cleanedUp = true;
 			socket.off("close", cleanup);
 			socket.off("error", cleanup);
-			this.clearClientCatchupRetry(client);
 			for (const [pauseId, entry] of this.sessionInputPauses) {
 				if (entry.owner !== client) continue;
 				entry.pause.release();
@@ -3858,6 +3871,7 @@ export class AgentDaemon {
 				const snapshotSignal = streamsSnapshot
 					? markClientSnapshotStreaming(client, state.activeSessionId)
 					: undefined;
+				const snapshotAttemptSignal = snapshotSignal ? createSnapshotAttemptSignal(snapshotSignal) : undefined;
 				let result: DaemonAttachResult;
 				state.pendingAttaches++;
 				try {
@@ -3895,9 +3909,9 @@ export class AgentDaemon {
 						transcript = await this.prepareWorkerSnapshotTranscript({
 							activeSessionId: state.activeSessionId,
 							snapshotId,
-							generationKey: this.snapshotPayloadGenerationKey(result),
+							generationKey: `${this.snapshotPayloadGenerationKey(result)}:${command.snapshotGenerationNonce ?? "shared"}`,
 							messages: result.snapshot.messages,
-							signal: snapshotSignal,
+							signal: snapshotAttemptSignal,
 						});
 					} catch (error) {
 						state.clients.delete(client);
@@ -3922,7 +3936,7 @@ export class AgentDaemon {
 							streamedResult,
 							transcript,
 							"attach",
-							snapshotSignal,
+							snapshotAttemptSignal,
 							true,
 						).catch((error) => this.log(`could not stream attach snapshot: ${String(error)}`));
 					});
@@ -5193,7 +5207,7 @@ export class AgentDaemon {
 			) {
 				const payload = await existing.promise;
 				options.signal?.throwIfAborted();
-				return payload.createTransfer(options.activeSessionId, options.snapshotId);
+				return this.createWorkerSnapshotTransfer(options.activeSessionId, options.snapshotId, existing, payload);
 			}
 			if (existing) {
 				const stalePayload = await existing.promise.catch(() => undefined);
@@ -5209,14 +5223,14 @@ export class AgentDaemon {
 				promise: prepareSnapshotTranscriptPayload({
 					messages: options.messages,
 					targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
-					signal: AbortSignal.timeout(WORKER_SNAPSHOT_PREPARATION_TIMEOUT_MS),
+					signal: options.signal ?? AbortSignal.timeout(WORKER_SNAPSHOT_PREPARATION_TIMEOUT_MS),
 				}),
 			};
 			this.snapshotPayloadGenerations.set(options.activeSessionId, generation);
 			try {
 				const payload = await generation.promise;
 				options.signal?.throwIfAborted();
-				return payload.createTransfer(options.activeSessionId, options.snapshotId);
+				return this.createWorkerSnapshotTransfer(options.activeSessionId, options.snapshotId, generation, payload);
 			} catch (error) {
 				if (this.snapshotPayloadGenerations.get(options.activeSessionId) === generation) {
 					this.snapshotPayloadGenerations.delete(options.activeSessionId);
@@ -5224,6 +5238,22 @@ export class AgentDaemon {
 				throw error;
 			}
 		}
+	}
+
+	private createWorkerSnapshotTransfer(
+		activeSessionId: string,
+		snapshotId: string,
+		generation: { key: string; messages: readonly AgentMessage[]; promise: Promise<SnapshotTranscriptPayloadCache> },
+		payload: SnapshotTranscriptPayloadCache,
+	): SnapshotTranscriptChunkSource {
+		const transfer = payload.createTransfer(activeSessionId, snapshotId);
+		transfer.markFailed = () => {
+			if (this.snapshotPayloadGenerations.get(activeSessionId) === generation) {
+				this.snapshotPayloadGenerations.delete(activeSessionId);
+				payload.dispose();
+			}
+		};
+		return transfer;
 	}
 
 	private snapshotPayloadGenerationKey(result: DaemonAttachResult): string {
@@ -5255,7 +5285,8 @@ export class AgentDaemon {
 		if (snapshotAlreadyMarked && !signal) {
 			throw new Error(`Snapshot ${stream.id} is missing its transfer signal`);
 		}
-		const transferSignal = signal ?? markClientSnapshotStreaming(client, result.activeSessionId);
+		const attachmentSignal = signal ?? markClientSnapshotStreaming(client, result.activeSessionId);
+		const transferSignal = signal ?? createSnapshotAttemptSignal(attachmentSignal);
 		if (client.socket.destroyed) {
 			finishClientSnapshotStreaming(client, result.activeSessionId);
 			transcript.dispose?.();
@@ -5269,7 +5300,17 @@ export class AgentDaemon {
 		});
 		client.snapshotTransferTails.set(result.activeSessionId, transfer);
 		if (previousTransfer) {
-			await previousTransfer;
+			try {
+				await waitForSnapshotAttempt(previousTransfer, transferSignal, stream.id);
+			} catch (error) {
+				finishTransfer();
+				if (client.snapshotTransferTails.get(result.activeSessionId) === transfer) {
+					client.snapshotTransferTails.delete(result.activeSessionId);
+				}
+				finishClientSnapshotStreaming(client, result.activeSessionId);
+				transcript.dispose?.();
+				throw error;
+			}
 		}
 		const { messages: _messages, ...snapshot } = result.snapshot;
 		const snapshotBegin: DaemonOutbound = {
@@ -5309,6 +5350,7 @@ export class AgentDaemon {
 						activeSessionId: result.activeSessionId,
 						snapshotId: stream.id,
 						error: streamError.message,
+						purpose: purpose === "catchup" ? "resync" : purpose,
 					},
 					purpose,
 					undefined,
@@ -5333,11 +5375,17 @@ export class AgentDaemon {
 				return;
 			}
 			let chunkCount = 0;
-			for await (const chunk of transcript) {
-				if (transferSignal.aborted) {
-					await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
-					return;
-				}
+			const asyncIteratorFactory = (transcript as Partial<AsyncIterable<SnapshotTranscriptWireChunk>>)[
+				Symbol.asyncIterator
+			];
+			const asyncIterator = asyncIteratorFactory?.call(transcript);
+			const syncIteratorFactory = (transcript as Partial<Iterable<SnapshotTranscriptWireChunk>>)[Symbol.iterator];
+			const syncIterator = asyncIterator ? undefined : syncIteratorFactory?.call(transcript);
+			if (!asyncIterator && !syncIterator) throw new Error(`Snapshot ${stream.id} has no transcript iterator`);
+			while (true) {
+				const nextPromise = asyncIterator ? asyncIterator.next() : Promise.resolve(syncIterator!.next());
+				const next = await waitForSnapshotAttempt(nextPromise, transferSignal, stream.id);
+				if (next.done) break;
 				const headerMessage: DaemonOutbound = {
 					type: "session_snapshot_chunk",
 					activeSessionId: result.activeSessionId,
@@ -5345,10 +5393,8 @@ export class AgentDaemon {
 					index: chunkCount,
 					messages: [],
 				};
-				if (!(await this.writeWorkerSnapshotBuffer(client, chunk, headerMessage, purpose, transferSignal))) {
-					if (transferSignal.aborted) {
-						await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
-					}
+				if (!(await this.writeWorkerSnapshotBuffer(client, next.value, headerMessage, purpose, transferSignal))) {
+					await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
 					return;
 				}
 				chunkCount++;
@@ -5357,7 +5403,7 @@ export class AgentDaemon {
 				await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
 				return;
 			}
-			await this.writeWorkerSnapshotRecord(
+			const ended = await this.writeWorkerSnapshotRecord(
 				client,
 				{
 					type: "session_snapshot_end",
@@ -5370,6 +5416,7 @@ export class AgentDaemon {
 				purpose,
 				transferSignal,
 			);
+			if (!ended) await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
 		} catch (error) {
 			if (transferSignal.aborted) {
 				await deliverSnapshotFailure(new Error(`Snapshot ${stream.id} was aborted`));
@@ -5418,27 +5465,85 @@ export class AgentDaemon {
 		signal?: AbortSignal,
 		drainTimeoutMs?: number,
 	): Promise<boolean> {
-		if (signal?.aborted || client.socket.destroyed) {
-			return false;
+		if (signal?.aborted || client.socket.destroyed) return false;
+		if (client.transport === "private-framed" && !Object.hasOwn(this, "writeSerialized")) {
+			const parts = this.encodeWorkerPrivateFrameParts(buffer, message, "jsonl", purpose);
+			return this.writePrivateFrameParts(client, parts, signal, drainTimeoutMs);
 		}
-		if (this.writeSerialized(client, buffer, message, "jsonl", purpose)) {
+		if (this.writeSerialized(client, buffer, message, "jsonl", purpose)) return true;
+		return this.waitForWorkerSnapshotDrain(client, signal, drainTimeoutMs);
+	}
+
+	private encodeWorkerPrivateFrameParts(
+		line: string | Buffer | readonly Buffer[],
+		message: DaemonOutbound,
+		payloadEncoding: "jsonl" | "assistant-delta",
+		snapshotPurpose?: "attach" | "replacement" | "catchup",
+	): Buffer[] {
+		const payloadParts = typeof line === "string" ? [Buffer.from(line)] : Buffer.isBuffer(line) ? [line] : [...line];
+		return encodePrivateFrameParts<DaemonWorkerFrameHeader>(
+			{
+				kind: "outbound",
+				outboundType: message.type,
+				...(hasDaemonOutboundActiveSessionId(message) ? { activeSessionId: message.activeSessionId } : {}),
+				...("id" in message && typeof message.id === "string" ? { requestId: message.id } : {}),
+				...("snapshotId" in message && typeof message.snapshotId === "string"
+					? { snapshotId: message.snapshotId }
+					: {}),
+				...(message.type === "session_event" ? { sessionEventType: message.event.type } : {}),
+				payloadEncoding,
+				...(snapshotPurpose ? { snapshotPurpose } : {}),
+			},
+			payloadParts,
+		);
+	}
+
+	private async writePrivateFrameParts(
+		client: DaemonSocketClient,
+		parts: readonly Buffer[],
+		signal?: AbortSignal,
+		drainTimeoutMs?: number,
+	): Promise<boolean> {
+		const previous = client.privateFrameWriteTail;
+		let resolveTail!: () => void;
+		const tail = new Promise<void>((resolve) => {
+			resolveTail = resolve;
+		});
+		client.privateFrameWriteTail = tail;
+		try {
+			if (previous) await waitForSnapshotAttempt(previous, signal ?? AbortSignal.timeout(30_000), "private-frame");
+			for (const part of parts) {
+				for (let offset = 0; offset < part.length; offset += WORKER_PRIVATE_FRAME_WRITE_BYTES) {
+					if (signal?.aborted || client.socket.destroyed) return false;
+					const slice = part.subarray(offset, offset + WORKER_PRIVATE_FRAME_WRITE_BYTES);
+					if (client.socket.write(slice)) continue;
+					client.backpressured = true;
+					if (!(await this.waitForWorkerSnapshotDrain(client, signal, drainTimeoutMs))) return false;
+				}
+			}
 			return true;
+		} finally {
+			resolveTail();
+			if (client.privateFrameWriteTail === tail) client.privateFrameWriteTail = undefined;
 		}
-		return new Promise<boolean>((resolveDrain) => {
+	}
+
+	private waitForWorkerSnapshotDrain(
+		client: DaemonSocketClient,
+		signal?: AbortSignal,
+		drainTimeoutMs?: number,
+	): Promise<boolean> {
+		return new Promise((resolveDrain) => {
 			let settled = false;
 			let drainTimeout: NodeJS.Timeout | undefined;
 			const finish = (value: boolean) => {
-				if (settled) {
-					return;
-				}
+				if (settled) return;
 				settled = true;
 				client.socket.off("drain", onDrain);
 				client.socket.off("close", onClose);
 				client.socket.off("error", onClose);
 				signal?.removeEventListener("abort", onAbort);
-				if (drainTimeout) {
-					clearTimeout(drainTimeout);
-				}
+				if (drainTimeout) clearTimeout(drainTimeout);
 				resolveDrain(value);
 			};
 			const onDrain = () => finish(true);
@@ -5452,9 +5557,7 @@ export class AgentDaemon {
 				drainTimeout = setTimeout(() => finish(false), drainTimeoutMs);
 				drainTimeout.unref();
 			}
-			if (signal?.aborted || client.socket.destroyed) {
-				finish(false);
-			}
+			if (signal?.aborted || client.socket.destroyed) finish(false);
 		});
 	}
 
@@ -6788,6 +6891,7 @@ export class AgentDaemon {
 		snapshotId: string,
 		snapshotSignal: AbortSignal,
 	): Promise<void> {
+		const snapshotAttemptSignal = createSnapshotAttemptSignal(snapshotSignal);
 		const result = await this.createAttachResult(client, state, {
 			type: "attach",
 			activeSessionId: state.activeSessionId,
@@ -6806,7 +6910,7 @@ export class AgentDaemon {
 			snapshotId,
 			generationKey: this.snapshotPayloadGenerationKey(result),
 			messages: result.snapshot.messages,
-			signal: snapshotSignal,
+			signal: snapshotAttemptSignal,
 		});
 		this.write(client, { ...message, messages: [], snapshotFollows: true });
 		void this.streamWorkerSnapshot(
@@ -6823,7 +6927,7 @@ export class AgentDaemon {
 			},
 			transcript,
 			"replacement",
-			snapshotSignal,
+			snapshotAttemptSignal,
 			true,
 		).catch((error) => {
 			this.log(`could not stream replacement snapshot: ${String(error)}`);
@@ -6871,7 +6975,6 @@ export class AgentDaemon {
 		if (client.snapshotStreaming || client.backpressured) {
 			return Promise.resolve();
 		}
-		this.clearClientCatchupRetry(client);
 		const catchup = this.drainBackpressuredClientCatchupQueue(client).finally(() => {
 			if (client.catchupPromise === catchup) {
 				client.catchupPromise = undefined;
@@ -6881,33 +6984,6 @@ export class AgentDaemon {
 		return catchup;
 	}
 
-	private clearClientCatchupRetry(client: DaemonSocketClient): void {
-		if (!client.catchupRetryTimer) {
-			return;
-		}
-		clearTimeout(client.catchupRetryTimer);
-		client.catchupRetryTimer = undefined;
-	}
-
-	private scheduleClientCatchupRetry(client: DaemonSocketClient): void {
-		if (client.socket.destroyed || client.catchupRetryTimer) {
-			return;
-		}
-		client.catchupRetryTimer = setTimeout(() => {
-			client.catchupRetryTimer = undefined;
-			if (client.socket.destroyed || !client.catchupActiveSessionIds?.size) {
-				return;
-			}
-			if (client.snapshotStreaming || client.backpressured) {
-				this.scheduleClientCatchupRetry(client);
-				return;
-			}
-			void this.catchUpBackpressuredClient(client).catch((error) =>
-				this.log(`could not retry catch-up for client ${client.id}: ${String(error)}`),
-			);
-		}, CLIENT_CATCHUP_RETRY_MS);
-	}
-
 	private async drainBackpressuredClientCatchupQueue(client: DaemonSocketClient): Promise<void> {
 		while (
 			!client.socket.destroyed &&
@@ -6915,13 +6991,11 @@ export class AgentDaemon {
 			!client.backpressured &&
 			client.catchupActiveSessionIds?.size
 		) {
-			if ((await this.drainBackpressuredClientCatchups(client)) === "retry-later") {
-				return;
-			}
+			await this.drainBackpressuredClientCatchups(client);
 		}
 	}
 
-	private async drainBackpressuredClientCatchups(client: DaemonSocketClient): Promise<"drained" | "retry-later"> {
+	private async drainBackpressuredClientCatchups(client: DaemonSocketClient): Promise<"drained"> {
 		if (client.socket.destroyed) {
 			return "drained";
 		}
@@ -6949,23 +7023,9 @@ export class AgentDaemon {
 					client.transport === "private-framed" &&
 					daemonClientCapabilitiesForSession(client, activeSessionId).has("chunked_snapshot")
 				) {
-					if (purpose === "replacement") {
-						this.write(client, {
-							type: "session_replaced",
-							activeSessionId,
-							state: result.snapshot.state,
-							messages: [],
-							snapshotFollows: true,
-							meta: createDaemonEventMeta(
-								activeSessionId,
-								state.lastEventSequence,
-								undefined,
-								state.eventGeneration,
-							),
-						});
-					}
 					const snapshotId = createSnapshotTransferId();
 					const snapshotSignal = markClientSnapshotStreaming(client, activeSessionId);
+					const snapshotAttemptSignal = createSnapshotAttemptSignal(snapshotSignal);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
 						transcript = await this.prepareWorkerSnapshotTranscript({
@@ -6973,11 +7033,50 @@ export class AgentDaemon {
 							snapshotId,
 							generationKey: this.snapshotPayloadGenerationKey(result),
 							messages: result.snapshot.messages,
-							signal: snapshotSignal,
+							signal: snapshotAttemptSignal,
 						});
 					} catch (error) {
 						finishClientSnapshotStreaming(client, activeSessionId);
-						throw error;
+						const snapshotError = error instanceof Error ? error : new Error(String(error));
+						await this.writeWorkerSnapshotRecord(
+							client,
+							{
+								type: "session_snapshot_failed",
+								activeSessionId,
+								snapshotId,
+								error: snapshotError.message,
+								purpose,
+							},
+							purpose === "replacement" ? "replacement" : "catchup",
+							undefined,
+							WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS,
+						);
+						continue;
+					}
+					if (this.sessions.get(activeSessionId) !== state || !state.clients.has(client)) {
+						finishClientSnapshotStreaming(client, activeSessionId);
+						transcript.dispose?.();
+						continue;
+					}
+					if (purpose === "replacement") {
+						await this.writeWorkerSnapshotRecord(
+							client,
+							{
+								type: "session_replaced",
+								activeSessionId,
+								state: result.snapshot.state,
+								messages: [],
+								snapshotFollows: true,
+								meta: createDaemonEventMeta(
+									activeSessionId,
+									state.lastEventSequence,
+									undefined,
+									state.eventGeneration,
+								),
+							},
+							"replacement",
+							snapshotAttemptSignal,
+						);
 					}
 					await this.streamWorkerSnapshot(
 						client,
@@ -6993,7 +7092,7 @@ export class AgentDaemon {
 						},
 						transcript,
 						purpose === "replacement" ? "replacement" : "catchup",
-						snapshotSignal,
+						snapshotAttemptSignal,
 						true,
 					);
 					continue;
@@ -7018,15 +7117,26 @@ export class AgentDaemon {
 					for (const remaining of pending.slice(index + 1)) {
 						this.queueClientCatchup(client, remaining.activeSessionId, remaining.purpose);
 					}
-					return "retry-later";
+					return "drained";
 				}
 			} catch (error) {
-				for (const remaining of pending.slice(index)) {
-					this.queueClientCatchup(client, remaining.activeSessionId, remaining.purpose);
-				}
+				const snapshotError = error instanceof Error ? error : new Error(String(error));
 				this.log(`could not catch up client ${client.id} for ${activeSessionId}: ${String(error)}`);
-				this.scheduleClientCatchupRetry(client);
-				return "retry-later";
+				if (!client.socket.destroyed && client.attachedActiveSessionIds.has(activeSessionId)) {
+					await this.writeWorkerSnapshotRecord(
+						client,
+						{
+							type: "session_snapshot_failed",
+							activeSessionId,
+							snapshotId: createSnapshotTransferId(),
+							error: snapshotError.message,
+							purpose,
+						},
+						purpose === "replacement" ? "replacement" : "catchup",
+						undefined,
+						WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS,
+					);
+				}
 			}
 		}
 		return "drained";
@@ -7100,31 +7210,31 @@ export class AgentDaemon {
 		const payloadParts = typeof line === "string" ? [Buffer.from(line)] : Buffer.isBuffer(line) ? [line] : [...line];
 		const wireParts =
 			client.transport === "private-framed"
-				? encodePrivateFrameParts<DaemonWorkerFrameHeader>(
-						{
-							kind: "outbound",
-							outboundType: message.type,
-							...("id" in message && typeof message.id === "string" ? { requestId: message.id } : {}),
-							...(hasDaemonOutboundActiveSessionId(message) ? { activeSessionId: message.activeSessionId } : {}),
-							...("snapshotId" in message && typeof message.snapshotId === "string"
-								? { snapshotId: message.snapshotId }
-								: {}),
-							...(message.type === "session_event" ? { sessionEventType: message.event.type } : {}),
-							payloadEncoding,
-							...(snapshotPurpose ? { snapshotPurpose } : {}),
-						},
-						payloadParts,
-					)
+				? this.encodeWorkerPrivateFrameParts(line, message, payloadEncoding, snapshotPurpose)
 				: payloadParts;
-		let accepted = true;
-		if (wireParts.length > 1) client.socket.cork?.();
-		try {
-			for (const part of wireParts) accepted = client.socket.write(part) && accepted;
-		} finally {
-			if (wireParts.length > 1) client.socket.uncork?.();
-		}
-		if (!accepted) client.backpressured = true;
-		return accepted;
+		const writeNow = () => {
+			let accepted = true;
+			if (wireParts.length > 1) client.socket.cork?.();
+			try {
+				for (const part of wireParts) accepted = client.socket.write(part) && accepted;
+			} finally {
+				if (wireParts.length > 1) client.socket.uncork?.();
+			}
+			if (!accepted) client.backpressured = true;
+			return accepted;
+		};
+		const previous = client.transport === "private-framed" ? client.privateFrameWriteTail : undefined;
+		if (!previous) return writeNow();
+		const queued = previous
+			.catch(() => undefined)
+			.then(() => {
+				writeNow();
+			});
+		client.privateFrameWriteTail = queued;
+		void queued.finally(() => {
+			if (client.privateFrameWriteTail === queued) client.privateFrameWriteTail = undefined;
+		});
+		return true;
 	}
 
 	private abortSideQuestionsFor(client: DaemonSocketClient, activeSessionId: string): void {

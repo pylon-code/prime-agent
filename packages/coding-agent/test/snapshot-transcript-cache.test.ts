@@ -10,6 +10,7 @@ import {
 	createSnapshotCacheProcessRoot,
 	prepareSnapshotTranscriptCache,
 	prepareSnapshotTranscriptPayload,
+	SNAPSHOT_MEMORY_CACHE_BYTES,
 	SnapshotTranscriptCache,
 	type SnapshotTranscriptCacheIo,
 	sweepAbandonedSnapshotCacheRoots,
@@ -371,15 +372,40 @@ describe("snapshot transcript cache", () => {
 		const payloadBuffers = firstChunks.map((entry) => entry.value![1]);
 		expect(payloadBuffers[1]).toBe(payloadBuffers[0]);
 		expect(payloadBuffers[2]).toBe(payloadBuffers[0]);
-		expect(single.payload.retainedPayloadBytes).toBeLessThanOrEqual(single.payload.bytes);
-		await Promise.all(iterators.map((iterator) => iterator.return?.()));
+		const consume = async (iterator: (typeof iterators)[number]) => {
+			while (!(await iterator.next()).done) {
+				// Deliberately drain one reader while its siblings remain at the first chunk.
+			}
+		};
+		await consume(iterators[0]!);
+		expect(single.payload.activeReaders).toBe(2);
+		expect(single.payload.retainedPayloadBytes).toBeLessThanOrEqual(SNAPSHOT_MEMORY_CACHE_BYTES);
+		await consume(iterators[1]!);
+		expect(single.payload.activeReaders).toBe(1);
+		expect(single.payload.retainedPayloadBytes).toBeLessThanOrEqual(SNAPSHOT_MEMORY_CACHE_BYTES);
+		await consume(iterators[2]!);
 		expect(single.payload.activeReaders).toBe(0);
+		expect(single.payload.retainedPayloadBytes).toBeLessThanOrEqual(SNAPSHOT_MEMORY_CACHE_BYTES);
 		single.payload.dispose();
 
 		const multiple = await run(messages(36, 1024 * 1024));
 		expect(multiple.maxEventLoopDelayMs).toBeLessThan(50);
 		expect(multiple.rssDeltaBytes).toBeLessThan(192 * 1024 * 1024);
 		expect(multiple.payload.bytes).toBeGreaterThanOrEqual(36 * 1024 * 1024);
+		const skewed = ["fast", "middle", "slow"].map((purpose) =>
+			multiple.payload.createTransfer("active-skewed", `snapshot-${purpose}`),
+		);
+		const skewedIterators = skewed.map((transfer) =>
+			(transfer as AsyncIterable<readonly Buffer[]>)[Symbol.asyncIterator](),
+		);
+		await Promise.all(skewedIterators.map((iterator) => iterator.next()));
+		for (const iterator of skewedIterators) {
+			while (!(await iterator.next()).done) {
+				// Each earlier reader fully drains while every later reader stays pinned at chunk zero.
+			}
+			expect(multiple.payload.retainedPayloadBytes).toBeLessThanOrEqual(SNAPSHOT_MEMORY_CACHE_BYTES);
+		}
+		expect(multiple.payload.activeReaders).toBe(0);
 		multiple.payload.dispose();
 	}, 30_000);
 });

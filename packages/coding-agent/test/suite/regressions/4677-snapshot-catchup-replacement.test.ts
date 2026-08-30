@@ -149,6 +149,69 @@ function workerHarness(result: DaemonAttachResult, transcript: SnapshotTranscrip
 }
 
 describe("ENG-4677 snapshot catch-up replacement", () => {
+	it("atomically remaps an alias snapshot fence before canonical events can pass", () => {
+		const root = tempDirectory();
+		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			descriptorDir: join(root, "state"),
+		});
+		const client = socketClient("alias-client");
+		client.capabilities.add("correlated_prompt_lifecycle_v1");
+		const transcript = new SnapshotTranscriptCache({
+			activeSessionId,
+			snapshotId: "alias-snapshot",
+			cacheRoot: root,
+		});
+		const worker = workerHarness(streamedResult("alias-snapshot", 0, 1), transcript);
+		const written: Buffer[] = [];
+		const internals = supervisor as unknown as {
+			clients: Set<DaemonSocketClient>;
+			writeSerialized(client: DaemonSocketClient, payload: Buffer): boolean;
+			reserveSnapshotStream(client: DaemonSocketClient, selector: string): () => void;
+			remapSnapshotStreamReservation(
+				client: DaemonSocketClient,
+				selector: string,
+				activeSessionId: string,
+				release: () => void,
+			): () => void;
+			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		internals.clients.add(client);
+		internals.writeSerialized = (_client, payload) => {
+			written.push(payload);
+			return true;
+		};
+		const alias = "session-4677";
+		const releaseAlias = internals.reserveSnapshotStream(client, alias);
+		const releaseCanonical = internals.remapSnapshotStreamReservation(client, alias, activeSessionId, releaseAlias);
+
+		expect(client.snapshotActiveSessionIds).toEqual(new Set([activeSessionId]));
+		internals.handleWorkerFrame(worker, {
+			header: {
+				kind: "outbound",
+				outboundType: "session_event",
+				activeSessionId,
+				sessionEventType: "agent_start",
+				payloadEncoding: "jsonl",
+			},
+			payload: Buffer.from(
+				JSON.stringify({
+					type: "session_event",
+					activeSessionId,
+					event: { type: "agent_start" },
+					attribution: { scope: "session" },
+				}),
+			),
+		});
+		expect(written).toEqual([]);
+		expect(client.catchupActiveSessionIds).toEqual(new Set([activeSessionId]));
+		client.catchupActiveSessionIds?.clear();
+		releaseCanonical();
+		expect(client.snapshotActiveSessionIds).toEqual(new Set());
+		transcript.dispose();
+		client.socket.destroy();
+	});
+
 	it("assigns supervisor-owned UUIDs to mixed-version full snapshots with the same cursor and count", async () => {
 		const root = tempDirectory();
 		const supervisor = new DaemonSupervisor(join(root, "supervisor.sock"), {
@@ -752,14 +815,13 @@ describe("ENG-4677 snapshot catch-up replacement", () => {
 		internals.queueCatchup(client, activeSessionId, "replacement");
 		await internals.catchUpClient(client);
 
+		const publicReplacement = written.find(
+			(message) => message.type === "session_snapshot_begin" && message.purpose === "replacement",
+		);
+		expect(publicReplacement).toBeDefined();
 		expect(
-			written.some(
-				(message) =>
-					message.type === "session_snapshot_begin" &&
-					message.snapshotId === replacementSnapshotId &&
-					message.purpose === "replacement",
-			),
-		).toBe(true);
+			publicReplacement && "snapshotId" in publicReplacement ? publicReplacement.snapshotId : undefined,
+		).not.toBe(replacementSnapshotId);
 		expect(worker.transcriptCaches.get(activeSessionId)?.snapshotId).toBe(replacementSnapshotId);
 		client.socket.destroy();
 	});

@@ -76,8 +76,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds capability-gated correlated prompt lifecycle and event provenance.
 // Revision 25 negotiates immutable snapshot transfer identities with session workers.
-export const DAEMON_SCHEMA_REVISION = 25;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-25-2c8fb17d3895";
+// Revision 26 correlates snapshot failures that occur before a begin frame can be emitted.
+export const DAEMON_SCHEMA_REVISION = 26;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-1ac2610350df";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -413,6 +414,8 @@ export type DaemonCommand =
 			type: "attach";
 			activeSessionId: string;
 			supportsExtensionUi?: boolean;
+			/** A retry nonce forces a fresh transcript payload generation after a failed transfer. */
+			snapshotGenerationNonce?: string;
 	  } & DaemonAttachClientMetadata &
 			DaemonClientEnv &
 			DaemonLaunchEnv)
@@ -1064,6 +1067,8 @@ export type DaemonOutbound =
 			activeSessionId: string;
 			snapshotId: string;
 			error: string;
+			/** Runtime failures may carry purpose when no begin frame could be prepared. */
+			purpose?: "attach" | "replacement" | "resync";
 	  }
 	| { type: "session_detached"; activeSessionId: string }
 	| { type: "session_closed"; activeSessionId: string; reason: DaemonSessionClosedReason; meta?: DaemonEventMeta }

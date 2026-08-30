@@ -15,8 +15,6 @@ export interface DaemonSocketClient {
 	catchupPurposes?: Map<string, "replacement" | "resync">;
 	/** The single catch-up drain currently serving this client. */
 	catchupPromise?: Promise<void>;
-	/** Delayed retry after transient catch-up snapshot preparation failure. */
-	catchupRetryTimer?: NodeJS.Timeout;
 	backpressured?: boolean;
 	authenticated?: boolean;
 	transport?: "jsonl" | "private-framed";
@@ -25,6 +23,8 @@ export interface DaemonSocketClient {
 	snapshotActiveSessionCounts?: Map<string, number>;
 	snapshotTransferAbortControllers?: Map<string, AbortController>;
 	snapshotTransferTails?: Map<string, Promise<void>>;
+	/** Serializes private frames when a large snapshot frame pauses between parts. */
+	privateFrameWriteTail?: Promise<void>;
 	detachInput: () => void;
 	supportsExtensionUi: boolean;
 	capabilities: Set<DaemonClientCapability>;
