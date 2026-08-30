@@ -324,6 +324,21 @@ export function buildSessionTreeFromFlatNodes(
 
 const sharedAttachmentOwners = new WeakMap<DaemonClient, Map<string, DaemonAgentConnection>>();
 const sharedAttachmentMutationTails = new WeakMap<DaemonClient, Promise<void>>();
+const MAX_PENDING_NEGOTIATED_RUNTIME_FRAMES = 128;
+
+function isCorrelatedPromptRuntimeFrame(message: DaemonOutbound): boolean {
+	switch (message.type) {
+		case "prompt_lifecycle":
+			return true;
+		case "session_event":
+			return message.attribution !== undefined || message.event.promptCorrelationId !== undefined;
+		case "extension_ui_request":
+		case "extension_error":
+			return message.attribution !== undefined;
+		default:
+			return false;
+	}
+}
 
 export class DaemonAgentConnection implements AgentConnection {
 	private readonly listeners = new Set<AgentConnectionEventListener>();
@@ -363,6 +378,9 @@ export class DaemonAgentConnection implements AgentConnection {
 	private attachmentInvalidationRevision = 0;
 	private negotiatedCapabilities: ReadonlySet<DaemonClientCapability> = new Set();
 	private negotiatedTransportGeneration: number | undefined;
+	private negotiatedRuntimeCapabilities: ReadonlySet<DaemonClientCapability> = new Set();
+	private negotiatedRuntimeTransportGeneration: number | undefined;
+	private pendingNegotiatedRuntimeFrames: DaemonOutbound[] = [];
 	private sharedAttachmentActiveSessionId: string | undefined;
 	private reconnectPromise?: Promise<void>;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
@@ -371,12 +389,15 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	private dispatchDaemonMessage(message: DaemonOutbound): void {
 		if (this.replacementReconciliationFailed) return;
+		if (this.deferNegotiatedRuntimeFrame(message)) return;
 		if (this.pendingChunkedReplacement && !isSnapshotTransferMessage(message)) {
 			this.pendingChunkedReplacement.queuedMessages.push(message);
 			return;
 		}
 		const fencesReplacement =
-			message.type === "session_replaced" && !message.snapshotFollows && this.supportsCorrelatedPromptLifecycle();
+			message.type === "session_replaced" &&
+			!message.snapshotFollows &&
+			this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1");
 		const previous = this.replacementMessageTail;
 		const handling = previous
 			? previous.then(() => {
@@ -491,6 +512,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		logicalPurpose: DaemonSnapshotPurpose = "attach",
 		allowWhileDisposing = false,
 	): Promise<void> {
+		this.invalidateNegotiatedCapabilityProof();
+		if (this.replacementReconciliationFailed) {
+			return Promise.reject(new Error("Daemon connection replacement reconciliation has failed"));
+		}
 		return this.withSharedAttachmentMutation(async () => {
 			try {
 				await this.attachSessionUnserialized(
@@ -518,6 +543,9 @@ export class DaemonAgentConnection implements AgentConnection {
 	): Promise<void> {
 		if (this.disposed || (this.disposing && !allowWhileDisposing)) {
 			throw new Error("Daemon connection is disposing");
+		}
+		if (this.replacementReconciliationFailed) {
+			throw new Error("Daemon connection replacement reconciliation has failed");
 		}
 		const supportsExtensionUi = this.options.supportsExtensionUi !== false;
 		const capabilities: DaemonClientCapability[] = [
@@ -623,7 +651,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					],
 				});
 			} catch (error) {
-				if (this.supportsCorrelatedPromptLifecycle()) {
+				if (negotiatedCapabilities.has("correlated_prompt_lifecycle_v1")) {
 					await this.emit({ type: "correlated_prompt_protocol_violation" });
 				}
 				throw error;
@@ -703,7 +731,9 @@ export class DaemonAgentConnection implements AgentConnection {
 				type: "get_session_context",
 				activeSessionId: this.activeSessionId,
 			}),
-			this.supportsCorrelatedPromptLifecycle() ? this.getPromptLifecycles() : Promise.resolve(undefined),
+			this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")
+				? this.getPromptLifecycles()
+				: Promise.resolve(undefined),
 		]);
 		const observedSnapshot = this.latestSnapshot;
 		const sameGeneration = observedSnapshot?.state.sessionId === state.sessionId;
@@ -804,6 +834,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (
 			this.disposing ||
 			this.disposed ||
+			this.replacementReconciliationFailed ||
 			this.negotiatedTransportGeneration !== this.client.getTransportGeneration()
 		) {
 			return false;
@@ -816,12 +847,24 @@ export class DaemonAgentConnection implements AgentConnection {
 		);
 	}
 
+	private supportsNegotiatedRuntimeCapability(capability: DaemonClientCapability): boolean {
+		return (
+			!this.disposed &&
+			!this.replacementReconciliationFailed &&
+			this.negotiatedRuntimeTransportGeneration === this.client.getTransportGeneration() &&
+			this.negotiatedRuntimeCapabilities.has(capability)
+		);
+	}
+
 	/** Server-offer evidence used to construct the pre-attach capability list. */
 	supportsCorrelatedPromptLifecycle(): boolean {
 		return this.client.supportsServerCapability("correlated_prompt_lifecycle_v1");
 	}
 
 	async getPromptLifecycles(): Promise<PromptLifecycleStateSnapshot> {
+		if (!this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")) {
+			throw new DaemonCapabilityUnavailableError("get_prompt_lifecycles", "correlated_prompt_lifecycle_v1");
+		}
 		return this.getPromptLifecyclesFor(this.activeSessionId, this.attachedSessionId);
 	}
 
@@ -829,7 +872,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		activeSessionId: string,
 		sessionId: string | undefined,
 	): Promise<PromptLifecycleStateSnapshot> {
-		if (!this.supportsCorrelatedPromptLifecycle()) {
+		if (!this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")) {
 			throw new DaemonCapabilityUnavailableError("get_prompt_lifecycles", "correlated_prompt_lifecycle_v1");
 		}
 		if (!sessionId) throw new Error("Prompt lifecycle query requires an attached session generation");
@@ -848,7 +891,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		message: string,
 		options: AgentConnectionCorrelatedPromptOptions,
 	): Promise<AgentConnectionCorrelatedPromptResult> {
-		if (!this.supportsCorrelatedPromptLifecycle()) {
+		if (!this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")) {
 			throw new DaemonCapabilityUnavailableError("submit_correlated_prompt", "correlated_prompt_lifecycle_v1");
 		}
 		if (options.signal?.aborted) {
@@ -928,7 +971,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async cancelPromptLifecycle(correlationId: string): Promise<PromptLifecycleCancellationResult> {
-		if (!this.supportsCorrelatedPromptLifecycle()) {
+		if (!this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")) {
 			throw new DaemonCapabilityUnavailableError("cancel_correlated_prompt", "correlated_prompt_lifecycle_v1");
 		}
 		const cachedLifecycle = this.latestSnapshot?.promptLifecycles;
@@ -1711,6 +1754,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		sourceActiveSessionId: string,
 		targetActiveSessionId: string,
 	): Promise<{ cancelled: false }> {
+		this.invalidateNegotiatedCapabilityProof();
+		if (this.replacementReconciliationFailed) {
+			return Promise.reject(new Error("Daemon connection replacement reconciliation has failed"));
+		}
 		return this.withSharedAttachmentMutation(async () => {
 			try {
 				return await this.reattachSessionUnserialized(sourceActiveSessionId, targetActiveSessionId);
@@ -1726,6 +1773,9 @@ export class DaemonAgentConnection implements AgentConnection {
 		targetActiveSessionId: string,
 	): Promise<{ cancelled: false }> {
 		if (this.disposing || this.disposed) throw new Error("Daemon connection is disposing");
+		if (this.replacementReconciliationFailed) {
+			throw new Error("Daemon connection replacement reconciliation has failed");
+		}
 		this.pendingReattachActiveSessionIds.add(targetActiveSessionId);
 		let reattached = false;
 		let attachmentEpoch: number | undefined;
@@ -2257,7 +2307,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		if (message.type === "session_event") {
 			if (
-				this.supportsCorrelatedPromptLifecycle() &&
+				this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1") &&
 				(!isPromptEventAttribution(message.attribution) ||
 					message.event.promptCorrelationId === undefined ||
 					(message.attribution.scope === "session" && message.event.promptCorrelationId !== null) ||
@@ -2280,7 +2330,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (message.type === "prompt_lifecycle") {
-			if (!this.supportsCorrelatedPromptLifecycle()) return;
+			if (!this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")) return;
 			if (!isPromptLifecycleSnapshot(message.lifecycle)) {
 				await this.emit({ type: "correlated_prompt_protocol_violation" });
 				return;
@@ -2323,7 +2373,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					],
 				});
 			} catch {
-				if (this.supportsCorrelatedPromptLifecycle()) {
+				if (this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")) {
 					await this.emit({ type: "correlated_prompt_protocol_violation" });
 				}
 				return;
@@ -2333,11 +2383,11 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (message.type === "session_replaced") {
-			this.invalidateNegotiatedCapabilityProof();
+			this.invalidateNegotiatedCapabilityProof(false);
 			try {
 				validateConnectionStateIdentity(message.state, message.activeSessionId);
 			} catch {
-				if (this.supportsCorrelatedPromptLifecycle()) {
+				if (this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")) {
 					await this.emit({ type: "correlated_prompt_protocol_violation" });
 				}
 				this.failClosedReplacementReconciliation();
@@ -2350,7 +2400,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.pendingChunkedReplacement = { header: message, queuedMessages: [] };
 				return;
 			}
-			const promptLifecycles = this.supportsCorrelatedPromptLifecycle()
+			const promptLifecycles = this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")
 				? await this.getPromptLifecyclesFor(message.activeSessionId, message.state.sessionId)
 				: undefined;
 			const reconciledPromptLifecycles =
@@ -2375,7 +2425,7 @@ export class DaemonAgentConnection implements AgentConnection {
 
 		if (
 			(message.type === "extension_ui_request" || message.type === "extension_error") &&
-			this.supportsCorrelatedPromptLifecycle() &&
+			this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1") &&
 			!isPromptEventAttribution(message.attribution)
 		) {
 			await this.emit({ type: "correlated_prompt_protocol_violation" });
@@ -2573,6 +2623,29 @@ export class DaemonAgentConnection implements AgentConnection {
 		throw lastError ?? new Error("the restored session did not become available");
 	}
 
+	private deferNegotiatedRuntimeFrame(message: DaemonOutbound): boolean {
+		if (!isCorrelatedPromptRuntimeFrame(message)) return false;
+		if (this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")) return false;
+		if ("activeSessionId" in message && typeof message.activeSessionId === "string") {
+			const attempt = this.latestSnapshotRequestAttempt(message.activeSessionId);
+			if (attempt?.state === "requesting" || attempt?.state === "receiving") {
+				if (this.pendingNegotiatedRuntimeFrames.length >= MAX_PENDING_NEGOTIATED_RUNTIME_FRAMES) {
+					this.failClosedReplacementReconciliation();
+				} else {
+					this.pendingNegotiatedRuntimeFrames.push(message);
+				}
+			}
+		}
+		return true;
+	}
+
+	private releasePendingNegotiatedRuntimeFrames(): void {
+		const pending = this.pendingNegotiatedRuntimeFrames;
+		this.pendingNegotiatedRuntimeFrames = [];
+		if (!this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")) return;
+		for (const message of pending) this.dispatchDaemonMessage(message);
+	}
+
 	private withSharedAttachmentMutation<T>(operation: () => Promise<T>): Promise<T> {
 		const previous = sharedAttachmentMutationTails.get(this.client) ?? Promise.resolve();
 		const run = previous.then(operation, operation);
@@ -2598,10 +2671,16 @@ export class DaemonAgentConnection implements AgentConnection {
 		return owners;
 	}
 
-	private invalidateNegotiatedCapabilityProof(): void {
+	private invalidateNegotiatedCapabilityProof(clearRuntimeCapabilities = true): void {
 		this.attachmentInvalidationRevision++;
 		this.negotiatedCapabilities = new Set();
 		this.negotiatedTransportGeneration = undefined;
+		if (clearRuntimeCapabilities) {
+			this.negotiatedRuntimeCapabilities = new Set();
+			this.negotiatedRuntimeTransportGeneration = undefined;
+		}
+		this.pendingNegotiatedRuntimeFrames = [];
+		if (!clearRuntimeCapabilities) return;
 		const activeSessionId = this.sharedAttachmentActiveSessionId;
 		this.sharedAttachmentActiveSessionId = undefined;
 		if (!activeSessionId) return;
@@ -2648,6 +2727,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (
 			(this.disposing && !allowWhileDisposing) ||
 			this.disposed ||
+			this.replacementReconciliationFailed ||
 			this.attachmentEpoch !== attachmentEpoch ||
 			this.attachmentInvalidationRevision !== invalidationRevision ||
 			this.client.getTransportGeneration() !== transportGeneration ||
@@ -2662,8 +2742,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		capabilities: ReadonlySet<DaemonClientCapability>,
 		transportGeneration: number,
 	): void {
+		if (this.replacementReconciliationFailed) {
+			throw new Error("Daemon connection replacement reconciliation has failed");
+		}
 		this.negotiatedCapabilities = capabilities;
 		this.negotiatedTransportGeneration = transportGeneration;
+		this.negotiatedRuntimeCapabilities = capabilities;
+		this.negotiatedRuntimeTransportGeneration = transportGeneration;
+		this.releasePendingNegotiatedRuntimeFrames();
 	}
 
 	private negotiatedCapabilitiesFromAttach(
@@ -2922,6 +3008,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		activeSessionId: string,
 		explicitPurpose?: DaemonSnapshotPurpose,
 	): Promise<void> {
+		const reportCorrelatedViolation = this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1");
 		const recovery = this.transitionSnapshotFailure(
 			snapshotId,
 			assembly,
@@ -2929,7 +3016,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			activeSessionId,
 			explicitPurpose ?? assembly.begin?.purpose ?? (this.pendingChunkedReplacement ? "replacement" : undefined),
 		);
-		if (this.supportsCorrelatedPromptLifecycle()) {
+		if (reportCorrelatedViolation) {
 			await this.emit({ type: "correlated_prompt_protocol_violation" });
 		}
 		if (recovery) await recovery;
@@ -3104,7 +3191,9 @@ export class DaemonAgentConnection implements AgentConnection {
 			expectedState: options.expectedState,
 			cachedSnapshot: this.latestSnapshot,
 			replay: options.replay,
-			includePromptLifecycles: options.includePromptLifecycles ?? this.supportsCorrelatedPromptLifecycle(),
+			includePromptLifecycles:
+				options.includePromptLifecycles ??
+				this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1"),
 		});
 		return this.stageMappedSnapshotCommit(latestSnapshot, {
 			activeSessionId: options.envelopeActiveSessionId,

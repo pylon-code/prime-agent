@@ -1,0 +1,1 @@
+- Added a generation-scoped public proof for attach-negotiated daemon client capabilities.
