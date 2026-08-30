@@ -236,6 +236,26 @@ function isPromptLifecycleCancellationResult(
 	);
 }
 
+function delayUntilRetryOrOwnerClose(client: DaemonClient, timeoutMs: number): Promise<void> {
+	if (client.isClosed) return Promise.resolve();
+	return new Promise((resolve) => {
+		let settled = false;
+		let unsubscribe = () => {};
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			unsubscribe();
+			resolve();
+		};
+		const timeout = setTimeout(finish, timeoutMs);
+		unsubscribe = client.onClose(() => {
+			if (client.isClosed) finish();
+		});
+		if (client.isClosed) finish();
+	});
+}
+
 function reconnectDaemonTransportAfterUpdate(client: DaemonClient): Promise<void> {
 	const existing = updateTransportReconnects.get(client);
 	if (existing) {
@@ -243,18 +263,22 @@ function reconnectDaemonTransportAfterUpdate(client: DaemonClient): Promise<void
 	}
 	const reconnectPromise = Promise.resolve()
 		.then(async () => {
+			if (client.isClosed) throw new Error("the daemon client was closed by its owner");
 			client.disconnectForReconnect("update");
 			const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
 			let lastError: unknown;
-			while (Date.now() < deadline) {
+			while (!client.isClosed && Date.now() < deadline) {
 				try {
 					await client.reconnect(1000);
+					if (client.isClosed) throw new Error("the daemon client was closed by its owner");
 					return;
 				} catch (error) {
+					if (client.isClosed) throw new Error("the daemon client was closed by its owner");
 					lastError = error;
 				}
-				await delay(UPDATE_RECONNECT_RETRY_MS);
+				await delayUntilRetryOrOwnerClose(client, UPDATE_RECONNECT_RETRY_MS);
 			}
+			if (client.isClosed) throw new Error("the daemon client was closed by its owner");
 			throw lastError ?? new Error("the updated daemon did not become available");
 		})
 		.finally(() => {
@@ -509,8 +533,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				return;
 			}
 			if (this.client.isClosed) {
-				this.terminalCloseEmitted = true;
-				void this.emit({ type: "closed", error: "Prime Agent daemon client was closed." });
+				this.emitOwnerClosedTerminal();
 				return;
 			}
 			if (invalidatedInputPause) {
@@ -2176,14 +2199,25 @@ export class DaemonAgentConnection implements AgentConnection {
 			const deadline = Date.now() + (this.options.reconnectTimeoutMs ?? DAEMON_RECONNECT_TIMEOUT_MS);
 			let attempt = 0;
 			let lastError: Error = cause;
-			while (!this.disposed && Date.now() < deadline) {
+			while (!this.disposed && !this.terminalCloseEmitted && !this.client.isClosed && Date.now() < deadline) {
 				try {
 					await this.options.recoverDaemon?.();
-					if (this.disposed) {
+					if (this.client.isClosed) {
+						this.emitOwnerClosedTerminal();
 						return;
 					}
+					if (this.disposed || this.terminalCloseEmitted) return;
 					await this.client.connect(1000);
+					if (this.client.isClosed) {
+						this.emitOwnerClosedTerminal();
+						return;
+					}
 					await this.client.waitForHello(3000);
+					if (this.client.isClosed) {
+						this.emitOwnerClosedTerminal();
+						return;
+					}
+					if (this.disposed || this.terminalCloseEmitted) return;
 					// Owned disposal may need one authenticated reattach to reach the
 					// authoritative completion command. Disposal keeps the public proof
 					// false and suppresses restoration events throughout this path.
@@ -2195,27 +2229,41 @@ export class DaemonAgentConnection implements AgentConnection {
 						"attach",
 						this.disposing && this.options.ownedSession === true,
 					);
-					if (this.disposing || this.disposed) return;
+					if (this.client.isClosed) {
+						this.emitOwnerClosedTerminal();
+						return;
+					}
+					if (this.disposing || this.disposed || this.terminalCloseEmitted) return;
 					const snapshot = await this.getInitialSnapshot();
+					if (this.client.isClosed) {
+						this.emitOwnerClosedTerminal();
+						return;
+					}
+					if (this.disposed || this.terminalCloseEmitted) return;
 					void this.emit({ type: "session_resynced", snapshot });
 					void this.emit({ type: "connection_status", status: "connected" });
 					return;
 				} catch (error) {
 					lastError = error instanceof Error ? error : new Error(String(error));
-					if (this.disposed) {
+					if (this.client.isClosed) {
+						this.emitOwnerClosedTerminal();
 						return;
 					}
+					if (this.disposed || this.terminalCloseEmitted) return;
 					this.client.resetTransportForReconnect();
 					const remainingMs = deadline - Date.now();
-					if (remainingMs <= 0) {
-						break;
-					}
+					if (remainingMs <= 0) break;
 					const delayMs = Math.min(remainingMs, 2000, 100 * 2 ** Math.min(attempt, 5));
 					attempt++;
-					await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+					await delayUntilRetryOrOwnerClose(this.client, delayMs);
 				}
 			}
-			if (!this.disposed) {
+			if (this.client.isClosed) {
+				this.emitOwnerClosedTerminal();
+				return;
+			}
+			if (!this.disposed && !this.terminalCloseEmitted) {
+				this.terminalCloseEmitted = true;
 				this.client.close();
 				await this.emit({ type: "closed", error: `Daemon reconnection failed: ${lastError.message}` });
 			}
@@ -2495,9 +2543,26 @@ export class DaemonAgentConnection implements AgentConnection {
 				return;
 			}
 			const shapingRevision = this.attachmentInvalidationRevision;
+			const routeAdmissionRevision = this.attachmentAdmissionRevision;
+			const routeAttachmentEpoch = this.attachmentEpoch;
+			const routeTransportGeneration = this.client.getTransportGeneration();
+			const routeActiveSessionId = this.activeSessionId;
 			const queriedPromptLifecycles = this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")
 				? await this.getPromptLifecyclesFor(message.activeSessionId, message.state.sessionId)
 				: undefined;
+			if (
+				this.disposing ||
+				this.disposed ||
+				this.terminalCloseEmitted ||
+				this.updateRestartPending ||
+				this.replacementReconciliationFailed ||
+				this.attachmentAdmissionRevision !== routeAdmissionRevision ||
+				this.attachmentEpoch !== routeAttachmentEpoch ||
+				this.client.getTransportGeneration() !== routeTransportGeneration ||
+				this.activeSessionId !== routeActiveSessionId
+			) {
+				return;
+			}
 			const promptLifecycles =
 				queriedPromptLifecycles &&
 				this.attachmentInvalidationRevision === shapingRevision &&
@@ -2592,6 +2657,12 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
+	private emitOwnerClosedTerminal(): void {
+		if (this.disposed || this.terminalCloseEmitted) return;
+		this.terminalCloseEmitted = true;
+		void this.emit({ type: "closed", error: "Prime Agent daemon client was closed." });
+	}
+
 	private formatDaemonSessionClosedError(reason: DaemonSessionClosedReason): string {
 		const explanation: Record<DaemonSessionClosedReason, string> = {
 			killed:
@@ -2632,6 +2703,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (this.updateReconnectPromise) {
 			return this.updateReconnectPromise;
 		}
+		if (this.client.isClosed) {
+			this.emitOwnerClosedTerminal();
+			return Promise.resolve();
+		}
 		void this.emit({
 			type: "connection_status",
 			status: "reconnecting",
@@ -2640,14 +2715,18 @@ export class DaemonAgentConnection implements AgentConnection {
 		const reconnectPromise = reconnectDaemonTransportAfterUpdate(this.client)
 			.then(() => this.restoreConnectionAfterUpdate())
 			.then(() => {
-				if (!this.disposed) {
+				if (!this.disposed && !this.terminalCloseEmitted && !this.client.isClosed) {
 					void this.emit({ type: "connection_status", status: "connected" });
 				}
 			})
 			.catch(async (error: unknown) => {
 				this.updateRestartPending = false;
+				if (this.client.isClosed) {
+					this.emitOwnerClosedTerminal();
+					return;
+				}
 				this.updateReconnectFailed = true;
-				if (!this.disposed) {
+				if (!this.disposed && !this.terminalCloseEmitted) {
 					this.terminalCloseEmitted = true;
 					await this.emit({
 						type: "closed",
@@ -2672,16 +2751,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
 		let lastError: unknown;
-		while (!this.disposed && Date.now() < deadline) {
+		while (!this.disposed && !this.terminalCloseEmitted && !this.client.isClosed && Date.now() < deadline) {
 			try {
 				await this.client.reconnect(1000);
-				if (this.disposed) {
-					return;
-				}
+				if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
+				if (this.disposed || this.terminalCloseEmitted) return;
 				const response = await this.client.request({ type: "list" }, 30000);
-				if (this.disposed) {
-					return;
-				}
+				if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
+				if (this.disposed || this.terminalCloseEmitted) return;
 				if (!response.success) {
 					throw deserializeDaemonError(response);
 				}
@@ -2693,34 +2770,30 @@ export class DaemonAgentConnection implements AgentConnection {
 							(sessionId !== undefined && summary.sessionId === sessionId)),
 				);
 				if (restored?.activeSessionId) {
-					if (this.disposed) {
-						return;
-					}
+					if (this.disposed || this.terminalCloseEmitted) return;
 					this.pendingReattachActiveSessionIds.add(restored.activeSessionId);
 					try {
 						await this.attachSession(restored.activeSessionId, undefined, true);
 					} finally {
 						this.pendingReattachActiveSessionIds.delete(restored.activeSessionId);
 					}
-					if (this.disposed) {
-						return;
-					}
+					if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
+					if (this.disposed || this.terminalCloseEmitted) return;
 					const snapshot = await this.getInitialSnapshot();
-					if (this.disposed) {
-						return;
-					}
+					if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
+					if (this.disposed || this.terminalCloseEmitted) return;
 					this.updateRestartPending = false;
 					void this.emit({ type: "session_resynced", snapshot });
 					return;
 				}
 			} catch (error) {
+				if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
 				lastError = error;
 			}
-			await delay(UPDATE_RECONNECT_RETRY_MS);
+			await delayUntilRetryOrOwnerClose(this.client, UPDATE_RECONNECT_RETRY_MS);
 		}
-		if (this.disposed) {
-			return;
-		}
+		if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
+		if (this.disposed || this.terminalCloseEmitted) return;
 		throw lastError ?? new Error("the restored session did not become available");
 	}
 

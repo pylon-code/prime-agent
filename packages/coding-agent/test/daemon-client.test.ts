@@ -167,6 +167,43 @@ describe("DaemonClient", () => {
 		expect(closed).toHaveBeenCalledTimes(1);
 	});
 
+	it("notifies a socketless recovery listener when owner close follows transport loss", async () => {
+		const client = new DaemonClient("/tmp/private-recovery-close.sock");
+		const connecting = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connecting;
+		const closed: Error[] = [];
+		client.onClose((error) => closed.push(error));
+
+		socket.emit("close");
+		expect(client.isClosed).toBe(false);
+		expect(closed).toHaveLength(1);
+		client.close();
+
+		expect(client.isClosed).toBe(true);
+		expect(closed).toHaveLength(2);
+		expect(closed[1]?.message).toContain("Prime Agent daemon client closed before the operation completed.");
+		client.close();
+		expect(closed).toHaveLength(2);
+	});
+
+	it("notifies close listeners once when explicit close has no active socket", async () => {
+		const client = new DaemonClient("/tmp/private-owner-close.sock");
+		const closed: Error[] = [];
+		client.onClose((error) => closed.push(error));
+
+		client.close();
+
+		expect(client.isClosed).toBe(true);
+		expect(closed).toHaveLength(1);
+		expect(closed[0]?.message).toContain("Prime Agent daemon client closed before the operation completed.");
+		await expect(client.connect()).rejects.toThrow("Prime Agent daemon client is closed.");
+		expect(netMock.sockets).toEqual([]);
+		client.close();
+		expect(closed).toHaveLength(1);
+	});
+
 	it("exports the bounded-ingress SDK proof and validates finite byte limits", () => {
 		const rootOptions: RootDaemonClientOptions = { maxInboundFrameBytes: 1 };
 		const rootFeatures: RootPrimeAgentSdkFeature[] = [

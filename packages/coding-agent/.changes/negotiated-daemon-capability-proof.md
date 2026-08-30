@@ -1,1 +1,2 @@
 - Added a generation-scoped public proof for attach-negotiated daemon client capabilities.
+- Made explicit `DaemonClient.close()` terminal, including during in-flight normal and update recovery.

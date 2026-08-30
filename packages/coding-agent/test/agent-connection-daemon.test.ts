@@ -46,7 +46,6 @@ class FakeDaemonClient {
 	restoredAttachGate: Promise<void> | undefined;
 	restoredAttachCompleted = 0;
 	closeCount = 0;
-	emitCloseOnClose = false;
 	connected = true;
 	ownerClosed = false;
 	transportGeneration = 1;
@@ -634,6 +633,7 @@ class FakeDaemonClient {
 	}
 
 	async connect(): Promise<void> {
+		if (this.ownerClosed) throw new Error("Prime Agent daemon client is closed");
 		if (this.connected) {
 			throw new Error("Prime Agent daemon client is already connected");
 		}
@@ -656,11 +656,13 @@ class FakeDaemonClient {
 	}
 
 	async reconnect(): Promise<void> {
+		if (this.ownerClosed) throw new Error("Prime Agent daemon client is closed");
 		if (this.connected) {
 			return;
 		}
 		this.reconnectCount++;
 		if (this.reconnectGate) await this.reconnectGate;
+		if (this.ownerClosed) throw new Error("Prime Agent daemon client is closed");
 		if (this.reconnectError) {
 			throw this.reconnectError;
 		}
@@ -677,12 +679,12 @@ class FakeDaemonClient {
 	}
 
 	close(): void {
+		if (this.ownerClosed) return;
+		this.ownerClosed = true;
 		this.closeCount++;
 		if (this.connected) this.transportGeneration++;
 		this.connected = false;
-		if (this.emitCloseOnClose) {
-			this.emitClose(new Error("Daemon socket closed"));
-		}
+		this.emitClose(new Error("Daemon socket closed"));
 	}
 
 	disconnectForReconnect(reason: "shutdown" | "update"): void {
@@ -1423,6 +1425,76 @@ describe("DaemonAgentConnection", () => {
 		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
 	});
 
+	it("stops an in-flight normal recovery when the owner closes a socketless client", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseRecovery!: () => void;
+		const recoveryGate = new Promise<void>((resolve) => {
+			releaseRecovery = resolve;
+		});
+		const recoverDaemon = vi.fn(async () => recoveryGate);
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			recoverDaemon,
+			reconnectTimeoutMs: 500,
+		});
+		await connection.attach();
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		fakeClient.emitClose(new Error("private transport-loss canary"));
+		await vi.waitFor(() => expect(recoverDaemon).toHaveBeenCalledTimes(1));
+		const recovery = (connection as unknown as { reconnectPromise?: Promise<void> }).reconnectPromise;
+		expect(recovery).toBeDefined();
+		fakeClient.close();
+		await vi.waitFor(() =>
+			expect(events.filter((event) => event.type === "closed")).toEqual([
+				{ type: "closed", error: "Prime Agent daemon client was closed." },
+			]),
+		);
+		releaseRecovery();
+		await recovery;
+
+		expect(recoverDaemon).toHaveBeenCalledTimes(1);
+		expect(fakeClient.reconnectCount).toBe(0);
+		expect(events.filter((event) => event.type === "connection_status" && event.status === "connected")).toEqual([]);
+		expect(JSON.stringify(events.filter((event) => event.type === "closed"))).not.toContain("private");
+	});
+
+	it("stops an in-flight update recovery when the owner closes a socketless client", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseReconnect!: () => void;
+		fakeClient.reconnectGate = new Promise<void>((resolve) => {
+			releaseReconnect = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		fakeClient.emitClose(new DaemonSocketClosedError("/tmp/private-update-canary.sock", "update"));
+		await vi.waitFor(() => expect(fakeClient.reconnectCount).toBe(1));
+		const recovery = (connection as unknown as { updateReconnectPromise?: Promise<void> }).updateReconnectPromise;
+		expect(recovery).toBeDefined();
+		fakeClient.close();
+		await vi.waitFor(() =>
+			expect(events.filter((event) => event.type === "closed")).toEqual([
+				{ type: "closed", error: "Prime Agent daemon client was closed." },
+			]),
+		);
+		releaseReconnect();
+		await recovery;
+
+		expect(fakeClient.reconnectCount).toBe(1);
+		expect(fakeClient.requests.filter((request) => request.type === "list")).toEqual([]);
+		expect(events.filter((event) => event.type === "connection_status" && event.status === "connected")).toEqual([]);
+		expect(JSON.stringify(events.filter((event) => event.type === "closed"))).not.toContain("private");
+	});
+
 	it("serializes shared-client attaches and proves only the latest completed attachment", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
@@ -1595,6 +1667,60 @@ describe("DaemonAgentConnection", () => {
 
 		await first.dispose();
 		expect(second.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("discards an old replacement query after the same connection reattaches to a new route", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		let releaseLifecycleQuery!: () => void;
+		fakeClient.promptLifecycleGate = new Promise<void>((resolve) => {
+			releaseLifecycleQuery = resolve;
+		});
+		fakeClient.switchSessionActiveSessionId = "active-b";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a");
+		await connection.attach();
+		const replacementSessionIds: string[] = [];
+		connection.subscribe((event) => {
+			if (event.type === "session_replaced") replacementSessionIds.push(event.state.sessionId);
+		});
+
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-a",
+			state: createConnectionState("active-a", "session-a-stale"),
+			messages: [{ role: "user", content: "stale replacement", timestamp: 1 }],
+		});
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.some((request) => request.type === "get_prompt_lifecycles")).toBe(true),
+		);
+		await expect(connection.switchSession("/tmp/session-b.jsonl")).resolves.toEqual({ cancelled: false });
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+
+		const tailDrained = new Promise<void>((resolve) => {
+			connection.subscribe((event) => {
+				if (event.type === "heartbeats_changed") resolve();
+			});
+		});
+		releaseLifecycleQuery();
+		fakeClient.emitMessage({ type: "heartbeats_changed" });
+		await tailDrained;
+
+		const route = connection as unknown as {
+			activeSessionId: string;
+			latestSnapshot?: AgentConnectionSnapshot;
+		};
+		expect(route.activeSessionId).toBe("active-b");
+		expect(route.latestSnapshot).toMatchObject({
+			state: { activeSessionId: "active-b", sessionId: "session-current" },
+		});
+		expect(replacementSessionIds).toEqual(["session-current"]);
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		await connection.submitCorrelatedPrompt("route to B", { correlationId: "route-b" });
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "submit_correlated_prompt",
+			activeSessionId: "active-b",
+			correlationId: "route-b",
+		});
 	});
 
 	it("drops stale replacement shaping when shared-client capabilities change during its query", async () => {
@@ -3603,7 +3729,6 @@ describe("DaemonAgentConnection", () => {
 
 	it("reattaches an open window to its restored session after an update restart", async () => {
 		const fakeClient = new FakeDaemonClient();
-		fakeClient.emitCloseOnClose = true;
 		const restoredMessages: AgentMessage[] = [{ role: "user", content: "restored prompt", timestamp: 2 }];
 		fakeClient.updateRestartSessions = [
 			{
@@ -3709,7 +3834,6 @@ describe("DaemonAgentConnection", () => {
 
 	it("coordinates one transport reconnect across connections sharing a daemon client", async () => {
 		const fakeClient = new FakeDaemonClient();
-		fakeClient.emitCloseOnClose = true;
 		fakeClient.updateRestartSessions = [
 			{
 				id: "restored-a",

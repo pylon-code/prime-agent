@@ -476,6 +476,7 @@ export class DaemonClient {
 	}
 
 	close(): void {
+		if (this.closed) return;
 		this.closed = true;
 		this.reconnectOptions = undefined;
 		this.terminalTransportError = undefined;
@@ -485,7 +486,7 @@ export class DaemonClient {
 		);
 		if (socket) this.clearSocketReference(socket);
 		this.rejectAll(error);
-		if (socket) this.emitCloseListeners(error);
+		this.emitCloseListeners(error);
 		socket?.end();
 		socket?.destroy();
 	}
