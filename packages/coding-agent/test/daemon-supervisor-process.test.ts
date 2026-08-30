@@ -690,7 +690,11 @@ describe("daemon supervisor resident workers", () => {
 			success: false,
 			error: `Unknown active session: ${summary.activeSessionId}`,
 		});
-		otherClient.close();
+		const activeCleanup = await otherClient.request({
+			type: "get_owned_session_cleanup",
+			activeSessionId: summary.activeSessionId,
+		});
+		expect(activeCleanup).toMatchObject({ success: true, data: { status: "active" } });
 		const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 			ownedSession: true,
 			supportsExtensionUi: false,
@@ -716,7 +720,19 @@ describe("daemon supervisor resident workers", () => {
 		expect(descriptor.createCommand).not.toHaveProperty("launchEnv");
 		expect(descriptor.createCommand).not.toHaveProperty("lifecycle");
 
+		const completed = await client.request({
+			type: "complete_owned_session",
+			activeSessionId: summary.activeSessionId,
+		});
+		expect(completed.success).toBe(true);
+		const settledCleanup = await otherClient.request({
+			type: "get_owned_session_cleanup",
+			activeSessionId: summary.activeSessionId,
+		});
+		expect(settledCleanup).toEqual(expect.objectContaining({ success: true, data: { status: "settled" } }));
+		expect(settledCleanup.success ? Object.keys(settledCleanup.data as object) : []).toEqual(["status"]);
 		await connection.dispose();
+		otherClient.close();
 		await waitForProcessGone(summary.workerPid);
 		workerPids.delete(summary.workerPid);
 		await waitForCondition(
@@ -729,6 +745,75 @@ describe("daemon supervisor resident workers", () => {
 		client.close();
 		await waitForSocketGone(socketPath);
 	}, 60_000);
+
+	it("lets a different client prove cleanup after the owner socket disappears", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const socketPath = join(tmpdir(), `prime-supervisor-owned-crash-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const owner = await connectEventually(socketPath, supervisor);
+		const created = await owner.request({
+			type: "create",
+			lifecycle: "client_owned",
+			noSession: true,
+			launchEnv: { TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json") },
+			config: { cwd: projectDir, agentDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid || !summary.activeSessionId) {
+			throw new Error("Client-owned worker did not expose its process identity");
+		}
+		workerPids.add(summary.workerPid);
+		const observer = await connectEventually(socketPath);
+		try {
+			await expect(
+				observer.request({ type: "get_owned_session_cleanup", activeSessionId: summary.activeSessionId }),
+			).resolves.toMatchObject({ success: true, data: { status: "active" } });
+			process.kill(summary.workerPid, "SIGSTOP");
+			owner.close();
+
+			let sawStopping = false;
+			let settled = false;
+			const deadline = Date.now() + 50_000;
+			while (Date.now() < deadline) {
+				const response = await observer.request({
+					type: "get_owned_session_cleanup",
+					activeSessionId: summary.activeSessionId,
+				});
+				if (!response.success) throw new Error(response.error);
+				const status = (response.data as { status?: string } | undefined)?.status;
+				if (status === "stopping") sawStopping = true;
+				if (status === "settled") {
+					settled = true;
+					break;
+				}
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+			}
+			expect(sawStopping).toBe(true);
+			expect(settled).toBe(true);
+			await waitForProcessGone(summary.workerPid);
+			workerPids.delete(summary.workerPid);
+			expect(countWorkerDescriptors(agentDir)).toBe(0);
+			await observer.request({ type: "shutdown" });
+			await waitForSocketGone(socketPath);
+		} finally {
+			owner.close();
+			observer.close();
+			if (workerPids.has(summary.workerPid)) {
+				try {
+					process.kill(summary.workerPid, "SIGCONT");
+					process.kill(summary.workerPid, "SIGKILL");
+				} catch {
+					// The authoritative cleanup path already removed it.
+				}
+				workerPids.delete(summary.workerPid);
+			}
+		}
+	}, 75_000);
 
 	it("releases an adopted client-owned worker when disposal races supervisor replacement", async () => {
 		const root = tempDir();
@@ -773,6 +858,11 @@ describe("daemon supervisor resident workers", () => {
 			"Adopted client-owned worker descriptor was not removed",
 		);
 		const replacementClient = await connectEventually(socketPath);
+		const replacementCleanup = await replacementClient.request({
+			type: "get_owned_session_cleanup",
+			activeSessionId: summary.activeSessionId,
+		});
+		expect(replacementCleanup).toMatchObject({ success: true, data: { status: "settled" } });
 		await replacementClient.request({ type: "shutdown" });
 		replacementClient.close();
 		await waitForSocketGone(socketPath);

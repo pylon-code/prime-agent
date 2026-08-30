@@ -102,11 +102,22 @@ The protocol does not promise that every historical event remains replayable. Du
 
 ## Command Lifecycle and Idempotency
 
-The public daemon protocol is JSONL-framed and currently at protocol v4. Commands may be sent in versioned envelopes containing protocol metadata, client ID, and command ID.
+The public daemon protocol is JSONL-framed and currently at protocol v7. Commands may be sent in versioned envelopes containing protocol metadata, client ID, and command ID.
 
 Mutating commands are recorded before dispatch. A repeated completed command returns its recorded result. A command known to have been received but lacking a durable result is reported as uncertain instead of being replayed blindly. Clients acknowledge durable results so old journal entries can be compacted.
 
 The `AgentConnection` method promise is a client convenience. It should not be treated as a general accepted/running/completed remote workflow API.
+
+## Client-Owned Session Cleanup
+
+`DaemonAgentConnection.dispose()` performs best-effort cleanup for a client-owned session, but it deliberately does not turn cleanup failure into a disposal failure. An authoritative local host must use raw `DaemonClient` commands instead:
+
+1. Require the supervisor-only `authoritative_owned_session_cleanup_v1` server capability.
+2. Send `complete_owned_session` from the owning client and check its response.
+3. If the owner connection disappears or completion is uncertain, poll `get_owned_session_cleanup` from a replacement client with the exact host-private `activeSessionId`.
+4. Accept only `settled` as proof that the exact worker generation, cleanup journals, durable descriptor, and in-memory registration are absent. Treat `active`, `stopping`, a missing capability, or transport uncertainty as not cleaned up.
+
+The query returns only `{ status: "active" | "stopping" | "settled" }`. It does not expose process IDs, worker or owner IDs, filesystem paths, tokens, descriptor contents, or diagnostics. Stock v0.8.1 does not offer this capability, so `DaemonClient` rejects the query locally without sending an unknown command. The proof applies to registrations created or durably adopted by a capable supervisor; it cannot retroactively certify a descriptorless orphan created before that supervisor observed it.
 
 ## Session Replacement
 

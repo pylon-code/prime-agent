@@ -191,11 +191,30 @@ processTests("stock v0.8.1 daemon entrypoint compatibility", () => {
 			if (!createdSummary.activeSessionId || !createdSummary.workerPid)
 				throw new Error("Compatibility worker was incomplete");
 			workerPids.add(createdSummary.workerPid);
+			if (firstCli === historicalCli) {
+				expect(firstClient.supportsServerCapability("authoritative_owned_session_cleanup_v1")).toBe(false);
+				await expect(
+					firstClient.request({
+						type: "get_owned_session_cleanup",
+						activeSessionId: createdSummary.activeSessionId,
+					}),
+				).rejects.toThrow("authoritative_owned_session_cleanup_v1");
+				await expect(firstClient.request({ type: "list" })).resolves.toMatchObject({ success: true });
+			}
 			firstClient.close();
 			await stopSupervisor(firstSupervisor);
 
 			const replacement = launch(replacementCli, agentDir, socketPath, projectDir);
 			const client = await connectEventually(socketPath, replacement);
+			if (replacementCli === historicalCli) {
+				expect(client.supportsServerCapability("authoritative_owned_session_cleanup_v1")).toBe(false);
+				await expect(
+					client.request({
+						type: "get_owned_session_cleanup",
+						activeSessionId: createdSummary.activeSessionId,
+					}),
+				).rejects.toThrow("authoritative_owned_session_cleanup_v1");
+			}
 			const listed = await client.request({ type: "list" });
 			if (!listed.success) throw new Error(listed.error);
 			const adopted = summaries(listed.data).find(

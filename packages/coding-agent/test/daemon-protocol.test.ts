@@ -15,6 +15,7 @@ import {
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
+	DAEMON_SUPERVISOR_SERVER_CAPABILITIES,
 	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonCommand,
 	type DaemonOutbound,
@@ -113,6 +114,15 @@ describe("daemon protocol helpers", () => {
 			minProtocol: 7,
 			capability: "client_owned_sessions",
 		});
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_owned_session_cleanup).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 27,
+			capability: "authoritative_owned_session_cleanup_v1",
+		});
+		expect(DAEMON_DEFAULT_CLIENT_CAPABILITIES).not.toContain("authoritative_owned_session_cleanup_v1");
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain("authoritative_owned_session_cleanup_v1");
+		expect(DAEMON_SUPERVISOR_SERVER_CAPABILITIES).toContain("authoritative_owned_session_cleanup_v1");
+		expect(isDaemonMutatingCommand({ type: "get_owned_session_cleanup" })).toBe(false);
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.heartbeats_changed).toEqual({
 			minProtocol: 7,
 			capability: "heartbeat_catalog",

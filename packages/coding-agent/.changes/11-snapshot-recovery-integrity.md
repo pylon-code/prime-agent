@@ -1,3 +1,4 @@
 - Fixed daemon snapshot catch-up and recovery so transfer mismatches no longer interrupt healthy workers and recovered sessions preserve their state and owner ([#11](https://github.com/pylon-code/prime-agent/issues/11)).
 - Fixed recovered child rosters and activity so parent sessions show current delegated work after restart ([#11](https://github.com/pylon-code/prime-agent/issues/11)).
 - Fixed concurrent session opens so one owner and recovery attempt is reused instead of starting competing workers ([#11](https://github.com/pylon-code/prime-agent/issues/11)).
+- Added capability-gated authoritative cleanup proof for client-owned daemon sessions, including crash-safe descriptor-last retries and privacy-safe polling from a replacement host ([#11](https://github.com/pylon-code/prime-agent/issues/11)).

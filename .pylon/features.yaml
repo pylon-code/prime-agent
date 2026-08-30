@@ -188,3 +188,18 @@ decisions:
     revisit_when:
       - Prime gives each transfer immutable bytes and a unique identity while preserving the event cursor as ordering metadata.
       - Prime retries an isolated bad snapshot generation without closing the resident worker control channel.
+
+  authoritative-owned-session-cleanup:
+    area: runtime-reliability
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/11
+      - https://github.com/pylon-code/pylon/issues/114
+      - https://github.com/rynfar/comet/issues/5
+    fork_change: negotiated-authoritative-owned-session-cleanup-v1
+    upstream_support: Prime v0.8.1 supports client-owned sessions and best-effort owner cleanup, but another host process cannot prove exact worker-generation and durable-descriptor absence after the owner connection disappears.
+    revisit_when:
+      - Prime upstream exposes an equivalent privacy-safe, capability-negotiated cleanup proof with durable descriptor-last retries.
+      - Comet and Pylon can remove the fork capability without weakening crash cleanup or stock-Prime fallback behavior.

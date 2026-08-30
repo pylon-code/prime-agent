@@ -77,8 +77,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 24 adds capability-gated correlated prompt lifecycle and event provenance.
 // Revision 25 negotiates immutable snapshot transfer identities with session workers.
 // Revision 26 correlates snapshot failures that occur before a begin frame can be emitted.
-export const DAEMON_SCHEMA_REVISION = 26;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-1ac2610350df";
+// Revision 27 adds a capability-gated authoritative owned-session cleanup query.
+export const DAEMON_SCHEMA_REVISION = 27;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-27-7c0c21a689b5";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -103,6 +104,10 @@ export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "u
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
 }
+export type DaemonOwnedSessionCleanupStatus = "active" | "stopping" | "settled";
+export interface DaemonOwnedSessionCleanupResult {
+	status: DaemonOwnedSessionCleanupStatus;
+}
 export type DaemonServerCapability =
 	| DaemonClientCapability
 	| "delete_rlm_subagent"
@@ -125,7 +130,8 @@ export type DaemonServerCapability =
 	| "rlm_quiescence_barrier"
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
-	| "acp_mcp_servers";
+	| "acp_mcp_servers"
+	| "authoritative_owned_session_cleanup_v1";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -172,6 +178,12 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
+];
+
+/** Supervisor-only offers. Private session workers must not advertise these commands. */
+export const DAEMON_SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
+	...DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	"authoritative_owned_session_cleanup_v1",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -430,6 +442,7 @@ export type DaemonCommand =
 			DaemonLaunchEnv)
 	| { id?: string; type: "detach"; activeSessionId?: string }
 	| { id?: string; type: "complete_owned_session"; activeSessionId: string }
+	| { id?: string; type: "get_owned_session_cleanup"; activeSessionId: string }
 	| { id?: string; type: "promote_owned_session"; activeSessionId: string }
 	| { id?: string; type: "kill"; activeSessionId: string }
 	| { id?: string; type: "rename"; activeSessionId: string; name: string }
@@ -723,6 +736,11 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 	minProtocol: 7,
 	capability: "client_owned_sessions",
 } as const;
+const AUTHORITATIVE_OWNED_SESSION_CLEANUP_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 27,
+	capability: "authoritative_owned_session_cleanup_v1",
+} as const;
 const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
@@ -766,6 +784,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	reattach: LEGACY_DAEMON_COMMAND,
 	detach: LEGACY_DAEMON_COMMAND,
 	complete_owned_session: CLIENT_OWNED_DAEMON_COMMAND,
+	get_owned_session_cleanup: AUTHORITATIVE_OWNED_SESSION_CLEANUP_COMMAND,
 	promote_owned_session: CLIENT_OWNED_DAEMON_COMMAND,
 	kill: LEGACY_DAEMON_COMMAND,
 	rename: LEGACY_DAEMON_COMMAND,
@@ -1218,6 +1237,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"list_agent_peers",
 	"attach",
 	"reattach",
+	"get_owned_session_cleanup",
 	"agent_messages_status",
 	"wait_for_idle",
 	"get_session_header",

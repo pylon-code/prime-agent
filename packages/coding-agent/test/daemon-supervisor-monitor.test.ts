@@ -1827,20 +1827,21 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 		const workers = new Map([[worker.descriptor.workerId, worker]]);
 		const recoverUncertainWorkerOperations = vi.fn(async () => {});
-		const deleteWorkerDescriptor = vi.fn();
+		const stopWorker = vi.fn(async () => {
+			workers.delete(worker.descriptor.workerId);
+		});
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
-			sessionInputPauses: new Map(),
 			processIdentity: vi.fn(() => "gone"),
 			recoverUncertainWorkerOperations,
-			deleteWorkerDescriptor,
+			stopWorker,
 		}) as {
 			reclaimStaleWorkerRegistration(target: typeof worker): Promise<boolean>;
 		};
 
 		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(true);
 		expect(recoverUncertainWorkerOperations).toHaveBeenCalledWith(worker, false);
-		expect(deleteWorkerDescriptor).toHaveBeenCalledWith(worker);
+		expect(stopWorker).toHaveBeenCalledWith(worker, true, true);
 		expect(workers.has(worker.descriptor.workerId)).toBe(false);
 	});
 
@@ -2325,6 +2326,196 @@ describe("daemon worker supervisor monitoring", () => {
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
 			startIdSpy.mockRestore();
+		}
+	});
+
+	it("reports exact privacy-safe owned cleanup states", () => {
+		const descriptorDir = mkdtempSync(join(tmpdir(), "prime-supervisor-owned-cleanup-status-"));
+		try {
+			const worker = {
+				descriptor: {
+					workerId: "owned-cleanup-worker",
+					rootActiveSessionId: "active-owned-cleanup",
+				},
+				intentionalStop: false,
+				stopFinalization: undefined,
+			};
+			const workers = new Map([[worker.descriptor.workerId, worker]]);
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				descriptorDir,
+				socketPath: "/tmp/owned-cleanup-status.sock",
+				workers,
+				workerStopCounts: new Map(),
+				log: vi.fn(),
+			}) as {
+				getOwnedSessionCleanup(activeSessionId: string): { status: "active" | "stopping" | "settled" };
+			};
+
+			expect(supervisor.getOwnedSessionCleanup(worker.descriptor.rootActiveSessionId)).toEqual({ status: "active" });
+			expect(supervisor.getOwnedSessionCleanup("owned-cleanup")).toEqual({ status: "settled" });
+			worker.intentionalStop = true;
+			expect(supervisor.getOwnedSessionCleanup(worker.descriptor.rootActiveSessionId)).toEqual({
+				status: "stopping",
+			});
+			workers.clear();
+			writeFileSync(join(descriptorDir, "uncertain.json"), "{not-json");
+			expect(supervisor.getOwnedSessionCleanup(worker.descriptor.rootActiveSessionId)).toEqual({
+				status: "stopping",
+			});
+			rmSync(join(descriptorDir, "uncertain.json"), { force: true });
+			const settled = supervisor.getOwnedSessionCleanup(worker.descriptor.rootActiveSessionId);
+			expect(settled).toEqual({ status: "settled" });
+			expect(Object.keys(settled)).toEqual(["status"]);
+		} finally {
+			rmSync(descriptorDir, { recursive: true, force: true });
+		}
+	});
+
+	it("retains a tombstoned registration when descriptor removal fails and settles only after retry", async () => {
+		const descriptorDir = mkdtempSync(join(tmpdir(), "prime-supervisor-owned-cleanup-unlink-"));
+		const worker = {
+			descriptor: {
+				workerId: "owned-cleanup-unlink-worker",
+				pid: 111_116,
+				processStartId: "proc:owned-cleanup",
+				rootActiveSessionId: "active-owned-cleanup-unlink",
+				stopRequestedAt: new Date().toISOString(),
+			},
+			client: undefined,
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: true,
+			stopRevision: 0,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const deleteWorkerDescriptor = vi.fn<() => void>().mockImplementationOnce(() => {
+			throw new Error("descriptor unlink failed");
+		});
+		const scheduleWorkerStopFinalization = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			descriptorDir,
+			socketPath: "/tmp/owned-cleanup-unlink.sock",
+			workers,
+			shuttingDown: false,
+			persistWorkerStopTombstone: vi.fn(),
+			deleteWorkerDescriptor,
+			scheduleWorkerStopFinalization,
+			invalidateWorkerSessionInputPauses: vi.fn(),
+			broadcastHeartbeatsChanged: vi.fn(),
+			log: vi.fn(),
+		}) as unknown as {
+			stopWorker(target: typeof worker, removeDescriptor: boolean, force?: boolean): Promise<void>;
+			getOwnedSessionCleanup(activeSessionId: string): { status: "active" | "stopping" | "settled" };
+		};
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
+		try {
+			await expect(supervisor.stopWorker(worker, true, true)).rejects.toThrow("descriptor unlink failed");
+			expect(workers.get(worker.descriptor.workerId)).toBe(worker);
+			expect(scheduleWorkerStopFinalization).toHaveBeenCalledOnce();
+			expect(supervisor.getOwnedSessionCleanup(worker.descriptor.rootActiveSessionId)).toEqual({
+				status: "stopping",
+			});
+
+			await supervisor.stopWorker(worker, true, true);
+			expect(workers.has(worker.descriptor.workerId)).toBe(false);
+			expect(deleteWorkerDescriptor).toHaveBeenCalledTimes(2);
+			expect(supervisor.getOwnedSessionCleanup(worker.descriptor.rootActiveSessionId)).toEqual({
+				status: "settled",
+			});
+		} finally {
+			existsSpy.mockRestore();
+			rmSync(descriptorDir, { recursive: true, force: true });
+		}
+	});
+
+	it("arms authoritative retry when the first stop tombstone write fails", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "owned-cleanup-tombstone-worker",
+				pid: 111_117,
+				processStartId: "proc:owned-cleanup-tombstone",
+				rootActiveSessionId: "active-owned-cleanup-tombstone",
+				stopRequestedAt: undefined as string | undefined,
+			},
+			client: undefined,
+			summaries: new Map(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const scheduleWorkerStopFinalization = vi.fn();
+		const persistWorkerStopTombstone = vi.fn(() => {
+			worker.intentionalStop = true;
+			worker.descriptor.stopRequestedAt = new Date().toISOString();
+			throw new Error("tombstone write failed");
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			shuttingDown: false,
+			persistWorkerStopTombstone,
+			scheduleWorkerStopFinalization,
+		}) as unknown as {
+			stopWorker(target: typeof worker, removeDescriptor: boolean): Promise<void>;
+		};
+
+		await expect(supervisor.stopWorker(worker, true)).rejects.toThrow("tombstone write failed");
+		expect(workers.get(worker.descriptor.workerId)).toBe(worker);
+		expect(worker.descriptor.stopRequestedAt).toBeDefined();
+		expect(scheduleWorkerStopFinalization).toHaveBeenCalledOnce();
+	});
+
+	it("retries durable stop intent before finalizing a dead owned worker", async () => {
+		vi.useFakeTimers();
+		const worker = {
+			descriptor: {
+				workerId: "owned-cleanup-durable-retry-worker",
+				pid: 111_118,
+				processStartId: "proc:owned-cleanup-durable-retry",
+				rootActiveSessionId: "active-owned-cleanup-durable-retry",
+				stopRequestedAt: new Date().toISOString(),
+			},
+			intentionalStop: true,
+			stopRevision: 0,
+			stopFinalization: undefined as Promise<void> | undefined,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const persistWorker = vi.fn<() => void>().mockImplementationOnce(() => {
+			throw new Error("durable tombstone unavailable");
+		});
+		const stopWorker = vi.fn(async () => {
+			workers.delete(worker.descriptor.workerId);
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			shuttingDown: false,
+			persistWorker,
+			stopWorker,
+			log: vi.fn(),
+			reportCleanupFailure: vi.fn(),
+		}) as {
+			scheduleWorkerStopFinalization(target: typeof worker): void;
+		};
+		const childProcessModule = await import("../src/utils/child-process.js");
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
+		try {
+			supervisor.scheduleWorkerStopFinalization(worker);
+			expect(stopWorker).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(20_000);
+			await worker.stopFinalization;
+
+			expect(persistWorker).toHaveBeenCalledTimes(2);
+			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false);
+			expect(persistWorker.mock.invocationCallOrder.at(-1)).toBeLessThan(stopWorker.mock.invocationCallOrder[0]!);
+		} finally {
+			existsSpy.mockRestore();
 		}
 	});
 
@@ -2816,6 +3007,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
 			stopWorker,
+			persistWorkerStopTombstone: vi.fn(),
 			log: vi.fn(),
 			reportCleanupFailure: vi.fn(),
 		}) as {
@@ -2852,6 +3044,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
 			stopWorker,
+			persistWorkerStopTombstone: vi.fn(),
 			log: vi.fn(),
 			reportCleanupFailure: vi.fn(),
 		}) as {
@@ -2897,6 +3090,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers,
 			stopWorker,
+			persistWorkerStopTombstone: vi.fn(),
 			log: vi.fn(),
 			reportCleanupFailure: vi.fn(),
 		}) as {

@@ -326,6 +326,8 @@ export {
 	type DaemonEventSequence,
 	type DaemonModeOptions,
 	type DaemonOutbound,
+	type DaemonOwnedSessionCleanupResult,
+	type DaemonOwnedSessionCleanupStatus,
 	type DaemonProtocolInfo,
 	type DaemonProtocolName,
 	type DaemonProtocolVersion,

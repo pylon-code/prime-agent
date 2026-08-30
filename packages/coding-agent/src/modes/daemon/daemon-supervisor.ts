@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -71,16 +71,17 @@ import {
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
-	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
+	DAEMON_SUPERVISOR_SERVER_CAPABILITIES,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonOutbound,
+	type DaemonOwnedSessionCleanupResult,
 	type DaemonResponse,
 	type DaemonUpdateRestartManifest,
 	daemonOutboundForCorrelatedPromptCapability,
@@ -203,6 +204,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"reattach",
 	"detach",
 	"complete_owned_session",
+	"get_owned_session_cleanup",
 	"promote_owned_session",
 	"kill",
 	"rename",
@@ -1082,8 +1084,14 @@ export class DaemonSupervisor {
 					intentionalStop: durableDescriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
 				};
-				this.persistWorker(worker);
 				this.workers.set(durableDescriptor.workerId, worker);
+				try {
+					this.persistWorker(worker);
+				} catch (error) {
+					// Keep a valid durable registration in memory even when its
+					// recovery-state rewrite fails. Cleanup queries must fail closed.
+					this.log(`Could not refresh worker descriptor ${path}: ${String(error)}`);
+				}
 			} catch (error) {
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
 			}
@@ -1138,16 +1146,71 @@ export class DaemonSupervisor {
 		renameSync(tempPath, worker.descriptorPath);
 	}
 
+	private removeWorkerCleanupFile(path: string): void {
+		rmSync(path, { force: true });
+		try {
+			lstatSync(path);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		throw new Error("Worker cleanup file still exists after removal");
+	}
+
 	private deleteWorkerDescriptor(worker: ResidentWorker): void {
 		try {
-			rmSync(worker.descriptorPath, { force: true });
-			rmSync(worker.descriptor.recoveryJournalPath, { force: true });
+			// Ancillary journals are removed first. The descriptor is the durable
+			// registration and must remain present until every other cleanup step
+			// has succeeded and been verified.
+			this.removeWorkerCleanupFile(worker.descriptor.recoveryJournalPath);
 			if (worker.descriptor.orphanProcessJournalPath) {
-				rmSync(worker.descriptor.orphanProcessJournalPath, { force: true });
+				this.removeWorkerCleanupFile(worker.descriptor.orphanProcessJournalPath);
 			}
+			this.removeWorkerCleanupFile(worker.descriptorPath);
 		} catch (error) {
 			this.log(`Failed to remove worker descriptor ${worker.descriptorPath}: ${String(error)}`);
+			throw new Error("Worker cleanup could not verify durable registration removal");
 		}
+	}
+
+	private hasDurableOwnedSessionRegistration(activeSessionId: string): boolean {
+		try {
+			for (const name of readdirSync(this.descriptorDir)) {
+				if (name === SUPERVISOR_CONFIG_FILE_NAME || !name.endsWith(".json")) continue;
+				const path = join(this.descriptorDir, name);
+				let descriptor: unknown;
+				try {
+					descriptor = JSON.parse(readFileSync(path, "utf8"));
+				} catch (error) {
+					this.log(`Could not inspect worker descriptor ${path}: ${String(error)}`);
+					return true;
+				}
+				if (!isDaemonWorkerDescriptor(descriptor, this.socketPath)) {
+					this.log(`Could not validate worker descriptor ${path} while checking cleanup`);
+					return true;
+				}
+				if (descriptor.rootActiveSessionId === activeSessionId) return true;
+			}
+			return false;
+		} catch (error) {
+			this.log(`Could not inspect durable worker registrations: ${String(error)}`);
+			return true;
+		}
+	}
+
+	private getOwnedSessionCleanup(activeSessionId: string): DaemonOwnedSessionCleanupResult {
+		const worker = [...this.workers.values()].find(
+			(candidate) => candidate.descriptor.rootActiveSessionId === activeSessionId,
+		);
+		if (worker) {
+			const stopping =
+				worker.descriptor.stopRequestedAt !== undefined ||
+				worker.intentionalStop ||
+				(worker.stopFinalization !== undefined && worker.stopFinalization !== null) ||
+				(this.workerStopCounts?.get(worker) ?? 0) > 0;
+			return { status: stopping ? "stopping" : "active" };
+		}
+		return { status: this.hasDurableOwnedSessionRegistration(activeSessionId) ? "stopping" : "settled" };
 	}
 
 	private handleConnection(socket: Socket): void {
@@ -1184,7 +1247,7 @@ export class DaemonSupervisor {
 						supervisorProcessStartId: this.ownership?.record.processStartId,
 						supervisorSocketPath: this.ownership?.record.socketPath,
 						clientId: client.id,
-						serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+						serverCapabilities: DAEMON_SUPERVISOR_SERVER_CAPABILITIES,
 					});
 				}
 			},
@@ -2035,6 +2098,8 @@ export class DaemonSupervisor {
 				await this.releaseClientSessionInputPauses(client, command.activeSessionId, true);
 				return success(command.id, "detach");
 			}
+			case "get_owned_session_cleanup":
+				return success(command.id, command.type, this.getOwnedSessionCleanup(command.activeSessionId));
 			case "complete_owned_session": {
 				const match = await this.findWorkerForClient(client, command.activeSessionId);
 				if (match.worker.descriptor.ownerClientId !== this.protocolClientId(client)) {
@@ -2433,7 +2498,12 @@ export class DaemonSupervisor {
 				}
 				return await forward();
 			}
-			this.persistWorkerStopTombstone(match.worker, true);
+			try {
+				this.persistWorkerStopTombstone(match.worker, true);
+			} catch (error) {
+				this.scheduleWorkerStopFinalization(match.worker);
+				throw error;
+			}
 			const releaseStopOwnership = this.acquireWorkerStopOwnership(match.worker);
 			let response: DaemonResponse;
 			try {
@@ -2692,11 +2762,8 @@ export class DaemonSupervisor {
 			if (identity !== "gone" && identity !== "replaced") {
 				return false;
 			}
-			worker.intentionalStop = true;
 			await this.recoverUncertainWorkerOperations(worker, false);
-			this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
-			this.workers.delete(worker.descriptor.workerId);
-			this.deleteWorkerDescriptor(worker);
+			await this.stopWorker(worker, true, true);
 			return true;
 		}
 		// Fail fast before waiting on anything: only a confirmed-dead process is
@@ -3091,7 +3158,12 @@ export class DaemonSupervisor {
 			} catch (error) {
 				worker.descriptor.lifecycle = "failed";
 				worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
-				this.persistWorker(worker);
+				try {
+					this.persistWorker(worker);
+				} catch (persistError) {
+					this.reportCleanupFailure(`worker adoption tombstone ${worker.descriptor.workerId}`, persistError);
+				}
+				this.scheduleWorkerStopFinalization(worker);
 				this.log(`Could not complete intentional stop for worker ${worker.descriptor.workerId}: ${String(error)}`);
 			}
 			return;
@@ -5655,14 +5727,16 @@ export class DaemonSupervisor {
 			activeSessionId === worker.descriptor.rootActiveSessionId &&
 			!this.shuttingDown
 		) {
-			worker.intentionalStop = true;
 			// An exact stop owns its registration and descriptor cleanup until its
-			// tuple assertions complete. A synchronous root shutdown event can arrive
-			// before its request resolves, so leave both intact while it is active.
+			// tuple assertions complete. Without one, retain a durable tombstone and
+			// let the exact-generation finalizer prove process and descriptor absence.
 			if ((this.workerStopCounts?.get(worker) ?? 0) === 0) {
-				this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
-				this.workers.delete(worker.descriptor.workerId);
-				this.deleteWorkerDescriptor(worker);
+				try {
+					this.persistWorkerStopTombstone(worker);
+				} catch (error) {
+					this.reportCleanupFailure(`worker shutdown tombstone ${worker.descriptor.workerId}`, error);
+				}
+				this.scheduleWorkerStopFinalization(worker);
 			}
 		}
 	}
@@ -6108,6 +6182,16 @@ export class DaemonSupervisor {
 		const releaseStopOwnership = this.acquireWorkerStopOwnership(worker);
 		try {
 			await this.stopWorkerUntracked(worker, removeDescriptor, force, archiveSession, recoveryCleanup, directChild);
+		} catch (error) {
+			if (
+				removeDescriptor &&
+				!directChild &&
+				this.workers.get(worker.descriptor.workerId) === worker &&
+				worker.descriptor.stopRequestedAt !== undefined
+			) {
+				this.scheduleWorkerStopFinalization(worker);
+			}
+			throw error;
 		} finally {
 			releaseStopOwnership();
 		}
@@ -6141,7 +6225,9 @@ export class DaemonSupervisor {
 				return;
 			}
 			if (
+				this.workers.get(worker.descriptor.workerId) !== worker ||
 				worker.descriptor.pid !== entryPid ||
+				worker.descriptor.processStartId !== entryStartId ||
 				(removeDescriptor && worker.descriptor.stopRequestedAt === undefined)
 			) {
 				throw new Error(`Session worker ${worker.descriptor.workerId} was relaunched during stop`);
@@ -6258,10 +6344,10 @@ export class DaemonSupervisor {
 			assertStopStillApplies();
 		}
 		this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
-		this.workers.delete(worker.descriptor.workerId);
 		if (removeDescriptor) {
 			this.deleteWorkerDescriptor(worker);
 		}
+		this.workers.delete(worker.descriptor.workerId);
 		if (!this.shuttingDown) {
 			this.broadcastHeartbeatsChanged();
 		}
@@ -6287,12 +6373,23 @@ export class DaemonSupervisor {
 		// pid. The finalizer must never follow either successor.
 		const pid = worker.descriptor.pid;
 		const processStartId = worker.descriptor.processStartId;
-		const stopRevision = worker.stopRevision;
 		const isStopGenerationCurrent = () =>
 			this.workers.get(worker.descriptor.workerId) === worker &&
-			worker.stopRevision === stopRevision &&
 			worker.descriptor.stopRequestedAt !== undefined &&
-			worker.descriptor.pid === pid;
+			worker.descriptor.pid === pid &&
+			worker.descriptor.processStartId === processStartId;
+		// Do not signal or remove anything until stop intent is durable. A failed
+		// first tombstone write is retried here without losing the registration.
+		while (!this.shuttingDown && isStopGenerationCurrent()) {
+			try {
+				this.persistWorkerStopTombstone(worker, worker.descriptor.archiveOnStop === true);
+				break;
+			} catch (error) {
+				this.reportCleanupFailure(`worker stop tombstone ${worker.descriptor.workerId}`, error);
+				await unrefDelay(STOP_FINALIZATION_RETRY_MS);
+			}
+		}
+		if (this.shuttingDown || !isStopGenerationCurrent()) return;
 		// A replaced pid counts as gone (never SIGKILL a recycled pid); an
 		// unobservable identity counts as alive (never clean up a possibly-live
 		// worker). kill(0) probes every poll; ps-backed checks are throttled.
@@ -6339,7 +6436,7 @@ export class DaemonSupervisor {
 				// unobservable identity skips this attempt but keeps escalation
 				// armed so a wedged worker is still killed on a later pass.
 				const observedNow = processStartId === undefined ? undefined : getProcessStartId(pid);
-				if (processStartId === undefined || observedNow === processStartId) {
+				if (processStartId !== undefined && observedNow === processStartId) {
 					signalProcessGroupOrProcess(pid, "SIGKILL");
 					killed = true;
 				}
@@ -6353,7 +6450,8 @@ export class DaemonSupervisor {
 		const isCleanupStillWanted = () =>
 			this.workers.get(worker.descriptor.workerId) === worker &&
 			worker.descriptor.stopRequestedAt !== undefined &&
-			worker.descriptor.pid === pid;
+			worker.descriptor.pid === pid &&
+			worker.descriptor.processStartId === processStartId;
 		while (!this.shuttingDown && isCleanupStillWanted()) {
 			try {
 				await this.stopWorker(worker, true, true, worker.descriptor.archiveOnStop === true);
