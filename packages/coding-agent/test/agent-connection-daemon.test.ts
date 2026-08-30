@@ -1723,8 +1723,16 @@ describe("DaemonAgentConnection", () => {
 			lastEventSequence: staleSnapshot.lastEventSequence,
 			lastEventCursor: staleSnapshot.lastEventCursor,
 		});
+		fakeClient.emitMessage({
+			type: "session_snapshot_failed",
+			activeSessionId: "active-a",
+			snapshotId: "stale-failed-before-begin",
+			purpose: "replacement",
+			error: "private retired A failure",
+		});
 		await Promise.resolve();
 		expect(events.filter((event) => event.type === "session_replaced")).toEqual([]);
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1);
 		releaseReattach();
 		await expect(switching).resolves.toEqual({ cancelled: false });
 		const fence = connection as unknown as { pendingChunkedReplacement?: unknown };
@@ -4836,6 +4844,45 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.closeCount).toBe(0);
 		await failed.dispose();
 		await sibling.dispose();
+	});
+
+	it("binds a failure-before-begin frame to the exact current attach attempt", async () => {
+		const fakeClient = new FakeDaemonClient();
+		let releaseAttach!: () => void;
+		fakeClient.attachGate = new Promise<void>((resolve) => {
+			releaseAttach = resolve;
+		});
+		let attachResultCount = 0;
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			if (attachResultCount++ > 0) return result;
+			return {
+				...result,
+				snapshot: { ...result.snapshot, messages: [] },
+				snapshotStream: { id: "failed-before-begin", messageCount: 0, targetChunkBytes: 512 * 1024 },
+			};
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		const attaching = connection.attach();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(1),
+		);
+		fakeClient.emitMessage({
+			type: "session_snapshot_failed",
+			activeSessionId: "active-1",
+			snapshotId: "failed-before-begin",
+			purpose: "attach",
+			error: "snapshot failed before begin",
+		});
+		releaseAttach();
+		await attaching;
+
+		expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2);
+		expect(
+			(connection as unknown as { snapshotRequestAttempts: Map<number, unknown> }).snapshotRequestAttempts.size,
+		).toBe(0);
+		expect((connection as unknown as { runtimeSnapshotAttempt?: unknown }).runtimeSnapshotAttempt).toBeUndefined();
 	});
 
 	it("assembles chunked attach snapshots even when chunks arrive before the attach response continuation", async () => {

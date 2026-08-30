@@ -2453,13 +2453,23 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		if (message.type === "session_snapshot_failed") {
 			const existingAssembly = this.snapshotAssemblies.get(message.snapshotId);
+			const requestAttempt = this.latestSnapshotRequestAttempt(message.activeSessionId);
+			const activeRequestAttempt =
+				requestAttempt?.state === "requesting" || requestAttempt?.state === "receiving"
+					? requestAttempt
+					: undefined;
+			if (this.discardUnsolicitedRuntimeSnapshots && !existingAssembly && !activeRequestAttempt) {
+				this.ignoreSnapshotId(message.snapshotId);
+				return;
+			}
 			const explicitPurpose = message.purpose;
 			const assembly =
 				existingAssembly ??
-				(this.pendingChunkedReplacement || explicitPurpose
-					? this.getSnapshotAssembly(message.snapshotId)
+				(this.pendingChunkedReplacement || explicitPurpose || activeRequestAttempt
+					? this.getSnapshotAssembly(message.snapshotId, activeRequestAttempt)
 					: undefined);
 			if (!assembly || assembly.settled || assembly.attachmentEpoch !== this.attachmentEpoch) return;
+			if (activeRequestAttempt) activeRequestAttempt.candidateSnapshotIds.add(message.snapshotId);
 			const purpose =
 				explicitPurpose ?? assembly.begin?.purpose ?? (this.pendingChunkedReplacement ? "replacement" : "attach");
 			const recovery = this.transitionSnapshotFailure(
