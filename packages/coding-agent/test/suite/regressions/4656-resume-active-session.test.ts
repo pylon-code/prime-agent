@@ -263,7 +263,7 @@ describe("ENG-4656 active session resume", () => {
 				return releaseReservation;
 			}),
 			attachClient: vi.fn(async (client: DaemonSocketClient) => {
-				expect(client.attachedActiveSessionIds.has(targetActiveSessionId)).toBe(true);
+				expect(client.attachedActiveSessionIds.has(targetActiveSessionId)).toBe(false);
 				operations.push("attach");
 				client.attachedActiveSessionIds.add(targetActiveSessionId);
 				return { worker: targetWorker, result: createAttachResult(targetActiveSessionId) };

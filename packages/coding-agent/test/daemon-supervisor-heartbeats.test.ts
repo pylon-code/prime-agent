@@ -98,6 +98,7 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		const supervisor = createSupervisorHarness();
 		const target = {
 			...worker("ready"),
+			descriptor: { workerId: "target", lifecycle: "ready" },
 			heartbeatSnapshot: [{ job: { id: "heartbeat-1" } }],
 			heartbeatSnapshotStale: false,
 		};
