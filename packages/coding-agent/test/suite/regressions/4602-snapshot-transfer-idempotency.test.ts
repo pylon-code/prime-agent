@@ -197,7 +197,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			clients: new Set<DaemonSocketClient>(),
 			eventGeneration: "generation-4602",
 			lastEventSequence: 1,
-			runtime: { metadata: { kind: "top-level", createdAt: 1 } },
+			runtime: { metadata: { kind: "top-level", createdAt: 1 }, session: { sessionId: "session-4602" } },
 		} as unknown as ActiveSessionState;
 		const socket = new PassThrough();
 		const client = {
@@ -258,7 +258,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			pendingAttaches: 0,
 			eventGeneration: "generation-4602",
 			lastEventSequence: 1,
-			runtime: { metadata: { kind: "top-level", createdAt: 1 } },
+			runtime: { metadata: { kind: "top-level", createdAt: 1 }, session: { sessionId: "session-4602" } },
 		} as unknown as ActiveSessionState;
 		const socket = new PassThrough();
 		const client = {

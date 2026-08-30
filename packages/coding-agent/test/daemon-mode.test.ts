@@ -3229,6 +3229,8 @@ describe("daemon mode helpers", () => {
 			createRuntime: vi.fn(),
 		});
 		const state = makeState("active");
+		state.eventGeneration = "attach-generation";
+		(state.runtime as unknown as { session: { sessionId: string } }).session = { sessionId: "session-active" };
 		const client = makeClient("client-1", state.activeSessionId);
 		client.attachedActiveSessionIds.clear();
 		let releaseSnapshot!: () => void;
@@ -3237,7 +3239,13 @@ describe("daemon mode helpers", () => {
 		});
 		const result = {
 			activeSessionId: state.activeSessionId,
-			snapshot: { summary: {}, state: {}, messages: [] },
+			snapshot: {
+				summary: {},
+				state: { sessionId: "session-active" },
+				messages: [],
+				lastEventSequence: 0,
+				lastEventCursor: { generation: state.eventGeneration, sequence: 0 },
+			},
 			lastEventSequence: 0,
 		} as unknown as DaemonAttachResult;
 		const internals = daemon as unknown as {
@@ -3346,11 +3354,18 @@ describe("daemon mode helpers", () => {
 			});
 			const state = makeState("active");
 			state.eventGeneration = "generation-1";
+			(state.runtime as unknown as { session: { sessionId: string } }).session = { sessionId: "session-active" };
 			const client = makeClient("client-1", state.activeSessionId);
 			client.transport = "private-framed";
 			const result = {
 				activeSessionId: state.activeSessionId,
-				snapshot: { summary: {}, state: {}, messages: [] },
+				snapshot: {
+					summary: {},
+					state: { sessionId: "session-active" },
+					messages: [],
+					lastEventSequence: 0,
+					lastEventCursor: { generation: state.eventGeneration, sequence: 0 },
+				},
 				lastEventSequence: 0,
 			} as unknown as DaemonAttachResult;
 			const streamWorkerSnapshot = vi.fn(async () => undefined);
@@ -4544,6 +4559,50 @@ describe("daemon mode helpers", () => {
 			expect(snapshot.children).toEqual([expect.objectContaining({ id: "finished-child" })]);
 			expect(snapshot.lastEventSequence).toBe(1);
 			expect(snapshot.lastEventCursor).toMatchObject({ generation: state.eventGeneration, sequence: 1 });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("retries attach admission when the event cursor advances after snapshot creation", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-attach-admission-cursor-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createAttachResult(
+					client: DaemonSocketClient,
+					state: ActiveSessionState,
+					command: Extract<DaemonCommand, { type: "attach" }>,
+				): Promise<DaemonAttachResult>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const state = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const client = makeClient("attach-cursor-client", state.activeSessionId);
+			client.attachedActiveSessionIds.clear();
+			const createAttachResult = internals.createAttachResult.bind(internals);
+			let calls = 0;
+			internals.createAttachResult = vi.fn(async (attachClient, attachState, attachCommand) => {
+				expect(state.clients.has(client)).toBe(false);
+				const candidate = await createAttachResult(attachClient, attachState, attachCommand);
+				calls++;
+				if (calls === 1) state.lastEventSequence++;
+				return candidate;
+			});
+
+			const response = (await internals.handleCommand(client, {
+				type: "attach",
+				activeSessionId: state.activeSessionId,
+				capabilities: ["attach_snapshot", "event_sequence", "slim_attach"],
+			})) as { success: true; data: DaemonAttachResult };
+
+			expect(internals.createAttachResult).toHaveBeenCalledTimes(2);
+			expect(state.clients.has(client)).toBe(true);
+			expect(client.attachedActiveSessionIds).toContain(state.activeSessionId);
+			expect(response.data.snapshot.lastEventSequence).toBe(1);
+			expect(response.data.lastEventSequence).toBe(response.data.snapshot.lastEventSequence);
+			expect(response.data.lastEventCursor).toEqual(response.data.snapshot.lastEventCursor);
+			expect(response.data.replay.toCursor).toEqual(response.data.snapshot.lastEventCursor);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -5773,7 +5832,18 @@ describe("daemon mode helpers", () => {
 			).releaseRlmChildSession = vi.fn(() => true);
 			internals.createAttachResult = vi.fn(async () => {
 				await snapshotGate;
-				return { activeSessionId: childState.activeSessionId, snapshot: {}, lastEventSequence: 0 };
+				return {
+					activeSessionId: childState.activeSessionId,
+					snapshot: {
+						state: { sessionId: childState.runtime.session.sessionId },
+						lastEventSequence: childState.lastEventSequence,
+						lastEventCursor: {
+							generation: childState.eventGeneration,
+							sequence: childState.lastEventSequence,
+						},
+					},
+					lastEventSequence: childState.lastEventSequence,
+				};
 			});
 
 			const attach = internals.handleCommand(client, {

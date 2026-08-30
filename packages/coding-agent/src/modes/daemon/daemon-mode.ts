@@ -3881,16 +3881,39 @@ export class AgentDaemon {
 					? markClientSnapshotStreaming(client, state.activeSessionId)
 					: undefined;
 				const snapshotAttemptSignal = snapshotSignal ? createSnapshotAttemptSignal(snapshotSignal) : undefined;
-				let result: DaemonAttachResult;
+				let result: DaemonAttachResult | undefined;
 				state.pendingAttaches++;
 				try {
-					result = await this.createAttachResult(client, state, command);
-					if (
-						this.sessions.get(state.activeSessionId) !== state ||
-						this.closingSessions.has(state.activeSessionId)
-					) {
-						throw new BoundSessionUnavailableError(
-							`Active session ${state.activeSessionId} closed during attach`,
+					for (let attempt = 0; attempt <= MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES; attempt++) {
+						const selectedSession = state.runtime.session;
+						const candidate = await this.createAttachResult(client, state, command);
+						if (
+							this.sessions.get(state.activeSessionId) === state &&
+							!this.closingSessions.has(state.activeSessionId) &&
+							state.runtime.session === selectedSession &&
+							state.runtime.session.sessionId === candidate.snapshot.state.sessionId &&
+							state.eventGeneration === candidate.snapshot.lastEventCursor?.generation &&
+							state.lastEventSequence === candidate.snapshot.lastEventSequence
+						) {
+							result = candidate;
+							// This is the attach admission cut. There must be no await between
+							// validating the snapshot cursor and registering the client.
+							state.clients.add(client);
+							client.attachedActiveSessionIds.add(state.activeSessionId);
+							break;
+						}
+					}
+					if (!result) {
+						if (
+							this.sessions.get(state.activeSessionId) !== state ||
+							this.closingSessions.has(state.activeSessionId)
+						) {
+							throw new BoundSessionUnavailableError(
+								`Active session ${state.activeSessionId} closed during attach`,
+							);
+						}
+						throw new Error(
+							`Session ${state.activeSessionId} changed while its attach snapshot was being prepared`,
 						);
 					}
 				} catch (error) {
@@ -3902,8 +3925,6 @@ export class AgentDaemon {
 				} finally {
 					state.pendingAttaches--;
 				}
-				state.clients.add(client);
-				client.attachedActiveSessionIds.add(state.activeSessionId);
 				if (deferClientEnv && clientEnv) {
 					this.updateRestart?.deferredClientEnv.push({
 						client,
@@ -5114,6 +5135,10 @@ export class AgentDaemon {
 	): Promise<DaemonAttachResult> {
 		const capabilities = daemonClientCapabilitiesForSession(client, state.activeSessionId);
 		const snapshot = await this.createSessionSnapshot(state, capabilities.has("correlated_prompt_lifecycle_v1"));
+		const snapshotCursor = snapshot.lastEventCursor ?? {
+			generation: state.eventGeneration,
+			sequence: snapshot.lastEventSequence,
+		};
 		const replay =
 			command.resumeCursor?.activeSessionId && command.resumeCursor.activeSessionId !== state.activeSessionId
 				? {
@@ -5122,14 +5147,11 @@ export class AgentDaemon {
 							"sequence" in command.resumeCursor
 								? command.resumeCursor.sequence
 								: command.resumeCursor.eventSequence,
-						toSequence: state.lastEventSequence,
-						toCursor: {
-							generation: state.eventGeneration,
-							sequence: state.lastEventSequence,
-						},
+						toSequence: snapshot.lastEventSequence,
+						toCursor: snapshotCursor,
 						reason: "resume_cursor_session_mismatch",
 					}
-				: createDaemonReplayInfo(command.resumeCursor, state.lastEventSequence, state.eventGeneration);
+				: createDaemonReplayInfo(command.resumeCursor, snapshot.lastEventSequence, snapshotCursor.generation);
 		// Slim clients read summary/messages from the snapshot; duplicating them at
 		// the top level would serialize the full history twice more per attach.
 		const slim = capabilities.has("slim_attach");
@@ -5139,11 +5161,8 @@ export class AgentDaemon {
 			...(slim ? {} : { state: snapshot.summary, messages: snapshot.messages }),
 			snapshot,
 			replay,
-			lastEventSequence: state.lastEventSequence,
-			lastEventCursor: {
-				generation: state.eventGeneration,
-				sequence: state.lastEventSequence,
-			},
+			lastEventSequence: snapshot.lastEventSequence,
+			lastEventCursor: snapshotCursor,
 			client: {
 				id: client.id,
 				capabilities: [...capabilities],
@@ -5536,19 +5555,32 @@ export class AgentDaemon {
 		void tail.finally(() => {
 			if (client.privateFrameWriteTail === tail) client.privateFrameWriteTail = undefined;
 		});
+		let committed = false;
+		let completed = false;
 		try {
 			if (previous) await waitForSnapshotAttempt(previous, signal ?? AbortSignal.timeout(30_000), "private-frame");
 			for (const part of parts) {
 				for (let offset = 0; offset < part.length; offset += WORKER_PRIVATE_FRAME_WRITE_BYTES) {
 					if (signal?.aborted || client.socket.destroyed) return false;
 					const slice = part.subarray(offset, offset + WORKER_PRIVATE_FRAME_WRITE_BYTES);
+					if (slice.length === 0) continue;
+					// socket.write(false) still accepts the bytes. Once the length prefix
+					// is committed, an interrupted write must close the channel rather
+					// than let a later frame fill the announced payload.
+					committed = true;
 					if (client.socket.write(slice)) continue;
 					client.backpressured = true;
 					if (!(await this.waitForWorkerSnapshotDrain(client, signal, drainTimeoutMs))) return false;
 				}
 			}
+			completed = true;
 			return true;
 		} finally {
+			if (committed && !completed && !client.socket.destroyed) {
+				client.socket.destroy(
+					new Error("Private frame write was interrupted after its length prefix was committed"),
+				);
+			}
 			releaseCurrent();
 		}
 	}

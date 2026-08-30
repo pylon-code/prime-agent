@@ -550,6 +550,69 @@ describe("ENG-4601 worker snapshot cache", () => {
 		socket.destroy();
 	});
 
+	it("closes a private channel when an active frame aborts after committing its length", async () => {
+		const root = tempDirectory();
+		const daemon = new AgentDaemon(join(root, "worker.sock"), {
+			defaultSessionConfig: { agentDir: root, cwd: root },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { client, socket } = socketClient("worker-private-frame-active-abort");
+		socket.on("error", () => {});
+		const written: Buffer[] = [];
+		let writes = 0;
+		vi.spyOn(socket, "write").mockImplementation(((chunk: Uint8Array) => {
+			written.push(Buffer.from(chunk));
+			writes++;
+			return writes !== 3;
+		}) as typeof socket.write);
+		const parts = encodePrivateFrameParts<DaemonWorkerFrameHeader>(
+			{
+				kind: "outbound",
+				outboundType: "session_snapshot_chunk",
+				activeSessionId,
+				snapshotId: "active-abort-frame",
+				payloadEncoding: "jsonl",
+			},
+			[Buffer.alloc(128 * 1024, 0x61)],
+		);
+		const internals = daemon as unknown as {
+			writePrivateFrameParts(
+				client: DaemonSocketClient,
+				parts: readonly Buffer[],
+				signal?: AbortSignal,
+			): Promise<boolean>;
+			write(client: DaemonSocketClient, message: DaemonOutbound): boolean;
+		};
+		const controller = new AbortController();
+
+		const activeWrite = internals.writePrivateFrameParts(client, parts, controller.signal);
+		for (let attempt = 0; attempt < 10 && socket.listenerCount("drain") === 0; attempt++) {
+			await Promise.resolve();
+		}
+		expect(writes).toBe(3);
+		expect(socket.listenerCount("drain")).toBe(1);
+		controller.abort();
+
+		await expect(activeWrite).resolves.toBe(false);
+		await client.privateFrameWriteTail;
+		await Promise.resolve();
+		const writesAfterAbort = written.length;
+		expect(socket.destroyed).toBe(true);
+		expect(
+			internals.write(client, {
+				type: "session_closed",
+				activeSessionId,
+				reason: "killed",
+			}),
+		).toBe(false);
+		expect(written).toHaveLength(writesAfterAbort);
+		expect(client.privateFrameWriteTail).toBeUndefined();
+		expect(socket.listenerCount("drain")).toBe(0);
+		expect(socket.listenerCount("close")).toBe(0);
+	});
+
 	it("closes a permanently backpressured worker channel after an aborted snapshot", async () => {
 		vi.useFakeTimers();
 		try {

@@ -314,8 +314,10 @@ interface ResidentWorker {
 	snapshotGenerations: Map<string, Map<string, SnapshotTranscriptGeneration>>;
 	snapshotLoads: Map<string, Promise<DaemonAttachResult>>;
 	snapshotLoadSnapshotIds: Map<string, string | undefined>;
-	/** Active-session IDs this authenticated resident worker may emit. */
+	/** Active-session IDs the current authenticated worker channel may emit. */
 	authorizedActiveSessionIds: Set<string>;
+	/** Invalidates stale roster refreshes and provisional child grants across channel changes. */
+	authorityRevision?: number;
 	recovery?: Promise<void>;
 	deferredRecovery?: Promise<void>;
 	intentionalStop: boolean;
@@ -3012,10 +3014,12 @@ export class DaemonSupervisor {
 					1000,
 				);
 				await this.assertRecoveryAllowed();
-				client.onFrame((frame) => this.handleWorkerFrame(worker, frame));
+				client.onFrame((frame) => this.handleWorkerFrame(worker, frame, client));
 				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
 				worker.client?.close();
 				worker.client = client;
+				worker.authorityRevision = (worker.authorityRevision ?? 0) + 1;
+				worker.authorizedActiveSessionIds = new Set([worker.descriptor.rootActiveSessionId]);
 				return client;
 			} catch (error) {
 				lastError = error;
@@ -3123,6 +3127,8 @@ export class DaemonSupervisor {
 		}
 		this.abortTranscriptPreparations(worker, error);
 		worker.client = undefined;
+		worker.authorityRevision = (worker.authorityRevision ?? 0) + 1;
+		worker.authorizedActiveSessionIds = new Set([worker.descriptor.rootActiveSessionId]);
 		this.invalidateWorkerSessionInputPauses(worker, "Session worker disconnected while input was paused");
 		const interrupted = new Map<string, Set<string>>();
 		for (const [activeSessionId, generations] of worker.snapshotGenerations ?? []) {
@@ -3832,15 +3838,20 @@ export class DaemonSupervisor {
 		return worker.authorizedActiveSessionIds;
 	}
 
-	private workerOwnsActiveSessionId(worker: ResidentWorker, activeSessionId: string): boolean {
+	private workerOwnsActiveSessionId(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		sourceClient?: DaemonWorkerClient,
+	): boolean {
 		// Prototype-only unit harnesses omit both identity fields. Every production
 		// worker has a descriptor and remains registered while its channel is valid.
 		if (!worker.descriptor) return !this.workers;
 		if (this.workers && this.workers.get(worker.descriptor.workerId) !== worker) return false;
+		if (sourceClient && worker.client !== sourceClient) return false;
 		return this.workerAuthorizedActiveSessionIds(worker).has(activeSessionId);
 	}
 
-	private bindWorkerActiveSessionIds(worker: ResidentWorker, activeSessionIds: Iterable<string>): void {
+	private validateWorkerActiveSessionIds(worker: ResidentWorker, activeSessionIds: Iterable<string>): Set<string> {
 		const candidates = new Set(activeSessionIds);
 		for (const activeSessionId of candidates) {
 			if (!activeSessionId) throw new Error("Session worker returned an empty active-session ID");
@@ -3851,14 +3862,22 @@ export class DaemonSupervisor {
 				}
 			}
 		}
+		return candidates;
+	}
+
+	private provisionWorkerActiveSessionIds(worker: ResidentWorker, activeSessionIds: Iterable<string>): void {
+		const candidates = this.validateWorkerActiveSessionIds(worker, activeSessionIds);
+		worker.authorityRevision = (worker.authorityRevision ?? 0) + 1;
 		const authorized = this.workerAuthorizedActiveSessionIds(worker);
 		for (const activeSessionId of candidates) authorized.add(activeSessionId);
 	}
 
-	private rejectWorkerFrame(worker: ResidentWorker, error: Error): void {
-		const workerClient = worker.client;
+	private rejectWorkerFrame(worker: ResidentWorker, error: Error, sourceClient?: DaemonWorkerClient): void {
+		const workerClient = sourceClient ?? worker.client;
 		if (!workerClient) return;
-		this.handleWorkerClose(worker, workerClient, error);
+		if (worker.client === workerClient) {
+			void this.handleWorkerClose(worker, workerClient, error);
+		}
 		workerClient.close();
 	}
 
@@ -3866,17 +3885,28 @@ export class DaemonSupervisor {
 		if (this.isWorkerStopping(worker)) {
 			throw new Error("Session worker is stopping");
 		}
-		if (!worker.client) {
+		const workerClient = worker.client;
+		if (!workerClient) {
 			throw new Error("Session worker is not connected");
 		}
-		const response = await worker.client.request({ type: "list" }, 5000);
+		const authorityRevision = (worker.authorityRevision ?? 0) + 1;
+		worker.authorityRevision = authorityRevision;
+		const response = await workerClient.request({ type: "list" }, 5000);
+		if (
+			worker.client !== workerClient ||
+			worker.authorityRevision !== authorityRevision ||
+			(this.workers && this.workers.get(worker.descriptor.workerId) !== worker)
+		) {
+			throw new Error("Session worker authority changed during roster refresh");
+		}
 		const summaries = sessionSummariesFromResponse(response);
 		const nextSummaries = new Map(summaries.map((summary) => [summary.activeSessionId ?? summary.id, summary]));
 		const root = nextSummaries.get(worker.descriptor.rootActiveSessionId);
 		if (recovery && !root) {
 			throw new Error(`Session worker omitted its root session during recovery`);
 		}
-		this.bindWorkerActiveSessionIds(worker, nextSummaries.keys());
+		const nextAuthority = this.validateWorkerActiveSessionIds(worker, nextSummaries.keys());
+		worker.authorizedActiveSessionIds = nextAuthority;
 		worker.summaries = nextSummaries;
 		for (const summary of summaries) {
 			const activeSessionId = summary.activeSessionId ?? summary.id;
@@ -5020,7 +5050,22 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private handleWorkerFrame(worker: ResidentWorker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void {
+	private handleWorkerFrame(
+		worker: ResidentWorker,
+		frame: PrivateFrame<DaemonWorkerFrameHeader>,
+		sourceClient?: DaemonWorkerClient,
+	): void {
+		if (
+			(worker.descriptor && this.workers && this.workers.get(worker.descriptor.workerId) !== worker) ||
+			(sourceClient && worker.client !== sourceClient)
+		) {
+			this.rejectWorkerFrame(
+				worker,
+				new Error("Worker frame came from a stale authenticated channel"),
+				sourceClient,
+			);
+			return;
+		}
 		if (frame.header.kind !== "outbound") {
 			return;
 		}
@@ -5034,15 +5079,23 @@ export class DaemonSupervisor {
 		} = frame.header;
 		if (outboundType === "heartbeats_changed") {
 			if (activeSessionId) {
-				this.rejectWorkerFrame(worker, new Error("Worker heartbeat frame was unexpectedly session-scoped"));
+				this.rejectWorkerFrame(
+					worker,
+					new Error("Worker heartbeat frame was unexpectedly session-scoped"),
+					sourceClient,
+				);
 				return;
 			}
 			worker.heartbeatSnapshotStale = true;
 			this.broadcastHeartbeatsChanged();
 			return;
 		}
-		if (activeSessionId && !this.workerOwnsActiveSessionId(worker, activeSessionId)) {
-			this.rejectWorkerFrame(worker, new Error(`Worker emitted an unauthorized active session ${activeSessionId}`));
+		if (activeSessionId && !this.workerOwnsActiveSessionId(worker, activeSessionId, sourceClient)) {
+			this.rejectWorkerFrame(
+				worker,
+				new Error(`Worker emitted an unauthorized active session ${activeSessionId}`),
+				sourceClient,
+			);
 			return;
 		}
 		if (
@@ -5052,12 +5105,7 @@ export class DaemonSupervisor {
 				outboundType === "session_snapshot_failed") &&
 			!activeSessionId
 		) {
-			const error = new Error("Worker returned an uncorrelatable snapshot frame");
-			const workerClient = worker.client;
-			if (workerClient) {
-				this.handleWorkerClose(worker, workerClient, error);
-				workerClient.close();
-			}
+			this.rejectWorkerFrame(worker, new Error("Worker returned an uncorrelatable snapshot frame"), sourceClient);
 			return;
 		}
 		if (outboundType === "session_snapshot_begin" && activeSessionId) {
@@ -5493,7 +5541,11 @@ export class DaemonSupervisor {
 				return;
 			}
 			if (compactValue.activeSessionId !== activeSessionId) {
-				this.rejectWorkerFrame(worker, new Error("Worker compact payload did not match its active-session header"));
+				this.rejectWorkerFrame(
+					worker,
+					new Error("Worker compact payload did not match its active-session header"),
+					sourceClient,
+				);
 				return;
 			}
 			const reconstructed = this.streamReconstructor.reconstruct(compactValue);
@@ -5507,7 +5559,7 @@ export class DaemonSupervisor {
 			try {
 				decodedOutbound = JSON.parse(frame.payload.toString("utf8")) as DaemonOutbound;
 			} catch {
-				this.rejectWorkerFrame(worker, new Error("Worker returned malformed session-scoped JSON"));
+				this.rejectWorkerFrame(worker, new Error("Worker returned malformed session-scoped JSON"), sourceClient);
 				return;
 			}
 		}
@@ -5515,7 +5567,11 @@ export class DaemonSupervisor {
 			decodedOutbound.type !== outboundType ||
 			(decodedOutbound as { activeSessionId?: unknown }).activeSessionId !== activeSessionId
 		) {
-			this.rejectWorkerFrame(worker, new Error("Worker payload did not match its routed frame header"));
+			this.rejectWorkerFrame(
+				worker,
+				new Error("Worker payload did not match its routed frame header"),
+				sourceClient,
+			);
 			return;
 		}
 		this.streamReconstructor.observe(decodedOutbound);
@@ -5525,9 +5581,9 @@ export class DaemonSupervisor {
 			decodedOutbound.event.child.activeSessionId
 		) {
 			try {
-				this.bindWorkerActiveSessionIds(worker, [decodedOutbound.event.child.activeSessionId]);
+				this.provisionWorkerActiveSessionIds(worker, [decodedOutbound.event.child.activeSessionId]);
 			} catch (error) {
-				this.rejectWorkerFrame(worker, error instanceof Error ? error : new Error(String(error)));
+				this.rejectWorkerFrame(worker, error instanceof Error ? error : new Error(String(error)), sourceClient);
 				return;
 			}
 		}

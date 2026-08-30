@@ -3720,6 +3720,141 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(workerA.client.close).toHaveBeenCalledOnce();
 	});
 
+	it("revokes removed roster authority and rejects stale worker channels", async () => {
+		const root = { id: "active-root", activeSessionId: "active-root", sessionId: "session-root", cwd: "/tmp" };
+		const removedChild = "active-removed-child";
+		const oldClient = { close: vi.fn() };
+		const currentClient = {
+			close: vi.fn(),
+			request: vi.fn(async () => success(undefined, "list", { sessions: [root] })),
+		};
+		const worker = {
+			descriptor: {
+				workerId: "worker-roster-revoke",
+				rootActiveSessionId: root.activeSessionId,
+				createCommand: { type: "create" as const },
+			},
+			client: currentClient,
+			authorizedActiveSessionIds: new Set([root.activeSessionId, removedChild]),
+			authorityRevision: 1,
+			summaries: new Map([
+				[root.activeSessionId, root as SessionSummary],
+				[
+					removedChild,
+					{
+						id: removedChild,
+						activeSessionId: removedChild,
+						sessionId: "session-child",
+						cwd: "/tmp",
+					} as SessionSummary,
+				],
+			]),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			snapshotLoads: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const handleWorkerClose = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set(),
+			streamReconstructor: { seed: vi.fn(), clear: vi.fn(), observe: vi.fn() },
+			handleWorkerClose,
+			invalidateWorkerSnapshot: vi.fn(),
+			persistWorker: vi.fn(),
+		}) as {
+			refreshWorkerSummaries(target: typeof worker): Promise<void>;
+			handleWorkerFrame(
+				target: typeof worker,
+				frame: PrivateFrame<DaemonWorkerFrameHeader>,
+				sourceClient?: typeof currentClient,
+			): void;
+		};
+		const removedChildFrame: PrivateFrame<DaemonWorkerFrameHeader> = {
+			header: {
+				kind: "outbound",
+				outboundType: "session_event",
+				activeSessionId: removedChild,
+				sessionEventType: "turn_start",
+			},
+			payload: Buffer.from(
+				JSON.stringify({
+					type: "session_event",
+					activeSessionId: removedChild,
+					event: { type: "turn_start" },
+					attribution: { scope: "session" },
+				}),
+			),
+		};
+
+		await supervisor.refreshWorkerSummaries(worker);
+		expect(worker.authorizedActiveSessionIds).toEqual(new Set([root.activeSessionId]));
+		supervisor.handleWorkerFrame(worker, removedChildFrame, currentClient);
+		expect(handleWorkerClose).toHaveBeenCalledOnce();
+		expect(currentClient.close).toHaveBeenCalledOnce();
+		expect(worker.snapshotCache.size).toBe(0);
+
+		handleWorkerClose.mockClear();
+		currentClient.close.mockClear();
+		supervisor.handleWorkerFrame(worker, removedChildFrame, oldClient as typeof currentClient);
+		expect(oldClient.close).toHaveBeenCalledOnce();
+		expect(currentClient.close).not.toHaveBeenCalled();
+		expect(handleWorkerClose).not.toHaveBeenCalled();
+	});
+
+	it("does not let an older roster refresh resurrect revoked authority", async () => {
+		const root = { id: "active-root", activeSessionId: "active-root", sessionId: "session-root", cwd: "/tmp" };
+		const removedChild = {
+			id: "active-old-child",
+			activeSessionId: "active-old-child",
+			sessionId: "session-old-child",
+			cwd: "/tmp",
+		};
+		let resolveOlder!: (value: unknown) => void;
+		let resolveNewer!: (value: unknown) => void;
+		const older = new Promise((resolve) => {
+			resolveOlder = resolve;
+		});
+		const newer = new Promise((resolve) => {
+			resolveNewer = resolve;
+		});
+		const client = {
+			request: vi.fn().mockReturnValueOnce(older).mockReturnValueOnce(newer),
+		};
+		const worker = {
+			descriptor: {
+				workerId: "worker-roster-order",
+				rootActiveSessionId: root.activeSessionId,
+				createCommand: { type: "create" as const },
+			},
+			client,
+			authorizedActiveSessionIds: new Set([root.activeSessionId, removedChild.activeSessionId]),
+			authorityRevision: 0,
+			summaries: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			streamReconstructor: { seed: vi.fn(), clear: vi.fn() },
+			persistWorker: vi.fn(),
+		}) as {
+			refreshWorkerSummaries(target: typeof worker): Promise<void>;
+		};
+
+		const olderRefresh = supervisor.refreshWorkerSummaries(worker);
+		const newerRefresh = supervisor.refreshWorkerSummaries(worker);
+		resolveNewer(success(undefined, "list", { sessions: [root] }));
+		await newerRefresh;
+		resolveOlder(success(undefined, "list", { sessions: [root, removedChild] }));
+		await expect(olderRefresh).rejects.toThrow("authority changed during roster refresh");
+
+		expect(worker.authorizedActiveSessionIds).toEqual(new Set([root.activeSessionId]));
+		expect(worker.summaries.has(removedChild.activeSessionId)).toBe(false);
+	});
+
 	it("shapes correlated worker events separately for capable and legacy clients", () => {
 		const activeSessionId = "active-correlated";
 		const capableWrites: string[] = [];
