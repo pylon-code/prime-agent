@@ -465,6 +465,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private reconnectPromise?: Promise<void>;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
 	private transportCloseRetirementInProgress = false;
+	private sessionCloseRetirementInProgress = false;
 	private disposing = false;
 	private disposed = false;
 
@@ -477,7 +478,12 @@ export class DaemonAgentConnection implements AgentConnection {
 				message.type === "session_closed" &&
 				message.activeSessionId === pendingChunkedReplacement.header.activeSessionId
 			) {
-				this.retirePendingChunkedReplacement();
+				this.sessionCloseRetirementInProgress = true;
+				try {
+					this.retirePendingChunkedReplacement();
+				} finally {
+					this.sessionCloseRetirementInProgress = false;
+				}
 			} else {
 				const remainingWeight =
 					MAX_PENDING_NEGOTIATED_RUNTIME_FRAME_WEIGHT - pendingChunkedReplacement.queuedMessageWeight;
@@ -2351,6 +2357,12 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.failClosedReplacementReconciliation();
 			return;
 		}
+		if (
+			(message.type === "session_replaced" || message.type === "session_resynced") &&
+			this.suppressesUnsolicitedSnapshotTransfers()
+		) {
+			return;
+		}
 		if ("snapshotId" in message && this.ignoredSnapshotIds.has(message.snapshotId)) {
 			const exactRequestBegin =
 				message.type === "session_snapshot_begin" &&
@@ -2720,21 +2732,27 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		if (message.type === "session_closed") {
 			this.invalidateNegotiatedCapabilityProof();
-			const updateClose = message.reason === "update";
-			if (updateClose) {
-				this.captureDaemonLogPath();
-				this.updateRestartPending = true;
-			} else {
-				this.terminalCloseEmitted = true;
-			}
+			const lifecycleOwner = this.claimSessionCloseLifecycle(message.reason);
 			this.retirePendingChunkedReplacement();
 			this.retireSnapshotTransfers(new Error("Daemon session closed during snapshot transfer"));
-			if (updateClose) {
+			if (!lifecycleOwner) return;
+			if (lifecycleOwner === "update") {
 				void this.reconnectAfterUpdate();
 				return;
 			}
 			await this.emit({ type: "closed", error: this.formatDaemonSessionClosedError(message.reason) });
 		}
+	}
+
+	private claimSessionCloseLifecycle(reason: DaemonSessionClosedReason): "terminal" | "update" | undefined {
+		if (this.terminalCloseEmitted || this.updateRestartPending) return undefined;
+		if (reason === "update") {
+			this.captureDaemonLogPath();
+			this.updateRestartPending = true;
+			return "update";
+		}
+		this.terminalCloseEmitted = true;
+		return "terminal";
 	}
 
 	private captureDaemonLogPath(): void {
@@ -3296,6 +3314,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				!this.terminalCloseEmitted &&
 				!this.updateRestartPending &&
 				!this.transportCloseRetirementInProgress &&
+				!this.sessionCloseRetirementInProgress &&
 				!this.disposing &&
 				!this.disposed
 			) {
