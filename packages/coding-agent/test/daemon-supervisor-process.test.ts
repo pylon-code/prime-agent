@@ -1359,24 +1359,26 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 			// Detached launchers admitted during the killed-supervisor window can finish
 			// after the tracked replacement exits. Drain only supervisors authenticated
 			// on this test-owned socket, and require two clients to agree on identity.
+			const lateSupervisorHandshakeTimeoutMs = 5000;
+			const unavailableProofMs = 5000;
 			let unavailableSince = Date.now();
-			const drainDeadline = Date.now() + 5000;
+			const drainDeadline = Date.now() + 20_000;
 			while (Date.now() < drainDeadline) {
 				const first = new DaemonClient(socketPath);
 				try {
 					await first.connect(100);
 				} catch {
 					first.close();
-					if (Date.now() - unavailableSince >= 1000) break;
+					if (Date.now() - unavailableSince >= unavailableProofMs) break;
 					await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
 					continue;
 				}
 				unavailableSince = Date.now();
 				const second = new DaemonClient(socketPath);
 				try {
-					await second.connect(1000);
-					const firstHello = await first.waitForHello(1000);
-					const secondHello = await second.waitForHello(1000);
+					await second.connect(lateSupervisorHandshakeTimeoutMs);
+					const firstHello = await first.waitForHello(lateSupervisorHandshakeTimeoutMs);
+					const secondHello = await second.waitForHello(lateSupervisorHandshakeTimeoutMs);
 					if (
 						!firstHello.supervisorPid ||
 						!firstHello.supervisorProcessStartId ||
@@ -1396,7 +1398,7 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 					second.close();
 				}
 			}
-			if (Date.now() - unavailableSince < 1000) {
+			if (Date.now() - unavailableSince < unavailableProofMs) {
 				throw new Error("Test-owned supervisor socket did not remain unavailable");
 			}
 		},
