@@ -301,6 +301,7 @@ turn-scoped-subagent-cancellation:
       - Prime upstream makes exactly one retry layer own policy so provider SDK retries cannot multiply session retries.
 =======
       - https://github.com/pylon-code/prime-agent/issues/25
+      - https://github.com/pylon-code/prime-agent/pull/35
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/346
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/464
