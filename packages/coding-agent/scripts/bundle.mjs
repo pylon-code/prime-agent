@@ -19,14 +19,20 @@ import { build } from "esbuild";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const outdir = join(packageDir, "dist", "bundle");
-let buildId;
-try {
-	buildId = execFileSync("git", ["describe", "--tags", "--always", "--dirty"], {
-		cwd: dirname(packageDir),
-		encoding: "utf8",
-	}).trim();
-} catch {
-	buildId = `release-${JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")).version}`;
+const releaseBuildId = process.env.PRIME_AGENT_RELEASE_BUILD_ID?.trim();
+if (releaseBuildId && !/^pylon-build-g[0-9a-f]{12}-r[1-9]\d*$/.test(releaseBuildId)) {
+	throw new Error("PRIME_AGENT_RELEASE_BUILD_ID must identify an immutable Pylon build recipe.");
+}
+let buildId = releaseBuildId;
+if (!buildId) {
+	try {
+		buildId = execFileSync("git", ["describe", "--tags", "--always", "--dirty"], {
+			cwd: dirname(packageDir),
+			encoding: "utf8",
+		}).trim();
+	} catch {
+		buildId = `release-${JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")).version}`;
+	}
 }
 
 rmSync(outdir, { recursive: true, force: true });

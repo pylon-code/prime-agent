@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -179,6 +180,56 @@ describe("package commands", () => {
 		} finally {
 			errorSpy.mockRestore();
 		}
+	});
+
+	it("blocks stock self-update for an exact Pylon distribution without contacting the configured feed", () => {
+		const distributionPackageDir = join(tempDir, "pylon-prime-agent");
+		mkdirSync(distributionPackageDir, { recursive: true });
+		const sourceCommit = "0123456789abcdef0123456789abcdef01234567";
+		writeFileSync(
+			join(distributionPackageDir, "package.json"),
+			JSON.stringify({
+				name: "prime-agent",
+				version: VERSION,
+				piConfig: { name: "prime-agent", configDir: ".prime/agent" },
+				pylonDistribution: {
+					schemaVersion: 1,
+					repository: "https://github.com/pylon-code/prime-agent",
+					sourceCommit,
+					sourceTree: "89abcdef0123456789abcdef0123456789abcdef",
+					buildId: `pylon-build-g${sourceCommit.slice(0, 12)}-r1`,
+					recipeRevision: 1,
+					node: "22.23.2",
+					npm: "11.10.1",
+					packageLockSha256: "a".repeat(64),
+				},
+			}),
+		);
+		const result = spawnSync(
+			process.execPath,
+			[
+				join(import.meta.dirname, "../../../node_modules/tsx/dist/cli.mjs"),
+				join(import.meta.dirname, "../src/cli.ts"),
+				"update",
+				"--force",
+			],
+			{
+				cwd: projectDir,
+				env: {
+					...process.env,
+					PI_PACKAGE_DIR: distributionPackageDir,
+					PRIME_AGENT_DOWNLOAD_BASE_URL: "https://upstream-feed.invalid",
+				},
+				encoding: "utf8",
+				timeout: 20_000,
+				maxBuffer: 1024 * 1024,
+			},
+		);
+
+		expect(result.error).toBeUndefined();
+		expect(result.status).toBe(1);
+		expect(`${result.stdout}\n${result.stderr}`).toContain("https://github.com/pylon-code/prime-agent/releases");
+		expect(`${result.stdout}\n${result.stderr}`).not.toContain("upstream-feed.invalid");
 	});
 
 	it("uses global npmCommand and the release manifest install spec for forced self updates", async () => {

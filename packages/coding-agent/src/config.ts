@@ -475,6 +475,18 @@ export function getBundledSkillsDir(): string {
 // App Config (from package.json piConfig)
 // =============================================================================
 
+export interface PylonDistributionMetadata {
+	schemaVersion: 1;
+	repository: "https://github.com/pylon-code/prime-agent";
+	sourceCommit: string;
+	sourceTree: string;
+	buildId: string;
+	recipeRevision: number;
+	node: string;
+	npm: string;
+	packageLockSha256: string;
+}
+
 interface PackageJson {
 	name?: string;
 	version?: string;
@@ -482,6 +494,35 @@ interface PackageJson {
 		name?: string;
 		configDir?: string;
 	};
+	pylonDistribution?: unknown;
+}
+
+export function parsePylonDistribution(value: unknown): PylonDistributionMetadata | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const candidate = value as Record<string, unknown>;
+	if (
+		Object.keys(candidate).sort().join(",") !==
+			"buildId,node,npm,packageLockSha256,recipeRevision,repository,schemaVersion,sourceCommit,sourceTree" ||
+		candidate.schemaVersion !== 1 ||
+		candidate.repository !== "https://github.com/pylon-code/prime-agent" ||
+		typeof candidate.sourceCommit !== "string" ||
+		!/^[0-9a-f]{40}$/.test(candidate.sourceCommit) ||
+		typeof candidate.sourceTree !== "string" ||
+		!/^[0-9a-f]{40}$/.test(candidate.sourceTree) ||
+		typeof candidate.recipeRevision !== "number" ||
+		!Number.isSafeInteger(candidate.recipeRevision) ||
+		candidate.recipeRevision < 1 ||
+		typeof candidate.node !== "string" ||
+		!/^\d+\.\d+\.\d+$/.test(candidate.node) ||
+		typeof candidate.npm !== "string" ||
+		!/^\d+\.\d+\.\d+$/.test(candidate.npm) ||
+		typeof candidate.packageLockSha256 !== "string" ||
+		!/^[0-9a-f]{64}$/.test(candidate.packageLockSha256) ||
+		candidate.buildId !== `pylon-build-g${candidate.sourceCommit.slice(0, 12)}-r${candidate.recipeRevision}`
+	) {
+		return undefined;
+	}
+	return Object.freeze(candidate as unknown as PylonDistributionMetadata);
 }
 
 const pkg = JSON.parse(readFileSync(getPackageJsonPath(), "utf-8")) as PackageJson;
@@ -493,6 +534,7 @@ const envPrefix =
 		.replace(/[^A-Z0-9]+/g, "_")
 		.replace(/^_+|_+$/g, "") || "PI";
 export const PACKAGE_NAME: string = pkg.name || "@earendil-works/pi-coding-agent";
+export const PYLON_DISTRIBUTION = parsePylonDistribution(pkg.pylonDistribution);
 export const APP_NAME: string = piConfigName || "pi";
 export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
 export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".prime/agent";

@@ -367,3 +367,20 @@ decisions:
     revisit_when:
       - Prime upstream exposes an equivalent public-root token, exact caller environment reuse, generation-scoped post-attach proof, and structured bounded cleanup outcomes.
       - Pylon can remove the fork token without weakening native multi-instance isolation or its pre-create ACP fallback.
+
+  deterministic-pylon-release-artifacts:
+    area: distribution
+    state: candidate
+    owner: pylon-fork
+    decision: redesign
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/28
+      - https://github.com/pylon-code/prime-agent/issues/29
+      - https://github.com/pylon-code/pylon/issues/114
+      - https://github.com/pylon-code/pylon/issues/193
+      - https://github.com/pylon-code/pylon/issues/194
+    fork_change: deterministic-pylon-release-artifacts-v1
+    upstream_support: Prime's R2 packer accepts mutable channel and archive inputs, refreshes live model catalogs during normal builds, retains upstream package provenance, and does not produce a Pylon-owned deterministic manifest or integrity-complete internal artifact graph.
+    revisit_when:
+      - Pylon no longer maintains a Prime distribution or the upstream artifact recipe can emit the exact fork-owned deterministic contract without publication side effects.
+      - The source, recipe, toolchain, manifest, internal URL, and digest invariants can be preserved without fork-specific release code.

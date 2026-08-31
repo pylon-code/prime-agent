@@ -214,10 +214,136 @@ jobs:
         working-directory: packages/coding-agent
         run: npx tsx ../../node_modules/vitest/dist/cli.js --run test/daemon-supervisor-process.test.ts -t "proves exact owned cleanup over a Windows named pipe"
 
+  pylon-artifact-pack:
+    name: Pylon artifact pack (${{ matrix.copy }})
+    needs: trust
+    if: needs.trust.outputs.allowed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [a, b]
+    env:
+      PYLON_RELEASE_NODE: 22.23.2
+      PYLON_RELEASE_NPM: 11.10.1
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.PYLON_RELEASE_NODE }}
+
+      - name: Install pinned build inputs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
+          npm install --global "npm@${PYLON_RELEASE_NPM}"
+          test "$(node --version)" = "v${PYLON_RELEASE_NODE}"
+          test "$(npm --version)" = "${PYLON_RELEASE_NPM}"
+          npm ci
+
+      - name: Test release contract
+        run: npm run test:pylon-release
+
+      - name: Build offline and pack without network
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "HOME=$HOME" \
+            "GIT_CONFIG_COUNT=1" \
+            "GIT_CONFIG_KEY_0=safe.directory" \
+            "GIT_CONFIG_VALUE_0=$GITHUB_WORKSPACE" \
+            unshare --net -- npm run release:pylon:pack
+
+      - name: Verify artifact contract
+        run: npm run release:pylon:verify
+
+      - name: Upload candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pylon-prime-pack-${{ matrix.copy }}
+          path: .npm/pylon-release/artifacts
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  pylon-artifact-reproducibility:
+    name: Pylon artifact reproducibility
+    needs: pylon-artifact-pack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Download first isolated pack
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pylon-prime-pack-a
+          path: pack-a
+
+      - name: Download second isolated pack
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pylon-prime-pack-b
+          path: pack-b
+
+      - name: Require byte-identical outputs
+        run: diff --recursive --brief pack-a pack-b
+
+  pylon-artifact-install:
+    name: Pylon artifact install (${{ matrix.os }})
+    needs: [trust, pylon-artifact-pack, pylon-artifact-reproducibility]
+    if: needs.trust.outputs.allowed == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    env:
+      PYLON_RELEASE_NODE: 22.23.2
+      PYLON_RELEASE_NPM: 11.10.1
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.PYLON_RELEASE_NODE }}
+
+      - name: Install pinned npm
+        run: npm install --global "npm@${{ env.PYLON_RELEASE_NPM }}"
+
+      - name: Download reproducible pack
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pylon-prime-pack-a
+          path: .npm/pylon-release/artifacts
+
+      - name: Verify temporary-prefix runtime
+        run: npm run release:pylon:smoke
+
   build-check-test:
     name: build-check-test
     if: always() && (needs.trust.outputs.allowed == 'true' || inputs.require_trusted)
-    needs: [trust, build-check, test, owned-session-contract-windows]
+    needs:
+      - trust
+      - build-check
+      - test
+      - owned-session-contract-windows
+      - pylon-artifact-pack
+      - pylon-artifact-reproducibility
+      - pylon-artifact-install
     runs-on: ubuntu-latest
     steps:
       - name: Verify CI results
@@ -226,8 +352,14 @@ jobs:
           BUILD_CHECK_RESULT: ${{ needs.build-check.result }}
           TEST_RESULT: ${{ needs.test.result }}
           WINDOWS_OWNED_SESSION_RESULT: ${{ needs.owned-session-contract-windows.result }}
+          ARTIFACT_PACK_RESULT: ${{ needs.pylon-artifact-pack.result }}
+          ARTIFACT_REPRODUCIBILITY_RESULT: ${{ needs.pylon-artifact-reproducibility.result }}
+          ARTIFACT_INSTALL_RESULT: ${{ needs.pylon-artifact-install.result }}
         run: |
           test "$TRUST_ALLOWED" = true
           test "$BUILD_CHECK_RESULT" = success
           test "$TEST_RESULT" = success
           test "$WINDOWS_OWNED_SESSION_RESULT" = success
+          test "$ARTIFACT_PACK_RESULT" = success
+          test "$ARTIFACT_REPRODUCIBILITY_RESULT" = success
+          test "$ARTIFACT_INSTALL_RESULT" = success
