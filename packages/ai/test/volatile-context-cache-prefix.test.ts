@@ -263,6 +263,35 @@ describe("Anthropic volatile context placement", () => {
 		const payload = await captureAnthropicPayload("   \n  ");
 		expect(flattenParts(payload.messages[payload.messages.length - 1])).toHaveLength(1);
 	});
+
+	it("sends volatile context in the system prompt for an appendOnlyHistory model", async () => {
+		const model: Model<"anthropic-messages"> = {
+			...getModel("anthropic", "claude-sonnet-4-5"),
+			baseUrl: "http://127.0.0.1:9",
+			appendOnlyHistory: true,
+		};
+		const source = baseContext("# Continual Harness State\n\nmemory: 1");
+		let captured: CapturedPayload | undefined;
+		// Routed through the registry, which owns the placement decision.
+		await streamSimple(model, source, {
+			apiKey: "fake-key",
+			maxRetries: 0,
+			onPayload: (payload) => {
+				captured = payload as CapturedPayload;
+				return payload;
+			},
+		}).result();
+
+		if (!captured) throw new Error("Expected the Anthropic payload to be captured");
+		expect(JSON.stringify(captured.system)).toContain("Continual Harness State");
+
+		// No payload-only block: the message array still matches the caller's history.
+		const parts = flattenParts(captured.messages[captured.messages.length - 1]);
+		expect(parts).toHaveLength(1);
+		expect(parts[0]?.text).toBe("second");
+		expect(parts[0]?.cache_control).toEqual({ type: "ephemeral" });
+		expect(captured.messages).toHaveLength(source.messages.length);
+	});
 });
 
 describe("OpenAI-completions volatile context placement", () => {
@@ -354,6 +383,36 @@ describe("volatile context handling at the provider registry", () => {
 		expect(contexts).toHaveLength(1);
 		expect(contexts[0].volatileContext).toBe("volatile tail");
 		expect(contexts[0].messages).toHaveLength(baseContext().messages.length);
+	});
+
+	it("routes volatile context into the system prompt for appendOnlyHistory models", () => {
+		for (const handlesVolatileContext of [true, false]) {
+			const api = handlesVolatileContext ? "native-api" : "fallback-api";
+			const { contexts, model } = recordingProvider(api, handlesVolatileContext);
+			const source = baseContext("# Continual Harness State\n\nmemory: 1");
+
+			streamSimple({ ...model, appendOnlyHistory: true }, source);
+
+			expect(contexts).toHaveLength(1);
+			const received = contexts[0];
+			expect(received.volatileContext).toBeUndefined();
+			// A session-cached backend matches on the message array, so it must be
+			// byte-identical to the caller's persisted history.
+			expect(JSON.stringify(received.messages)).toBe(JSON.stringify(source.messages));
+			expect(received.systemPrompt).toBe(
+				"You are a general purpose agent.\n\n# Continual Harness State\n\nmemory: 1",
+			);
+			unregisterApiProviders(api);
+		}
+	});
+
+	it("uses the volatile content as the system prompt when an appendOnlyHistory model has none", () => {
+		const { contexts, model } = recordingProvider("native-api", true);
+
+		streamSimple({ ...model, appendOnlyHistory: true }, { messages: [], volatileContext: "memory: 1" });
+
+		expect(contexts[0].systemPrompt).toBe("memory: 1");
+		expect(contexts[0].messages).toHaveLength(0);
 	});
 
 	it("keeps volatile content out of the faux provider's simulated cache prefix", async () => {

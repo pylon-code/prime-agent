@@ -159,6 +159,7 @@ const ModelDefinitionSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	appendOnlyHistory: Type.Optional(Type.Boolean()),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -178,6 +179,7 @@ const ModelOverrideSchema = Type.Object({
 	),
 	contextWindow: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
+	appendOnlyHistory: Type.Optional(Type.Boolean()),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
 });
@@ -333,6 +335,7 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
+	if (override.appendOnlyHistory !== undefined) result.appendOnlyHistory = override.appendOnlyHistory;
 
 	if (override.cost) {
 		result.cost = {
@@ -739,6 +742,7 @@ export class ModelRegistry {
 					cost: modelDef.cost ?? defaultCost,
 					contextWindow: modelDef.contextWindow ?? 128000,
 					maxTokens: modelDef.maxTokens ?? 16384,
+					appendOnlyHistory: modelDef.appendOnlyHistory,
 					headers: undefined,
 					compat,
 				} as Model<Api>);
@@ -1541,6 +1545,7 @@ export class ModelRegistry {
 					cost: modelDef.cost,
 					contextWindow: modelDef.contextWindow,
 					maxTokens: modelDef.maxTokens,
+					appendOnlyHistory: modelDef.appendOnlyHistory,
 					headers: undefined,
 					compat: modelDef.compat,
 				} as Model<Api>);
@@ -1587,6 +1592,8 @@ export interface ProviderConfigInput {
 		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		contextWindow: number;
 		maxTokens: number;
+		/** Set for proxy or session-cached backends that require an append-only message history. */
+		appendOnlyHistory?: boolean;
 		headers?: Record<string, string>;
 		compat?: Model<Api>["compat"];
 	}>;

@@ -208,6 +208,55 @@ describe("issue 26: stable prompt-cache prefix", () => {
 		expect(requests[1].prefix.tools).toBe(requests[0].prefix.tools);
 	});
 
+	it("keeps the history append-only and moves volatile content into the system prompt for an appendOnlyHistory model", async () => {
+		const { harness, requests } = await createRecordingHarness();
+		harnesses.push(harness);
+		isolateGlobalHarnessState(harness);
+
+		const fauxModel = harness.getModel();
+		harness.session.modelRegistry.registerProvider("append-only-proxy", {
+			baseUrl: fauxModel.baseUrl,
+			apiKey: "faux-key",
+			api: harness.faux.api,
+			models: [
+				{
+					id: "append-only-model",
+					name: "Append Only Proxy",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128000,
+					maxTokens: 16384,
+					appendOnlyHistory: true,
+				},
+			],
+		});
+		const registered = harness.session.modelRegistry.getAll().find((model) => model.id === "append-only-model");
+		// The flag has to survive registerProvider parsing to reach the provider.
+		expect(registered?.appendOnlyHistory).toBe(true);
+		await harness.session.setModel(registered!);
+
+		await harness.session.prompt("first");
+		seedLocalMemory(harness, "proxy_note", "Session-cached backends need an append-only history.");
+		harness.session.setActiveToolsByName(harness.session.getActiveToolNames());
+		await harness.session.prompt("second");
+
+		expect(requests).toHaveLength(2);
+		const [first, second] = requests;
+
+		// No payload-only block anywhere: each request's history only appends to the last.
+		expect(first.volatile).toBe("");
+		expect(second.volatile).toBe("");
+		expect(second.prefix.history.startsWith(first.prefix.history.slice(0, -1))).toBe(true);
+		expect(first.prefix.history).not.toContain("Continual Harness State");
+		expect(second.prefix.history).not.toContain("Continual Harness State");
+
+		// The content still reaches the model, inside the system prompt.
+		expect(first.prefix.systemPrompt).toContain("# Continual Harness State");
+		expect(second.prefix.systemPrompt).toContain("proxy_note");
+		expect(second.prefix.systemPrompt).toContain("Session-cached backends need an append-only history.");
+	});
+
 	it("pins tool order to first activation so reordering cannot move the cache marker", async () => {
 		const { harness } = await createRecordingHarness();
 		harnesses.push(harness);

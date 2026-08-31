@@ -331,7 +331,7 @@ decisions:
       - https://github.com/PrimeIntellect-ai/prime-agent/commit/f81acc6679ab214f1c40821588d9e5e97c47bdb1
       - https://github.com/PrimeIntellect-ai/prime-agent/tree/c382f09856d4a8c8d2b765179657047d58691f25
     fork_change: stable-prompt-cache-prefix-v1
-    upstream_support: Prime through c382f09856d4 reduced the system-prompt date to a day stamp for cache stability, but it still serializes mutable continual-harness state and that date into the cached system prompt, has no provider-neutral volatile-content channel, and does not pin active tool order behind the `cache_control` marker on the last tool definition.
+    upstream_support: Prime through c382f09856d4 reduced the system-prompt date to a day stamp for cache stability, but it still serializes mutable continual-harness state and that date into the cached system prompt, has no provider-neutral volatile-content channel, no per-model placement contract for session-cached proxy backends, and does not pin active tool order behind the `cache_control` marker on the last tool definition.
     revisit_when:
-      - Prime upstream provides an equivalent provider-neutral channel that keeps mutable state and clock-derived content out of the cached tools/system/history prefix.
-      - Pylon can drop the fork behavior without regressing measured cache-hit rates through a Claude-Max proxy.
+      - Prime upstream provides an equivalent provider-neutral channel that keeps mutable state and clock-derived content out of the cached tools/system/history prefix, including a declared constraint for append-only-history backends.
+      - Pylon can drop the fork behavior without regressing measured cache-hit rates through a Claude-Max proxy or Meridian lineage continuation rates.

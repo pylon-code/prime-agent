@@ -7,7 +7,7 @@ import type {
 	StreamFunction,
 	StreamOptions,
 } from "./types.js";
-import { foldVolatileContext } from "./utils/volatile-context.js";
+import { foldVolatileContext, foldVolatileContextIntoSystemPrompt } from "./utils/volatile-context.js";
 
 export type ApiStreamFunction = (
 	model: Model<Api>,
@@ -46,6 +46,20 @@ type RegisteredApiProvider = {
 
 const apiProviderRegistry = new Map<string, RegisteredApiProvider>();
 
+/**
+ * Decide where `Context.volatileContext` goes before the provider sees it.
+ *
+ * Prefix-cached backends want it after the last cache breakpoint, which the
+ * provider places. Session-cached `appendOnlyHistory` backends need the message
+ * array untouched, so it goes into the system prompt instead.
+ */
+function resolveVolatilePlacement(model: Model<Api>, context: Context, handlesVolatileContext: boolean): Context {
+	if (model.appendOnlyHistory) {
+		return foldVolatileContextIntoSystemPrompt(context);
+	}
+	return handlesVolatileContext ? context : foldVolatileContext(context);
+}
+
 function wrapStream<TApi extends Api, TOptions extends StreamOptions>(
 	api: TApi,
 	stream: StreamFunction<TApi, TOptions>,
@@ -55,7 +69,7 @@ function wrapStream<TApi extends Api, TOptions extends StreamOptions>(
 		if (model.api !== api) {
 			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
 		}
-		const resolved = handlesVolatileContext ? context : foldVolatileContext(context);
+		const resolved = resolveVolatilePlacement(model, context, handlesVolatileContext);
 		return stream(model as Model<TApi>, resolved, options as TOptions);
 	};
 }
@@ -69,7 +83,7 @@ function wrapStreamSimple<TApi extends Api>(
 		if (model.api !== api) {
 			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
 		}
-		const resolved = handlesVolatileContext ? context : foldVolatileContext(context);
+		const resolved = resolveVolatilePlacement(model, context, handlesVolatileContext);
 		return streamSimple(model as Model<TApi>, resolved, options);
 	};
 }

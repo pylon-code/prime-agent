@@ -462,6 +462,17 @@ export interface Model<TApi extends Api> {
 	maxTokens: number;
 	/** Flagship model surfaced above non-featured models of the same provider in pickers. */
 	featured?: boolean;
+	/**
+	 * Set when the backend keeps its own session cache keyed on the request message
+	 * array, so that array must stay byte-identical to the conversation history the
+	 * client persisted — a proxy in front of an agent SDK, for example.
+	 *
+	 * `Context.volatileContext` then goes into the system prompt instead of the end
+	 * of the message list, because a payload-only message block breaks the backend's
+	 * lineage matching and forces a full-history replay on every request. The
+	 * backend's own session cache absorbs the system-prompt change instead.
+	 */
+	appendOnlyHistory?: boolean;
 	headers?: Record<string, string>;
 	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
 	compat?: TApi extends "openai-completions"

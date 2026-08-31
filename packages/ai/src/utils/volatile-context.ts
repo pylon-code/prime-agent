@@ -27,3 +27,21 @@ export function foldVolatileContext(context: Context): Context {
 	const messages: Message[] = [...context.messages, trailing];
 	return { ...context, messages, volatileContext: undefined };
 }
+
+/**
+ * Move volatile content to the end of the system prompt, leaving the message
+ * list byte-identical to the caller's history.
+ *
+ * Used for `Model.appendOnlyHistory` backends. They cache by session rather than
+ * by prefix, so a system-prompt change costs one re-send while a payload-only
+ * message block would invalidate their whole history lineage.
+ */
+export function foldVolatileContextIntoSystemPrompt(context: Context): Context {
+	const text = resolveVolatileContext(context);
+	if (!text) {
+		return context.volatileContext === undefined ? context : { ...context, volatileContext: undefined };
+	}
+
+	const systemPrompt = context.systemPrompt ? `${context.systemPrompt}\n\n${text}` : text;
+	return { ...context, systemPrompt, volatileContext: undefined };
+}

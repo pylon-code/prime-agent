@@ -997,6 +997,16 @@ The model still sees it, but never inside a cached region:
 - Anthropic and OpenAI-completions append it after their `cache_control` breakpoints, so the cached tools, system prompt, and conversation history are unaffected when it changes.
 - Every other provider receives it appended to the end of `Context.messages`, which is after the automatically cached prefix. Set `handlesVolatileContext: true` when registering a custom provider that positions the content itself.
 
+### Session-cached backends
+
+Trailing placement assumes the backend caches by request prefix. A proxy in front of an agent SDK does not: it matches the incoming message array against the history it already holds and resumes that session, so a payload-only trailing block reads as a modified history and forces a full replay.
+
+Set `appendOnlyHistory: true` on those models. The volatile content then goes into the system prompt and the message array stays byte-identical to the caller's history:
+
+```typescript
+const model = { ...getModel('anthropic', 'claude-opus-4-6'), baseUrl: 'https://my-sdk-proxy.example.com', appendOnlyHistory: true };
+```
+
 ## Context Serialization
 
 The `Context` object can be easily serialized and deserialized using standard JSON methods, making it simple to persist conversations, implement chat history, or transfer contexts between services:
