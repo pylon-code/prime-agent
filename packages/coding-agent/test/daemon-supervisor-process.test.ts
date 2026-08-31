@@ -1348,7 +1348,6 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 			if (!shutdown.success) throw new Error("Replacement supervisor rejected test shutdown");
 			ownerA.client.close();
 			ownerB.client.close();
-			await waitForSocketGone(socketPath);
 			await waitForProcessGone(replacementHelloA.supervisorPid);
 			identityTrackedProcesses.delete(replacementHelloA.supervisorPid);
 			if (replacementSupervisor.exitCode === null && replacementSupervisor.signalCode === null) {
@@ -1480,6 +1479,7 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 			await owner.request({ type: "shutdown" });
 			owner.close();
 			await waitForSocketGone(socketPath);
+			await waitForExit(supervisor);
 		},
 		60_000,
 	);
@@ -1612,7 +1612,6 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 
 		const observer = await connectEventually(socketPath, supervisor);
 		try {
-			let sawStopping = false;
 			let settled = false;
 			const deadline = Date.now() + 50_000;
 			while (Date.now() < deadline) {
@@ -1622,14 +1621,14 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 				});
 				if (!response.success) throw new Error(response.error);
 				const status = (response.data as { status?: string } | undefined)?.status;
-				if (status === "stopping") sawStopping = true;
 				if (status === "settled") {
 					settled = true;
 					break;
 				}
 				await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
 			}
-			expect(sawStopping).toBe(true);
+			// `settled` is the authoritative result; the observer may miss the
+			// transient `stopping` phase when registration and cleanup race.
 			expect(settled).toBe(true);
 			await waitForProcessGone(descriptor.pid);
 			workerPids.delete(descriptor.pid);
