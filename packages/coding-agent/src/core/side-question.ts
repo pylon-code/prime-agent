@@ -1,7 +1,17 @@
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
+import type { ExtensionProviderHooks } from "./extension-provider-hooks.js";
 
 export type SideQuestionStatus = "running" | "complete" | "cancelled" | "error";
+
+/**
+ * The session a side question forks from. Structural so callers can pass an
+ * `AgentSession` without this module depending on it.
+ */
+export interface SideQuestionHost {
+	agent: Agent;
+	createScopedProviderHooks(scope: string): ExtensionProviderHooks;
+}
 
 export interface SideQuestionEvent {
 	id: string;
@@ -40,16 +50,21 @@ function readAssistantText(message: AgentMessage): string {
 }
 
 export function startSideQuestion(
-	parent: Agent,
+	host: SideQuestionHost,
 	id: string,
 	question: string,
 	onEvent: (event: SideQuestionEvent) => void | Promise<void>,
 	previousTurns: SideQuestionTurn[] = [],
 ): SideQuestionRun {
+	const parent = host.agent;
 	const model = parent.state.model;
 	if (!model) {
 		throw new Error("Select a model before asking a side question");
 	}
+	// A side question replays the main conversation plus turns the main session
+	// never sent, so it must not be stamped with the main session's provider
+	// identity: same key, divergent history discards the provider-side session.
+	const providerHooks = host.createScopedProviderHooks(`side:${id}`);
 
 	// Each turn re-clones the live main conversation, so follow-ups always see
 	// the newest main-thread context; earlier side turns are replayed after it.
@@ -88,13 +103,13 @@ export function startSideQuestion(
 			tools: [],
 		},
 		convertToLlm: parent.convertToLlm,
-		transformContext: parent.transformContext,
+		transformContext: providerHooks.transformContext,
 		streamFn: parent.streamFn,
 		getApiKey: parent.getApiKey,
-		onPayload: parent.onPayload,
-		onResponse: parent.onResponse,
+		onPayload: providerHooks.onPayload,
+		onResponse: providerHooks.onResponse,
 		shouldStopAfterTurn: () => true,
-		sessionId: parent.sessionId,
+		sessionId: parent.sessionId === undefined ? undefined : `${parent.sessionId}/side:${id}`,
 		thinkingBudgets: parent.thinkingBudgets,
 		transport: "sse",
 		maxRetryDelayMs: parent.maxRetryDelayMs,

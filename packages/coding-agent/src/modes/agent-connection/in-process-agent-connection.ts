@@ -442,7 +442,7 @@ export class InProcessAgentConnection implements AgentConnection {
 			throw new Error(`Side question already exists: ${id}`);
 		}
 		const run = startSideQuestion(
-			this.session.agent,
+			this.session,
 			id,
 			question,
 			(event) => this.emit({ type: "side_question_event", event }),

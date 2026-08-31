@@ -1,0 +1,1 @@
+- Fixed inline subagents, side questions, compaction, branch summarization, and refinement sending provider requests under the parent session's identity or none at all ([#23](https://github.com/pylon-code/prime-agent/issues/23)).

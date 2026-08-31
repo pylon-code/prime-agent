@@ -8,6 +8,7 @@ import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import { createExtensionProviderHooks } from "./extension-provider-hooks.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
 import { convertToLlm } from "./messages.js";
@@ -273,6 +274,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
+	const providerHooks = createExtensionProviderHooks(() => extensionRunnerRef.current);
 
 	agent = new Agent({
 		initialState: {
@@ -298,30 +300,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
 			});
 		},
-		onPayload: async (payload, _model) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("before_provider_request")) {
-				return payload;
-			}
-			return runner.emitBeforeProviderRequest(payload);
-		},
-		onResponse: async (response, _model) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner?.hasHandlers("after_provider_response")) {
-				return;
-			}
-			await runner.emit({
-				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
-			});
-		},
+		onPayload: providerHooks.onPayload,
+		onResponse: providerHooks.onResponse,
 		sessionId: sessionManager.getSessionId(),
-		transformContext: async (messages) => {
-			const runner = extensionRunnerRef.current;
-			if (!runner) return messages;
-			return runner.emitContext(messages);
-		},
+		transformContext: providerHooks.transformContext,
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
 		transport: settingsManager.getTransport(),

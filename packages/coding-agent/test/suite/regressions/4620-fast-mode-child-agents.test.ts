@@ -78,7 +78,7 @@ describe("ENG-4620 fast mode child agents", () => {
 				},
 			]);
 
-			const run = startSideQuestion(harness.session.agent, "question-1", "Check fast mode", () => {});
+			const run = startSideQuestion(harness.session, "question-1", "Check fast mode", () => {});
 			await run.done;
 		} finally {
 			harness.cleanup();

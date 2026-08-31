@@ -9,7 +9,7 @@ import { type Theme, theme } from "../../modes/interactive/theme/theme.js";
 import type { ResourceDiagnostic } from "../diagnostics.js";
 import type { KeybindingsConfig } from "../keybindings.js";
 import type { ModelRegistry } from "../model-registry.js";
-import type { SessionManager } from "../session-manager.js";
+import type { ReadonlySessionManager, SessionManager } from "../session-manager.js";
 import type { BuildSystemPromptOptions } from "../system-prompt.js";
 import type {
 	BeforeAgentStartEvent,
@@ -231,6 +231,35 @@ const noOpUIContext: ExtensionUIContext = {
 	getToolsExpanded: () => false,
 	setToolsExpanded: () => {},
 };
+
+/**
+ * Read-only session view whose id identifies work derived from a session
+ * rather than the session itself. Everything else still reports the owning
+ * session, so an extension keyed on `getSessionId()` gets a distinct provider
+ * identity without losing access to the real transcript.
+ */
+function scopedSessionManagerView(base: SessionManager, scope: string): ReadonlySessionManager {
+	return {
+		getCwd: () => base.getCwd(),
+		getSessionDir: () => base.getSessionDir(),
+		getSessionId: () => `${base.getSessionId()}/${scope}`,
+		getSessionFile: () => base.getSessionFile(),
+		getLeafId: () => base.getLeafId(),
+		getLeafEntry: () => base.getLeafEntry(),
+		getEntry: (id) => base.getEntry(id),
+		getLabel: (id) => base.getLabel(id),
+		getBranch: (fromId) => base.getBranch(fromId),
+		getHeader: () => base.getHeader(),
+		getEntries: () => base.getEntries(),
+		getTree: () => base.getTree(),
+		getSessionName: () => base.getSessionName(),
+	};
+}
+
+export interface ScopedEmitOptions {
+	/** Derives a child provider identity from the owning session's id. */
+	sessionIdScope?: string;
+}
 
 export class ExtensionRunner {
 	private extensions: Extension[];
@@ -575,7 +604,7 @@ export class ExtensionRunner {
 	 * Create an ExtensionContext for use in event handlers and tool execution.
 	 * Context values are resolved at call time, so changes via bindCore/bindUI are reflected.
 	 */
-	createContext(): ExtensionContext {
+	createContext(sessionIdScope?: string): ExtensionContext {
 		const runner = this;
 		const getModel = this.getModel;
 		return {
@@ -593,7 +622,9 @@ export class ExtensionRunner {
 			},
 			get sessionManager() {
 				runner.assertActive();
-				return runner.sessionManager;
+				return sessionIdScope
+					? scopedSessionManagerView(runner.sessionManager, sessionIdScope)
+					: runner.sessionManager;
 			},
 			get modelRegistry() {
 				runner.assertActive();
@@ -861,8 +892,8 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
-	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
-		const ctx = this.createContext();
+	async emitContext(messages: AgentMessage[], options: ScopedEmitOptions = {}): Promise<AgentMessage[]> {
+		const ctx = this.createContext(options.sessionIdScope);
 		let currentMessages = structuredClone(messages);
 
 		for (const ext of this.extensions) {
@@ -893,8 +924,8 @@ export class ExtensionRunner {
 		return currentMessages;
 	}
 
-	async emitBeforeProviderRequest(payload: unknown): Promise<unknown> {
-		const ctx = this.createContext();
+	async emitBeforeProviderRequest(payload: unknown, options: ScopedEmitOptions = {}): Promise<unknown> {
+		const ctx = this.createContext(options.sessionIdScope);
 		let currentPayload = payload;
 
 		for (const ext of this.extensions) {
