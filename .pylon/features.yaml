@@ -325,7 +325,7 @@ decisions:
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/22
       - https://github.com/pylon-code/prime-agent/issues/26
-      - https://github.com/pylon-code/prime-agent/pull/32
+      - https://github.com/pylon-code/prime-agent/pull/36
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/commit/4b9e6006fad553dcca5aa69b23a039088064589f
       - https://github.com/PrimeIntellect-ai/prime-agent/commit/f81acc6679ab214f1c40821588d9e5e97c47bdb1
