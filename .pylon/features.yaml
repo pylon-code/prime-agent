@@ -335,3 +335,19 @@ decisions:
     revisit_when:
       - Prime upstream provides an equivalent provider-neutral channel that keeps mutable state and clock-derived content out of the cached tools/system/history prefix, including a declared constraint for append-only-history backends.
       - Pylon can drop the fork behavior without regressing measured cache-hit rates through a Claude-Max proxy or Meridian lineage continuation rates.
+
+  parent-session-identity:
+    area: runtime-reliability
+    state: shipped
+    owner: pylon-prime-integration
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/22
+      - https://github.com/pylon-code/prime-agent/issues/34
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/tree/c718bf3c30fd8da206ed551837cbb54f7ad15948
+    fork_change: parent-session-identity-v1
+    upstream_support: Prime through c718bf3c30fd knows a subagent's parent only as in-memory daemon runtime metadata and as trace headers derived by walking the parentSession file pointer. Its session header has no parentSessionId, ReadonlySessionManager has no getParentSessionId, and parentSession also records fork and new-session lineage, so no extension-visible surface can name the agent that spawned a session.
+    revisit_when:
+      - Prime records a spawn-only parent session id in the session header or exposes an equivalent accessor on the extension-visible session manager.
+      - The proxy-side parent-tree cancellation registry in rynfar/meridian#902 stops needing the parent edge inside the provider payload.

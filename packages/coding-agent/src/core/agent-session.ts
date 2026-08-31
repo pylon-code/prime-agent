@@ -10052,12 +10052,14 @@ export class AgentSession {
 
 	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
 		const childSessionManager = SessionManager.create(this._cwd, options.sessionDir);
-		if (options.parentSession.sessionFile) {
-			childSessionManager.newSession({
-				parentSession: options.parentSession.sessionFile,
-				rlmDepth: options.rlmDepth,
-			});
-		}
+		// Recorded unconditionally, matching the daemon host: an unpersisted parent
+		// has no file to point at, but the child still has to name the agent that
+		// spawned it so extensions can report the tree edge.
+		childSessionManager.newSession({
+			parentSession: options.parentSession.sessionFile,
+			parentSessionId: options.parentSession.sessionId,
+			rlmDepth: options.rlmDepth,
+		});
 		childSessionManager.appendModelChange(options.model.provider, options.model.id);
 		childSessionManager.appendThinkingLevelChange(options.thinkingLevel);
 		childSessionManager.appendServiceTierChange(options.serviceTier);

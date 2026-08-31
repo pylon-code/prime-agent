@@ -1,0 +1,1 @@
+- Added `ctx.sessionManager.getParentSessionId()` so extensions can report the session that spawned a subagent, and recorded it in the session header so a resumed subagent still reports its parent ([#34](https://github.com/pylon-code/prime-agent/issues/34)).
