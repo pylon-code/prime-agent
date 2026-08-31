@@ -282,12 +282,15 @@ decisions:
       - Prime routes subagent and derived-request provider hooks through the owning session's extension runner.
       - An upstream extension contract exposes per-agent provider identity that supersedes the scoped session-id view.
   kind-aware-provider-retry:
+
+turn-scoped-subagent-cancellation:
     area: runtime-reliability
     state: shipped
     owner: pylon-prime-integration
     decision: redesign
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/22
+<<<<<<< HEAD
       - https://github.com/pylon-code/prime-agent/issues/24
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/tree/a903d4b6768f484bd6d459b7b0aa7dee38e461e2
@@ -296,3 +299,16 @@ decisions:
     revisit_when:
       - Prime upstream makes the session retry loop failure-kind aware and honors Retry-After with a delay ceiling.
       - Prime upstream makes exactly one retry layer own policy so provider SDK retries cannot multiply session retries.
+=======
+      - https://github.com/pylon-code/prime-agent/issues/25
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/346
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/464
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/1253
+      - https://github.com/PrimeIntellect-ai/prime-agent/tree/c382f09856d4a8c8d2b765179657047d58691f25
+    fork_change: none
+    upstream_support: Prime through c382f09856d4 keeps two cancel semantics. `AgentSession.requestAbort()` deliberately leaves active RLM child runs alive (PR #346 pinned that with a characterization test) while only `abort()` and `abortForUpdateRestart()` cascade, and every user-facing cancel path routes through `requestAbort()`. PR #464 made per-child cancellation explicit but never bound it to a turn abort, and open PR #1253 scopes child cancellation to kernel host teardown only. No upstream contract cancels the children a cancelled turn owns.
+    revisit_when:
+      - Prime makes a user-facing turn abort cancel the child runs it owns, or exposes an equivalent turn-scoped cancellation contract.
+      - Prime introduces a real detached or background spawn mode, which would need a per-child survival decision instead of one retained-versus-active rule.
+>>>>>>> 4a393796c (fix: cascade requestAbort into active RLM child runs)

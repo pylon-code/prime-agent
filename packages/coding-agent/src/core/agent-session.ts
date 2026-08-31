@@ -7462,6 +7462,14 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
+	/**
+	 * Cancel the active turn and everything it owns, including in-flight RLM child
+	 * runs. Every user-facing cancel (interactive ctrl-c, ACP/daemon `abort`,
+	 * `abort_and_clear_queue`) routes here, so a spawn run must die with the turn
+	 * instead of holding provider capacity. Retained child sessions are addressable
+	 * background subagents and are left running; cancel those by id with
+	 * {@link cancelRlmChildRun}.
+	 */
 	requestAbort(): void {
 		this._failDeferredPromptLifecycles();
 		for (const run of [...this._unsettledRlmChildRuns]) {
@@ -7490,13 +7498,15 @@ export class AgentSession {
 		this._autoRefineReviewAbort?.abort();
 		this._refineAbortController?.abort();
 		this.agent.abort();
+		// After the scheduler suspension above, so cancelled runs are abandoned for
+		// quiescence and cannot inject a late terminal notice into the next turn.
+		this._cancelActiveRlmChildRuns("Parent session aborted");
 	}
 
 	async abort(): Promise<void> {
 		const compactionOperation = this._compactionOperation;
 		const branchSummaryOperation = this._branchSummaryOperation;
 		this.requestAbort();
-		this._cancelActiveRlmChildRuns("Parent session aborted");
 		this._goalAbortInProgress = this._goalState.status === "active";
 		try {
 			await Promise.allSettled([
