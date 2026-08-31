@@ -7,7 +7,7 @@ import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { PYLON_RELEASE_REPOSITORY } from "./lib/pylon-release.mjs";
-import { withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
+import { syncConsumerStateDirectory, withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 import {
 	canonicalJson,
 	parseStableTag,
@@ -56,18 +56,6 @@ async function readCanonicalState(statePath) {
 	return state;
 }
 
-async function syncDirectory(path) {
-	let handle;
-	try {
-		handle = await open(path, "r");
-		await handle.sync();
-	} catch (error) {
-		if (!["EINVAL", "EPERM", "EISDIR"].includes(error?.code)) throw error;
-	} finally {
-		if (handle !== undefined) await handle.close();
-	}
-}
-
 async function writeStateAtomically(statePath, state) {
 	const directory = dirname(statePath);
 	const temporary = resolve(directory, `.${basename(statePath)}.${process.pid}.${randomUUID()}.tmp`);
@@ -79,7 +67,7 @@ async function writeStateAtomically(statePath, state) {
 		await handle.close();
 		handle = undefined;
 		await rename(temporary, statePath);
-		await syncDirectory(directory);
+		await syncConsumerStateDirectory(directory);
 	} finally {
 		if (handle !== undefined) await handle.close();
 		await rm(temporary, { force: true });

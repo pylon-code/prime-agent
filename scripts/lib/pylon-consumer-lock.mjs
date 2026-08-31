@@ -8,13 +8,64 @@ import {
 	readFile,
 	rm,
 } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, join, parse, relative, resolve, sep } from "node:path";
 
 import lockfile from "proper-lockfile";
 
 export const PYLON_CONSUMER_LOCK_STALE_MS = 30_000;
 export const PYLON_CONSUMER_LOCK_UPDATE_MS = 10_000;
 const anchorContents = "pylon-consumer-state-lock-v1\n";
+
+export async function syncConsumerStateDirectory(path, { openDirectory = open } = {}) {
+	let handle;
+	try {
+		handle = await openDirectory(path, "r");
+		await handle.sync();
+	} catch (error) {
+		if (!["EINVAL", "EPERM", "EISDIR"].includes(error?.code)) throw error;
+	} finally {
+		if (handle !== undefined) await handle.close();
+	}
+}
+
+export async function ensureDurableConsumerStateDirectory(
+	directory,
+	{
+		lstatEntry = lstat,
+		makeDirectory = mkdir,
+		syncDirectory = syncConsumerStateDirectory,
+	} = {},
+) {
+	const absolute = resolve(directory);
+	const root = parse(absolute).root;
+	let parent = root;
+	const rootEntry = await lstatEntry(root);
+	if (!rootEntry.isDirectory()) {
+		throw new Error("Consumer high-water state directory must be one canonical real directory.");
+	}
+	const remainder = relative(root, absolute);
+	for (const component of remainder ? remainder.split(sep) : []) {
+		const current = join(parent, component);
+		let entry;
+		try {
+			entry = await lstatEntry(current);
+		} catch (error) {
+			if (error?.code !== "ENOENT") throw error;
+			try {
+				await makeDirectory(current, { mode: 0o700 });
+			} catch (mkdirError) {
+				if (mkdirError?.code !== "EEXIST") throw mkdirError;
+			}
+			await syncDirectory(parent);
+			entry = await lstatEntry(current);
+		}
+		if (!entry.isDirectory()) {
+			throw new Error("Consumer high-water state directory must be one canonical real directory.");
+		}
+		parent = current;
+	}
+	return absolute;
+}
 
 async function ensureAnchor(anchorPath) {
 	const temporary = `${anchorPath}.${process.pid}.${randomUUID()}.tmp`;
@@ -50,10 +101,7 @@ export async function withConsumerStateLock(
 ) {
 	const absoluteStatePath = resolve(statePath);
 	const directory = dirname(absoluteStatePath);
-	await mkdir(directory, { recursive: true, mode: 0o700 });
-	if (!(await lstat(directory)).isDirectory()) {
-		throw new Error("Consumer high-water state directory must be one canonical real directory.");
-	}
+	await ensureDurableConsumerStateDirectory(directory);
 	const anchorPath = `${absoluteStatePath}.lock-anchor`;
 	await ensureAnchor(anchorPath);
 	let release;

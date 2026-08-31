@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { watch } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -56,7 +56,7 @@ import { validatePreviewWorkflowRunEvidence, verifyGhAttestationResult } from ".
 import { recordPreviewHighWater } from "./verify-pylon-preview-history.mjs";
 import { verifyStableHistoryWithState } from "./verify-pylon-stable-history.mjs";
 import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
-import { withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
+import { ensureDurableConsumerStateDirectory, withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 import { isExactWithdrawalReplay, selectStableHistoryReleases } from "./prepare-pylon-stable-manifest.mjs";
 import { recoverStableDraft } from "./recover-pylon-stable-manifest.mjs";
 
@@ -181,6 +181,53 @@ function githubScriptForStep(workflowPath, stepName) {
 	return body.join("\n");
 }
 
+function exactPublicationTagRuleset() {
+	return {
+		id: 21_950_766,
+		name: "Pylon immutable publication tags",
+		target: "tag",
+		source_type: "Repository",
+		source: "pylon-code/prime-agent",
+		enforcement: "active",
+		conditions: {
+			ref_name: {
+				exclude: [],
+				include: ["refs/tags/pylon-build-*", "refs/tags/pylon-stable-*"],
+			},
+		},
+		rules: [
+			{ type: "update", parameters: { update_allows_fetch_and_merge: false } },
+			{ type: "deletion" },
+		],
+	};
+}
+
+async function inlinePublicationTagRulesetValidator(responses) {
+	const script = githubScriptForStep(".github/workflows/pylon-preview-release.yml", "Require the canonical protected push");
+	const start = script.indexOf("const requireExactPublicationTagRuleset = async () => {");
+	const end = script.indexOf("\nawait requireExactPublicationTagRuleset();", start);
+	assert.ok(start >= 0 && end > start, "preview admission lacks the frozen tag-ruleset validator");
+	const create = new AsyncFunction(
+		"github", "owner", "repo",
+		`${script.slice(start, end)}\nreturn requireExactPublicationTagRuleset;`,
+	);
+	let request = 0;
+	const github = {
+		request: async (route, parameters) => {
+			assert.equal(route, "GET /repos/{owner}/{repo}/rulesets/{ruleset_id}");
+			assert.deepEqual(parameters, {
+				owner: "pylon-code", repo: "prime-agent", ruleset_id: 21_950_766,
+				headers: { accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+			});
+			const response = responses[Math.min(request, responses.length - 1)];
+			request += 1;
+			if (response instanceof Error) throw response;
+			return { status: 200, data: response };
+		},
+	};
+	return { validate: await create(github, "pylon-code", "prime-agent"), requests: () => request };
+}
+
 test("canonical publication JSON sorts every object key and rejects unsupported values", () => {
 	assert.equal(canonicalJson({ z: 1, a: { y: 2, b: 3 } }), '{\n  "a": {\n    "b": 3,\n    "y": 2\n  },\n  "z": 1\n}\n');
 	assert.throws(() => canonicalJson({ bad: undefined }), /undefined/);
@@ -269,10 +316,10 @@ test("current policy validates an older supported closed recipe without executin
 });
 
 test("consumer preview high-water allows gaps but rejects rollback and same-sequence equivocation", async () => {
-	const fixture = mkdtempSync(join(tmpdir(), "pylon-preview-state-"));
+	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-preview-state-")));
 	try {
 		const { preview, previewBytes } = manifests();
-		const statePath = join(fixture, "consumer", "preview.json");
+		const statePath = join(fixture, "consumer", "nested", "preview.json");
 		await assert.rejects(() => recordPreviewHighWater(preview, previewBytes, { statePath }), /--initialize/);
 		assert.equal((await recordPreviewHighWater(preview, previewBytes, { statePath, initialize: true })).advanced, true);
 		assert.equal((await recordPreviewHighWater(preview, previewBytes, { statePath })).advanced, false);
@@ -321,13 +368,13 @@ test("stable history is contiguous, previous-digest chained, high-water marked, 
 });
 
 test("consumer stable high-water requires explicit initialization, is idempotent, and advances atomically", async () => {
-	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-state-"));
+	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-stable-state-")));
 	try {
 		const first = firstStable();
 		const second = secondStable(first);
 		const firstPath = join(fixture, "first.json");
 		const secondPath = join(fixture, "second.json");
-		const statePath = join(fixture, "consumer", "stable.json");
+		const statePath = join(fixture, "consumer", "nested", "stable.json");
 		writeFileSync(firstPath, canonicalJson(first));
 		writeFileSync(secondPath, canonicalJson(second));
 		await assert.rejects(() => verifyStableHistoryWithState([firstPath], { statePath }), /--initialize/);
@@ -348,7 +395,7 @@ test("consumer stable high-water requires explicit initialization, is idempotent
 });
 
 test("consumer stable high-water rejects rollback and a rewritten witnessed sequence", async () => {
-	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-state-"));
+	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-stable-state-")));
 	try {
 		const first = firstStable();
 		const second = secondStable(first);
@@ -378,7 +425,7 @@ test("consumer stable high-water rejects rollback and a rewritten witnessed sequ
 });
 
 test("consumer stable high-water rejects malformed, noncanonical, symlinked, and locked local state", async () => {
-	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-state-"));
+	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-stable-state-")));
 	try {
 		const manifestPath = join(fixture, "first.json");
 		const statePath = join(fixture, "stable.json");
@@ -396,6 +443,14 @@ test("consumer stable high-water rejects malformed, noncanonical, symlinked, and
 		symlinkSync(manifestPath, statePath);
 		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath }), /regular file/);
 		rmSync(statePath);
+		const realDirectory = join(fixture, "real-state-directory");
+		const linkedDirectory = join(fixture, "linked-state-directory");
+		mkdirSync(realDirectory);
+		symlinkSync(realDirectory, linkedDirectory);
+		await assert.rejects(
+			() => verifyStableHistoryWithState([manifestPath], { statePath: join(linkedDirectory, "stable.json"), initialize: true }),
+			/canonical real directory/,
+		);
 		mkdirSync(`${statePath}.lock`);
 		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /locked/);
 	} finally {
@@ -844,7 +899,32 @@ test("recipe and publication policy registries close independent immutable ident
 });
 
 test("consumer lock heartbeat prevents stale-equivalent theft and dead stale locks recover", async () => {
-	const fixture = mkdtempSync(join(tmpdir(), "pylon-consumer-lock-"));
+	const virtualRoot = resolve("/");
+	const first = join(virtualRoot, "pylon-durable-state-test");
+	const second = join(first, "nested");
+	const existing = new Set([virtualRoot]);
+	const durabilityEvents = [];
+	const operations = {
+		lstatEntry: async (path) => {
+			if (!existing.has(path)) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+			return { isDirectory: () => true };
+		},
+		makeDirectory: async (path, options) => {
+			assert.deepEqual(options, { mode: 0o700 });
+			durabilityEvents.push(`mkdir:${path}`);
+			existing.add(path);
+		},
+		syncDirectory: async (path) => durabilityEvents.push(`sync:${path}`),
+	};
+	await ensureDurableConsumerStateDirectory(second, operations);
+	assert.deepEqual(durabilityEvents, [
+		`mkdir:${first}`, `sync:${virtualRoot}`, `mkdir:${second}`, `sync:${first}`,
+	]);
+	durabilityEvents.length = 0;
+	await ensureDurableConsumerStateDirectory(second, operations);
+	assert.deepEqual(durabilityEvents, [], "an existing real directory needs no new durability mutation");
+
+	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-consumer-lock-")));
 	const timing = { stale: 2_000, update: 1_000 };
 	try {
 		for (const name of ["preview.json", "stable.json"]) {
@@ -881,7 +961,7 @@ test("consumer lock heartbeat prevents stale-equivalent theft and dead stale loc
 	}
 });
 
-test("every inline admission and final publisher closes the exact branch-check trust root", () => {
+test("every inline admission and final publisher closes the exact branch-check trust root", async () => {
 	for (const [workflow, step] of [
 		[".github/workflows/pylon-preview-release.yml", "Require the canonical protected push"],
 		[".github/workflows/pylon-preview-release.yml", "Verify exact checks and publish once"],
@@ -895,6 +975,76 @@ test("every inline admission and final publisher closes the exact branch-check t
 		]) assert.ok(script.includes(value), `${workflow}:${step} lacks ${value}`);
 		assert.match(script, /JSON\.stringify\(actualPolicy\) !== JSON\.stringify/);
 		assert.doesNotMatch(script, /appId === null|!expectedPath/);
+	}
+
+	const rulesetSteps = [
+		[".github/workflows/pylon-preview-release.yml", "Require the canonical protected push", 1],
+		[".github/workflows/pylon-preview-release.yml", "Create or finish the exact durable draft", 2],
+		[".github/workflows/pylon-preview-release.yml", "Verify exact checks and publish once", 2],
+		[".github/workflows/pylon-stable-release.yml", "Require protected pylon and an exact verified preview source", 1],
+		[".github/workflows/pylon-stable-release.yml", "Re-download the exact draft, reserve N once, and publish only that draft", 4],
+	];
+	const frozenValidators = new Set();
+	for (const [workflow, step, expectedCalls] of rulesetSteps) {
+		const script = githubScriptForStep(workflow, step);
+		const start = script.indexOf("const requireExactPublicationTagRuleset = async () => {");
+		const end = script.indexOf("\nawait requireExactPublicationTagRuleset();", start);
+		assert.ok(start >= 0 && end > start, `${workflow}:${step} lacks an inline tag-ruleset proof`);
+		frozenValidators.add(script.slice(start, end));
+		assert.equal((script.match(/await requireExactPublicationTagRuleset\(\);/g) ?? []).length, expectedCalls);
+		assert.match(script, /refs\/tags\/pylon-stable-sequence-000001/);
+	}
+	assert.equal(frozenValidators.size, 1, "every writer must use the same frozen inline validator bytes");
+
+	const valid = exactPublicationTagRuleset();
+	const { validate } = await inlinePublicationTagRulesetValidator([valid]);
+	await validate();
+	const mutations = [
+		(value) => (value.enforcement = "disabled"),
+		(value) => (value.bypass_actors = [{ actor_type: "RepositoryRole", actor_id: 5 }]),
+		(value) => value.conditions.ref_name.exclude.push("refs/tags/pylon-stable-sequence-*"),
+		(value) => (value.conditions.ref_name.include[1] = "refs/tags/pylon-stable-[0-9]*"),
+		(value) => value.conditions.ref_name.include.pop(),
+		(value) => value.rules.pop(),
+		(value) => (value.rules[0].parameters.update_allows_fetch_and_merge = true),
+		(value) => (value.rules[0].parameters.extra = false),
+		(value) => value.rules.push({ type: "creation" }),
+		(value) => (value.id = 1),
+		(value) => (value.name = "Other ruleset"),
+		(value) => (value.source = "fork/prime-agent"),
+		(value) => (value.target = "branch"),
+		(value) => delete value.conditions.ref_name.exclude,
+		(value) => (value.conditions.extra = {}),
+	];
+	for (const mutate of mutations) {
+		const changed = structuredClone(valid);
+		mutate(changed);
+		const rejected = await inlinePublicationTagRulesetValidator([changed]);
+		await assert.rejects(() => rejected.validate(), /exact active non-bypassable immutable tag ruleset/);
+	}
+	const unavailable = await inlinePublicationTagRulesetValidator([new Error("ruleset auth or endpoint unavailable")]);
+	await assert.rejects(() => unavailable.validate(), /unavailable/);
+	const stale = structuredClone(valid);
+	stale.enforcement = "disabled";
+	const pointInTime = await inlinePublicationTagRulesetValidator([valid, stale]);
+	await pointInTime.validate();
+	await assert.rejects(() => pointInTime.validate(), /exact active non-bypassable immutable tag ruleset/);
+	assert.equal(pointInTime.requests(), 2, "a stale admission proof must not authorize a later write");
+
+	for (const workflow of [
+		readFileSync(join(root, ".github/workflows/pylon-preview-release.yml"), "utf8"),
+		readFileSync(join(root, ".github/workflows/pylon-stable-release.yml"), "utf8"),
+	]) {
+		for (const mutation of workflow.matchAll(/github\.rest\.git\.createRef/g)) {
+			const proof = workflow.lastIndexOf("await requireExactPublicationTagRuleset();", mutation.index);
+			const between = workflow.slice(proof + "await requireExactPublicationTagRuleset();".length, mutation.index).replace(/\(?await\s*$/, "");
+			assert.ok(proof >= 0 && !/\bawait\b/.test(between), "tag CAS lacks an immediately fresh ruleset proof");
+		}
+		for (const mutation of workflow.matchAll(/github\.rest\.repos\.updateRelease/g)) {
+			const proof = workflow.lastIndexOf("await requireExactPublicationTagRuleset();", mutation.index);
+			const between = workflow.slice(proof + "await requireExactPublicationTagRuleset();".length, mutation.index).replace(/\(?await\s*$/, "");
+			assert.ok(proof >= 0 && !/\bawait\b/.test(between), "immutable publish lacks an immediately fresh ruleset proof");
+		}
 	}
 });
 

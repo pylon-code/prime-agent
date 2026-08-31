@@ -13,7 +13,7 @@ import {
 	sha256Bytes,
 } from "./lib/pylon-publication.mjs";
 import { PYLON_RELEASE_REPOSITORY } from "./lib/pylon-release.mjs";
-import { withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
+import { syncConsumerStateDirectory, withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 import { verifyPreviewAttestations } from "./verify-pylon-publication-attestations.mjs";
 
 const STATE_SCHEMA_VERSION = 1;
@@ -38,18 +38,6 @@ function validateState(state) {
 	return state;
 }
 
-async function syncDirectory(path) {
-	let handle;
-	try {
-		handle = await open(path, "r");
-		await handle.sync();
-	} catch (error) {
-		if (!["EINVAL", "EPERM", "EISDIR"].includes(error?.code)) throw error;
-	} finally {
-		if (handle !== undefined) await handle.close();
-	}
-}
-
 async function atomicWrite(statePath, state) {
 	const directory = dirname(statePath);
 	const temporary = resolve(directory, `.${basename(statePath)}.${process.pid}.${randomUUID()}.tmp`);
@@ -61,7 +49,7 @@ async function atomicWrite(statePath, state) {
 		await handle.close();
 		handle = undefined;
 		await rename(temporary, statePath);
-		await syncDirectory(directory);
+		await syncConsumerStateDirectory(directory);
 	} finally {
 		if (handle !== undefined) await handle.close();
 		await rm(temporary, { force: true });
