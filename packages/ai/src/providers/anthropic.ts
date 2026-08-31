@@ -389,11 +389,21 @@ function anthropicSseError(data: string, requestId?: string, retryAfterMs?: numb
 	let errorType: string | undefined;
 	let detail: string | undefined;
 	try {
-		const parsed = parseJsonWithRepair<{ error?: { type?: string; message?: string }; request_id?: string }>(data);
+		const parsed = parseJsonWithRepair<{
+			error?: { type?: string; message?: string; retry_after?: number };
+			request_id?: string;
+		}>(data);
 		errorType = parsed.error?.type;
 		detail = parsed.error?.message;
 		// Proxies may strip the request-id header; the error body carries it too.
 		requestId ??= typeof parsed.request_id === "string" ? parsed.request_id : undefined;
+		// A stream's headers are sent before the error is known, so proxies that
+		// compute a wait mid-stream (e.g. Meridian) carry it in the frame as
+		// seconds. The in-frame value describes this exact failure; prefer it.
+		const frameRetryAfter = parsed.error?.retry_after;
+		if (typeof frameRetryAfter === "number" && Number.isFinite(frameRetryAfter) && frameRetryAfter >= 0) {
+			retryAfterMs = Math.round(frameRetryAfter * 1000);
+		}
 	} catch {
 		detail = data;
 	}
