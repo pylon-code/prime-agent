@@ -128,27 +128,60 @@ jobs:
                 draft = matches[0];
                 draftId = String(draft.id);
               } else throw new Error("Recovery identity must be a reservation, stable draft tag, or numeric release id.");
-              if (!draft.draft || draft.immutable === true || draft.assets?.length !== 1 || draft.assets[0].name !== "pylon-stable-channel-v1.json") {
+              if (!draft.draft || draft.immutable === true || !Array.isArray(draft.assets) || draft.assets.length > 1) {
                 throw new Error("Recovery identity does not resolve to one exact unpublished stable draft.");
               }
-              const response = await github.request("GET /repos/{owner}/{repo}/releases/assets/{asset_id}", {
-                owner, repo, asset_id: draft.assets[0].id, headers: { accept: "application/octet-stream" },
-              });
-              const bytes = Buffer.from(response.data);
+              if (typeof draft.body !== "string" || Buffer.byteLength(draft.body, "utf8") > 80 * 1024) {
+                throw new Error("Recovery draft body is absent or exceeds the safe 80 KiB bound.");
+              }
+              const encoded = /^Manifest base64: ([A-Za-z0-9+/]+={0,2})$/m.exec(draft.body)?.[1];
+              const encodedSize = /^Manifest bytes: ([1-9][0-9]*)$/m.exec(draft.body)?.[1];
+              const encodedDigest = /^Manifest sha256: ([0-9a-f]{64})$/m.exec(draft.body)?.[1];
+              if (!encoded || !encodedSize || !encodedDigest || (draft.body.match(/^Stable recovery manifest: base64-v1$/gm) ?? []).length !== 1) {
+                throw new Error("Recovery draft body lacks one exact stable manifest envelope.");
+              }
+              const bytes = Buffer.from(encoded, "base64");
               const digest = crypto.createHash("sha256").update(bytes).digest("hex");
+              if (bytes.toString("base64") !== encoded || bytes.length !== Number(encodedSize) || bytes.length > 48 * 1024 || digest !== encodedDigest) {
+                throw new Error("Recovery draft body manifest is altered, truncated, or oversized.");
+              }
               const manifest = JSON.parse(bytes);
+              const canonical = (value) => {
+                if (value === null || ["string", "boolean"].includes(typeof value)) return value;
+                if (typeof value === "number" && Number.isFinite(value)) return value;
+                if (Array.isArray(value)) return value.map(canonical);
+                if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) throw new Error("Unsupported recovery manifest value.");
+                return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+              };
+              if (bytes.toString("utf8") !== `${JSON.stringify(canonical(manifest), null, 2)}\n`) throw new Error("Recovery manifest is not canonical JSON.");
               previewTag = manifest.build?.previewTag;
               sourceSha = manifest.build?.source?.commit;
               sourceTree = manifest.build?.source?.tree;
               policySha = manifest.promotion?.policyCommit;
               policyTree = manifest.promotion?.policyTree;
+              const expectedBody = [
+                "Pylon Prime stable publication.", "", `Tag: ${manifest.tag}`, `Source: ${sourceSha}`, `Tree: ${sourceTree}`,
+                `Policy: ${policySha}`, `Policy tree: ${policyTree}`, `Recipe: r${manifest.build?.recipeRevision}`,
+                "Stable recovery manifest: base64-v1", `Manifest bytes: ${bytes.length}`, `Manifest sha256: ${digest}`,
+                `Manifest base64: ${encoded}`, "", "Verify the immutable release and artifact attestations before use.",
+              ].join("\n");
               if (
-                previewTag !== requestedPreview || manifest.promotion?.kind !== originalOperation ||
+                previewTag !== requestedPreview || manifest.promotion?.kind !== originalOperation || draft.body !== expectedBody ||
                 draft.tag_name !== manifest.tag || draft.target_commitish !== policySha ||
-                draft.assets[0].size !== bytes.length || draft.assets[0].digest !== `sha256:${digest}` ||
                 !/^[0-9a-f]{40}$/.test(sourceSha ?? "") || !/^[0-9a-f]{40}$/.test(sourceTree ?? "") ||
                 !/^[0-9a-f]{40}$/.test(policySha ?? "") || !/^[0-9a-f]{40}$/.test(policyTree ?? "")
               ) throw new Error("Recovery draft does not match the operator or exact manifest identity.");
+              const asset = draft.assets[0];
+              if (asset) {
+                if (asset.name !== "pylon-stable-channel-v1.json") throw new Error("Recovery draft singleton asset has an unexpected name.");
+                const response = await github.request("GET /repos/{owner}/{repo}/releases/assets/{asset_id}", {
+                  owner, repo, asset_id: asset.id, headers: { accept: "application/octet-stream" },
+                });
+                const downloaded = Buffer.from(response.data);
+                if (!downloaded.equals(bytes) || asset.size !== bytes.length || asset.digest !== `sha256:${digest}`) {
+                  throw new Error("Recovery draft asset differs from the exact body-carried manifest.");
+                }
+              }
               if (originalOperation === "withdraw") {
                 const revocation = manifest.promotion.revocation;
                 if (revocation?.stableTag !== process.env.REVOKE_STABLE_TAG || revocation?.reason !== process.env.REASON) {
@@ -163,9 +196,14 @@ jobs:
               }
               const computedReservation = `pylon-stable-sequence-${String(manifest.sequence).padStart(6, "0")}`;
               if (reservation) {
+                const withdrawalLines = originalOperation === "withdraw" ? [
+                  `Withdraw stable tag: ${manifest.promotion.revocation.stableTag}`,
+                  `Withdraw build tag: ${manifest.promotion.revocation.buildTag}`,
+                  `Withdraw reason: ${manifest.promotion.revocation.reason}`,
+                ] : [];
                 const expected = [
                   "Pylon stable sequence reservation", `Sequence: ${String(manifest.sequence).padStart(6, "0")}`,
-                  `Policy: ${policySha}`, `Policy tree: ${policyTree}`, `Operation: ${originalOperation}`,
+                  `Policy: ${policySha}`, `Policy tree: ${policyTree}`, `Operation: ${originalOperation}`, ...withdrawalLines,
                   `Stable tag: ${manifest.tag}`, `Preview: ${previewTag}`, `Manifest: sha256:${digest}`,
                   `Draft release: ${draft.id}`, "",
                 ].join("\n");
@@ -208,21 +246,20 @@ jobs:
             );
             const rule = protection.repository?.ref?.branchProtectionRule;
             const required = rule?.requiredStatusChecks;
-            if (!rule?.requiresStatusChecks || !Array.isArray(required) || required.length === 0) {
-              throw new Error("Protected pylon required-check policy is unavailable.");
+            const expectedPolicy = [
+              { context: "Check changelog fragment", appId: 15368, workflowPath: ".github/workflows/changelog-merged-proof.yml" },
+              { context: "build-check-test", appId: 15368, workflowPath: ".github/workflows/ci.yml" },
+            ];
+            const actualPolicy = Array.isArray(required) ? required.map((requirement) => ({
+              context: requirement.context, appId: requirement.app?.databaseId ?? null,
+            })).sort((left, right) => left.context < right.context ? -1 : left.context > right.context ? 1 : 0) : null;
+            if (!rule?.requiresStatusChecks || JSON.stringify(actualPolicy) !== JSON.stringify(expectedPolicy.map(({ context, appId }) => ({ context, appId })))) {
+              throw new Error("Protected pylon must require exactly the two app-bound publication checks.");
             }
             const proveChecks = async (sha, label) => {
               const checks = await github.paginate(github.rest.checks.listForRef, { owner, repo, ref: sha, filter: "latest", per_page: 100 });
-              const statuses = (await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha })).data.statuses;
-              for (const requirement of required) {
-                const appId = requirement.app?.databaseId ?? null;
-                if (appId === null) {
-                  if (!statuses.some((status) => status.context === requirement.context && status.state === "success" && status.sha === sha)) {
-                    throw new Error(`Required status ${requirement.context} is not green on ${label}.`);
-                  }
-                  continue;
-                }
-                const candidates = checks.filter((check) => check.name === requirement.context && check.head_sha === sha && check.app?.id === appId && check.status === "completed" && check.conclusion === "success");
+              for (const requirement of expectedPolicy) {
+                const candidates = checks.filter((check) => check.name === requirement.context && check.head_sha === sha && check.app?.id === requirement.appId && check.status === "completed" && check.conclusion === "success");
                 let proved = false;
                 for (const check of candidates) {
                   const runId = /^https:\/\/github\.com\/pylon-code\/prime-agent\/actions\/runs\/([0-9]+)(?:\/job\/[0-9]+)?$/.exec(check.details_url ?? "")?.[1];
@@ -230,13 +267,12 @@ jobs:
                   const suite = (await github.rest.checks.getSuite({ owner, repo, check_suite_id: check.check_suite.id })).data;
                   const run = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(runId) })).data;
                   const workflow = (await github.rest.actions.getWorkflow({ owner, repo, workflow_id: run.workflow_id })).data;
-                  const expectedPath = { "build-check-test": ".github/workflows/ci.yml", "Check changelog fragment": ".github/workflows/changelog-merged-proof.yml" }[requirement.context];
                   if (
-                    suite.app?.id === appId && suite.head_sha === sha && suite.status === "completed" && suite.conclusion === "success" &&
+                    suite.app?.id === requirement.appId && suite.head_sha === sha && suite.status === "completed" && suite.conclusion === "success" &&
                     run.check_suite_id === suite.id && run.repository?.id === 1349002285 && run.repository?.full_name === repository &&
                     run.head_repository?.id === 1349002285 && run.head_repository?.full_name === repository && run.event === "push" &&
                     run.head_branch === "pylon" && run.head_sha === sha && run.status === "completed" && run.conclusion === "success" &&
-                    workflow.path.startsWith(".github/workflows/") && (!expectedPath || workflow.path === expectedPath)
+                    workflow.path === requirement.workflowPath
                   ) { proved = true; break; }
                 }
                 if (!proved) throw new Error(`Required check ${requirement.context} lacks canonical exact-SHA proof on ${label}.`);
@@ -314,7 +350,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
+        os: [ubuntu-24.04, macos-15]
     steps:
       - name: Checkout current protected install policy
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -379,6 +415,7 @@ jobs:
       sequence: ${{ steps.prepare.outputs.sequence }}
       draft_id: ${{ steps.prepare.outputs.draft_id }}
       reservation_tag: ${{ steps.prepare.outputs.reservation_tag }}
+      manifest_sha256: ${{ steps.prepare.outputs.manifest_sha256 }}
       mode: ${{ needs.admission.outputs.mode }}
     steps:
       - name: Checkout protected promotion policy
@@ -619,6 +656,7 @@ jobs:
             const stat = fs.lstatSync(process.env.STABLE_MANIFEST);
             if (!stat.isFile()) throw new Error("Stable draft subject is not one regular file.");
             const bytes = fs.readFileSync(process.env.STABLE_MANIFEST);
+            if (bytes.length < 1 || bytes.length > 48 * 1024) throw new Error("Stable manifest exceeds the safe 48 KiB recovery bound.");
             const manifest = JSON.parse(bytes);
             const canonical = (value) => {
               if (value === null || ["string", "boolean"].includes(typeof value)) return value;
@@ -638,12 +676,15 @@ jobs:
               manifest.build.previewTag !== manifest.build.id || manifest.promotion?.policyCommit !== context.sha
             ) throw new Error("Stable draft identity is malformed or not signed by this policy commit.");
             const name = `Pylon Prime stable ${tag}`;
+            const encoded = bytes.toString("base64");
             const body = [
               "Pylon Prime stable publication.", "", `Tag: ${tag}`, `Source: ${manifest.build.source.commit}`,
               `Tree: ${manifest.build.source.tree}`, `Policy: ${manifest.promotion.policyCommit}`,
-              `Policy tree: ${manifest.promotion.policyTree}`, `Recipe: r${manifest.build.recipeRevision}`, "",
-              "Verify the immutable release and artifact attestations before use.",
+              `Policy tree: ${manifest.promotion.policyTree}`, `Recipe: r${manifest.build.recipeRevision}`,
+              "Stable recovery manifest: base64-v1", `Manifest bytes: ${bytes.length}`, `Manifest sha256: ${digest}`,
+              `Manifest base64: ${encoded}`, "", "Verify the immutable release and artifact attestations before use.",
             ].join("\n");
+            if (Buffer.byteLength(body, "utf8") > 80 * 1024) throw new Error("Stable recovery release body exceeds 80 KiB.");
             const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
             const matching = releases.filter((release) => release.tag_name === tag);
             if (matching.length > 1) throw new Error("Stable draft tag is ambiguous.");
@@ -708,6 +749,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
+      actions: read
       checks: read
       contents: write
     steps:
@@ -723,6 +765,7 @@ jobs:
           OPERATION: ${{ inputs.operation }}
           REVOKE_STABLE_TAG: ${{ inputs.revoke_stable_tag }}
           REASON: ${{ inputs.reason }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.prepare.outputs.manifest_sha256 }}
         with:
           script: |
             const crypto = require("node:crypto");
@@ -738,16 +781,25 @@ jobs:
             ) throw new Error("Stable publisher requires one exact canonical transaction.");
             const current = await github.rest.git.getRef({ owner, repo, ref: "heads/pylon" });
             if (current.data.object.type !== "commit" || current.data.object.sha !== context.sha) throw new Error("Stable publication run is stale relative to live pylon.");
-            const draft = (await github.rest.repos.getRelease({ owner, repo, release_id: draftId })).data;
-            if (!draft.draft || draft.immutable === true || draft.assets?.length !== 1 || draft.assets[0].name !== "pylon-stable-channel-v1.json") {
-              throw new Error("Stable transaction no longer resolves to one unpublished complete draft.");
+            let draft = (await github.rest.repos.getRelease({ owner, repo, release_id: draftId })).data;
+            if (!draft.draft || draft.immutable === true || !Array.isArray(draft.assets) || draft.assets.length > 1) {
+              throw new Error("Stable transaction no longer resolves to one exact unpublished draft.");
             }
-            const downloaded = await github.request("GET /repos/{owner}/{repo}/releases/assets/{asset_id}", {
-              owner, repo, asset_id: draft.assets[0].id, headers: { accept: "application/octet-stream" },
-            });
-            const bytes = Buffer.from(downloaded.data);
+            if (typeof draft.body !== "string" || Buffer.byteLength(draft.body, "utf8") > 80 * 1024) {
+              throw new Error("Stable recovery body is absent or exceeds 80 KiB.");
+            }
+            const encoded = /^Manifest base64: ([A-Za-z0-9+/]+={0,2})$/m.exec(draft.body)?.[1];
+            const encodedSize = /^Manifest bytes: ([1-9][0-9]*)$/m.exec(draft.body)?.[1];
+            const encodedDigest = /^Manifest sha256: ([0-9a-f]{64})$/m.exec(draft.body)?.[1];
+            if (!encoded || !encodedSize || !encodedDigest || (draft.body.match(/^Stable recovery manifest: base64-v1$/gm) ?? []).length !== 1) {
+              throw new Error("Stable recovery body lacks one exact manifest envelope.");
+            }
+            const bytes = Buffer.from(encoded, "base64");
             const digest = crypto.createHash("sha256").update(bytes).digest("hex");
-            if (draft.assets[0].size !== bytes.length || draft.assets[0].digest !== `sha256:${digest}`) throw new Error("Stable draft metadata does not match its re-downloaded bytes.");
+            if (digest !== process.env.EXPECTED_MANIFEST_SHA256) throw new Error("Stable draft bytes differ from the exact prepared or recovered manifest digest.");
+            if (bytes.toString("base64") !== encoded || bytes.length !== Number(encodedSize) || bytes.length > 48 * 1024 || digest !== encodedDigest) {
+              throw new Error("Stable recovery body manifest is altered, truncated, or oversized.");
+            }
             const manifest = JSON.parse(bytes);
             const canonical = (value) => {
               if (value === null || ["string", "boolean"].includes(typeof value)) return value;
@@ -760,6 +812,32 @@ jobs:
               }));
             };
             if (bytes.toString("utf8") !== `${JSON.stringify(canonical(manifest), null, 2)}\n`) throw new Error("Stable draft bytes are not canonical JSON.");
+            const recoveryBody = [
+              "Pylon Prime stable publication.", "", `Tag: ${manifest.tag}`, `Source: ${manifest.build?.source?.commit}`,
+              `Tree: ${manifest.build?.source?.tree}`, `Policy: ${manifest.promotion?.policyCommit}`,
+              `Policy tree: ${manifest.promotion?.policyTree}`, `Recipe: r${manifest.build?.recipeRevision}`,
+              "Stable recovery manifest: base64-v1", `Manifest bytes: ${bytes.length}`, `Manifest sha256: ${digest}`,
+              `Manifest base64: ${encoded}`, "", "Verify the immutable release and artifact attestations before use.",
+            ].join("\n");
+            if (draft.body !== recoveryBody) throw new Error("Stable recovery body metadata differs from its exact manifest.");
+            let asset = draft.assets[0];
+            if (asset && asset.name !== "pylon-stable-channel-v1.json") throw new Error("Stable draft singleton asset has an unexpected name.");
+            if (!asset) {
+              await github.request("POST /repos/{owner}/{repo}/releases/{release_id}/assets", {
+                owner, repo, release_id: draft.id, name: "pylon-stable-channel-v1.json", data: bytes,
+                headers: { "content-type": "application/json", "content-length": bytes.length },
+              });
+              draft = (await github.rest.repos.getRelease({ owner, repo, release_id: draft.id })).data;
+              if (!draft.draft || draft.assets?.length !== 1 || draft.body !== recoveryBody) throw new Error("Recovered stable singleton did not stage exactly once.");
+              asset = draft.assets[0];
+            }
+            const downloaded = await github.request("GET /repos/{owner}/{repo}/releases/assets/{asset_id}", {
+              owner, repo, asset_id: asset.id, headers: { accept: "application/octet-stream" },
+            });
+            const downloadedBytes = Buffer.from(downloaded.data);
+            if (!downloadedBytes.equals(bytes) || asset.name !== "pylon-stable-channel-v1.json" || asset.size !== bytes.length || asset.digest !== `sha256:${digest}`) {
+              throw new Error("Stable draft singleton differs from the exact body-carried attested bytes.");
+            }
             const stableMatch = /^pylon-stable-([0-9]{6})-g([0-9a-f]{12})-r([1-9][0-9]*)$/.exec(manifest.tag ?? "");
             const previewMatch = /^pylon-build-g([0-9a-f]{12})-r([1-9][0-9]*)$/.exec(manifest.build?.previewTag ?? "");
             if (
@@ -836,20 +914,22 @@ jobs:
               `query($owner:String!,$repo:String!,$ref:String!){repository(owner:$owner,name:$repo){ref(qualifiedName:$ref){branchProtectionRule{requiresStatusChecks requiredStatusChecks{context app{databaseId}}}}}}`,
               { owner, repo, ref: "refs/heads/pylon" },
             );
-            const required = protection.repository?.ref?.branchProtectionRule?.requiredStatusChecks;
-            if (!protection.repository?.ref?.branchProtectionRule?.requiresStatusChecks || !Array.isArray(required) || required.length === 0) {
-              throw new Error("Protected pylon required-check policy is unavailable.");
+            const rule = protection.repository?.ref?.branchProtectionRule;
+            const required = rule?.requiredStatusChecks;
+            const expectedPolicy = [
+              { context: "Check changelog fragment", appId: 15368, workflowPath: ".github/workflows/changelog-merged-proof.yml" },
+              { context: "build-check-test", appId: 15368, workflowPath: ".github/workflows/ci.yml" },
+            ];
+            const actualPolicy = Array.isArray(required) ? required.map((requirement) => ({
+              context: requirement.context, appId: requirement.app?.databaseId ?? null,
+            })).sort((left, right) => left.context < right.context ? -1 : left.context > right.context ? 1 : 0) : null;
+            if (!rule?.requiresStatusChecks || JSON.stringify(actualPolicy) !== JSON.stringify(expectedPolicy.map(({ context, appId }) => ({ context, appId })))) {
+              throw new Error("Protected pylon must require exactly the two app-bound publication checks.");
             }
             const proveChecks = async (sha, label) => {
               const checks = await github.paginate(github.rest.checks.listForRef, { owner, repo, ref: sha, filter: "latest", per_page: 100 });
-              const statuses = (await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha })).data.statuses;
-              for (const requirement of required) {
-                const appId = requirement.app?.databaseId ?? null;
-                if (appId === null) {
-                  if (!statuses.some((status) => status.context === requirement.context && status.state === "success" && status.sha === sha)) throw new Error(`Required status ${requirement.context} is not green on ${label}.`);
-                  continue;
-                }
-                const candidates = checks.filter((check) => check.name === requirement.context && check.head_sha === sha && check.app?.id === appId && check.status === "completed" && check.conclusion === "success");
+              for (const requirement of expectedPolicy) {
+                const candidates = checks.filter((check) => check.name === requirement.context && check.head_sha === sha && check.app?.id === requirement.appId && check.status === "completed" && check.conclusion === "success");
                 let proved = false;
                 for (const check of candidates) {
                   const runId = /^https:\/\/github\.com\/pylon-code\/prime-agent\/actions\/runs\/([0-9]+)(?:\/job\/[0-9]+)?$/.exec(check.details_url ?? "")?.[1];
@@ -857,13 +937,12 @@ jobs:
                   const suite = (await github.rest.checks.getSuite({ owner, repo, check_suite_id: check.check_suite.id })).data;
                   const run = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(runId) })).data;
                   const workflow = (await github.rest.actions.getWorkflow({ owner, repo, workflow_id: run.workflow_id })).data;
-                  const expectedPath = { "build-check-test": ".github/workflows/ci.yml", "Check changelog fragment": ".github/workflows/changelog-merged-proof.yml" }[requirement.context];
                   if (
-                    suite.app?.id === appId && suite.head_sha === sha && suite.status === "completed" && suite.conclusion === "success" &&
+                    suite.app?.id === requirement.appId && suite.head_sha === sha && suite.status === "completed" && suite.conclusion === "success" &&
                     run.check_suite_id === suite.id && run.repository?.id === 1349002285 && run.repository?.full_name === repository &&
                     run.head_repository?.id === 1349002285 && run.head_repository?.full_name === repository && run.event === "push" &&
                     run.head_branch === "pylon" && run.head_sha === sha && run.status === "completed" && run.conclusion === "success" &&
-                    workflow.path.startsWith(".github/workflows/") && (!expectedPath || workflow.path === expectedPath)
+                    workflow.path === requirement.workflowPath
                   ) { proved = true; break; }
                 }
                 if (!proved) throw new Error(`Required check ${requirement.context} lacks canonical exact-SHA proof on ${label}.`);
@@ -891,21 +970,27 @@ jobs:
             const sameSequence = allReleases.filter((release) => /^pylon-stable-[0-9]{6}-g/.test(release.tag_name ?? "") && Number(/^pylon-stable-([0-9]{6})-/.exec(release.tag_name)[1]) === manifest.sequence);
             if (sameSequence.length !== 1 || sameSequence[0].id !== draft.id) throw new Error("Stable sequence has a different or ambiguous draft/release identity.");
             const name = `Pylon Prime stable ${manifest.tag}`;
-            const body = [
-              "Pylon Prime stable publication.", "", `Tag: ${manifest.tag}`, `Source: ${manifest.build.source.commit}`,
-              `Tree: ${manifest.build.source.tree}`, `Policy: ${manifest.promotion.policyCommit}`,
-              `Policy tree: ${manifest.promotion.policyTree}`, `Recipe: r${manifest.build.recipeRevision}`, "",
-              "Verify the immutable release and artifact attestations before use.",
-            ].join("\n");
+            const body = recoveryBody;
             if (
               draft.tag_name !== manifest.tag || draft.name !== name || draft.body !== body || draft.prerelease !== false ||
               draft.target_commitish !== manifest.promotion.policyCommit
             ) throw new Error("Stable draft metadata changed before CAS.");
+            let stableRef;
+            const requireStableRef = async () => {
+              stableRef = (await github.rest.git.getRef({ owner, repo, ref: `tags/${manifest.tag}` })).data;
+              if (stableRef.object.type !== "commit" || stableRef.object.sha !== manifest.promotion.policyCommit) {
+                throw new Error("Stable publication tag is annotated or targets a different commit.");
+              }
+              return stableRef;
+            };
             try {
-              await github.rest.git.getRef({ owner, repo, ref: `tags/${manifest.tag}` });
-              throw new Error("Stable publication tag exists before its exact draft is published.");
+              await requireStableRef();
+              if (mode !== "resume" || process.env.RESERVATION_PRESENT !== "true") {
+                throw new Error("Stable publication tag exists before its exact reserved recovery.");
+              }
             } catch (error) {
               if (error.status !== 404) throw error;
+              stableRef = undefined;
             }
             const reservationTag = `pylon-stable-sequence-${String(manifest.sequence).padStart(6, "0")}`;
             const withdrawalLines = operation === "withdraw" ? [
@@ -963,12 +1048,23 @@ jobs:
                 throw error;
               }
             }
-            if (process.env.RESERVATION_PRESENT === "true") {
-              // The existing reservation already freezes the old policy tuple. Fresh approval and this final live read authorize only finalization.
-              const finalPylon = await github.rest.git.getRef({ owner, repo, ref: "heads/pylon" });
-              if (finalPylon.data.object.type !== "commit" || finalPylon.data.object.sha !== context.sha) throw new Error("Stable recovery became stale immediately before publication.");
+            // The annotated reservation freezes N and its approved tuple. The separate lightweight tag CAS
+            // binds the release name to the exact policy commit before GitHub makes the release immutable.
+            const finalPylon = await github.rest.git.getRef({ owner, repo, ref: "heads/pylon" });
+            if (finalPylon.data.object.type !== "commit" || finalPylon.data.object.sha !== context.sha) {
+              throw new Error("Stable transaction became stale immediately before final tag CAS.");
             }
-            // After CAS the only mutation is publishing this exact fully uploaded draft.
+            if (!stableRef) {
+              try {
+                stableRef = (await github.rest.git.createRef({
+                  owner, repo, ref: `refs/tags/${manifest.tag}`, sha: manifest.promotion.policyCommit,
+                })).data;
+              } catch (error) {
+                if (error.status !== 422) throw error;
+                await requireStableRef();
+              }
+            }
+            await requireStableRef();
             await github.rest.repos.updateRelease({ owner, repo, release_id: draft.id, draft: false });
 
             const immutable = (await github.rest.repos.getRelease({ owner, repo, release_id: draft.id })).data;
@@ -978,8 +1074,7 @@ jobs:
               immutable.assets?.length !== 1 || immutable.assets[0].name !== "pylon-stable-channel-v1.json" ||
               immutable.assets[0].size !== bytes.length || immutable.assets[0].digest !== `sha256:${digest}`
             ) throw new Error("Stable release immutable postconditions differ from the reserved transaction.");
-            const stableRef = await github.rest.git.getRef({ owner, repo, ref: `tags/${manifest.tag}` });
-            if (stableRef.data.object.type !== "commit" || stableRef.data.object.sha !== manifest.promotion.policyCommit) throw new Error("Stable release tag postcondition differs.");
+            await requireStableRef();
             reservation = (await github.rest.git.getRef({ owner, repo, ref: `tags/${reservationTag}` })).data;
             await requireReservation();
             const after = (await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 }))

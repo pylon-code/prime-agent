@@ -5,11 +5,9 @@ import {
 	closeSync,
 	fsyncSync,
 	lstatSync,
-	mkdirSync,
 	openSync,
 	readFileSync,
 	renameSync,
-	rmdirSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -17,6 +15,7 @@ import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { PYLON_RELEASE_REPOSITORY } from "./lib/pylon-release.mjs";
+import { withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 import {
 	canonicalJson,
 	parseStableTag,
@@ -92,19 +91,6 @@ function writeStateAtomically(statePath, state) {
 	}
 }
 
-function acquireStateLock(statePath) {
-	const lockPath = `${statePath}.lock`;
-	try {
-		mkdirSync(lockPath, { mode: 0o700 });
-	} catch (error) {
-		if (error?.code === "EEXIST") {
-			throw new Error(`Consumer stable high-water state is locked: ${lockPath}`);
-		}
-		throw error;
-	}
-	return lockPath;
-}
-
 function verifiedManifestFiles(paths) {
 	if (!Array.isArray(paths) || paths.length === 0) throw new Error("Provide every stable manifest from sequence 1 through current high-water.");
 	return paths.map((input) => {
@@ -120,9 +106,7 @@ function verifiedManifestFiles(paths) {
 export function verifyStableHistoryWithState(paths, { statePath, initialize = false }) {
 	if (typeof statePath !== "string" || !statePath) throw new Error("A consumer-local --state path is required.");
 	const absoluteStatePath = resolve(statePath);
-	mkdirSync(dirname(absoluteStatePath), { recursive: true, mode: 0o700 });
-	const lockPath = acquireStateLock(absoluteStatePath);
-	try {
+	return withConsumerStateLock(absoluteStatePath, () => {
 		const stateEntry = lstatSync(absoluteStatePath, { throwIfNoEntry: false });
 		const stateExists = stateEntry !== undefined;
 		if (stateExists && !stateEntry.isFile()) {
@@ -162,9 +146,7 @@ export function verifyStableHistoryWithState(paths, { statePath, initialize = fa
 		const advanced = !priorState || highWater.sequence > priorState.highWater.sequence;
 		if (advanced) writeStateAtomically(absoluteStatePath, state);
 		return { history, state: advanced ? state : priorState, advanced };
-	} finally {
-		rmdirSync(lockPath);
-	}
+	});
 }
 
 function parseArgs(args) {

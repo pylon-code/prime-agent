@@ -8,19 +8,21 @@ Publication fails closed unless all of these controls exist:
 
 - the canonical repository is `pylon-code/prime-agent`, with immutable GitHub Releases enabled;
 - `refs/heads/pylon` requires strict exact-SHA `build-check-test` and `Check changelog fragment` checks from GitHub Actions app `15368`;
-- `pylon-preview` and `pylon-stable` use custom deployment branches with only `pylon`, require reviewer `rynfar` (user id `11325514`), and keep the documented solo-maintainer `prevent_self_review: false` exception;
-- `pylon-upstream-sync` has the same reviewer and branch restriction before the scheduled sync workflow is enabled;
+- `pylon-preview` and `pylon-stable` use custom deployment branches with only `pylon`, require reviewer `rynfar` (user id `11325514`), set `prevent_self_review: false`, and set `can_admins_bypass: false`;
+- `pylon-upstream-sync` has the same sole custom `pylon` branch, reviewer, `prevent_self_review: false`, and `can_admins_bypass: false` policy before the scheduled sync workflow is enabled;
 - the stable workflow keeps `pylon-stable-publication` serialized with `cancel-in-progress: false`;
 - active no-bypass repository ruleset `21950766`, **Pylon immutable publication tags**, targets `refs/tags/pylon-build-*` and `refs/tags/pylon-stable-*`, permits creation, and forbids every update and deletion; and
 - repository action policy requires full commit-SHA pins.
 
+Before enabling any writer, read back all three environment protection-rule responses. Each must show `can_admins_bypass: false`, reviewer `rynfar`, `prevent_self_review: false`, and exactly one custom deployment branch named `pylon`. Treat a missing, extra, or different value as a publication blocker.
+
 The normal preview and stable attester jobs carry `pylon-preview` and `pylon-stable` directly. Approval therefore occurs before OIDC signing. Read-only verification follows. Every contents writer is downstream of that verified attestation. An explicit stable recovery creates no new attestation, so its mutually exclusive zero-write `authorize-stable-resume` job carries `pylon-stable` instead. The upstream-sync contents writer carries `pylon-upstream-sync` directly. Each path asks for one approval.
 
-The jobs use only `GITHUB_TOKEN`. Do not add npm, R2, PAT, app, or repository secrets.
+The jobs use only `GITHUB_TOKEN`. Do not add npm, R2, PAT, app, or repository secrets. Upstream sync checks out exactly `${{ github.sha }}` and, in the same shell that executes repository code, proves the canonical repository/event/ref, exact `HEAD`, workspace, and immediate live `pylon` SHA; a stale approved run stops before the sync script.
 
 ## Preview publication
 
-`.github/workflows/pylon-preview-release.yml` runs only for an exact canonical push to `refs/heads/pylon`. It uses Node `22.23.2` and npm `11.10.1`, packs twice with build networking disabled, compares all subjects byte for byte, and installs the first pack on Linux, macOS, and Windows.
+`.github/workflows/pylon-preview-release.yml` runs only for an exact canonical push to `refs/heads/pylon`. It uses Node `22.23.2` and npm `11.10.1`, packs twice with build networking disabled, compares all subjects byte for byte, and installs the first pack on Ubuntu Linux and macOS. Ubuntu is the supported gate for Linux and WSL2; native Windows publication support is deferred.
 
 The preview identity is:
 
@@ -47,11 +49,11 @@ The canonical preview manifest binds the full source commit/tree, recipe, build-
 
 `sequence` is the positive safe integer `github.run_number` for the one preview workflow. `workflowRunId` is its exact positive decimal run id. Failed runs create gaps, so consumers allow a higher non-adjacent sequence. A workflow sequence reset requires a new signed epoch/schema and consumer migration; it must never silently reuse epoch 1. Ordering never comes from a commit abbreviation, SemVer, a timestamp, the GitHub “latest” pointer, or a tag sort.
 
-`runAttempt` is deliberately not in manifest bytes. A rerun keeps the same run id, run number, manifest, and build-tag identity. The verified SLSA workflow/v1 predicate supplies the actual `/runs/<id>/attempts/<attempt>` invocation. Verification requires its signed run id to equal `workflowRunId`, then reads that immutable Actions run and proves the exact run number, repository id, workflow path/ref, push event, source SHA/branch, GitHub Actions check-suite app, and successful directly environment-gated attester job for the signed attempt.
+`runAttempt` is deliberately not in manifest bytes. A rerun keeps the same run id, run number, manifest, and build-tag identity. The verified SLSA workflow/v1 predicate supplies the actual `/runs/<id>/attempts/<attempt>` invocation. Verification requires its signed run id to equal `workflowRunId`, then reads that exact immutable attempt endpoint and its attempt-specific jobs. It proves the run number, repository id, workflow path/ref, push event, source SHA/branch, GitHub Actions check-suite app, and successful directly environment-gated attester job. The aggregate `/runs/<id>` view is mutable across reruns and is not an attestation trust root; a later failed rerun cannot invalidate an earlier exact signed and published attempt.
 
 The approved attester signs exactly six subjects with pinned `actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8`, whose reviewed pinned chain delegates to `actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d`. A read-only job verifies the exact subject set, SLSA v1 workflow predicate, GitHub OIDC issuer, signer digest/ref, public Rekor entry, and run invocation. Only then can checkout-free contents jobs fully stage and publish the exact draft.
 
-A publisher re-reads live `pylon` immediately before its first release mutation and again immediately before publication. GitHub has no conditional transaction across a branch and release. These reads give point-in-time authorization: a later push does not revoke the exact already-authorized draft.
+A publisher re-reads live `pylon` before its first mutation and again at the final tag/publication boundary. It creates or refetches the exact lightweight preview tag and requires the full source commit before making the release immutable. GitHub does not offer an atomic transaction across branch reads, tag creation, and release publication. Each read and compare-and-set is a separate fail-closed point-in-time check; this design does not claim cross-resource atomicity.
 
 ## Preview consumer high-water
 
@@ -68,25 +70,25 @@ GH_TOKEN="$(gh auth token)" npm run release:pylon:verify-preview-history -- \
   --initialize
 ```
 
-Use `--initialize` only after manually inspecting the first full verified receipt. Omit it thereafter. The state and adjacent exclusive lock must be local regular non-symlink entries. The write is file-fsync, atomic rename, then directory-fsync. Lower sequences and the same sequence with a different tag, run id, or manifest digest fail as rollback/equivocation. Higher gaps are valid.
+Use `--initialize` only after manually inspecting the first full verified receipt. Omit it thereafter. The state and persistent lock anchor must be local regular non-symlink entries. `proper-lockfile@4.1.2` owns the adjacent lock directory with a 30-second stale bound and 10-second heartbeat. Active contention fails immediately; a crashed owner becomes recoverable after the stale bound without manual deletion. The write is file-fsync, atomic rename, then directory-fsync. Lower sequences and the same sequence with a different tag, run id, or manifest digest fail as rollback/equivocation. Higher gaps are valid.
 
 ## Stable promotion
 
 Run **Actions → Pylon stable promotion → Run workflow** on `pylon` with `operation=promote`, an immutable `preview_tag`, and no recovery or withdrawal identity.
 
-Current policy can promote an older recipe only when `scripts/pylon-prime-supported-release-recipes-v1.json` lists its exact closed manifest schema and Node/npm/minimum-Node tuple. The current verifier validates that historical receipt and its exact old preview attestation/workflow. The three-OS install uses current protected verifier source; it never checks out or executes the older source. The preview tag recipe must equal the build recipe copied into stable.
+Current policy can promote an older recipe only when `scripts/pylon-prime-supported-release-recipes-v1.json` lists its exact closed manifest schema, Node/npm/minimum-Node tuple, preview/stable workflow paths, and SHA-256 of both exact workflow byte strings. The verifier selects the manifest's exact recipe, fetches each signer workflow path at the signer commit, checks its byte digest before structural checks, and rejects unknown recipes or registry keys. Every future publication workflow edit requires a new recipe revision and new reviewed digests; never rewrite an existing recipe. The Ubuntu Linux/macOS install uses current protected verifier source; it never checks out or executes the older source. The preview tag recipe must equal the build recipe copied into stable.
 
 Normal stable transaction order is strict:
 
 1. Download the immutable preview. Verify six exact bytes, its signed workflow/run sequence, public Rekor evidence, source/tree, old preview workflow policy, current ancestry, and original/current exact-SHA checks.
-2. Install those same bytes on Linux, macOS, and Windows.
+2. Install those same bytes on Ubuntu Linux and macOS.
 3. Read and validate the complete immutable stable release/tag digest chain. Before extending a nonempty chain, verify the latest singleton stable manifest against the exact stable workflow/ref, signer policy commit/tree, SLSA v1, public Rekor, and the workflow's directly gated static policy at that signer digest.
 4. Prepare one canonical next manifest. The directly `pylon-stable`-gated attester signs that singleton. A separate read-only job verifies it.
-5. A checkout-free contents writer creates or resumes one exact draft, fully uploads it, and re-downloads/re-hashes the draft asset before CAS.
-6. The final checkout-free publisher re-downloads the draft from GitHub Releases, not an Actions artifact. It rechecks the live current tip/checks, old policy tree/ancestry/checks, immutable preview, recipe, N-1 history, operation fields, and draft id/digest.
-7. It creates annotated `pylon-stable-sequence-NNNNNN` as the sole sequence compare-and-set, then only publishes that exact draft and checks immutable postconditions.
+5. A checkout-free contents writer creates or resumes one exact draft. Creation durably places the exact canonical manifest bytes, byte count, and SHA-256 in the bounded release-body recovery envelope before asset upload. It uploads and re-downloads/re-hashes the singleton.
+6. The final checkout-free publisher re-downloads the draft from GitHub Releases, not an old Actions artifact. For a zero-asset crash draft, it recovers only the exact body-carried attested bytes, uploads the missing singleton once, and re-downloads/re-hashes it before any CAS. It rechecks the live current tip/checks, old policy tree/ancestry/checks, immutable preview, recipe, N-1 history, operation fields, and draft id/digest.
+7. It first creates annotated `pylon-stable-sequence-NNNNNN` as the sequence compare-and-set. It then creates or refetches the exact lightweight stable tag at the full policy commit. Only after both exact refs exist does it make that draft immutable and check postconditions.
 
-The reservation annotation binds sequence, policy commit/tree, promote/withdraw fields, stable and preview tags, stable-manifest SHA-256, and draft release id. A `422` refetches state and stops. No path selects N+1, moves, deletes, or reuses a ref. The live `pylon` read immediately before `createRef` has no fallible build/upload work between it and CAS. The reservation freezes the approved old policy tuple if `pylon` advances later.
+The reservation annotation binds sequence, policy commit/tree, the exact promote/withdraw tuple and reason, stable and preview tags, stable-manifest SHA-256, and draft release id. A reservation `422` refetches and stops for explicit recovery. Final tag `422` handling refetches and accepts only the exact lightweight full-commit target; a wrong or annotated object fails before immutable publication. No path selects N+1, moves, deletes, or reuses a ref. The reservation freezes the approved old policy tuple if `pylon` advances later. Reservation CAS, final tag CAS, and release publication are ordered GitHub operations, not one atomic GitHub transaction.
 
 Stable tags remain:
 
@@ -98,14 +100,16 @@ The signed stable manifest copies the preview sequence epoch/number/run id, full
 
 ## Explicit stable recovery
 
-A crash can leave either:
+A crash can leave any of these exact recoverable states:
 
-- a complete approved draft before CAS; or
-- the exact complete draft plus its permanent CAS reservation before release publication.
+- a zero-asset draft whose bounded body already carries the attested canonical manifest;
+- a complete approved draft before CAS;
+- the complete draft plus its permanent sequence reservation; or
+- both the reservation and exact final lightweight tag before release publication.
 
-Start a fresh run on current `pylon` with `operation=resume-promote` or `resume-withdraw`, the original `preview_tag`, withdrawal fields, and `resume_identity` set to the numeric draft release id, stable draft tag, or exact reservation tag. The run discovers the manifest bytes from that exact GitHub draft/release. It never relies on an old Actions artifact.
+Start a fresh run on current `pylon` with `operation=resume-promote` or `resume-withdraw`, the original `preview_tag`, withdrawal fields, and `resume_identity` set to the numeric draft release id, stable draft tag, or exact reservation tag. The run recovers manifest bytes from the exact draft body and requires any existing singleton to match byte for byte. The canonical stable manifest is limited to 48 KiB and the complete encoded release body to 80 KiB. Altered, truncated, oversized, or ambiguous envelopes/assets fail. It never relies on an old Actions artifact.
 
-Recovery requires the exact operator tuple; complete draft asset; old stable attestation and static approval policy; exact draft/annotation/digest; every signed N-1 history receipt; immutable old preview and preview attestation/run sequence; original source/policy checks; fresh current checks; old policy exact tree and ancestry; current three-OS install; and one fresh `pylon-stable` approval. It does not reprepare or reattest.
+Recovery requires the exact operator tuple; exact body-carried bytes and any present draft asset; old stable attestation and exact workflow-byte approval policy; exact draft/annotation/digest; every signed N-1 history receipt; immutable old preview and preview attestation/run sequence; original source/policy checks; fresh current checks; old policy exact tree and ancestry; current Ubuntu Linux/macOS install; and one fresh `pylon-stable` approval. History reading excludes exactly the selected recovery draft id and rejects every other draft. Recovery uploads and re-hashes a missing singleton before reservation/final-tag CAS. It does not reprepare or reattest.
 
 Draft-only recovery can create the still-free N reservation. Reservation recovery can finalize only the exact already-reserved tuple. An unexpected reservation, draft, tag, asset, sequence, annotation, signer, or digest fails closed.
 
@@ -124,17 +128,17 @@ npm run release:pylon:verify-stable-history -- \
   stable-history/pylon-stable-*/pylon-stable-channel-v1.json
 ```
 
-Use `--initialize` once, then omit it. The CLI requires the complete contiguous canonical chain, an adjacent exclusive lock, regular non-symlink manifests/state, and explicit local state. It rejects malformed state, a lower valid prefix, and any rewrite at or below the witnessed sequence. It atomically file-fsyncs, renames, and directory-fsyncs only a monotonic advance.
+Use `--initialize` once, then omit it. The CLI requires the complete contiguous canonical chain, a regular persistent lock anchor, regular non-symlink manifests/state, and explicit local state. The pinned lock has the same 30-second stale bound, 10-second heartbeat, immediate active-contention failure, and automatic crashed-owner recovery as preview state. The CLI rejects malformed state, a lower valid prefix, and any rewrite at or below the witnessed sequence. It file-fsyncs, atomically renames, and directory-fsyncs only a monotonic advance.
 
 ## Failure and incident handling
 
 - **Approval is absent:** configure the exact environment. Never remove or bypass `environment:`.
 - **Required proof is missing:** fix branch protection/check provenance and create a new protected merge. Never synthesize status.
-- **Draft differs:** stop. Do not delete an asset or rebuild/reprepare around it. Use exact recovery only for a complete matching transaction.
+- **Draft differs:** stop. Do not delete an asset or rebuild/reprepare around it. Exact recovery accepts only the bounded body-carried manifest and an absent or identical singleton; every other difference fails.
 - **Reservation race or `422`:** inspect the ref and owning run. Resume only the exact tuple. Never choose N+1, move, or delete.
 - **Attestation/Rekor/workflow policy fails:** do not approve, promote, install, or advance consumer state.
 - **Release is immutable:** workflows never delete it. A withdrawal is a later sequence.
 - **Invalid tag squat:** publication stays blocked. Record an incident and export the active ruleset plus tag/release/Actions audit evidence. A repository administrator must make one reviewed temporary ruleset change that permits deleting only the named invalid ref, delete it by exact ref/object identity, and immediately restore/read back ruleset `21950766` with the original targets, no bypass actors, update/deletion blocks, and `current_user_can_bypass: never`. Never let publication automation perform this recovery.
 - **Invalid immutable release:** preserve evidence first. GitHub may require an administrator to temporarily disable immutable releases before exact-id deletion. Delete only the proven invalid release, restore/read back immutable releases immediately, and link every API response in the incident. Never alter a valid published sequence.
 
-Run offline policy tests with `npm run test:pylon-publication`. They cover closed current/historical recipes, run-sequence and rerun identity, signed invocation evidence, preview/stable rollback state, exact approval DAGs, every contents writer, pinned actions, draft-before-CAS order, reservation recovery, and no source/download execution in publication writers.
+Run offline policy tests with `npm run test:pylon-publication`. They cover exact current/historical workflow digests and registry closure, immutable signed attempt evidence, zero-asset crash recovery, stale and active locks, exact required-check paths/apps, preview/stable tag squats and CAS order, withdrawal tuples, rollback state, approval DAGs, every contents writer, pinned actions, and no source/download execution in publication writers.

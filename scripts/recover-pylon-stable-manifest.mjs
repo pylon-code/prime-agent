@@ -10,6 +10,8 @@ import {
 	PYLON_PUBLICATION_REPOSITORY,
 	PYLON_STABLE_MANIFEST,
 	sha256Bytes,
+	stableManifestBytesFromReleaseBody,
+	stableReservationMessage,
 	validateStableHistory,
 	validateStableManifest,
 } from "./lib/pylon-publication.mjs";
@@ -58,45 +60,39 @@ async function api(path, { bytes = false, accept } = {}) {
 	return bytes ? Buffer.from(await response.arrayBuffer()) : response.json();
 }
 
-function reservationMessage(manifest, digest, draftId) {
-	const withdrawal = manifest.promotion.kind === "withdraw"
-		? [
-			`Withdraw stable tag: ${manifest.promotion.revocation.stableTag}`,
-			`Withdraw build tag: ${manifest.promotion.revocation.buildTag}`,
-			`Withdraw reason: ${manifest.promotion.revocation.reason}`,
-		]
-		: [];
-	return [
-		"Pylon stable sequence reservation", `Sequence: ${String(manifest.sequence).padStart(6, "0")}`,
-		`Policy: ${manifest.promotion.policyCommit}`, `Policy tree: ${manifest.promotion.policyTree}`,
-		`Operation: ${manifest.promotion.kind}`, ...withdrawal, `Stable tag: ${manifest.tag}`, `Preview: ${manifest.build.previewTag}`,
-		`Manifest: sha256:${digest}`, `Draft release: ${draftId}`, "",
-	].join("\n");
-}
-
 function outputs(values) {
 	if (!process.env.GITHUB_OUTPUT) return;
 	for (const [key, value] of Object.entries(values)) appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
 }
 
-export async function recoverStableDraft(args) {
-	const release = await api(`/repos/${PYLON_PUBLICATION_REPOSITORY}/releases/${args.draftId}`);
-	if (!release.draft || release.immutable === true || release.assets?.length !== 1 || release.assets[0].name !== PYLON_STABLE_MANIFEST) {
+export async function recoverStableDraft(args, dependencies = {}) {
+	const readApi = dependencies.api ?? api;
+	const readHistory = dependencies.readHistory ?? readStableHistory;
+	const verifyAttestation = dependencies.verifyAttestation ?? verifyStableAttestation;
+	const release = await readApi(`/repos/${PYLON_PUBLICATION_REPOSITORY}/releases/${args.draftId}`);
+	if (!release.draft || release.immutable === true || !Array.isArray(release.assets) || release.assets.length > 1) {
 		throw new Error("Recovery release is not one exact mutable stable draft.");
 	}
-	const bytes = await api(new URL(release.assets[0].url).pathname, { bytes: true, accept: "application/octet-stream" });
-	const digest = sha256Bytes(bytes);
-	const manifest = validateStableManifest(JSON.parse(bytes));
-	if (bytes.toString("utf8") !== canonicalJson(manifest)) throw new Error("Recovery stable manifest is not canonical.");
+	const recovered = stableManifestBytesFromReleaseBody(release.body);
+	const { bytes, digest, manifest } = recovered;
+	const asset = release.assets[0];
+	if (asset) {
+		if (asset.name !== PYLON_STABLE_MANIFEST || !asset.url) throw new Error("Recovery draft has an unexpected singleton asset.");
+		const downloaded = await readApi(new URL(asset.url).pathname, { bytes: true, accept: "application/octet-stream" });
+		if (
+			!downloaded.equals(bytes) || asset.size !== bytes.length || asset.digest !== `sha256:${digest}` ||
+			sha256Bytes(downloaded) !== digest
+		) throw new Error("Recovery draft asset differs from the exact body-carried attested bytes.");
+	}
 	const name = `Pylon Prime stable ${manifest.tag}`;
 	const body = publicationReleaseBody({
 		channel: "stable", tag: manifest.tag, source: manifest.build.source.commit, tree: manifest.build.source.tree,
 		recipeRevision: manifest.build.recipeRevision, policyCommit: manifest.promotion.policyCommit, policyTree: manifest.promotion.policyTree,
+		stableManifestBytes: bytes,
 	});
 	if (
 		release.tag_name !== manifest.tag || release.name !== name || release.body !== body || release.prerelease ||
-		release.target_commitish !== manifest.promotion.policyCommit || release.assets[0].size !== bytes.length ||
-		release.assets[0].digest !== `sha256:${digest}` || manifest.build.previewTag !== args.previewTag ||
+		release.target_commitish !== manifest.promotion.policyCommit || manifest.build.previewTag !== args.previewTag ||
 		manifest.promotion.kind !== args.operation
 	) throw new Error("Recovery draft metadata, bytes, preview, or operation differs.");
 	if (args.operation === "withdraw") {
@@ -104,7 +100,7 @@ export async function recoverStableDraft(args) {
 			throw new Error("Recovery withdrawal inputs differ from the approved draft.");
 		}
 	} else if (args.revokeTag || args.reason) throw new Error("Promote recovery cannot carry withdrawal inputs.");
-	const history = await readStableHistory({ verifyAllAttestations: true });
+	const history = await readHistory({ verifyAllAttestations: true, excludeDraftId: release.id, excludeDraftTag: manifest.tag });
 	const combined = validateStableHistory([...history, manifest]);
 	if (combined.length !== manifest.sequence || combined.at(-1).tag !== manifest.tag) {
 		throw new Error("Recovery draft is not the exact next signed-history sequence.");
@@ -112,16 +108,16 @@ export async function recoverStableDraft(args) {
 	const expectedReservation = `pylon-stable-sequence-${String(manifest.sequence).padStart(6, "0")}`;
 	if (args.reservationTag) {
 		if (args.reservationTag !== expectedReservation) throw new Error("Recovery reservation sequence differs from the draft.");
-		const ref = await api(`/repos/${PYLON_PUBLICATION_REPOSITORY}/git/ref/tags/${args.reservationTag}`);
+		const ref = await readApi(`/repos/${PYLON_PUBLICATION_REPOSITORY}/git/ref/tags/${args.reservationTag}`);
 		if (ref.object?.type !== "tag") throw new Error("Recovery reservation is not annotated.");
-		const annotation = await api(`/repos/${PYLON_PUBLICATION_REPOSITORY}/git/tags/${ref.object.sha}`);
+		const annotation = await readApi(`/repos/${PYLON_PUBLICATION_REPOSITORY}/git/tags/${ref.object.sha}`);
 		if (
-			annotation.tag !== args.reservationTag || annotation.message !== reservationMessage(manifest, digest, release.id) ||
+			annotation.tag !== args.reservationTag || annotation.message !== stableReservationMessage(manifest, digest, release.id) ||
 			annotation.object?.type !== "commit" || annotation.object.sha !== manifest.promotion.policyCommit
 		) throw new Error("Recovery reservation differs from the exact approved draft.");
 	} else {
 		try {
-			await api(`/repos/${PYLON_PUBLICATION_REPOSITORY}/git/ref/tags/${expectedReservation}`);
+			await readApi(`/repos/${PYLON_PUBLICATION_REPOSITORY}/git/ref/tags/${expectedReservation}`);
 			throw new Error("Draft-only recovery cannot replace an existing reservation.");
 		} catch (error) {
 			if (error.status !== 404) throw error;
@@ -130,7 +126,7 @@ export async function recoverStableDraft(args) {
 	mkdirSync(args.outDir, { recursive: true });
 	const manifestPath = join(args.outDir, PYLON_STABLE_MANIFEST);
 	writeFileSync(manifestPath, bytes, { mode: 0o600 });
-	verifyStableAttestation(manifestPath, manifest.promotion.policyCommit, manifest.promotion.policyTree);
+	verifyAttestation(manifestPath, manifest.promotion.policyCommit, manifest.promotion.policyTree);
 	return { release, manifest, bytes, digest, reservationTag: expectedReservation };
 }
 
@@ -139,7 +135,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
 		const args = parseArgs(process.argv.slice(2));
 		const recovered = await recoverStableDraft(args);
 		outputs({
-			publish: "true", tag: recovered.manifest.tag, source_sha: recovered.manifest.build.source.commit,
+			publish: "true", manifest_sha256: recovered.digest, tag: recovered.manifest.tag, source_sha: recovered.manifest.build.source.commit,
 			source_tree: recovered.manifest.build.source.tree, sequence: String(recovered.manifest.sequence),
 			draft_id: String(recovered.release.id), reservation_tag: recovered.reservationTag,
 		});

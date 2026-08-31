@@ -95,15 +95,28 @@ async function stableTagNames() {
 	}
 }
 
-export async function readStableHistory({ verifyAllAttestations = false } = {}) {
-	const releases = (await paginate(`/repos/${PYLON_PUBLICATION_REPOSITORY}/releases`)).filter((release) =>
-		release.tag_name?.startsWith("pylon-stable-"),
+export function selectStableHistoryReleases(releases, { excludeDraftId = null } = {}) {
+	if (!Array.isArray(releases)) throw new Error("Stable release history response is not a list.");
+	const selected = [];
+	for (const release of releases.filter((candidate) => candidate.tag_name?.startsWith("pylon-stable-"))) {
+		parseStableTag(release.tag_name);
+		if (release.draft && excludeDraftId !== null && String(release.id) === String(excludeDraftId)) continue;
+		if (release.draft) throw new Error(`Stable release ${release.tag_name} is an unexpected draft outside exact recovery.`);
+		selected.push(release);
+	}
+	return selected;
+}
+
+export async function readStableHistory({ verifyAllAttestations = false, excludeDraftId = null, excludeDraftTag = null } = {}) {
+	const allReleases = await paginate(`/repos/${PYLON_PUBLICATION_REPOSITORY}/releases`);
+	const excludedDraft = excludeDraftId === null ? null : allReleases.find((release) =>
+		release.draft && String(release.id) === String(excludeDraftId) && release.tag_name?.startsWith("pylon-stable-"),
 	);
+	const releases = selectStableHistoryReleases(allReleases, { excludeDraftId });
 	const manifests = [];
 	const manifestBytes = new Map();
 	for (const release of releases) {
-		parseStableTag(release.tag_name);
-		if (release.draft || release.immutable !== true || release.assets?.length !== 1) {
+		if (release.immutable !== true || release.assets?.length !== 1) {
 			throw new Error(`Stable release ${release.tag_name} is draft, mutable, or has an unexpected asset set.`);
 		}
 		const asset = release.assets[0];
@@ -129,6 +142,7 @@ export async function readStableHistory({ verifyAllAttestations = false } = {}) 
 				recipeRevision: manifest.build.recipeRevision,
 				policyCommit: manifest.promotion.policyCommit,
 				policyTree: manifest.promotion.policyTree,
+				stableManifestBytes: bytes,
 			}),
 			prerelease: false,
 			sourceSha: manifest.promotion.policyCommit,
@@ -138,7 +152,10 @@ export async function readStableHistory({ verifyAllAttestations = false } = {}) 
 		manifestBytes.set(manifest.tag, bytes);
 	}
 	const ordered = validateStableHistory(manifests);
-	const tags = await stableTagNames();
+	if (excludeDraftTag !== null && excludeDraftTag !== excludedDraft?.tag_name && excludedDraft !== null) {
+		throw new Error("Selected recovery draft id and tag do not identify the same draft.");
+	}
+	const tags = (await stableTagNames()).filter((tag) => tag !== (excludeDraftTag ?? excludedDraft?.tag_name));
 	const releaseTags = ordered.map((manifest) => manifest.tag).sort();
 	if (canonicalJson(tags) !== canonicalJson(releaseTags)) {
 		throw new Error("Stable tags and immutable release history differ.");
@@ -161,6 +178,14 @@ export async function readStableHistory({ verifyAllAttestations = false } = {}) 
 		}
 	}
 	return ordered;
+}
+
+export function isExactWithdrawalReplay(latest, { previewTag, revokeTag, reason }) {
+	const revocation = latest?.promotion?.revocation;
+	return latest?.build?.previewTag === previewTag && latest?.promotion?.kind === "withdraw" &&
+		revocation?.stableTag === revokeTag && /^pylon-build-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(revocation?.buildTag ?? "") &&
+		revocation?.reason === reason && revocation?.revokedBySequence === latest.sequence &&
+		latest.revocations?.some((entry) => canonicalJson(entry) === canonicalJson(revocation));
 }
 
 function writeOutputs(values) {
@@ -186,8 +211,11 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
 			stableManifest = latest;
 		} else if (
 			args.operation === "withdraw" &&
-			latest?.build.previewTag === verified.previewManifest.build.tag &&
-			latest.revocations.some((entry) => entry.stableTag === args.revokeTag)
+			isExactWithdrawalReplay(latest, {
+				previewTag: verified.previewManifest.build.tag,
+				revokeTag: args.revokeTag,
+				reason: args.reason,
+			})
 		) {
 			publish = false;
 			stableManifest = latest;
@@ -226,6 +254,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
 		writeFileSync(join(args.outDir, PYLON_STABLE_MANIFEST), outputBytes);
 		writeOutputs({
 			publish: String(publish),
+			manifest_sha256: sha256Bytes(Buffer.from(outputBytes)),
 			tag: stableManifest.tag,
 			source_sha: stableManifest.build.source.commit,
 			source_tree: stableManifest.build.source.tree,

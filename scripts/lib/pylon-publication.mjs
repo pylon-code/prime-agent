@@ -13,25 +13,6 @@ import {
 	validateReleaseManifest,
 } from "./pylon-release.mjs";
 
-const supportedRecipeRegistry = JSON.parse(
-	readFileSync(fileURLToPath(new URL("../pylon-prime-supported-release-recipes-v1.json", import.meta.url)), "utf8"),
-);
-const recipeKeys = ["recipeRevision", "manifestSchemaVersion", "nodeVersion", "npmVersion", "minimumNodeVersion"];
-if (
-	!supportedRecipeRegistry || Object.keys(supportedRecipeRegistry).sort().join(",") !== "recipes,schemaVersion" ||
-	supportedRecipeRegistry.schemaVersion !== 1 || !Array.isArray(supportedRecipeRegistry.recipes) ||
-	supportedRecipeRegistry.recipes.length === 0 ||
-	supportedRecipeRegistry.recipes.some((recipe) =>
-		!recipe || Object.keys(recipe).sort().join(",") !== recipeKeys.toSorted().join(",") ||
-		!Number.isSafeInteger(recipe.recipeRevision) || recipe.recipeRevision < 1 || recipe.manifestSchemaVersion !== 1 ||
-		![recipe.nodeVersion, recipe.npmVersion, recipe.minimumNodeVersion].every((value) => /^\d+\.\d+\.\d+$/.test(value))
-	) ||
-	new Set(supportedRecipeRegistry.recipes.map((recipe) => recipe.recipeRevision)).size !== supportedRecipeRegistry.recipes.length
-) throw new Error("Pylon historical release recipe registry is malformed.");
-export const PYLON_SUPPORTED_RELEASE_RECIPES = Object.freeze(
-	supportedRecipeRegistry.recipes.map((recipe) => Object.freeze({ ...recipe })),
-);
-
 export const PYLON_PREVIEW_MANIFEST = "pylon-preview-channel-v1.json";
 export const PYLON_STABLE_MANIFEST = "pylon-stable-channel-v1.json";
 export const PYLON_PUBLICATION_SCHEMA_VERSION = 1;
@@ -40,6 +21,61 @@ export const PYLON_PUBLICATION_REF = "refs/heads/pylon";
 export const PYLON_PREVIEW_WORKFLOW = ".github/workflows/pylon-preview-release.yml";
 export const PYLON_STABLE_WORKFLOW = ".github/workflows/pylon-stable-release.yml";
 export const GITHUB_ACTIONS_APP_ID = 15368;
+export const PYLON_REQUIRED_CHECKS = Object.freeze([
+	Object.freeze({ context: "Check changelog fragment", appId: GITHUB_ACTIONS_APP_ID, workflowPath: ".github/workflows/changelog-merged-proof.yml" }),
+	Object.freeze({ context: "build-check-test", appId: GITHUB_ACTIONS_APP_ID, workflowPath: ".github/workflows/ci.yml" }),
+]);
+
+function compactJsonSource(text) {
+	let result = "";
+	let quoted = false;
+	let escaped = false;
+	for (const character of text) {
+		if (quoted) {
+			result += character;
+			if (escaped) escaped = false;
+			else if (character === "\\") escaped = true;
+			else if (character === '"') quoted = false;
+		} else if (character === '"') {
+			quoted = true;
+			result += character;
+		} else if (!/\s/.test(character)) result += character;
+	}
+	if (quoted || escaped) throw new Error("Pylon historical release recipe registry has truncated JSON.");
+	return result;
+}
+
+export function parseSupportedReleaseRecipeRegistry(text) {
+	if (typeof text !== "string") throw new Error("Pylon historical release recipe registry must be JSON text.");
+	const registry = JSON.parse(text);
+	if (compactJsonSource(text) !== JSON.stringify(registry)) {
+		throw new Error("Pylon historical release recipe registry has duplicate keys or noncanonical JSON tokens.");
+	}
+	const recipeKeys = [
+		"recipeRevision", "manifestSchemaVersion", "nodeVersion", "npmVersion", "minimumNodeVersion",
+		"previewWorkflowPath", "previewWorkflowSha256", "stableWorkflowPath", "stableWorkflowSha256",
+	];
+	if (
+		!registry || Object.keys(registry).sort().join(",") !== "recipes,schemaVersion" ||
+		registry.schemaVersion !== 1 || !Array.isArray(registry.recipes) || registry.recipes.length === 0 ||
+		registry.recipes.some((recipe) =>
+			!recipe || Object.keys(recipe).sort().join(",") !== recipeKeys.toSorted().join(",") ||
+			!Number.isSafeInteger(recipe.recipeRevision) || recipe.recipeRevision < 1 || recipe.manifestSchemaVersion !== 1 ||
+			![recipe.nodeVersion, recipe.npmVersion, recipe.minimumNodeVersion].every((value) => /^\d+\.\d+\.\d+$/.test(value)) ||
+			recipe.previewWorkflowPath !== PYLON_PREVIEW_WORKFLOW || recipe.stableWorkflowPath !== PYLON_STABLE_WORKFLOW ||
+			![recipe.previewWorkflowSha256, recipe.stableWorkflowSha256].every((value) => /^[0-9a-f]{64}$/.test(value))
+		) ||
+		new Set(registry.recipes.map((recipe) => recipe.recipeRevision)).size !== registry.recipes.length
+	) throw new Error("Pylon historical release recipe registry is malformed.");
+	return registry;
+}
+
+const supportedRecipeRegistry = parseSupportedReleaseRecipeRegistry(
+	readFileSync(fileURLToPath(new URL("../pylon-prime-supported-release-recipes-v1.json", import.meta.url)), "utf8"),
+);
+export const PYLON_SUPPORTED_RELEASE_RECIPES = Object.freeze(
+	supportedRecipeRegistry.recipes.map((recipe) => Object.freeze({ ...recipe })),
+);
 
 const previewTagPattern = /^pylon-build-g([0-9a-f]{12})-r([1-9][0-9]*)$/;
 const stableTagPattern = /^pylon-stable-([0-9]{6})-g([0-9a-f]{12})-r([1-9][0-9]*)$/;
@@ -91,6 +127,23 @@ export function stableSequenceReservationTag(sequence) {
 	return `pylon-stable-sequence-${String(sequence).padStart(6, "0")}`;
 }
 
+export function stableReservationMessage(manifest, digest, draftId) {
+	if (!/^[0-9a-f]{64}$/.test(digest ?? "") || !Number.isSafeInteger(Number(draftId)) || Number(draftId) < 1) {
+		throw new Error("Stable reservation needs an exact manifest digest and draft id.");
+	}
+	const withdrawal = manifest?.promotion?.kind === "withdraw" ? [
+		`Withdraw stable tag: ${manifest.promotion.revocation?.stableTag}`,
+		`Withdraw build tag: ${manifest.promotion.revocation?.buildTag}`,
+		`Withdraw reason: ${manifest.promotion.revocation?.reason}`,
+	] : [];
+	return [
+		"Pylon stable sequence reservation", `Sequence: ${String(manifest?.sequence).padStart(6, "0")}`,
+		`Policy: ${manifest?.promotion?.policyCommit}`, `Policy tree: ${manifest?.promotion?.policyTree}`,
+		`Operation: ${manifest?.promotion?.kind}`, ...withdrawal, `Stable tag: ${manifest?.tag}`,
+		`Preview: ${manifest?.build?.previewTag}`, `Manifest: sha256:${digest}`, `Draft release: ${Number(draftId)}`, "",
+	].join("\n");
+}
+
 export function parseStableSequenceReservationTag(tag) {
 	const match = stableReservationTagPattern.exec(tag);
 	if (!match || Number.parseInt(match[1], 10) < 1) throw new Error(`Invalid Pylon stable reservation tag: ${String(tag)}`);
@@ -129,7 +182,10 @@ export function validatePublishedReleaseManifest(manifest, supportedRecipes = PY
 	const { source, build, package: publicPackage, assets, attestationSubjects } = manifest;
 	const recipe = supportedRecipes.find((candidate) => candidate.recipeRevision === build?.recipeRevision);
 	if (
-		!recipe || !exactKeys(recipe, ["recipeRevision", "manifestSchemaVersion", "nodeVersion", "npmVersion", "minimumNodeVersion"]) ||
+		!recipe || !exactKeys(recipe, [
+			"recipeRevision", "manifestSchemaVersion", "nodeVersion", "npmVersion", "minimumNodeVersion",
+			"previewWorkflowPath", "previewWorkflowSha256", "stableWorkflowPath", "stableWorkflowSha256",
+		]) ||
 		manifest.schemaVersion !== recipe.manifestSchemaVersion ||
 		!exactKeys(source, ["repository", "commit", "tree"]) || source.repository !== PYLON_RELEASE_REPOSITORY ||
 		!/^[0-9a-f]{40}$/.test(source.commit ?? "") || !/^[0-9a-f]{40}$/.test(source.tree ?? "") ||
@@ -496,30 +552,34 @@ export function assertCanonicalInvocation({ repository, ref, eventName, sha, exp
 	}
 }
 
-export function validateRequiredChecks({ sourceSha, requiredChecks, checkRuns, statuses = [] }) {
+export function validateRequiredChecks({ sourceSha, requiredChecks, checkRuns }) {
 	if (!/^[0-9a-f]{40}$/.test(sourceSha)) throw new Error("Required checks need an exact source SHA.");
-	if (!Array.isArray(requiredChecks) || requiredChecks.length === 0) {
-		throw new Error("Protected pylon has no readable required exact-SHA checks.");
+	if (!Array.isArray(requiredChecks) || !Array.isArray(checkRuns)) {
+		throw new Error("Protected pylon required-check policy is unavailable.");
 	}
-	for (const required of requiredChecks) {
-		if (typeof required.context !== "string" || !required.context) throw new Error("Malformed required check context.");
-		if (required.appId !== null && !Number.isSafeInteger(required.appId)) throw new Error("Malformed required check app.");
-		if (required.appId === null) {
-			const status = statuses.find((candidate) => candidate.context === required.context && candidate.sha === sourceSha);
-			if (!status || status.state !== "success") throw new Error(`Required status ${required.context} is not green on ${sourceSha}.`);
-			continue;
-		}
-		const check = checkRuns.find(
-			(candidate) =>
-				candidate.name === required.context &&
-				candidate.head_sha === sourceSha &&
-				candidate.app?.id === required.appId,
+	const actualPolicy = requiredChecks
+		.map((required) => ({ context: required?.context, appId: required?.appId }))
+		.sort((left, right) => compareText(String(left.context), String(right.context)));
+	const expectedPolicy = PYLON_REQUIRED_CHECKS.map(({ context, appId }) => ({ context, appId }));
+	if (canonicalJson(actualPolicy) !== canonicalJson(expectedPolicy)) {
+		throw new Error("Protected pylon required-check policy differs from the exact two GitHub Actions checks.");
+	}
+	for (const required of PYLON_REQUIRED_CHECKS) {
+		const matches = checkRuns.filter(
+			(candidate) => candidate.name === required.context && candidate.head_sha === sourceSha && candidate.app?.id === required.appId &&
+				candidate.status === "completed" && candidate.conclusion === "success" && candidate.workflowPath === required.workflowPath,
 		);
-		if (!check || check.status !== "completed" || check.conclusion !== "success") {
+		if (matches.length === 0) {
 			throw new Error(`Required check ${required.context} is not green on ${sourceSha} from app ${required.appId}.`);
 		}
 	}
 	return true;
+}
+
+export function requiredCheckWorkflowPath(context) {
+	const required = PYLON_REQUIRED_CHECKS.find((candidate) => candidate.context === context);
+	if (!required) throw new Error(`Unknown required check context: ${String(context)}`);
+	return required.workflowPath;
 }
 
 export function validateMergedChangelogProof({ repository, ref, eventName, mergeSha, pullRequests, headChecks, workflowRuns }) {
@@ -628,7 +688,12 @@ export function assertImmutableReleaseIdentity(actual, expected) {
 	return true;
 }
 
-export function publicationReleaseBody({ channel, tag, source, tree, recipeRevision, policyCommit, policyTree }) {
+export const PYLON_STABLE_MANIFEST_MAX_BYTES = 48 * 1024;
+export const PYLON_STABLE_RELEASE_BODY_MAX_BYTES = 80 * 1024;
+
+export function publicationReleaseBody({
+	channel, tag, source, tree, recipeRevision, policyCommit, policyTree, stableManifestBytes,
+}) {
 	if (!["preview", "stable"].includes(channel)) throw new Error("Invalid publication channel.");
 	const policy = channel === "stable"
 		? [`Policy: ${policyCommit}`, `Policy tree: ${policyTree}`]
@@ -636,7 +701,19 @@ export function publicationReleaseBody({ channel, tag, source, tree, recipeRevis
 	if (channel === "stable" && (!/^[0-9a-f]{40}$/.test(policyCommit ?? "") || !/^[0-9a-f]{40}$/.test(policyTree ?? ""))) {
 		throw new Error("Stable release body needs the protected promotion policy commit and tree.");
 	}
-	return [
+	let recovery = [];
+	if (channel === "stable") {
+		if (!Buffer.isBuffer(stableManifestBytes) || stableManifestBytes.length < 1 || stableManifestBytes.length > PYLON_STABLE_MANIFEST_MAX_BYTES) {
+			throw new Error(`Stable recovery manifest must be from 1 through ${PYLON_STABLE_MANIFEST_MAX_BYTES} bytes.`);
+		}
+		recovery = [
+			"Stable recovery manifest: base64-v1",
+			`Manifest bytes: ${stableManifestBytes.length}`,
+			`Manifest sha256: ${sha256Bytes(stableManifestBytes)}`,
+			`Manifest base64: ${stableManifestBytes.toString("base64")}`,
+		];
+	}
+	const body = [
 		`Pylon Prime ${channel} publication.`,
 		"",
 		`Tag: ${tag}`,
@@ -644,7 +721,38 @@ export function publicationReleaseBody({ channel, tag, source, tree, recipeRevis
 		`Tree: ${tree}`,
 		...policy,
 		`Recipe: r${recipeRevision}`,
+		...recovery,
 		"",
 		"Verify the immutable release and artifact attestations before use.",
 	].join("\n");
+	if (Buffer.byteLength(body, "utf8") > PYLON_STABLE_RELEASE_BODY_MAX_BYTES) {
+		throw new Error(`Stable recovery release body exceeds ${PYLON_STABLE_RELEASE_BODY_MAX_BYTES} bytes.`);
+	}
+	return body;
+}
+
+export function stableManifestBytesFromReleaseBody(body) {
+	if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > PYLON_STABLE_RELEASE_BODY_MAX_BYTES) {
+		throw new Error("Stable recovery release body is missing or exceeds its safe byte bound.");
+	}
+	const size = /^Manifest bytes: ([1-9][0-9]*)$/m.exec(body)?.[1];
+	const digest = /^Manifest sha256: ([0-9a-f]{64})$/m.exec(body)?.[1];
+	const encoded = /^Manifest base64: ([A-Za-z0-9+/]+={0,2})$/m.exec(body)?.[1];
+	if (!size || !digest || !encoded || (body.match(/^Stable recovery manifest: base64-v1$/gm) ?? []).length !== 1) {
+		throw new Error("Stable recovery release body has no exact manifest envelope.");
+	}
+	const bytes = Buffer.from(encoded, "base64");
+	if (
+		bytes.length !== Number(size) || bytes.length > PYLON_STABLE_MANIFEST_MAX_BYTES || bytes.toString("base64") !== encoded ||
+		sha256Bytes(bytes) !== digest
+	) throw new Error("Stable recovery manifest envelope is truncated, altered, or oversized.");
+	const manifest = validateStableManifest(JSON.parse(bytes));
+	if (bytes.toString("utf8") !== canonicalJson(manifest)) throw new Error("Stable recovery manifest is not canonical JSON.");
+	const expectedBody = publicationReleaseBody({
+		channel: "stable", tag: manifest.tag, source: manifest.build.source.commit, tree: manifest.build.source.tree,
+		recipeRevision: manifest.build.recipeRevision, policyCommit: manifest.promotion.policyCommit,
+		policyTree: manifest.promotion.policyTree, stableManifestBytes: bytes,
+	});
+	if (body !== expectedBody) throw new Error("Stable recovery release body metadata differs from its exact manifest.");
+	return { bytes, manifest, digest };
 }

@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createRequire } from "node:module";
 import { test } from "node:test";
 
 import {
@@ -21,13 +22,18 @@ import {
 	nextStableSequence,
 	parsePreviewTag,
 	parseStableTag,
+	parseSupportedReleaseRecipeRegistry,
 	publicationReleaseBody,
+	PYLON_REQUIRED_CHECKS,
 	PYLON_PREVIEW_MANIFEST,
 	PYLON_PREVIEW_WORKFLOW,
 	PYLON_PUBLICATION_REF,
 	PYLON_PUBLICATION_REPOSITORY,
 	PYLON_STABLE_MANIFEST,
+	PYLON_STABLE_WORKFLOW,
 	sha256Bytes,
+	stableManifestBytesFromReleaseBody,
+	stableReservationMessage,
 	stableSequenceReservationTag,
 	parseStableSequenceReservationTag,
 	stableTag,
@@ -40,13 +46,22 @@ import {
 	validateStableManifest,
 	validateWorkflowArtifactProvenance,
 } from "./lib/pylon-publication.mjs";
-import { ATTEST_ACTION_CHAIN, validateApprovedAttestationWorkflow } from "./lib/pylon-workflow-policy.mjs";
+import {
+	ATTEST_ACTION_CHAIN,
+	validateApprovedAttestationWorkflow,
+	validateApprovedWorkflowBytes,
+} from "./lib/pylon-workflow-policy.mjs";
 import { validatePreviewWorkflowRunEvidence, verifyGhAttestationResult } from "./verify-pylon-publication-attestations.mjs";
 import { recordPreviewHighWater } from "./verify-pylon-preview-history.mjs";
 import { verifyStableHistoryWithState } from "./verify-pylon-stable-history.mjs";
 import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
+import { PYLON_CONSUMER_LOCK_STALE_MS, withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
+import { isExactWithdrawalReplay, selectStableHistoryReleases } from "./prepare-pylon-stable-manifest.mjs";
+import { recoverStableDraft } from "./recover-pylon-stable-manifest.mjs";
 
 const root = resolve(import.meta.dirname, "..");
+const nodeRequire = createRequire(import.meta.url);
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const source = {
 	repository: "https://github.com/pylon-code/prime-agent",
 	commit: "0123456789abcdef0123456789abcdef01234567",
@@ -117,6 +132,49 @@ function secondStable(previous = firstStable(), options = {}) {
 	});
 }
 
+function slsaAttestationOutput(subject, expected, { runId = expected.workflowRunId ?? "445566", attempt = "2" } = {}) {
+	return JSON.stringify([{ verificationResult: {
+		statement: {
+			predicateType: "https://slsa.dev/provenance/v1",
+			subject: [{ name: subject.name, digest: { sha256: subject.sha256 } }],
+			predicate: {
+				buildDefinition: {
+					buildType: "https://actions.github.io/buildtypes/workflow/v1",
+					externalParameters: { workflow: {
+						repository: `https://github.com/${expected.repository}`, path: expected.workflow, ref: PYLON_PUBLICATION_REF,
+					} },
+					internalParameters: { github: {
+						event_name: expected.event, repository_id: "1349002285", repository_owner_id: "11325514", runner_environment: "github-hosted",
+					} },
+					resolvedDependencies: [{
+						uri: `git+https://github.com/${expected.repository}@${PYLON_PUBLICATION_REF}`,
+						digest: { gitCommit: expected.sourceSha },
+					}],
+				},
+				runDetails: {
+					builder: { id: `https://github.com/${expected.repository}/${expected.workflow}@${PYLON_PUBLICATION_REF}` },
+					metadata: { invocationId: `https://github.com/${expected.repository}/actions/runs/${runId}/attempts/${attempt}` },
+				},
+			},
+		},
+		verifiedTimestamps: [{ type: "Tlog", uri: "https://rekor.sigstore.dev" }],
+	} }]);
+}
+
+function githubScriptForStep(workflowPath, stepName) {
+	const lines = readFileSync(join(root, workflowPath), "utf8").split("\n");
+	const step = lines.findIndex((line) => line === `      - name: ${stepName}`);
+	if (step < 0) throw new Error(`Missing workflow step ${stepName}.`);
+	const marker = lines.findIndex((line, index) => index > step && line === "          script: |");
+	if (marker < 0) throw new Error(`Missing github-script body for ${stepName}.`);
+	const body = [];
+	for (let index = marker + 1; index < lines.length; index += 1) {
+		if (lines[index] && !lines[index].startsWith("            ")) break;
+		body.push(lines[index].slice(12));
+	}
+	return body.join("\n");
+}
+
 test("canonical publication JSON sorts every object key and rejects unsupported values", () => {
 	assert.equal(canonicalJson({ z: 1, a: { y: 2, b: 3 } }), '{\n  "a": {\n    "b": 3,\n    "y": 2\n  },\n  "z": 1\n}\n');
 	assert.throws(() => canonicalJson({ bad: undefined }), /undefined/);
@@ -168,6 +226,10 @@ test("current policy validates an older supported closed recipe without executin
 		nodeVersion: "20.19.1",
 		npmVersion: "10.8.2",
 		minimumNodeVersion: "20.12.0",
+		previewWorkflowPath: ".github/workflows/pylon-preview-release.yml",
+		previewWorkflowSha256: "a".repeat(64),
+		stableWorkflowPath: ".github/workflows/pylon-stable-release.yml",
+		stableWorkflowSha256: "b".repeat(64),
 	};
 	const release = fakeReleaseManifest();
 	release.build.id = `pylon-build-g${source.commit.slice(0, 12)}-r7`;
@@ -386,12 +448,21 @@ test("exact-SHA required checks reject wrong app, source, context, and result", 
 	];
 	const checkRuns = requiredChecks.map(({ context }) => ({
 		name: context,
+		workflowPath: PYLON_REQUIRED_CHECKS.find((required) => required.context === context).workflowPath,
 		head_sha: source.commit,
 		app: { id: GITHUB_ACTIONS_APP_ID },
 		status: "completed",
 		conclusion: "success",
 	}));
 	assert.equal(validateRequiredChecks({ sourceSha: source.commit, requiredChecks, checkRuns }), true);
+	for (const changedPolicy of [
+		requiredChecks.slice(0, 1),
+		[...requiredChecks, { context: "extra", appId: GITHUB_ACTIONS_APP_ID }],
+		requiredChecks.map((required, index) => index === 0 ? { ...required, appId: null } : required),
+	]) assert.throws(() => validateRequiredChecks({ sourceSha: source.commit, requiredChecks: changedPolicy, checkRuns }), /policy differs/);
+	const wrongPath = structuredClone(checkRuns);
+	wrongPath[0].workflowPath = ".github/workflows/other.yml";
+	assert.throws(() => validateRequiredChecks({ sourceSha: source.commit, requiredChecks, checkRuns: wrongPath }), /not green/);
 	for (const mutate of [
 		(run) => (run.app.id = 1),
 		(run) => (run.head_sha = "f".repeat(40)),
@@ -486,26 +557,24 @@ test("attestation policy rejects wrong repository, workflow, ref, source, issuer
 	]) assert.throws(() => validateAttestationEvidence({ ...evidence, [key]: value }, expected));
 });
 
-test("gh verification result requires the exact subject digest and Rekor inclusion", () => {
+test("gh verification result requires full workflow/v1 invocation, exact subjects, and Rekor", () => {
 	const subject = { name: "artifact.tgz", sha256: "a".repeat(64) };
-	const output = JSON.stringify([{ verificationResult: {
-		statement: { predicateType: "https://slsa.dev/provenance/v1", subject: [{ name: subject.name, digest: { sha256: subject.sha256 } }] },
-		verifiedTimestamps: [{ type: "Tlog", uri: "https://rekor.sigstore.dev", timestamp: "2026-01-01T00:00:00Z" }],
-	} }]);
-	assert.equal(verifyGhAttestationResult(output, subject), true);
-	assert.throws(() => verifyGhAttestationResult(output, { ...subject, sha256: "f".repeat(64) }), /subject/);
+	const expected = {
+		repository: PYLON_PUBLICATION_REPOSITORY, workflow: PYLON_STABLE_WORKFLOW,
+		event: "workflow_dispatch", sourceSha: source.commit,
+	};
+	const output = slsaAttestationOutput(subject, expected);
+	assert.deepEqual(verifyGhAttestationResult(output, subject, expected), [{ runId: "445566", runAttempt: "2" }]);
+	assert.throws(() => verifyGhAttestationResult(output, subject), /invocation/);
+	const missingPredicate = JSON.parse(output);
+	delete missingPredicate[0].verificationResult.statement.predicate;
+	assert.throws(() => verifyGhAttestationResult(JSON.stringify(missingPredicate), subject, expected), /workflow run/);
+	assert.throws(() => verifyGhAttestationResult(output, { ...subject, sha256: "f".repeat(64) }, expected), /subject set/);
 	const noRekor = output.replace("Tlog", "TimestampAuthority");
-	assert.throws(() => verifyGhAttestationResult(noRekor, subject), /Rekor/);
-	const parsed = JSON.parse(output);
-	parsed[0].verificationResult.statement.subject.push({ name: "extra", digest: { sha256: "b".repeat(64) } });
-	assert.throws(() => verifyGhAttestationResult(JSON.stringify(parsed), subject), /subject set/);
-	parsed[0].verificationResult.statement.subject[1] = structuredClone(parsed[0].verificationResult.statement.subject[0]);
-	assert.throws(() => verifyGhAttestationResult(JSON.stringify(parsed), subject), /duplicate|subject set/);
-	parsed[0].verificationResult.statement.subject = [{ name: subject.name, digest: { sha256: subject.sha256, sha512: "c".repeat(128) } }];
-	assert.throws(() => verifyGhAttestationResult(JSON.stringify(parsed), subject), /malformed subject/);
-	parsed[0].verificationResult.statement.subject = [{ name: subject.name, digest: { sha256: subject.sha256 } }];
-	parsed[0].verificationResult.statement.predicateType = "https://example.invalid/predicate";
-	assert.throws(() => verifyGhAttestationResult(JSON.stringify(parsed), subject), /predicate/);
+	assert.throws(() => verifyGhAttestationResult(noRekor, subject, expected), /Rekor/);
+	const extra = JSON.parse(output);
+	extra[0].verificationResult.statement.subject.push({ name: "extra", digest: { sha256: "b".repeat(64) } });
+	assert.throws(() => verifyGhAttestationResult(JSON.stringify(extra), subject, expected), /subject set/);
 });
 
 test("attestation invocation binds the signed run id and attempt while run number stays API-derived", () => {
@@ -546,7 +615,7 @@ test("attestation invocation binds the signed run id and attempt while run numbe
 		statement,
 		verifiedTimestamps: [{ type: "Tlog", uri: "https://rekor.sigstore.dev" }],
 	} }]);
-	assert.deepEqual(verifyGhAttestationResult(output, subject, expected), ["2"]);
+	assert.deepEqual(verifyGhAttestationResult(output, subject, expected), [{ runId: invocation.workflowRunId, runAttempt: "2" }]);
 	const wrongRun = structuredClone(statement);
 	wrongRun.predicate.runDetails.metadata.invocationId = `https://github.com/${expected.repository}/actions/runs/999/attempts/2`;
 	assert.throws(() => verifyGhAttestationResult(JSON.stringify([{ verificationResult: {
@@ -563,14 +632,16 @@ test("preview sequence rejects a workflow API run-id or run-number mismatch", ()
 		head_repository: { id: 1_349_002_285, full_name: PYLON_PUBLICATION_REPOSITORY },
 		check_suite_id: 7, status: "in_progress", conclusion: null,
 	};
-	const evidence = {
+	run.run_attempt = 2;
+	const attempt = {
 		run,
 		suite: { id: 7, app: { id: GITHUB_ACTIONS_APP_ID }, head_sha: source.commit },
 		jobs: [{ name: "Approve and attest six preview subjects", run_attempt: 2, status: "completed", conclusion: "success" }],
 	};
-	assert.equal(validatePreviewWorkflowRunEvidence(evidence, preview, ["2"]).workflowRunId, invocation.workflowRunId);
-	assert.throws(() => validatePreviewWorkflowRunEvidence({ ...evidence, run: { ...run, id: 9 } }, preview, ["2"]), /sequence/);
-	assert.throws(() => validatePreviewWorkflowRunEvidence({ ...evidence, run: { ...run, run_number: 18 } }, preview, ["2"]), /sequence/);
+	const signed = [{ runId: invocation.workflowRunId, runAttempt: "2" }];
+	assert.equal(validatePreviewWorkflowRunEvidence({ attempts: [attempt] }, preview, signed).workflowRunId, invocation.workflowRunId);
+	assert.throws(() => validatePreviewWorkflowRunEvidence({ attempts: [{ ...attempt, run: { ...run, id: 9 } }] }, preview, signed), /sequence/);
+	assert.throws(() => validatePreviewWorkflowRunEvidence({ attempts: [{ ...attempt, run: { ...run, run_number: 18 } }] }, preview, signed), /sequence/);
 });
 
 test("immutable release replay is idempotent only for identical metadata and bytes", () => {
@@ -663,6 +734,269 @@ test("standalone preview verification rejects tamper, extras, symlinks, and nonc
 	}
 });
 
+test("recipe registry closes exact workflow bytes and rejects extras and duplicate JSON keys", () => {
+	const registryText = readFileSync(join(root, "scripts/pylon-prime-supported-release-recipes-v1.json"), "utf8");
+	const registry = parseSupportedReleaseRecipeRegistry(registryText);
+	const recipe = registry.recipes[0];
+	const preview = readFileSync(join(root, recipe.previewWorkflowPath), "utf8");
+	const stable = readFileSync(join(root, recipe.stableWorkflowPath), "utf8");
+	assert.deepEqual(validateApprovedWorkflowBytes(recipe.previewWorkflowPath, preview, "preview", recipe.recipeRevision), {
+		workflow: recipe.previewWorkflowPath, environment: "pylon-preview",
+	});
+	assert.deepEqual(validateApprovedWorkflowBytes(recipe.stableWorkflowPath, stable, "stable", recipe.recipeRevision), {
+		workflow: recipe.stableWorkflowPath, environment: "pylon-stable",
+	});
+	for (const changed of [
+		`${preview}\n  rogue:\n    permissions: write-all\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo arbitrary\n`,
+		`${stable}\n  rogue-oidc:\n    permissions:\n      id-token: write\n      attestations: write\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo sign\n`,
+		preview.replace("jobs:\n", "jobs:\n  publish:\n    permissions: write-all\n"),
+		preview.replace("permissions: {}", "permissions: {}\npermissions: write-all"),
+	]) assert.throws(() => validateApprovedWorkflowBytes(recipe.previewWorkflowPath, changed, "preview", recipe.recipeRevision), /bytes differ/);
+	assert.throws(() => validateApprovedWorkflowBytes(recipe.previewWorkflowPath, preview, "preview", 999), /Unsupported/);
+	const extraRoot = structuredClone(registry);
+	extraRoot.extra = true;
+	assert.throws(() => parseSupportedReleaseRecipeRegistry(JSON.stringify(extraRoot)), /malformed/);
+	const extraRecipe = structuredClone(registry);
+	extraRecipe.recipes[0].extra = true;
+	assert.throws(() => parseSupportedReleaseRecipeRegistry(JSON.stringify(extraRecipe)), /malformed/);
+	assert.throws(
+		() => parseSupportedReleaseRecipeRegistry('{"schemaVersion":1,"schemaVersion":1,"recipes":[]}'),
+		/duplicate keys/,
+	);
+});
+
+test("consumer locks recover stale owners without sleep and reject active contention", () => {
+	const fixture = mkdtempSync(join(tmpdir(), "pylon-consumer-lock-"));
+	try {
+		for (const name of ["preview.json", "stable.json"]) {
+			const statePath = join(fixture, name);
+			withConsumerStateLock(statePath, () => {
+				assert.throws(() => withConsumerStateLock(statePath, () => {}), /actively locked/);
+			});
+			mkdirSync(`${statePath}.lock`);
+			const stale = new Date(Date.now() - PYLON_CONSUMER_LOCK_STALE_MS - 5_000);
+			utimesSync(`${statePath}.lock`, stale, stale);
+			let recovered = false;
+			withConsumerStateLock(statePath, () => { recovered = true; });
+			assert.equal(recovered, true);
+		}
+	} finally {
+		rmSync(fixture, { recursive: true, force: true });
+	}
+});
+
+test("every inline admission and final publisher closes the exact branch-check trust root", () => {
+	for (const [workflow, step] of [
+		[".github/workflows/pylon-preview-release.yml", "Require the canonical protected push"],
+		[".github/workflows/pylon-preview-release.yml", "Verify exact checks and publish once"],
+		[".github/workflows/pylon-stable-release.yml", "Require protected pylon and an exact verified preview source"],
+		[".github/workflows/pylon-stable-release.yml", "Re-download the exact draft, reserve N once, and publish only that draft"],
+	]) {
+		const script = githubScriptForStep(workflow, step);
+		for (const value of [
+			"Check changelog fragment", "build-check-test", "15368",
+			".github/workflows/changelog-merged-proof.yml", ".github/workflows/ci.yml",
+		]) assert.ok(script.includes(value), `${workflow}:${step} lacks ${value}`);
+		assert.match(script, /JSON\.stringify\(actualPolicy\) !== JSON\.stringify/);
+		assert.doesNotMatch(script, /appId === null|!expectedPath/);
+	}
+});
+
+test("stable recovery body durably carries bounded exact canonical manifest bytes", () => {
+	const manifest = firstStable();
+	const bytes = Buffer.from(canonicalJson(manifest));
+	const body = publicationReleaseBody({
+		channel: "stable", tag: manifest.tag, source: manifest.build.source.commit, tree: manifest.build.source.tree,
+		recipeRevision: manifest.build.recipeRevision, policyCommit: manifest.promotion.policyCommit,
+		policyTree: manifest.promotion.policyTree, stableManifestBytes: bytes,
+	});
+	const recovered = stableManifestBytesFromReleaseBody(body);
+	assert.equal(recovered.bytes.equals(bytes), true);
+	assert.equal(recovered.digest, sha256Bytes(bytes));
+	assert.throws(() => stableManifestBytesFromReleaseBody(body.replace("Manifest bytes: ", "Manifest bytes: 9")), /truncated|metadata/);
+	assert.throws(() => stableManifestBytesFromReleaseBody(body.slice(0, -1)), /metadata/);
+	assert.throws(() => publicationReleaseBody({
+		channel: "stable", tag: manifest.tag, source: manifest.build.source.commit, tree: manifest.build.source.tree,
+		recipeRevision: 1, policyCommit: source.commit, policyTree: source.tree,
+		stableManifestBytes: Buffer.alloc(48 * 1024 + 1),
+	}), /49152/);
+});
+
+test("stable zero-asset recovery reuses the body-carried attested bytes and excludes only its draft", async () => {
+	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-recovery-"));
+	try {
+		const manifest = firstStable();
+		const bytes = Buffer.from(canonicalJson(manifest));
+		const digest = sha256Bytes(bytes);
+		const release = {
+			id: 51, draft: true, immutable: false, tag_name: manifest.tag,
+			name: `Pylon Prime stable ${manifest.tag}`, prerelease: false,
+			target_commitish: manifest.promotion.policyCommit, assets: [],
+			body: publicationReleaseBody({
+				channel: "stable", tag: manifest.tag, source: manifest.build.source.commit, tree: manifest.build.source.tree,
+				recipeRevision: manifest.build.recipeRevision, policyCommit: manifest.promotion.policyCommit,
+				policyTree: manifest.promotion.policyTree, stableManifestBytes: bytes,
+			}),
+		};
+		let verified = false;
+		const notFound = Object.assign(new Error("not found"), { status: 404 });
+		const recovered = await recoverStableDraft({
+			draftId: 51, reservationTag: "", previewTag: manifest.build.previewTag, operation: "promote",
+			revokeTag: "", reason: "", outDir: fixture,
+		}, {
+			api: async (path) => path.endsWith("/releases/51") ? release : Promise.reject(notFound),
+			readHistory: async (options) => {
+				assert.deepEqual(options, { verifyAllAttestations: true, excludeDraftId: 51, excludeDraftTag: manifest.tag });
+				return [];
+			},
+			verifyAttestation: (path, policyCommit, policyTree) => {
+				assert.equal(readFileSync(path).equals(bytes), true);
+				assert.equal(policyCommit, source.commit);
+				assert.equal(policyTree, source.tree);
+				verified = true;
+			},
+		});
+		assert.equal(recovered.digest, digest);
+		assert.equal(verified, true);
+		assert.deepEqual(selectStableHistoryReleases([release], { excludeDraftId: 51 }), []);
+		assert.throws(() => selectStableHistoryReleases([release], { excludeDraftId: 52 }), /unexpected draft/);
+		const altered = structuredClone(release);
+		altered.body = altered.body.replace(digest, "f".repeat(64));
+		await assert.rejects(() => recoverStableDraft({
+			draftId: 51, reservationTag: "", previewTag: manifest.build.previewTag, operation: "promote",
+			revokeTag: "", reason: "", outDir: fixture,
+		}, { api: async () => altered }), /altered|truncated/);
+	} finally {
+		rmSync(fixture, { recursive: true, force: true });
+	}
+});
+
+test("withdrawal replay is a no-op only for the exact latest promotion tuple and reason", () => {
+	const first = firstStable();
+	const latest = secondStable(first, { withdraw: true });
+	const request = { previewTag: latest.build.previewTag, revokeTag: first.tag, reason: "security-withdrawal" };
+	assert.equal(isExactWithdrawalReplay(latest, request), true);
+	for (const changed of [
+		{ ...request, reason: "other-reason" },
+		{ ...request, revokeTag: latest.tag },
+		{ ...request, previewTag: "pylon-build-gffffffffffff-r1" },
+	]) assert.equal(isExactWithdrawalReplay(latest, changed), false);
+	const laterPromotion = structuredClone(latest);
+	laterPromotion.promotion = { kind: "promote", policyCommit: source.commit, policyTree: source.tree };
+	assert.equal(isExactWithdrawalReplay(laterPromotion, request), false);
+	const message = stableReservationMessage(latest, sha256Bytes(Buffer.from(canonicalJson(latest))), 51);
+	for (const field of ["Withdraw stable tag", "Withdraw build tag", "Withdraw reason"]) assert.match(message, new RegExp(`^${field}:`, "m"));
+});
+
+test("signed preview attempt evidence ignores a later aggregate rerun and response-loss conclusion", () => {
+	const { preview } = manifests();
+	const signed = [{ runId: invocation.workflowRunId, runAttempt: "1" }];
+	const attempt = {
+		run: {
+			id: Number(invocation.workflowRunId), run_attempt: 1, run_number: invocation.sequence,
+			event: "push", head_branch: "pylon", head_sha: source.commit, path: PYLON_PREVIEW_WORKFLOW,
+			repository: { id: 1_349_002_285, full_name: PYLON_PUBLICATION_REPOSITORY },
+			head_repository: { id: 1_349_002_285, full_name: PYLON_PUBLICATION_REPOSITORY },
+			check_suite_id: 77, status: "completed", conclusion: "failure",
+		},
+		suite: { id: 77, app: { id: GITHUB_ACTIONS_APP_ID }, head_sha: source.commit, conclusion: "failure" },
+		jobs: [{ name: "Approve and attest six preview subjects", run_attempt: 1, status: "completed", conclusion: "success" }],
+	};
+	assert.equal(validatePreviewWorkflowRunEvidence({ attempts: [attempt], aggregateRun: { run_attempt: 2, conclusion: "failure" } }, preview, signed).workflowRunId, invocation.workflowRunId);
+	const verifier = readFileSync(join(root, "scripts/verify-pylon-publication-attestations.mjs"), "utf8");
+	assert.match(verifier, /actions\/runs\/\$\{runId\}\/attempts\/\$\{runAttempt\}/);
+	assert.doesNotMatch(verifier, /actions\/runs\/\$\{previewManifest\.workflowRunId\}`/);
+});
+
+test("stable stage survives a crash after createRelease by recovering its exact zero-asset body", async () => {
+	const fixture = mkdtempSync(join(tmpdir(), "pylon-stage-crash-"));
+	const oldManifest = process.env.STABLE_MANIFEST;
+	try {
+		const manifest = firstStable();
+		const bytes = Buffer.from(canonicalJson(manifest));
+		const manifestPath = join(fixture, PYLON_STABLE_MANIFEST);
+		writeFileSync(manifestPath, bytes);
+		process.env.STABLE_MANIFEST = manifestPath;
+		let draft;
+		let crash = true;
+		const missing = () => Promise.reject(Object.assign(new Error("missing"), { status: 404 }));
+		const listReleases = async () => {};
+		const github = {
+			paginate: async (method) => method === listReleases ? (draft ? [draft] : []) : [],
+			rest: {
+				git: { getRef: missing },
+				repos: {
+					listReleases,
+					createRelease: async (request) => {
+						draft = { id: 51, draft: true, immutable: false, tag_name: request.tag_name, name: request.name,
+							body: request.body, prerelease: false, target_commitish: request.target_commitish, assets: [] };
+						if (crash) throw new Error("simulated crash after createRelease");
+						return { data: draft };
+					},
+					getRelease: async () => ({ data: draft }),
+				},
+			},
+			request: async (route, request) => {
+				if (route.startsWith("POST ")) {
+					draft.assets = [{ id: 9, name: request.name, size: request.data.length, digest: `sha256:${sha256Bytes(request.data)}` }];
+					return { data: draft.assets[0] };
+				}
+				return { data: bytes };
+			},
+		};
+		const context = { repo: { owner: "pylon-code", repo: "prime-agent" }, eventName: "workflow_dispatch", ref: PYLON_PUBLICATION_REF, sha: source.commit };
+		const script = githubScriptForStep(".github/workflows/pylon-stable-release.yml", "Create or finish the exact durable draft");
+		const execute = new AsyncFunction("github", "context", "core", "require", script);
+		await assert.rejects(() => execute(github, context, {}, nodeRequire), /simulated crash/);
+		assert.equal(draft.assets.length, 0);
+		assert.equal(stableManifestBytesFromReleaseBody(draft.body).bytes.equals(bytes), true);
+		crash = false;
+		assert.equal(await execute(github, context, {}, nodeRequire), 51);
+		assert.equal(draft.assets.length, 1);
+		assert.equal(draft.assets[0].digest, `sha256:${sha256Bytes(bytes)}`);
+	} finally {
+		if (oldManifest === undefined) delete process.env.STABLE_MANIFEST;
+		else process.env.STABLE_MANIFEST = oldManifest;
+		rmSync(fixture, { recursive: true, force: true });
+	}
+});
+
+test("final tag CAS models reject squats and preserve reservation-tag-publish order", async () => {
+	const exactCas = async ({ read, create, expected }) => {
+		try {
+			const existing = await read();
+			if (existing.type !== "commit" || existing.sha !== expected) throw new Error("unsafe tag");
+			return existing;
+		} catch (error) {
+			if (error.status !== 404) throw error;
+			try { await create(); } catch (race) { if (race.status !== 422) throw race; }
+			const raced = await read();
+			if (raced.type !== "commit" || raced.sha !== expected) throw new Error("unsafe tag");
+			return raced;
+		}
+	};
+	const missing = Object.assign(new Error("missing"), { status: 404 });
+	const raced = Object.assign(new Error("race"), { status: 422 });
+	assert.deepEqual(await exactCas({ read: async () => ({ type: "commit", sha: source.commit }), create: async () => {}, expected: source.commit }), { type: "commit", sha: source.commit });
+	let reads = 0;
+	assert.deepEqual(await exactCas({
+		read: async () => { reads += 1; if (reads === 1) throw missing; return { type: "commit", sha: source.commit }; },
+		create: async () => { throw raced; }, expected: source.commit,
+	}), { type: "commit", sha: source.commit });
+	for (const unsafe of [{ type: "tag", sha: source.commit }, { type: "commit", sha: "f".repeat(40) }]) {
+		await assert.rejects(() => exactCas({ read: async () => unsafe, create: async () => {}, expected: source.commit }), /unsafe tag/);
+	}
+	const preview = readFileSync(join(root, ".github/workflows/pylon-preview-release.yml"), "utf8");
+	assert.ok(preview.indexOf("refs/tags/${tag}") < preview.indexOf("repos.createRelease"));
+	assert.ok(preview.lastIndexOf("await requireExactTag()") < preview.lastIndexOf("repos.updateRelease"));
+	const stable = readFileSync(join(root, ".github/workflows/pylon-stable-release.yml"), "utf8");
+	const publish = stable.slice(stable.indexOf("name: Reserve and publish immutable stable sequence"));
+	assert.ok(publish.indexOf('POST /repos/{owner}/{repo}/releases/{release_id}/assets') < publish.indexOf("refs/tags/${reservationTag}"));
+	assert.ok(publish.indexOf("downloadedBytes.equals(bytes)") < publish.indexOf("refs/tags/${reservationTag}"));
+	assert.ok(publish.indexOf("refs/tags/${reservationTag}") < publish.indexOf("refs/tags/${manifest.tag}"));
+	assert.ok(publish.indexOf("refs/tags/${manifest.tag}") < publish.indexOf("repos.updateRelease"));
+});
+
 test("workflow static policy proves direct approvals and every contents-write graph", () => {
 	const workflowFiles = readdirSync(join(root, ".github/workflows"))
 		.filter((file) => /\.ya?ml$/.test(file))
@@ -743,7 +1077,7 @@ test("workflow static policy proves direct approvals and every contents-write gr
 	assert.match(stable, /refetched state and stopped without N\+1, move, or delete/);
 	assert.match(stable, /Draft release: \$\{draft\.id\}/);
 	assert.match(stable, /Withdraw build tag:/);
-	assert.match(stable, /After CAS the only mutation is publishing this exact fully uploaded draft/);
+	assert.match(stable, /separate lightweight tag CAS/);
 	assert.doesNotMatch(stable, /manifest\.sequence\s*\+\+|updateRef|deleteRef|deleteRelease|deleteReleaseAsset/);
 	const attestationVerifier = readFileSync(join(root, "scripts/verify-pylon-publication-attestations.mjs"), "utf8");
 	for (const flag of ["--cert-identity", "--signer-digest", "--source-ref", "--source-digest", "--cert-oidc-issuer", "--predicate-type", "--deny-self-hosted-runners"]) {

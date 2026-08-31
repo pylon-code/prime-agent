@@ -39,7 +39,24 @@ jobs:
             const pylon = await github.rest.git.getRef({ ...context.repo, ref: "heads/pylon" });
             if (pylon.data.object.type !== "commit" || pylon.data.object.sha !== context.sha) {
               core.setFailed("Preview publication event is stale relative to protected pylon.");
+              return;
             }
+            const expectedPolicy = [
+              { context: "Check changelog fragment", appId: 15368, workflowPath: ".github/workflows/changelog-merged-proof.yml" },
+              { context: "build-check-test", appId: 15368, workflowPath: ".github/workflows/ci.yml" },
+            ];
+            const protection = await github.graphql(
+              `query($owner:String!,$repo:String!,$ref:String!){repository(owner:$owner,name:$repo){ref(qualifiedName:$ref){branchProtectionRule{requiresStatusChecks requiredStatusChecks{context app{databaseId}}}}}}`,
+              { ...context.repo, ref: "refs/heads/pylon" },
+            );
+            const rule = protection.repository?.ref?.branchProtectionRule;
+            const actualPolicy = Array.isArray(rule?.requiredStatusChecks) ? rule.requiredStatusChecks.map((requirement) => ({
+              context: requirement.context, appId: requirement.app?.databaseId ?? null,
+            })).sort((left, right) => left.context < right.context ? -1 : left.context > right.context ? 1 : 0) : null;
+            if (!rule?.requiresStatusChecks || JSON.stringify(actualPolicy) !== JSON.stringify(expectedPolicy.map(({ context, appId }) => ({ context, appId })))) {
+              throw new Error("Protected pylon must require exactly the two app-bound publication checks.");
+            }
+            // Exact-SHA workflow proof is checked by the final publisher after the push checks can complete.
 
   pack:
     name: Preview offline pack (${{ matrix.copy }})
@@ -185,7 +202,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
+        os: [ubuntu-24.04, macos-15]
     steps:
       - name: Checkout exact pushed source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -307,6 +324,26 @@ jobs:
               `Tree: ${release.source.tree}`, `Recipe: r${release.build.recipeRevision}`, "",
               "Verify the immutable release and artifact attestations before use.",
             ].join("\n");
+            const requireExactTag = async () => {
+              const ref = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+              if (ref.data.object.type !== "commit" || ref.data.object.sha !== context.sha) {
+                throw new Error("Preview publication tag is annotated or targets a different commit.");
+              }
+              return ref.data;
+            };
+            try {
+              await requireExactTag();
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await requireLivePylon();
+              try {
+                await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha: context.sha });
+              } catch (createError) {
+                if (createError.status !== 422) throw createError;
+                await requireExactTag();
+              }
+              await requireExactTag();
+            }
             const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
             const matching = releases.filter((candidate) => candidate.tag_name === tag);
             if (matching.length > 1) throw new Error("Preview draft tag is ambiguous.");
@@ -337,11 +374,13 @@ jobs:
                 })).data;
                 createdDraft = true;
               } catch (error) {
-                if (error.status === 422) {
-                  await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
-                  throw new Error("Preview draft creation raced (422); refetched state and stopped.");
+                if (error.status !== 422) throw error;
+                const raced = (await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 }))
+                  .filter((candidate) => candidate.tag_name === tag);
+                if (raced.length !== 1 || !raced[0].draft) {
+                  throw new Error("Preview draft creation raced (422) without one exact recoverable draft.");
                 }
-                throw error;
+                draft = raced[0];
               }
             }
             if (
@@ -615,45 +654,40 @@ jobs:
             );
             const rule = protection.repository?.ref?.branchProtectionRule;
             const required = rule?.requiredStatusChecks;
-            if (!rule?.requiresStatusChecks || !Array.isArray(required) || required.length === 0) {
-              throw new Error("Protected pylon required-check policy is unavailable.");
+            const expectedPolicy = [
+              { context: "Check changelog fragment", appId: 15368, workflowPath: ".github/workflows/changelog-merged-proof.yml" },
+              { context: "build-check-test", appId: 15368, workflowPath: ".github/workflows/ci.yml" },
+            ];
+            const actualPolicy = Array.isArray(required) ? required.map((requirement) => ({
+              context: requirement.context, appId: requirement.app?.databaseId ?? null,
+            })).sort((left, right) => left.context < right.context ? -1 : left.context > right.context ? 1 : 0) : null;
+            if (!rule?.requiresStatusChecks || JSON.stringify(actualPolicy) !== JSON.stringify(expectedPolicy.map(({ context, appId }) => ({ context, appId })))) {
+              throw new Error("Protected pylon must require exactly the two app-bound publication checks.");
             }
             const checks = await github.paginate(github.rest.checks.listForRef, {
               owner, repo, ref: sourceSha, filter: "latest", per_page: 100,
             });
-            const statuses = (await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sourceSha })).data.statuses;
-            for (const requirement of required) {
-              const appId = requirement.app?.databaseId ?? null;
-              if (appId === null) {
-                if (!statuses.some((status) => status.context === requirement.context && status.state === "success" && status.sha === sourceSha)) {
-                  throw new Error(`Required status ${requirement.context} is not successful on the source SHA.`);
-                }
-              } else {
-                const candidates = checks.filter((check) =>
-                  check.name === requirement.context && check.head_sha === sourceSha && check.app?.id === appId &&
-                  check.status === "completed" && check.conclusion === "success"
-                );
-                let proved = false;
-                for (const check of candidates) {
-                  const runId = /^https:\/\/github\.com\/pylon-code\/prime-agent\/actions\/runs\/([0-9]+)(?:\/job\/[0-9]+)?$/.exec(check.details_url ?? "")?.[1];
-                  if (!runId) continue;
-                  const suite = (await github.rest.checks.getSuite({ owner, repo, check_suite_id: check.check_suite.id })).data;
-                  const run = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(runId) })).data;
-                  const workflow = (await github.rest.actions.getWorkflow({ owner, repo, workflow_id: run.workflow_id })).data;
-                  const expectedPath = {
-                    "build-check-test": ".github/workflows/ci.yml",
-                    "Check changelog fragment": ".github/workflows/changelog-merged-proof.yml",
-                  }[requirement.context];
-                  if (
-                    suite.app?.id === appId && suite.head_sha === sourceSha && suite.status === "completed" && suite.conclusion === "success" &&
-                    run.check_suite_id === suite.id && run.repository?.id === 1349002285 && run.repository?.full_name === repository &&
-                    run.head_repository?.id === 1349002285 && run.head_repository?.full_name === repository && run.event === "push" &&
-                    run.head_branch === "pylon" && run.head_sha === sourceSha && run.status === "completed" && run.conclusion === "success" &&
-                    workflow.path.startsWith(".github/workflows/") && (!expectedPath || workflow.path === expectedPath)
-                  ) { proved = true; break; }
-                }
-                if (!proved) throw new Error(`Required check ${requirement.context} lacks an exact canonical push workflow proof.`);
+            for (const requirement of expectedPolicy) {
+              const candidates = checks.filter((check) =>
+                check.name === requirement.context && check.head_sha === sourceSha && check.app?.id === requirement.appId &&
+                check.status === "completed" && check.conclusion === "success"
+              );
+              let proved = false;
+              for (const check of candidates) {
+                const runId = /^https:\/\/github\.com\/pylon-code\/prime-agent\/actions\/runs\/([0-9]+)(?:\/job\/[0-9]+)?$/.exec(check.details_url ?? "")?.[1];
+                if (!runId) continue;
+                const suite = (await github.rest.checks.getSuite({ owner, repo, check_suite_id: check.check_suite.id })).data;
+                const run = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(runId) })).data;
+                const workflow = (await github.rest.actions.getWorkflow({ owner, repo, workflow_id: run.workflow_id })).data;
+                if (
+                  suite.app?.id === requirement.appId && suite.head_sha === sourceSha && suite.status === "completed" && suite.conclusion === "success" &&
+                  run.check_suite_id === suite.id && run.repository?.id === 1349002285 && run.repository?.full_name === repository &&
+                  run.head_repository?.id === 1349002285 && run.head_repository?.full_name === repository && run.event === "push" &&
+                  run.head_branch === "pylon" && run.head_sha === sourceSha && run.status === "completed" && run.conclusion === "success" &&
+                  workflow.path === requirement.workflowPath
+                ) { proved = true; break; }
               }
+              if (!proved) throw new Error(`Required check ${requirement.context} lacks an exact canonical push workflow proof.`);
             }
             const files = fs.readdirSync(process.env.ARTIFACT_DIR).sort();
             const expectedFiles = [
@@ -681,6 +715,12 @@ jobs:
               `Tree: ${releaseManifest.source.tree}`, `Recipe: r${releaseManifest.build.recipeRevision}`, "",
               "Verify the immutable release and artifact attestations before use.",
             ].join("\n");
+            const requireExactTag = async () => {
+              const tagRef = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+              if (tagRef.data.object.type !== "commit" || tagRef.data.object.sha !== sourceSha) {
+                throw new Error("Preview tag does not target the exact source commit.");
+              }
+            };
             const assertExact = async (release) => {
               if (
                 release.immutable !== true || release.draft !== false || release.tag_name !== tag || release.name !== name ||
@@ -693,10 +733,7 @@ jobs:
                   throw new Error(`Existing preview asset differs: ${expected.name}`);
                 }
               }
-              const tagRef = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
-              if (tagRef.data.object.type !== "commit" || tagRef.data.object.sha !== sourceSha) {
-                throw new Error("Existing preview tag does not target the exact source commit.");
-              }
+              await requireExactTag();
             };
             let existing;
             try {
@@ -742,6 +779,7 @@ jobs:
             // GitHub has no multi-ref conditional transaction. This final read authorizes the tip at this instant;
             // a later push does not revoke the exact draft that is immediately published.
             await requireLivePylon();
+            await requireExactTag();
             await github.rest.repos.updateRelease({ owner, repo, release_id: draft.id, draft: false });
             const published = (await github.rest.repos.getRelease({ owner, repo, release_id: draft.id })).data;
             await assertExact(published);

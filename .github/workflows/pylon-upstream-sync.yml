@@ -30,14 +30,24 @@ jobs:
       - name: Checkout Pylon product branch
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: pylon
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Mirror Prime and prepare a review candidate
+      - name: Prove the approved exact live revision, then mirror Prime
         id: sync
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: scripts/pylon-sync-upstream.sh
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "pylon-code/prime-agent"
+          test "$GITHUB_EVENT_NAME" = "${{ github.event_name }}"
+          case "$GITHUB_EVENT_NAME" in schedule|workflow_dispatch) ;; *) exit 1 ;; esac
+          test "$GITHUB_REF" = "refs/heads/pylon"
+          test "$GITHUB_SHA" = "${{ github.sha }}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
+          test "$(gh api repos/pylon-code/prime-agent/git/ref/heads/pylon --jq .object.sha)" = "$GITHUB_SHA"
+          exec scripts/pylon-sync-upstream.sh
 
   verify:
     name: Verify candidate ${{ needs.sync.outputs.candidate_sha }} with trusted fork CI

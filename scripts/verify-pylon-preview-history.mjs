@@ -5,11 +5,9 @@ import {
 	closeSync,
 	fsyncSync,
 	lstatSync,
-	mkdirSync,
 	openSync,
 	readFileSync,
 	renameSync,
-	rmdirSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
@@ -23,6 +21,7 @@ import {
 	sha256Bytes,
 } from "./lib/pylon-publication.mjs";
 import { PYLON_RELEASE_REPOSITORY } from "./lib/pylon-release.mjs";
+import { withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 import { verifyPreviewAttestations } from "./verify-pylon-publication-attestations.mjs";
 
 const STATE_SCHEMA_VERSION = 1;
@@ -95,15 +94,7 @@ export function recordPreviewHighWater(previewManifest, previewBytes, { statePat
 		!/^[1-9][0-9]*$/.test(previewManifest.workflowRunId ?? "")
 	) throw new Error("Verified preview has a malformed monotonic sequence identity.");
 	const path = resolve(statePath);
-	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-	const lockPath = `${path}.lock`;
-	try {
-		mkdirSync(lockPath, { mode: 0o700 });
-	} catch (error) {
-		if (error?.code === "EEXIST") throw new Error(`Consumer preview high-water state is locked: ${lockPath}`);
-		throw error;
-	}
-	try {
+	return withConsumerStateLock(path, () => {
 		const entry = lstatSync(path, { throwIfNoEntry: false });
 		if (entry && !entry.isFile()) throw new Error("Consumer preview high-water state is not one regular file.");
 		if (!entry && !initialize) throw new Error("No consumer preview high-water exists. Verify the release, then use --initialize once.");
@@ -134,9 +125,7 @@ export function recordPreviewHighWater(previewManifest, previewBytes, { statePat
 		};
 		atomicWrite(path, state);
 		return { state, advanced: true };
-	} finally {
-		rmdirSync(lockPath);
-	}
+	});
 }
 
 function parseArgs(args) {
