@@ -7463,11 +7463,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * Cancel the active turn and everything it owns, including in-flight RLM child
-	 * runs. Every user-facing cancel (interactive ctrl-c, ACP/daemon `abort`,
-	 * `abort_and_clear_queue`) routes here, so a spawn run must die with the turn
-	 * instead of holding provider capacity. Retained child sessions are addressable
-	 * background subagents and are left running; cancel those by id with
+	 * Cancel the active turn and everything it owns, including every in-flight RLM
+	 * child run. Every user-facing cancel (interactive ctrl-c, ACP/daemon `abort`,
+	 * `abort_and_clear_queue`) routes here, so an unfinished spawn run must die with
+	 * the cancel rather than keep holding provider capacity, even when an earlier
+	 * turn admitted it. Retained child sessions have already finished their run and
+	 * stay addressable, so they keep running; cancel one by id with
 	 * {@link cancelRlmChildRun}.
 	 */
 	requestAbort(): void {
