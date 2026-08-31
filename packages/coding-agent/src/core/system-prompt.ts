@@ -37,7 +37,66 @@ export interface BuildSystemPromptOptions {
 	genericMcpServers?: string[];
 }
 
-/** Build the system prompt with tools, guidelines, and context */
+/** Current-day stamp, deliberately without a time component. */
+function currentDate(): string {
+	const now = new Date();
+	const year = now.getFullYear();
+	const month = String(now.getMonth() + 1).padStart(2, "0");
+	const day = String(now.getDate()).padStart(2, "0");
+	return `${year}-${month}-${day}`;
+}
+
+/** Tool- and skill-derived facts shared by the stable prompt and the volatile block. */
+function resolvePromptScope(options: BuildSystemPromptOptions) {
+	const skills = options.skills ?? [];
+	const tools = options.selectedTools ?? ["ipython"];
+	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
+	return {
+		skills,
+		tools,
+		hasIpython: tools.includes("ipython"),
+		hasBash: tools.includes("bash"),
+		visibleSkills,
+		visiblePythonSkillImportNames: getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName),
+		hasRefineSkill: visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME),
+	};
+}
+
+/**
+ * Build the volatile prompt block: content the model must see but that changes
+ * for reasons unrelated to the request, so it cannot live in the cached prefix.
+ *
+ * The section text is identical to what the system prompt used to inline; only
+ * its position moved, to after the provider's last prompt-cache breakpoint.
+ */
+export function buildVolatileContext(options: BuildSystemPromptOptions): string | undefined {
+	const { hasIpython, hasBash, hasRefineSkill } = resolvePromptScope(options);
+	const sections: string[] = [];
+
+	// Only custom prompts ever carried a date line; keep that scope unchanged.
+	if (options.customPrompt) {
+		sections.push(`Current date: ${currentDate()}`);
+	}
+
+	if (options.harnessState) {
+		sections.push(
+			formatHarnessStateForPrompt(options.harnessState, {
+				includeIpythonExamples: hasIpython,
+				includeShellExamples: hasBash,
+				includeRefineExamples: hasIpython && hasRefineSkill,
+			}),
+		);
+	}
+
+	return sections.length > 0 ? sections.join("\n\n") : undefined;
+}
+
+/**
+ * Build the stable system prompt with tools, guidelines, and context.
+ *
+ * Volatile content (harness state, current date) is deliberately excluded; see
+ * {@link buildVolatileContext}.
+ */
 export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const {
 		customPrompt,
@@ -47,29 +106,16 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		cwd,
 		messagesPath,
 		contextFiles: providedContextFiles,
-		skills: providedSkills,
 		allowRecursion,
-		harnessState,
 	} = options;
 	const promptCwd = cwd.replace(/\\/g, "/");
 	const promptMessagesPath = (messagesPath ?? "not persisted").replace(/\\/g, "/");
 
-	const now = new Date();
-	const year = now.getFullYear();
-	const month = String(now.getMonth() + 1).padStart(2, "0");
-	const day = String(now.getDate()).padStart(2, "0");
-	const date = `${year}-${month}-${day}`;
-
 	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
 
 	const contextFiles = providedContextFiles ?? [];
-	const skills = providedSkills ?? [];
-	const tools = selectedTools ?? ["ipython"];
-	const hasIpython = tools.includes("ipython");
-	const hasBash = tools.includes("bash");
-	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
-	const visiblePythonSkillImportNames = getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName);
-	const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
+	const { skills, tools, hasIpython, visibleSkills, visiblePythonSkillImportNames, hasRefineSkill } =
+		resolvePromptScope(options);
 	const genericMcpSection = hasIpython ? formatGenericMcpGuidance(options.genericMcpServers) : "";
 
 	if (customPrompt) {
@@ -91,8 +137,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 			prompt += formatSkillsForPrompt(skills);
 		}
 
-		// Add date and working directory last
-		prompt += `\nCurrent date: ${date}`;
+		// Add the working directory last
 		prompt += `\nCurrent working directory: ${promptCwd}`;
 
 		const childDoctrine = buildChildAgentDoctrine({
@@ -103,10 +148,6 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		});
 		if (childDoctrine) {
 			prompt += `\n\n${childDoctrine}`;
-		}
-
-		if (harnessState) {
-			prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
 		}
 
 		if (genericMcpSection) {
@@ -130,9 +171,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		parentAgent: options.rlmParentAgent,
 	});
 
-	// Appended AFTER the trained buildRlmPrompt prefix, and before the harness-state
-	// menu, so the model reads when/why to delegate and then sees the concrete subagent
-	// specs it can match against — the same ordering as Claude Code's Agent tool.
+	// Appended AFTER the trained buildRlmPrompt prefix, so the model reads when/why to
+	// delegate before it reaches the concrete subagent specs it can match against — the
+	// same ordering as Claude Code's Agent tool. The specs themselves now arrive in the
+	// volatile block, which still follows this guidance in the assembled request.
 	if ((allowRecursion ?? true) && hasIpython) {
 		const visiblePythonSkillNames = new Set(
 			getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName),
@@ -142,10 +184,6 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 			hasAgentMessage: visiblePythonSkillNames.has("agent_message"),
 			hasAgentObserve: visiblePythonSkillNames.has("agent_observe"),
 		})}`;
-	}
-
-	if (harnessState) {
-		prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
 	}
 
 	if (genericMcpSection) {

@@ -316,3 +316,22 @@ decisions:
     revisit_when:
       - Prime makes a user-facing turn abort cancel the child runs it owns, or exposes an equivalent turn-scoped cancellation contract.
       - Prime introduces a real detached or background spawn mode, which would need a per-child survival decision instead of one retained-versus-active rule.
+
+  stable-prompt-cache-prefix:
+    area: prompt-ownership
+    state: shipped
+    owner: shared
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/22
+      - https://github.com/pylon-code/prime-agent/issues/26
+      - https://github.com/pylon-code/prime-agent/pull/32
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/commit/4b9e6006fad553dcca5aa69b23a039088064589f
+      - https://github.com/PrimeIntellect-ai/prime-agent/commit/f81acc6679ab214f1c40821588d9e5e97c47bdb1
+      - https://github.com/PrimeIntellect-ai/prime-agent/tree/c382f09856d4a8c8d2b765179657047d58691f25
+    fork_change: stable-prompt-cache-prefix-v1
+    upstream_support: Prime through c382f09856d4 reduced the system-prompt date to a day stamp for cache stability, but it still serializes mutable continual-harness state and that date into the cached system prompt, has no provider-neutral volatile-content channel, and does not pin active tool order behind the `cache_control` marker on the last tool definition.
+    revisit_when:
+      - Prime upstream provides an equivalent provider-neutral channel that keeps mutable state and clock-derived content out of the cached tools/system/history prefix.
+      - Pylon can drop the fork behavior without regressing measured cache-hit rates through a Claude-Max proxy.

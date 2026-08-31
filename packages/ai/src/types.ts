@@ -254,6 +254,16 @@ export interface Context {
 	systemPrompt?: string;
 	messages: Message[];
 	tools?: Tool[];
+	/**
+	 * Content the model still needs but that must never enter a cached prefix,
+	 * such as mutable harness state or the current date.
+	 *
+	 * Providers place it after their final prompt-cache breakpoint so changing it
+	 * cannot invalidate the cached tools, system prompt, or conversation history.
+	 * Providers that do not mark cache breakpoints receive it folded into the end
+	 * of `messages` instead, so the content is never dropped.
+	 */
+	volatileContext?: string;
 }
 
 /**

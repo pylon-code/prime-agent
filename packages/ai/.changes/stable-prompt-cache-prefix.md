@@ -1,0 +1,1 @@
+- Added `Context.volatileContext` for content that must stay out of every cached prompt prefix; Anthropic and OpenAI-completions place it after their cache breakpoints and other providers receive it appended to the message list ([#26](https://github.com/pylon-code/prime-agent/issues/26)).

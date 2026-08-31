@@ -203,6 +203,10 @@ function serializeContext(context: Context): string {
 	if (context.tools?.length) {
 		parts.push(`tools:${JSON.stringify(context.tools)}`);
 	}
+	// Last, so the simulated cache prefix stays stable when volatile content changes.
+	if (context.volatileContext) {
+		parts.push(`volatile:${context.volatileContext}`);
+	}
 	return parts.join("\n\n");
 }
 
@@ -494,7 +498,9 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 	const streamSimple: StreamFunction<string, SimpleStreamOptions> = (streamModel, context, streamOptions) =>
 		stream(streamModel, context, streamOptions);
 
-	registerApiProvider({ api, stream, streamSimple }, sourceId);
+	// Volatile context stays on the context so tests observe exactly what the caller
+	// assembled, instead of a provider-specific folded message.
+	registerApiProvider({ api, stream, streamSimple, handlesVolatileContext: true }, sourceId);
 
 	function getModel(): Model<string>;
 	function getModel(requestedModelId: string): Model<string> | undefined;

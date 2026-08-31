@@ -42,6 +42,7 @@ import {
 	streamFailureMessage,
 	truncateRawPayload,
 } from "../utils/stream-failure.js";
+import { resolveVolatileContext } from "../utils/volatile-context.js";
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
@@ -965,9 +966,15 @@ function buildParams(
 	options?: AnthropicOptions,
 	cacheControl?: CacheControlEphemeral,
 ): MessageCreateParamsStreaming {
+	const messages = convertMessages(context.messages, model, isOAuthToken, cacheControl);
+	// Anthropic caches the prefix in tools -> system -> messages order, and the last
+	// breakpoint sits on the final history block. Appending volatile content after
+	// that breakpoint keeps a harness-state or date change out of every cached region.
+	appendVolatileContext(messages, resolveVolatileContext(context));
+
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
-		messages: convertMessages(context.messages, model, isOAuthToken, cacheControl),
+		messages,
 		max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
 		stream: true,
 	};
@@ -1061,6 +1068,29 @@ function buildParams(
 	}
 
 	return params;
+}
+
+/**
+ * Append volatile content as the final block of the request, after any
+ * `cache_control` breakpoint placed by {@link convertMessages}.
+ */
+function appendVolatileContext(messages: MessageParam[], volatileContext: string | undefined): void {
+	if (!volatileContext) return;
+
+	const text = sanitizeSurrogates(volatileContext);
+	const lastMessage = messages[messages.length - 1];
+	if (lastMessage?.role === "user") {
+		lastMessage.content =
+			typeof lastMessage.content === "string"
+				? [
+						{ type: "text", text: lastMessage.content },
+						{ type: "text", text },
+					]
+				: [...lastMessage.content, { type: "text", text }];
+		return;
+	}
+
+	messages.push({ role: "user", content: [{ type: "text", text }] });
 }
 
 // Normalize tool call IDs to match Anthropic's required pattern and length

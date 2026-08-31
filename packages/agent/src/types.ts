@@ -171,6 +171,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/** Resolves the system prompt immediately before each LLM call. */
 	getSystemPrompt?: () => string;
 
+	/** Resolves the volatile, never-cached context immediately before each LLM call. */
+	getVolatileContext?: () => string | undefined;
+
 	/**
 	 * Resolves an API key dynamically for each LLM call.
 	 *
@@ -306,6 +309,12 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
 export interface AgentState {
 	/** System prompt sent with each model request. */
 	systemPrompt: string;
+	/**
+	 * Content the model needs but that must stay out of every cached prefix,
+	 * such as mutable harness state or the current date. Providers place it after
+	 * their final prompt-cache breakpoint.
+	 */
+	volatileContext?: string;
 	/** Model used for future turns. */
 	model: Model<any>;
 	/** Requested reasoning level for future turns. */
@@ -374,6 +383,8 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 export interface AgentContext {
 	/** System prompt included with the request. */
 	systemPrompt: string;
+	/** Volatile content kept out of the cached prefix. See {@link AgentState.volatileContext}. */
+	volatileContext?: string;
 	/** Transcript visible to the model. */
 	messages: AgentMessage[];
 	/** Tools available for this run. */

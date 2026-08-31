@@ -46,6 +46,7 @@ Unified LLM API with automatic model discovery, provider configuration, token an
   - [OpenAI Compatibility Settings](#openai-compatibility-settings)
   - [Type Safety](#type-safety)
 - [Cross-Provider Handoffs](#cross-provider-handoffs)
+- [Volatile Context](#volatile-context)
 - [Context Serialization](#context-serialization)
 - [Browser Usage](#browser-usage)
   - [Browser Compatibility Notes](#browser-compatibility-notes)
@@ -976,6 +977,25 @@ This enables flexible workflows where you can:
 - Switch to a more capable model for complex reasoning
 - Use specialized models for specific tasks
 - Maintain conversation continuity across provider outages
+
+## Volatile Context
+
+Prompt caching only pays off when the request prefix is byte-stable. Content that changes for reasons unrelated to the conversation — mutable agent state, the current date — invalidates the cache for the whole prefix when it sits in the system prompt.
+
+Put that content in `Context.volatileContext` instead:
+
+```typescript
+const context: Context = {
+  systemPrompt: 'You are a helpful assistant.',
+  messages: [{ role: 'user', content: 'What changed?', timestamp: Date.now() }],
+  volatileContext: `Current date: ${new Date().toISOString().slice(0, 10)}`
+};
+```
+
+The model still sees it, but never inside a cached region:
+
+- Anthropic and OpenAI-completions append it after their `cache_control` breakpoints, so the cached tools, system prompt, and conversation history are unaffected when it changes.
+- Every other provider receives it appended to the end of `Context.messages`, which is after the automatically cached prefix. Set `handlesVolatileContext: true` when registering a custom provider that positions the content itself.
 
 ## Context Serialization
 

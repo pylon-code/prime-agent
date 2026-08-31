@@ -4139,7 +4139,7 @@ describe("AgentSession RLM session dir", () => {
 		expect(env.RLM_HARNESS_STATE_DIR).toBe(join(ephemeralDir, "harness"));
 	});
 
-	it("loads the ephemeral RLM harness path into the host system prompt", () => {
+	it("loads the ephemeral RLM harness path into the host volatile context", () => {
 		const ephemeralDir = join(tempDir, "ephemeral-rlm");
 		mkdirSync(join(ephemeralDir, "harness"), { recursive: true });
 		writeFileSync(
@@ -4174,10 +4174,12 @@ describe("AgentSession RLM session dir", () => {
 		);
 		const root = createSession(SessionManager.inMemory(tempDir), undefined, undefined, false, ephemeralDir);
 
-		const prompt = root.systemPrompt;
+		// Harness state travels outside the cached system prompt.
+		const volatileContext = root.agent.state.volatileContext ?? "";
 
-		expect(prompt).toContain("Ephemeral note");
-		expect(prompt).toContain("Loaded from the RLM session harness path.");
+		expect(root.systemPrompt).not.toContain("Ephemeral note");
+		expect(volatileContext).toContain("Ephemeral note");
+		expect(volatileContext).toContain("Loaded from the RLM session harness path.");
 	});
 
 	it("exports the configured agentDir to the kernel so skills find auth.json", () => {
