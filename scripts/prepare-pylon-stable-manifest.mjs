@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +20,7 @@ import {
 	validateStableManifest,
 } from "./lib/pylon-publication.mjs";
 import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
+import { verifyStableAttestation } from "./verify-pylon-stable-attestation.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -93,11 +95,12 @@ async function stableTagNames() {
 	}
 }
 
-async function readStableHistory() {
+export async function readStableHistory({ verifyAllAttestations = false } = {}) {
 	const releases = (await paginate(`/repos/${PYLON_PUBLICATION_REPOSITORY}/releases`)).filter((release) =>
 		release.tag_name?.startsWith("pylon-stable-"),
 	);
 	const manifests = [];
+	const manifestBytes = new Map();
 	for (const release of releases) {
 		parseStableTag(release.tag_name);
 		if (release.draft || release.immutable !== true || release.assets?.length !== 1) {
@@ -132,12 +135,30 @@ async function readStableHistory() {
 			assets: [{ name: PYLON_STABLE_MANIFEST, size: bytes.byteLength, sha256: sha256Bytes(bytes) }],
 		});
 		manifests.push(manifest);
+		manifestBytes.set(manifest.tag, bytes);
 	}
 	const ordered = validateStableHistory(manifests);
 	const tags = await stableTagNames();
 	const releaseTags = ordered.map((manifest) => manifest.tag).sort();
 	if (canonicalJson(tags) !== canonicalJson(releaseTags)) {
 		throw new Error("Stable tags and immutable release history differ.");
+	}
+	const authorizationSet = verifyAllAttestations ? ordered : ordered.slice(-1);
+	if (authorizationSet.length > 0) {
+		const verificationDir = mkdtempSync(join(tmpdir(), "pylon-stable-attestation-"));
+		const verificationPath = join(verificationDir, PYLON_STABLE_MANIFEST);
+		try {
+			for (const manifest of authorizationSet) {
+				writeFileSync(verificationPath, manifestBytes.get(manifest.tag), { mode: 0o600 });
+				verifyStableAttestation(
+					verificationPath,
+					manifest.promotion.policyCommit,
+					manifest.promotion.policyTree,
+				);
+			}
+		} finally {
+			rmSync(verificationDir, { recursive: true, force: true });
+		}
 	}
 	return ordered;
 }
@@ -147,70 +168,72 @@ function writeOutputs(values) {
 	for (const [name, value] of Object.entries(values)) appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
 }
 
-try {
-	const args = parseArgs(process.argv.slice(2));
-	const verified = verifyPreviewPublication(args.artifactDir);
-	const previewBytes = readFileSync(join(args.artifactDir, PYLON_PREVIEW_MANIFEST));
-	const history = await readStableHistory();
-	const latest = history.at(-1);
-	let publish = true;
-	let stableManifest;
-	if (
-		args.operation === "promote" &&
-		latest?.build.previewTag === verified.previewManifest.build.tag &&
-		latest.promotion.kind === "promote"
-	) {
-		publish = false;
-		stableManifest = latest;
-	} else if (
-		args.operation === "withdraw" &&
-		latest?.build.previewTag === verified.previewManifest.build.tag &&
-		latest.revocations.some((entry) => entry.stableTag === args.revokeTag)
-	) {
-		publish = false;
-		stableManifest = latest;
-	} else {
-		const sequence = nextStableSequence(history);
-		const revocations = latest ? structuredClone(latest.revocations) : [];
-		let promotion = { kind: "promote", policyCommit: args.policySha, policyTree: args.policyTree };
-		if (args.operation === "withdraw") {
-			const revoked = history.find((manifest) => manifest.tag === args.revokeTag);
-			if (!revoked) throw new Error("Withdrawal can revoke only an existing stable sequence.");
-			if (revocations.some((entry) => entry.stableTag === args.revokeTag)) {
-				throw new Error("Stable sequence is already withdrawn.");
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+	try {
+		const args = parseArgs(process.argv.slice(2));
+		const verified = verifyPreviewPublication(args.artifactDir, { historical: true });
+		const previewBytes = readFileSync(join(args.artifactDir, PYLON_PREVIEW_MANIFEST));
+		const history = await readStableHistory();
+		const latest = history.at(-1);
+		let publish = true;
+		let stableManifest;
+		if (
+			args.operation === "promote" &&
+			latest?.build.previewTag === verified.previewManifest.build.tag &&
+			latest.promotion.kind === "promote"
+		) {
+			publish = false;
+			stableManifest = latest;
+		} else if (
+			args.operation === "withdraw" &&
+			latest?.build.previewTag === verified.previewManifest.build.tag &&
+			latest.revocations.some((entry) => entry.stableTag === args.revokeTag)
+		) {
+			publish = false;
+			stableManifest = latest;
+		} else {
+			const sequence = nextStableSequence(history);
+			const revocations = latest ? structuredClone(latest.revocations) : [];
+			let promotion = { kind: "promote", policyCommit: args.policySha, policyTree: args.policyTree };
+			if (args.operation === "withdraw") {
+				const revoked = history.find((manifest) => manifest.tag === args.revokeTag);
+				if (!revoked) throw new Error("Withdrawal can revoke only an existing stable sequence.");
+				if (revocations.some((entry) => entry.stableTag === args.revokeTag)) {
+					throw new Error("Stable sequence is already withdrawn.");
+				}
+				const revocation = {
+					stableTag: revoked.tag,
+					buildTag: revoked.build.previewTag,
+					reason: args.reason,
+					revokedBySequence: sequence,
+				};
+				revocations.push(revocation);
+				promotion = { kind: "withdraw", policyCommit: args.policySha, policyTree: args.policyTree, revocation };
 			}
-			const revocation = {
-				stableTag: revoked.tag,
-				buildTag: revoked.build.previewTag,
-				reason: args.reason,
-				revokedBySequence: sequence,
-			};
-			revocations.push(revocation);
-			promotion = { kind: "withdraw", policyCommit: args.policySha, policyTree: args.policyTree, revocation };
+			stableManifest = createStableManifest({
+				previewManifest: verified.previewManifest,
+				previewManifestBytes: previewBytes,
+				sequence,
+				previous: latest
+					? { tag: latest.tag, sha256: sha256Bytes(Buffer.from(canonicalJson(latest))) }
+					: null,
+				revocations,
+				promotion,
+			});
 		}
-		stableManifest = createStableManifest({
-			previewManifest: verified.previewManifest,
-			previewManifestBytes: previewBytes,
-			sequence,
-			previous: latest
-				? { tag: latest.tag, sha256: sha256Bytes(Buffer.from(canonicalJson(latest))) }
-				: null,
-			revocations,
-			promotion,
+		mkdirSync(args.outDir, { recursive: true });
+		const outputBytes = canonicalJson(stableManifest);
+		writeFileSync(join(args.outDir, PYLON_STABLE_MANIFEST), outputBytes);
+		writeOutputs({
+			publish: String(publish),
+			tag: stableManifest.tag,
+			source_sha: stableManifest.build.source.commit,
+			source_tree: stableManifest.build.source.tree,
+			sequence: String(stableManifest.sequence),
 		});
+		console.log(JSON.stringify({ publish, tag: stableManifest.tag, sequence: stableManifest.sequence }));
+	} catch (error) {
+		console.error(error instanceof Error ? error.message : String(error));
+		process.exit(1);
 	}
-	mkdirSync(args.outDir, { recursive: true });
-	const outputBytes = canonicalJson(stableManifest);
-	writeFileSync(join(args.outDir, PYLON_STABLE_MANIFEST), outputBytes);
-	writeOutputs({
-		publish: String(publish),
-		tag: stableManifest.tag,
-		source_sha: stableManifest.build.source.commit,
-		source_tree: stableManifest.build.source.tree,
-		sequence: String(stableManifest.sequence),
-	});
-	console.log(JSON.stringify({ publish, tag: stableManifest.tag, sequence: stableManifest.sequence }));
-} catch (error) {
-	console.error(error instanceof Error ? error.message : String(error));
-	process.exit(1);
 }

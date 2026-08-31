@@ -14,26 +14,34 @@ import {
 	PYLON_PREVIEW_MANIFEST,
 	sha256Bytes,
 	validatePreviewManifest,
+	validatePublishedReleaseManifest,
 } from "./lib/pylon-publication.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultArtifacts = join(root, ".npm", "pylon-release", "artifacts");
 
-function artifactDirectory(args) {
-	if (args.length === 0) return defaultArtifacts;
-	if (args.length === 2 && args[0] === "--artifact-dir") return resolve(root, args[1]);
-	throw new Error("Usage: node scripts/verify-pylon-preview-publication.mjs [--artifact-dir path]");
+function parseArgs(args) {
+	const historicalIndex = args.indexOf("--historical");
+	const historical = historicalIndex !== -1;
+	const remaining = args.filter((_, index) => index !== historicalIndex);
+	if (remaining.length === 0) return { artifactsDir: defaultArtifacts, historical };
+	if (remaining.length === 2 && remaining[0] === "--artifact-dir") {
+		return { artifactsDir: resolve(root, remaining[1]), historical };
+	}
+	throw new Error("Usage: node scripts/verify-pylon-preview-publication.mjs [--historical] [--artifact-dir path]");
 }
 
-export function verifyPreviewPublication(artifactsDir) {
+export function verifyPreviewPublication(artifactsDir, { historical = false } = {}) {
 	const releaseBytes = readFileSync(join(artifactsDir, PYLON_RELEASE_MANIFEST));
-	const releaseManifest = validateReleaseManifest(JSON.parse(releaseBytes));
+	const releaseManifest = JSON.parse(releaseBytes);
+	if (historical) validatePublishedReleaseManifest(releaseManifest);
+	else validateReleaseManifest(releaseManifest);
 	const previewBytes = readFileSync(join(artifactsDir, PYLON_PREVIEW_MANIFEST));
 	const previewManifest = JSON.parse(previewBytes);
 	if (canonicalJson(previewManifest) !== previewBytes.toString("utf8")) {
 		throw new Error("Preview manifest is not canonical publication JSON.");
 	}
-	validatePreviewManifest(previewManifest, releaseManifest, releaseBytes);
+	validatePreviewManifest(previewManifest, releaseManifest, releaseBytes, { historical });
 	const expectedFiles = new Set([
 		PYLON_RELEASE_MANIFEST,
 		PYLON_PREVIEW_MANIFEST,
@@ -69,7 +77,8 @@ export function verifyPreviewPublication(artifactsDir) {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
 	try {
-		const verified = verifyPreviewPublication(artifactDirectory(process.argv.slice(2)));
+		const args = parseArgs(process.argv.slice(2));
+		const verified = verifyPreviewPublication(args.artifactsDir, { historical: args.historical });
 		console.log(
 			JSON.stringify({
 				tag: verified.previewManifest.build.tag,

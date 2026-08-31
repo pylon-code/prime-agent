@@ -45,7 +45,7 @@ No channel, timestamp, actor, workflow run, branch, mutable URL, or feature flag
 
 Every internal dependency must resolve by matching package name to its exact URL below the immutable build release. Missing semver rewrites and cross-wired archives fail packing and verification. Archive SHA-512 values are repeated in `npm-shrinkwrap.json`. These shrinkwrap entries are auditable receipts; npm does not reliably enforce a dependency archive's nested shrinkwrap during installation. The Pylon verifier and installer must enforce manifest and attestation digests before installation.
 
-The release manifest records the exact source, recipe, toolchain, lock digest, minimum Node version, package/command identity, sorted archive names, sizes, SHA-256, SHA-512, and external attestation subjects. It does not contain its own digest because that would be self-referential.
+The release manifest records the exact source, recipe, toolchain, lock digest, minimum Node version, package/command identity, sorted archive names, sizes, SHA-256, SHA-512, and external attestation subjects. It does not contain its own digest because that would be self-referential. The separate signed preview-channel manifest adds epoch-1 workflow `run_number` ordering and exact run id; the SLSA invocation supplies the rerun attempt without changing canonical preview bytes.
 
 ## Local verification
 
@@ -71,6 +71,6 @@ Matching CI packs are evidence for the pinned source, recipe, toolchain, and run
 
 Issue #28 creates no tag or GitHub Release and needs only `contents: read`. Its artifact jobs receive no repository secrets, and their Actions uploads are short-lived CI transport. They must not use npm publish, R2, `contents: write`, OIDC, or attestations.
 
-Issue #29 adds protected preview publication, six exact keyless attestations, manual byte-preserving stable promotion, and append-only withdrawal. Preview releases contain the four tarballs, this build manifest, and `pylon-preview-channel-v1.json`; stable releases contain only a signed `pylon-stable-channel-v1.json` sequence record and use permanent N-only reservation refs for global sequence uniqueness. Exact formats, environment gates, promotion/withdrawal operations, and independent verification commands live in `docs/pylon-publication.md`.
+Issue #29 adds protected preview publication, six exact keyless attestations, manual byte-preserving stable promotion, and append-only withdrawal. Preview releases contain the four tarballs, this build manifest, and a monotonic workflow-run-bound `pylon-preview-channel-v1.json`; stable releases contain only a signed `pylon-stable-channel-v1.json` sequence record that copies the preview sequence identity and uses permanent N-only reservation refs for global sequence uniqueness. Exact formats, environment gates, promotion/withdrawal operations, and independent verification commands live in `docs/pylon-publication.md`.
 
 Pylon issues #193 and #194 own signed receipt verification and opt-in side-by-side install/update/rollback/switch-back. Until those land, published artifacts are verifiable release inputs, not a managed Pylon installation channel.

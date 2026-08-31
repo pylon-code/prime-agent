@@ -120,7 +120,9 @@ jobs:
             const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;
             const workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;
             if (
-              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" || run.repository?.id !== 1349002285 ||
+              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" ||
+              run.id !== context.runId || run.run_number !== Number(process.env.GITHUB_RUN_NUMBER) ||
+              String(run.run_attempt) !== process.env.GITHUB_RUN_ATTEMPT || run.repository?.id !== 1349002285 ||
               run.repository?.full_name !== "pylon-code/prime-agent" || run.head_repository?.id !== 1349002285 ||
               run.head_repository?.full_name !== "pylon-code/prime-agent" || run.event !== context.eventName ||
               run.head_sha !== context.sha || run.head_branch !== "pylon" || context.ref !== "refs/heads/pylon" ||
@@ -141,7 +143,9 @@ jobs:
             const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;
             const workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;
             if (
-              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" || run.repository?.id !== 1349002285 ||
+              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" ||
+              run.id !== context.runId || run.run_number !== Number(process.env.GITHUB_RUN_NUMBER) ||
+              String(run.run_attempt) !== process.env.GITHUB_RUN_ATTEMPT || run.repository?.id !== 1349002285 ||
               run.repository?.full_name !== "pylon-code/prime-agent" || run.head_repository?.id !== 1349002285 ||
               run.head_repository?.full_name !== "pylon-code/prime-agent" || run.event !== context.eventName ||
               run.head_sha !== context.sha || run.head_branch !== "pylon" || context.ref !== "refs/heads/pylon" ||
@@ -205,7 +209,9 @@ jobs:
             const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;
             const workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;
             if (
-              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" || run.repository?.id !== 1349002285 ||
+              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" ||
+              run.id !== context.runId || run.run_number !== Number(process.env.GITHUB_RUN_NUMBER) ||
+              String(run.run_attempt) !== process.env.GITHUB_RUN_ATTEMPT || run.repository?.id !== 1349002285 ||
               run.repository?.full_name !== "pylon-code/prime-agent" || run.head_repository?.id !== 1349002285 ||
               run.head_repository?.full_name !== "pylon-code/prime-agent" || run.event !== context.eventName ||
               run.head_sha !== context.sha || run.head_branch !== "pylon" || context.ref !== "refs/heads/pylon" ||
@@ -231,38 +237,154 @@ jobs:
           node -e "require('node:fs').unlinkSync('.npm/pylon-release/artifacts/pylon-preview-channel-v1.json')"
           npm run release:pylon:smoke
 
+  stage-draft:
+    name: Stage exact preview draft
+    needs: [admission, pack, reproducibility, install, verify-attestation]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      draft_id: ${{ steps.stage.outputs.result }}
+    steps:
+      - name: Download approved preview subjects
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pylon-preview-pack-a
+          path: publication
+
+      - name: Create or finish the exact durable draft
+        id: stage
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          ARTIFACT_DIR: publication
+        with:
+          script: |
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const crypto = require("node:crypto");
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            if (`${owner}/${repo}` !== "pylon-code/prime-agent" || context.eventName !== "push" || context.ref !== "refs/heads/pylon") {
+              throw new Error("Preview draft staging requires the canonical pylon push.");
+            }
+            const requireLivePylon = async () => {
+              const pylon = await github.rest.git.getRef({ owner, repo, ref: "heads/pylon" });
+              if (pylon.data.object.type !== "commit" || pylon.data.object.sha !== context.sha) throw new Error("Preview draft staging is stale.");
+            };
+            await requireLivePylon();
+            const dir = process.env.ARTIFACT_DIR;
+            const names = fs.readdirSync(dir).sort();
+            if (names.length !== 6 || names.some((name) => !fs.lstatSync(path.join(dir, name)).isFile())) {
+              throw new Error("Preview draft requires exactly six regular files.");
+            }
+            const releaseBytes = fs.readFileSync(path.join(dir, "pylon-prime-agent-release-v1.json"));
+            const previewBytes = fs.readFileSync(path.join(dir, "pylon-preview-channel-v1.json"));
+            const release = JSON.parse(releaseBytes);
+            const preview = JSON.parse(previewBytes);
+            const sha256 = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
+            const tag = `pylon-build-g${context.sha.slice(0, 12)}-r${release.build?.recipeRevision}`;
+            if (
+              release.source?.commit !== context.sha || release.source?.tree !== preview.build?.source?.tree ||
+              release.build?.id !== tag || preview.build?.tag !== tag || preview.build?.releaseManifest?.sha256 !== sha256(releaseBytes) ||
+              preview.sequenceEpoch !== 1 || preview.sequence !== Number(process.env.GITHUB_RUN_NUMBER) ||
+              preview.workflowRunId !== process.env.GITHUB_RUN_ID
+            ) throw new Error("Preview draft manifests do not bind the exact source and workflow sequence.");
+            const expectedNames = [...release.assets.map((asset) => asset.file), "pylon-prime-agent-release-v1.json", "pylon-preview-channel-v1.json"].sort();
+            if (names.join("\n") !== expectedNames.join("\n")) throw new Error("Preview draft file set differs.");
+            const assets = names.map((name) => {
+              const bytes = fs.readFileSync(path.join(dir, name));
+              return { name, bytes, size: bytes.length, sha256: sha256(bytes) };
+            });
+            for (const receipt of release.assets) {
+              const actual = assets.find((asset) => asset.name === receipt.file);
+              if (!actual || actual.size !== receipt.size || actual.sha256 !== receipt.sha256) throw new Error(`Preview draft asset differs: ${receipt.file}`);
+            }
+            const name = `Pylon Prime preview ${tag}`;
+            const body = [
+              "Pylon Prime preview publication.", "", `Tag: ${tag}`, `Source: ${context.sha}`,
+              `Tree: ${release.source.tree}`, `Recipe: r${release.build.recipeRevision}`, "",
+              "Verify the immutable release and artifact attestations before use.",
+            ].join("\n");
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            const matching = releases.filter((candidate) => candidate.tag_name === tag);
+            if (matching.length > 1) throw new Error("Preview draft tag is ambiguous.");
+            let draft = matching[0];
+            if (draft && !draft.draft) {
+              if (
+                draft.immutable !== true || draft.tag_name !== tag || draft.name !== name || draft.body !== body ||
+                draft.prerelease !== true || draft.target_commitish !== context.sha || draft.assets.length !== assets.length
+              ) throw new Error("Existing preview publication differs from this exact rerun.");
+              for (const expected of assets) {
+                const actual = draft.assets.find((asset) => asset.name === expected.name);
+                if (!actual || actual.size !== expected.size || actual.digest !== `sha256:${expected.sha256}`) {
+                  throw new Error(`Existing preview publication differs: ${expected.name}`);
+                }
+              }
+              const tagRef = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+              if (tagRef.data.object.type !== "commit" || tagRef.data.object.sha !== context.sha) throw new Error("Existing preview tag differs.");
+              return draft.id;
+            }
+            let createdDraft = false;
+            if (!draft) {
+              try {
+                // Final live-tip read immediately precedes the first release mutation.
+                await requireLivePylon();
+                draft = (await github.rest.repos.createRelease({
+                  owner, repo, tag_name: tag, target_commitish: context.sha, name, body,
+                  draft: true, prerelease: true, make_latest: "false",
+                })).data;
+                createdDraft = true;
+              } catch (error) {
+                if (error.status === 422) {
+                  await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+                  throw new Error("Preview draft creation raced (422); refetched state and stopped.");
+                }
+                throw error;
+              }
+            }
+            if (
+              draft.tag_name !== tag || draft.name !== name || draft.body !== body || draft.target_commitish !== context.sha ||
+              draft.prerelease !== true || draft.immutable === true
+            ) throw new Error("Existing preview draft identity differs.");
+            for (const actual of draft.assets) {
+              const expected = assets.find((asset) => asset.name === actual.name);
+              if (!expected || actual.size !== expected.size || actual.digest !== `sha256:${expected.sha256}`) {
+                throw new Error(`Existing preview draft asset differs: ${actual.name}`);
+              }
+            }
+            const present = new Set(draft.assets.map((asset) => asset.name));
+            const missing = assets.filter((asset) => !present.has(asset.name));
+            if (!createdDraft && missing.length > 0) {
+              // A resumed draft gets a fresh point-in-time authorization before its first mutation.
+              await requireLivePylon();
+            }
+            for (const asset of missing) {
+              await github.request("POST /repos/{owner}/{repo}/releases/{release_id}/assets", {
+                owner, repo, release_id: draft.id, name: asset.name, data: asset.bytes,
+                headers: { "content-type": "application/octet-stream", "content-length": asset.size },
+              });
+            }
+            const staged = (await github.rest.repos.getRelease({ owner, repo, release_id: draft.id })).data;
+            if (staged.assets.length !== assets.length) throw new Error("Preview draft was not fully staged.");
+            for (const expected of assets) {
+              const actual = staged.assets.find((asset) => asset.name === expected.name);
+              if (!actual || actual.size !== expected.size || actual.digest !== `sha256:${expected.sha256}`) throw new Error(`Staged preview asset differs: ${expected.name}`);
+            }
+            return draft.id;
+
   attest:
-    name: Attest six preview subjects
+    name: Approve and attest six preview subjects
     needs: [pack, reproducibility, install]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    environment: pylon-preview
     permissions:
       actions: read
-      contents: read
       id-token: write
       attestations: write
     steps:
-      - name: Verify workflow artifact provenance
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
-        with:
-          script: |
-            const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;
-            const workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;
-            if (
-              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" || run.repository?.id !== 1349002285 ||
-              run.repository?.full_name !== "pylon-code/prime-agent" || run.head_repository?.id !== 1349002285 ||
-              run.head_repository?.full_name !== "pylon-code/prime-agent" || run.event !== context.eventName ||
-              run.head_sha !== context.sha || run.head_branch !== "pylon" || context.ref !== "refs/heads/pylon" ||
-              workflow.path !== ".github/workflows/pylon-preview-release.yml"
-            ) throw new Error("Artifact workflow provenance is not canonical.");
-            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
-              ...context.repo, run_id: context.runId, per_page: 100,
-            });
-            const matches = artifacts.filter((artifact) => artifact.name === "pylon-preview-pack-a");
-            if (matches.length !== 1 || matches[0].expired || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest ?? "")) {
-              throw new Error("Artifact is ambiguous, expired, or lacks a SHA-256 transport digest.");
-            }
-
       - name: Download byte-identical preview subjects
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -296,6 +418,10 @@ jobs:
           const release = JSON.parse(releaseBytes);
           const preview = JSON.parse(previewBytes);
           if (previewBytes.toString("utf8") !== canonicalJson(preview)) throw new Error("Preview manifest is not canonical JSON.");
+          if (
+            preview.sequenceEpoch !== 1 || preview.sequence !== Number(process.env.GITHUB_RUN_NUMBER) ||
+            preview.workflowRunId !== process.env.GITHUB_RUN_ID
+          ) throw new Error("Preview manifest workflow sequence differs from this approved attestation run.");
           if (preview.build?.releaseManifest?.file !== releaseName || preview.build.releaseManifest.sha256 !== sha256(releaseBytes)) {
             throw new Error("Preview does not bind the exact build manifest.");
           }
@@ -359,7 +485,9 @@ jobs:
             const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;
             const workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;
             if (
-              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" || run.repository?.id !== 1349002285 ||
+              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" ||
+              run.id !== context.runId || run.run_number !== Number(process.env.GITHUB_RUN_NUMBER) ||
+              String(run.run_attempt) !== process.env.GITHUB_RUN_ATTEMPT || run.repository?.id !== 1349002285 ||
               run.repository?.full_name !== "pylon-code/prime-agent" || run.head_repository?.id !== 1349002285 ||
               run.head_repository?.full_name !== "pylon-code/prime-agent" || run.event !== context.eventName ||
               run.head_sha !== context.sha || run.head_branch !== "pylon" || context.ref !== "refs/heads/pylon" ||
@@ -391,10 +519,9 @@ jobs:
 
   publish:
     name: Publish immutable preview
-    needs: [admission, pack, reproducibility, install, attest, verify-attestation]
+    needs: [stage-draft, verify-attestation]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    environment: pylon-preview
     permissions:
       actions: read
       checks: read
@@ -407,7 +534,9 @@ jobs:
             const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;
             const workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;
             if (
-              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" || run.repository?.id !== 1349002285 ||
+              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" ||
+              run.id !== context.runId || run.run_number !== Number(process.env.GITHUB_RUN_NUMBER) ||
+              String(run.run_attempt) !== process.env.GITHUB_RUN_ATTEMPT || run.repository?.id !== 1349002285 ||
               run.repository?.full_name !== "pylon-code/prime-agent" || run.head_repository?.id !== 1349002285 ||
               run.head_repository?.full_name !== "pylon-code/prime-agent" || run.event !== context.eventName ||
               run.head_sha !== context.sha || run.head_branch !== "pylon" || context.ref !== "refs/heads/pylon" ||
@@ -431,6 +560,7 @@ jobs:
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         env:
           ARTIFACT_DIR: publication
+          DRAFT_ID: ${{ needs.stage-draft.outputs.draft_id }}
         with:
           script: |
             const fs = require("node:fs");
@@ -449,10 +579,13 @@ jobs:
             ) {
               throw new Error("Preview publisher requires the canonical exact pylon push.");
             }
-            const livePylon = await github.rest.git.getRef({ owner, repo, ref: refName });
-            if (livePylon.data.object.type !== "commit" || livePylon.data.object.sha !== sourceSha) {
-              throw new Error("Preview publication became stale while verification ran.");
-            }
+            const requireLivePylon = async () => {
+              const livePylon = await github.rest.git.getRef({ owner, repo, ref: refName });
+              if (livePylon.data.object.type !== "commit" || livePylon.data.object.sha !== sourceSha) {
+                throw new Error("Preview publication became stale while verification ran.");
+              }
+            };
+            await requireLivePylon();
             const releaseBytes = fs.readFileSync(path.join(process.env.ARTIFACT_DIR, "pylon-prime-agent-release-v1.json"));
             const previewBytes = fs.readFileSync(path.join(process.env.ARTIFACT_DIR, "pylon-preview-channel-v1.json"));
             const releaseManifest = JSON.parse(releaseBytes);
@@ -468,9 +601,11 @@ jobs:
               previewManifest.build.tag !== expectedTag ||
               previewManifest.build.source.commit !== sourceSha ||
               previewManifest.build.source.tree !== releaseManifest.source.tree ||
-              previewManifest.build.releaseManifest.sha256 !== sha256(releaseBytes)
+              previewManifest.build.releaseManifest.sha256 !== sha256(releaseBytes) ||
+              previewManifest.sequenceEpoch !== 1 || previewManifest.sequence !== Number(process.env.GITHUB_RUN_NUMBER) ||
+              previewManifest.workflowRunId !== process.env.GITHUB_RUN_ID
             ) {
-              throw new Error("Downloaded preview metadata is not bound to this exact push.");
+              throw new Error("Downloaded preview metadata is not bound to this exact push and workflow sequence.");
             }
             const commit = await github.rest.git.getCommit({ owner, repo, commit_sha: sourceSha });
             if (commit.data.tree.sha !== releaseManifest.source.tree) throw new Error("GitHub source tree differs from the build manifest.");
@@ -576,6 +711,7 @@ jobs:
               existing = matching[0];
             }
             if (existing && !existing.draft) {
+              if (String(existing.id) !== process.env.DRAFT_ID) throw new Error("Idempotent preview release id differs from approved staging.");
               await assertExact(existing);
               core.info(`Immutable preview ${tag} already contains identical bytes and metadata.`);
               return;
@@ -593,32 +729,19 @@ jobs:
                 }
               }
             } else {
-              try {
-                await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
-                throw new Error("Preview tag exists without its exact immutable release.");
-              } catch (error) {
-                if (error.status !== 404) throw error;
-              }
-              try {
-                draft = (await github.rest.repos.createRelease({
-                  owner, repo, tag_name: tag, target_commitish: sourceSha, name, body, draft: true, prerelease: true, make_latest: "false",
-                })).data;
-              } catch (error) {
-                if (error.status === 422) {
-                  try { await github.rest.repos.getReleaseByTag({ owner, repo, tag }); } catch {}
-                  throw new Error("Preview tag reservation raced (422); refusing to choose another identity.");
-                }
-                throw error;
+              throw new Error("Approved preview draft is missing; publisher will not recreate it after attestation.");
+            }
+            if (String(draft.id) !== process.env.DRAFT_ID) throw new Error("Approved preview draft id changed after attestation.");
+            if (draft.assets.length !== assets.length) throw new Error("Approved preview draft is not fully staged.");
+            for (const expected of assets) {
+              const actual = draft.assets.find((asset) => asset.name === expected.name);
+              if (!actual || actual.size !== expected.size || actual.digest !== `sha256:${expected.sha256}`) {
+                throw new Error(`Approved preview draft asset differs: ${expected.name}`);
               }
             }
-            const present = new Set(draft.assets.map((asset) => asset.name));
-            for (const asset of assets) {
-              if (present.has(asset.name)) continue;
-              await github.request("POST /repos/{owner}/{repo}/releases/{release_id}/assets", {
-                owner, repo, release_id: draft.id, name: asset.name, data: asset.bytes,
-                headers: { "content-type": "application/octet-stream", "content-length": asset.size },
-              });
-            }
+            // GitHub has no multi-ref conditional transaction. This final read authorizes the tip at this instant;
+            // a later push does not revoke the exact draft that is immediately published.
+            await requireLivePylon();
             await github.rest.repos.updateRelease({ owner, repo, release_id: draft.id, draft: false });
             const published = (await github.rest.repos.getRelease({ owner, repo, release_id: draft.id })).data;
             await assertExact(published);

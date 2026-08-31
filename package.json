@@ -34,6 +34,7 @@
 		"release:pylon:verify": "node scripts/verify-pylon-prime-agent-release.mjs",
 		"release:pylon:preview": "node scripts/prepare-pylon-preview-manifest.mjs",
 		"release:pylon:verify-preview": "node scripts/verify-pylon-preview-publication.mjs",
+		"release:pylon:verify-preview-history": "node scripts/verify-pylon-preview-history.mjs",
 		"release:pylon:verify-attestations": "node scripts/verify-pylon-publication-attestations.mjs",
 		"release:pylon:verify-stable-attestation": "node scripts/verify-pylon-stable-attestation.mjs",
 		"release:pylon:verify-stable-history": "node scripts/verify-pylon-stable-history.mjs",

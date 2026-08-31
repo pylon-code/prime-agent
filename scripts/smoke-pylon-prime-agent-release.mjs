@@ -13,6 +13,7 @@ import {
 	run,
 } from "./lib/pylon-release.mjs";
 import { verifyPylonPrimeAgentRelease } from "./verify-pylon-prime-agent-release.mjs";
+import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultArtifacts = join(root, ".npm", "pylon-release", "artifacts");
@@ -24,9 +25,14 @@ export const PYLON_RELEASE_EXPECTED_SDK_FEATURES = Object.freeze([
 ]);
 
 function parseArgs(args) {
-	if (args.length === 0) return defaultArtifacts;
-	if (args.length === 2 && args[0] === "--artifact-dir") return resolve(root, args[1]);
-	throw new Error("Usage: node scripts/smoke-pylon-prime-agent-release.mjs [--artifact-dir path]");
+	const historicalIndex = args.indexOf("--historical");
+	const historical = historicalIndex !== -1;
+	const remaining = args.filter((_, index) => index !== historicalIndex);
+	if (remaining.length === 0) return { artifactsDir: defaultArtifacts, historical };
+	if (remaining.length === 2 && remaining[0] === "--artifact-dir") {
+		return { artifactsDir: resolve(root, remaining[1]), historical };
+	}
+	throw new Error("Usage: smoke-pylon-prime-agent-release [--historical] [--artifact-dir path]");
 }
 
 export function releaseInstallTimeoutMs(platform = process.platform) {
@@ -838,8 +844,10 @@ function createLocalAssetConsumer(prefix, artifactsDir, manifest) {
 	);
 }
 
-export async function smokePylonPrimeAgentRelease(artifactsDir) {
-	const manifest = verifyPylonPrimeAgentRelease(artifactsDir);
+export async function smokePylonPrimeAgentRelease(artifactsDir, { historical = false } = {}) {
+	const manifest = historical
+		? verifyPreviewPublication(artifactsDir, { historical: true }).releaseManifest
+		: verifyPylonPrimeAgentRelease(artifactsDir);
 	const tempRoot = mkdtempSync(join(tmpdir(), "pylon-prime-release-"));
 	let removeTempRoot = true;
 	try {
@@ -918,7 +926,8 @@ export async function smokePylonPrimeAgentRelease(artifactsDir) {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
 	try {
-		await smokePylonPrimeAgentRelease(parseArgs(process.argv.slice(2)));
+		const args = parseArgs(process.argv.slice(2));
+		await smokePylonPrimeAgentRelease(args.artifactsDir, { historical: args.historical });
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : String(error));
 		process.exit(1);

@@ -1,12 +1,36 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
+	normalizeNpmVersion,
 	PYLON_RELEASE_MANIFEST,
+	PYLON_RELEASE_PACKAGES,
 	PYLON_RELEASE_RECIPE_REVISION,
 	PYLON_RELEASE_REPOSITORY,
+	releaseAssetFile,
 	releaseBuildId,
 	validateReleaseManifest,
 } from "./pylon-release.mjs";
+
+const supportedRecipeRegistry = JSON.parse(
+	readFileSync(fileURLToPath(new URL("../pylon-prime-supported-release-recipes-v1.json", import.meta.url)), "utf8"),
+);
+const recipeKeys = ["recipeRevision", "manifestSchemaVersion", "nodeVersion", "npmVersion", "minimumNodeVersion"];
+if (
+	!supportedRecipeRegistry || Object.keys(supportedRecipeRegistry).sort().join(",") !== "recipes,schemaVersion" ||
+	supportedRecipeRegistry.schemaVersion !== 1 || !Array.isArray(supportedRecipeRegistry.recipes) ||
+	supportedRecipeRegistry.recipes.length === 0 ||
+	supportedRecipeRegistry.recipes.some((recipe) =>
+		!recipe || Object.keys(recipe).sort().join(",") !== recipeKeys.toSorted().join(",") ||
+		!Number.isSafeInteger(recipe.recipeRevision) || recipe.recipeRevision < 1 || recipe.manifestSchemaVersion !== 1 ||
+		![recipe.nodeVersion, recipe.npmVersion, recipe.minimumNodeVersion].every((value) => /^\d+\.\d+\.\d+$/.test(value))
+	) ||
+	new Set(supportedRecipeRegistry.recipes.map((recipe) => recipe.recipeRevision)).size !== supportedRecipeRegistry.recipes.length
+) throw new Error("Pylon historical release recipe registry is malformed.");
+export const PYLON_SUPPORTED_RELEASE_RECIPES = Object.freeze(
+	supportedRecipeRegistry.recipes.map((recipe) => Object.freeze({ ...recipe })),
+);
 
 export const PYLON_PREVIEW_MANIFEST = "pylon-preview-channel-v1.json";
 export const PYLON_STABLE_MANIFEST = "pylon-stable-channel-v1.json";
@@ -98,20 +122,79 @@ function exactKeys(value, keys) {
 	return isPlainObject(value) && Object.keys(value).sort().join(",") === [...keys].sort().join(",");
 }
 
+export function validatePublishedReleaseManifest(manifest, supportedRecipes = PYLON_SUPPORTED_RELEASE_RECIPES) {
+	if (!exactKeys(manifest, ["schemaVersion", "source", "build", "package", "assets", "attestationSubjects"])) {
+		throw new Error("Unsupported published Pylon release manifest.");
+	}
+	const { source, build, package: publicPackage, assets, attestationSubjects } = manifest;
+	const recipe = supportedRecipes.find((candidate) => candidate.recipeRevision === build?.recipeRevision);
+	if (
+		!recipe || !exactKeys(recipe, ["recipeRevision", "manifestSchemaVersion", "nodeVersion", "npmVersion", "minimumNodeVersion"]) ||
+		manifest.schemaVersion !== recipe.manifestSchemaVersion ||
+		!exactKeys(source, ["repository", "commit", "tree"]) || source.repository !== PYLON_RELEASE_REPOSITORY ||
+		!/^[0-9a-f]{40}$/.test(source.commit ?? "") || !/^[0-9a-f]{40}$/.test(source.tree ?? "") ||
+		!exactKeys(build, ["id", "recipeRevision", "node", "npm", "lockfile", "assetBaseUrl"]) ||
+		build.id !== `pylon-build-g${source.commit.slice(0, 12)}-r${recipe.recipeRevision}` ||
+		build.node !== recipe.nodeVersion || build.npm !== recipe.npmVersion ||
+		!exactKeys(build.lockfile, ["file", "sha256"]) || build.lockfile.file !== "package-lock.json" ||
+		!/^[0-9a-f]{64}$/.test(build.lockfile.sha256 ?? "") ||
+		build.assetBaseUrl !== `${PYLON_RELEASE_REPOSITORY}/releases/download/${build.id}` ||
+		!exactKeys(publicPackage, ["name", "command", "version", "minimumNode"]) ||
+		publicPackage.name !== "prime-agent" || publicPackage.command !== "prime-agent" ||
+		normalizeNpmVersion(publicPackage.version) !== publicPackage.version || publicPackage.minimumNode !== recipe.minimumNodeVersion ||
+		!Array.isArray(assets) || assets.length !== PYLON_RELEASE_PACKAGES.length ||
+		!Array.isArray(attestationSubjects) || attestationSubjects.length !== assets.length
+	) throw new Error("Malformed historical Pylon release manifest.");
+	const expectedAssets = new Map(PYLON_RELEASE_PACKAGES.map((entry) => [
+		releaseAssetFile(entry.assetStem, publicPackage.version), entry.packageName,
+	]));
+	const sortedFiles = assets.map((asset) => asset.file).toSorted();
+	if (assets.some((asset, index) => asset.file !== sortedFiles[index])) {
+		throw new Error("Published Pylon release assets are not sorted.");
+	}
+	for (let index = 0; index < assets.length; index += 1) {
+		const asset = assets[index];
+		const subject = attestationSubjects[index];
+		if (
+			!exactKeys(asset, ["package", "file", "size", "sha256", "sha512"]) ||
+			asset.package !== expectedAssets.get(asset.file) || !Number.isSafeInteger(asset.size) || asset.size < 1 ||
+			!/^[0-9a-f]{64}$/.test(asset.sha256 ?? "") || !/^[0-9a-f]{128}$/.test(asset.sha512 ?? "") ||
+			!exactKeys(subject, ["name", "digest"]) || !exactKeys(subject.digest, ["sha256", "sha512"]) ||
+			subject.name !== asset.file || subject.digest.sha256 !== asset.sha256 || subject.digest.sha512 !== asset.sha512
+		) throw new Error(`Malformed historical Pylon release asset: ${String(asset?.file)}`);
+		expectedAssets.delete(asset.file);
+	}
+	if (expectedAssets.size !== 0) throw new Error("Historical Pylon release asset set is incomplete.");
+	return manifest;
+}
+
 function publicationAssets(releaseManifest) {
 	return releaseManifest.assets.map(({ file, size, sha256, sha512 }) => ({ file, size, sha256, sha512 }));
 }
 
-export function createPreviewManifest(releaseManifest, releaseManifestBytes) {
-	validateReleaseManifest(releaseManifest);
+function validatePreviewSequence({ sequenceEpoch, sequence, workflowRunId }) {
+	if (
+		sequenceEpoch !== 1 || !Number.isSafeInteger(sequence) || sequence < 1 ||
+		!isCanonicalPositiveDecimal(workflowRunId)
+	) throw new Error("Preview sequence identity is malformed.");
+	return { sequenceEpoch, sequence, workflowRunId };
+}
+
+function isCanonicalPositiveDecimal(value) {
+	return typeof value === "string" && /^[1-9][0-9]*$/.test(value);
+}
+
+function previewManifestFor(releaseManifest, releaseManifestBytes, invocation) {
 	if (!Buffer.isBuffer(releaseManifestBytes) || releaseManifestBytes.byteLength === 0) {
 		throw new Error("Build manifest bytes are required.");
 	}
-	const tag = releaseBuildId(releaseManifest.source.commit);
+	const tag = releaseManifest.build.id;
+	const sequence = validatePreviewSequence(invocation);
 	return {
 		schemaVersion: PYLON_PUBLICATION_SCHEMA_VERSION,
 		channel: "preview",
 		repository: PYLON_RELEASE_REPOSITORY,
+		...sequence,
 		build: {
 			tag,
 			id: releaseManifest.build.id,
@@ -126,8 +209,21 @@ export function createPreviewManifest(releaseManifest, releaseManifestBytes) {
 	};
 }
 
-export function validatePreviewManifest(previewManifest, releaseManifest, releaseManifestBytes) {
-	const expected = createPreviewManifest(releaseManifest, releaseManifestBytes);
+export function createPreviewManifest(releaseManifest, releaseManifestBytes, invocation) {
+	validateReleaseManifest(releaseManifest);
+	if (releaseManifest.build.id !== releaseBuildId(releaseManifest.source.commit)) throw new Error("Current preview build id is malformed.");
+	return previewManifestFor(releaseManifest, releaseManifestBytes, invocation);
+}
+
+export function validatePreviewManifest(
+	previewManifest,
+	releaseManifest,
+	releaseManifestBytes,
+	{ historical = false, supportedRecipes = PYLON_SUPPORTED_RELEASE_RECIPES } = {},
+) {
+	if (historical) validatePublishedReleaseManifest(releaseManifest, supportedRecipes);
+	else validateReleaseManifest(releaseManifest);
+	const expected = previewManifestFor(releaseManifest, releaseManifestBytes, previewManifest);
 	if (canonicalJson(previewManifest) !== canonicalJson(expected)) {
 		throw new Error("Preview manifest does not match the exact deterministic build manifest.");
 	}
@@ -219,6 +315,7 @@ export function createStableManifest({ previewManifest, previewManifestBytes, se
 			previous,
 		},
 		build: {
+			previewSequence: validatePreviewSequence(previewManifest),
 			previewTag: previewManifest.build.tag,
 			id: previewManifest.build.id,
 			recipeRevision: previewManifest.build.recipeRevision,
@@ -235,7 +332,7 @@ export function createStableManifest({ previewManifest, previewManifestBytes, se
 	};
 }
 
-export function validateStableManifest(stableManifest) {
+export function validateStableManifest(stableManifest, supportedRecipes = PYLON_SUPPORTED_RELEASE_RECIPES) {
 	if (
 		!exactKeys(stableManifest, [
 			"schemaVersion",
@@ -256,8 +353,11 @@ export function validateStableManifest(stableManifest) {
 		throw new Error("Malformed Pylon stable manifest.");
 	}
 	const build = stableManifest.build;
+	const recipe = supportedRecipes.find((candidate) => candidate.recipeRevision === build?.recipeRevision);
 	if (
-		!exactKeys(build, ["previewTag", "id", "recipeRevision", "source", "releaseManifest", "previewManifest", "assets"]) ||
+		!recipe ||
+		!exactKeys(build, ["previewSequence", "previewTag", "id", "recipeRevision", "source", "releaseManifest", "previewManifest", "assets"]) ||
+		canonicalJson(validatePreviewSequence(build.previewSequence ?? {})) !== canonicalJson(build.previewSequence) ||
 		build.previewTag !== build.id || !Number.isSafeInteger(build.recipeRevision) || build.recipeRevision < 1 ||
 		!exactKeys(build.source, ["repository", "commit", "tree"]) ||
 		build.source.repository !== PYLON_RELEASE_REPOSITORY ||
@@ -299,7 +399,8 @@ export function validateStableManifest(stableManifest) {
 		tag.commit12 !== stableManifest.build?.source?.commit?.slice(0, 12) ||
 		tag.recipeRevision !== stableManifest.build?.recipeRevision ||
 		stableManifest.build.previewTag !== stableManifest.build.id ||
-		parsePreviewTag(stableManifest.build.previewTag).commit12 !== tag.commit12
+		parsePreviewTag(stableManifest.build.previewTag).commit12 !== tag.commit12 ||
+		parsePreviewTag(stableManifest.build.previewTag).recipeRevision !== stableManifest.build.recipeRevision
 	) {
 		throw new Error("Stable tag does not match its exact preview build.");
 	}

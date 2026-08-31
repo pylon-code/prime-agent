@@ -24,7 +24,11 @@ try {
 	const artifactsDir = artifactDirectory(process.argv.slice(2));
 	const releaseManifestBytes = readFileSync(join(artifactsDir, PYLON_RELEASE_MANIFEST));
 	const releaseManifest = JSON.parse(releaseManifestBytes);
-	const previewManifest = createPreviewManifest(releaseManifest, releaseManifestBytes);
+	const previewManifest = createPreviewManifest(releaseManifest, releaseManifestBytes, {
+		sequenceEpoch: 1,
+		sequence: Number(process.env.GITHUB_RUN_NUMBER),
+		workflowRunId: process.env.GITHUB_RUN_ID ?? "",
+	});
 	writeFileSync(join(artifactsDir, PYLON_PREVIEW_MANIFEST), canonicalJson(previewManifest));
 	console.log(`Created ${join(artifactsDir, PYLON_PREVIEW_MANIFEST)}`);
 } catch (error) {

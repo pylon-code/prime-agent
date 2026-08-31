@@ -14,6 +14,7 @@ import {
 	sha256Bytes,
 	validateStableManifest,
 } from "./lib/pylon-publication.mjs";
+import { verifyApprovedWorkflowAtSignerDigest } from "./lib/pylon-workflow-policy.mjs";
 import { verifyGhAttestationResult } from "./verify-pylon-publication-attestations.mjs";
 
 function parseArgs(args) {
@@ -27,7 +28,7 @@ function parseArgs(args) {
 	return { path, sourceSha, sourceTree };
 }
 
-function verify(path, sourceSha, sourceTree) {
+export function verifyStableAttestation(path, sourceSha, sourceTree) {
 	const bytes = readFileSync(path);
 	const manifest = validateStableManifest(JSON.parse(bytes));
 	if (canonicalJson(manifest) !== bytes.toString("utf8")) throw new Error("Stable manifest is not canonical publication JSON.");
@@ -35,6 +36,7 @@ function verify(path, sourceSha, sourceTree) {
 		throw new Error("Promotion commit/tree does not match the signed stable policy identity.");
 	}
 	const subject = { name: PYLON_STABLE_MANIFEST, sha256: sha256Bytes(bytes) };
+	verifyApprovedWorkflowAtSignerDigest(PYLON_STABLE_WORKFLOW, sourceSha, "stable");
 	const result = spawnSync(
 		"gh",
 		[
@@ -61,7 +63,7 @@ function verify(path, sourceSha, sourceTree) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
 	try {
 		const args = parseArgs(process.argv.slice(2));
-		const manifest = verify(args.path, args.sourceSha, args.sourceTree);
+		const manifest = verifyStableAttestation(args.path, args.sourceSha, args.sourceTree);
 		console.log(`Verified stable manifest provenance for ${manifest.tag}.`);
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : String(error));
