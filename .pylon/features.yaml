@@ -265,3 +265,19 @@ decisions:
     revisit_when:
       - Prime upstream exposes an equivalent generation-scoped, post-attach public proof that is false before attach and after invalidation.
       - Pylon and Comet can remove the fork SDK token/accessor without enabling optional behavior from a server offer, version, or method presence.
+
+  child-scoped-provider-identity:
+    area: runtime-reliability
+    state: shipped
+    owner: pylon-prime-integration
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/22
+      - https://github.com/pylon-code/prime-agent/issues/23
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/tree/a903d4b6768f484bd6d459b7b0aa7dee38e461e2
+    fork_change: child-scoped-provider-identity-v1
+    upstream_support: Prime through a903d4b6768f constructs inline RLM children and side questions with the root session's onPayload/onResponse closures, and calls compaction, branch summarization, and refinement completeSimple with no payload hook. Every derived request therefore either claims the parent's provider session identity while sending a divergent history or arrives with no identity at all.
+    revisit_when:
+      - Prime routes subagent and derived-request provider hooks through the owning session's extension runner.
+      - An upstream extension contract exposes per-agent provider identity that supersedes the scoped session-id view.

@@ -51,19 +51,16 @@ describe("ENG-4509 side questions", () => {
 				},
 			]);
 
-			const run = startSideQuestion(
-				harness.session.agent,
-				"question-1",
-				"What is the project codename?",
-				(event) => {
-					events.push(event);
-				},
-			);
+			const run = startSideQuestion(harness.session, "question-1", "What is the project codename?", (event) => {
+				events.push(event);
+			});
 			await run.done;
 
 			expect(events.at(-1)).toMatchObject({ status: "complete", answer: "kestrel" });
 			expect(observedTransport).toBe("sse");
-			expect(observedSessionId).toBe("cache-session");
+			// Scoped off the main session (see #23): the side conversation is a
+			// divergent history and must not reuse the main provider session key.
+			expect(observedSessionId).toBe("cache-session/side:question-1");
 			expect(harness.session.messages).toEqual(messagesBefore);
 			expect(harness.sessionManager.getEntries()).toEqual(entriesBefore);
 		} finally {
@@ -97,7 +94,7 @@ describe("ENG-4509 side questions", () => {
 
 			const events: SideQuestionEvent[] = [];
 			const run = startSideQuestion(
-				harness.session.agent,
+				harness.session,
 				"turn-2",
 				"Second side question?",
 				(event) => {
@@ -137,14 +134,9 @@ describe("ENG-4509 side questions", () => {
 			const mainRun = harness.session.prompt("Run the main task.");
 			await mainStarted.promise;
 			const events: SideQuestionEvent[] = [];
-			const sideRun = startSideQuestion(
-				harness.session.agent,
-				"question-2",
-				"Can I ask this concurrently?",
-				(event) => {
-					events.push(event);
-				},
-			);
+			const sideRun = startSideQuestion(harness.session, "question-2", "Can I ask this concurrently?", (event) => {
+				events.push(event);
+			});
 			await sideRun.done;
 
 			expect(harness.session.isStreaming).toBe(true);
@@ -172,7 +164,7 @@ describe("ENG-4509 side questions", () => {
 				},
 			]);
 			const events: SideQuestionEvent[] = [];
-			const run = startSideQuestion(harness.session.agent, "question-3", "Wait here", (event) => {
+			const run = startSideQuestion(harness.session, "question-3", "Wait here", (event) => {
 				events.push(event);
 			});
 			await sideStarted.promise;
@@ -191,7 +183,7 @@ describe("ENG-4509 side questions", () => {
 		try {
 			const events: SideQuestionEvent[] = [];
 			let shouldFail = true;
-			const run = startSideQuestion(harness.session.agent, "question-4", "Can this recover?", (event) => {
+			const run = startSideQuestion(harness.session, "question-4", "Can this recover?", (event) => {
 				if (shouldFail) {
 					shouldFail = false;
 					throw new Error("event delivery failed");

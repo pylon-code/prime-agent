@@ -1,0 +1,1 @@
+- Added `onPayload` support and recorded request payloads (`getSentPayloads`, `clearSentPayloads`) to the faux provider so payload-rewriting hosts and extensions can be tested ([#23](https://github.com/pylon-code/prime-agent/issues/23)).

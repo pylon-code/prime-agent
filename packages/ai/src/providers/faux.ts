@@ -113,6 +113,20 @@ export interface RegisterFauxProviderOptions {
 	};
 }
 
+/**
+ * Stand-in for a provider's serialized request body. Real providers build an
+ * API-shaped payload and hand it to `onPayload` before sending; the faux
+ * provider builds this instead so hosts and extensions that stamp identity
+ * onto the payload are exercised and observable.
+ */
+export interface FauxRequestPayload {
+	model: string;
+	systemPrompt?: string;
+	messages: Message[];
+	sessionId?: string;
+	metadata?: Record<string, unknown>;
+}
+
 export interface FauxProviderRegistration {
 	api: string;
 	models: [Model<string>, ...Model<string>[]];
@@ -122,6 +136,9 @@ export interface FauxProviderRegistration {
 	setResponses: (responses: FauxResponseStep[]) => void;
 	appendResponses: (responses: FauxResponseStep[]) => void;
 	getPendingResponseCount: () => number;
+	/** Payloads as they stood after `onPayload`, in request order. */
+	getSentPayloads: () => unknown[];
+	clearSentPayloads: () => void;
 	unregister: () => void;
 }
 
@@ -401,6 +418,7 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 	const tokensPerSecond = options.tokensPerSecond;
 	const state = { callCount: 0 };
 	const promptCache = new Map<string, string>();
+	const sentPayloads: unknown[] = [];
 
 	const modelDefinitions = options.models?.length
 		? options.models
@@ -435,6 +453,15 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 
 		queueMicrotask(async () => {
 			try {
+				const payload: FauxRequestPayload = {
+					model: requestModel.id,
+					systemPrompt: context.systemPrompt,
+					messages: context.messages,
+					sessionId: streamOptions?.sessionId,
+					metadata: streamOptions?.metadata,
+				};
+				const replacedPayload = await streamOptions?.onPayload?.(payload, requestModel);
+				sentPayloads.push(replacedPayload ?? payload);
 				await streamOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
 				if (!step) {
 					let message = createErrorMessage(
@@ -491,6 +518,12 @@ export function registerFauxProvider(options: RegisterFauxProviderOptions = {}):
 		},
 		getPendingResponseCount() {
 			return pendingResponses.length;
+		},
+		getSentPayloads() {
+			return [...sentPayloads];
+		},
+		clearSentPayloads() {
+			sentPayloads.length = 0;
 		},
 		unregister() {
 			unregisterApiProviders(sourceId);

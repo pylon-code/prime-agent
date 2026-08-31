@@ -8,6 +8,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
+import type { ProviderPayloadHook } from "../extension-provider-hooks.js";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -72,6 +73,11 @@ export interface GenerateBranchSummaryOptions {
 	replaceInstructions?: boolean;
 	/** Tokens reserved for prompt + LLM response (default 16384) */
 	reserveTokens?: number;
+	/**
+	 * Provider payload hook carrying the owning session's identity. Expected to
+	 * be scoped: the summarization prompt is not the session's conversation.
+	 */
+	onPayload?: ProviderPayloadHook;
 }
 /**
  * Collect entries that should be summarized when navigating from one position to another.
@@ -249,7 +255,16 @@ export async function generateBranchSummary(
 	entries: SessionEntry[],
 	options: GenerateBranchSummaryOptions,
 ): Promise<BranchSummaryResult> {
-	const { model, apiKey, headers, signal, customInstructions, replaceInstructions, reserveTokens = 16384 } = options;
+	const {
+		model,
+		apiKey,
+		headers,
+		signal,
+		customInstructions,
+		replaceInstructions,
+		reserveTokens = 16384,
+		onPayload,
+	} = options;
 	const contextWindow = model.contextWindow || 128000;
 	const tokenBudget = contextWindow - reserveTokens;
 
@@ -282,7 +297,7 @@ export async function generateBranchSummary(
 	const response = await completeSimple(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		{ apiKey, headers, signal, maxTokens: 2048 },
+		{ apiKey, headers, signal, onPayload, maxTokens: 2048 },
 	);
 	if (response.stopReason === "aborted") {
 		return { aborted: true };

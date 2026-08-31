@@ -117,6 +117,7 @@ import { normalizeHeartbeatDeliveryMode } from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
+import { createExtensionProviderHooks, type ExtensionProviderHooks } from "./extension-provider-hooks.js";
 import {
 	type ContextUsage,
 	type ExtensionCommandContextActions,
@@ -1352,6 +1353,19 @@ export class AgentSession {
 	/** Refreshes MCP provider registrations without rebuilding the session runtime. */
 	refreshMcpProviders(): void {
 		this._mcpManager?.refresh();
+	}
+
+	/**
+	 * Provider hooks for requests made on this session's behalf that send a
+	 * conversation this session never sent — side questions and the
+	 * summarization/refinement passes. `scope` derives a child identity from the
+	 * session id so those requests reach the provider identified, without
+	 * claiming the session's own provider session key for a divergent history.
+	 *
+	 * The runner is resolved per request, so `/reload` is picked up.
+	 */
+	createScopedProviderHooks(scope: string): ExtensionProviderHooks {
+		return createExtensionProviderHooks(() => this._extensionRunner, { sessionIdScope: scope });
 	}
 
 	/**
@@ -8015,7 +8029,16 @@ export class AgentSession {
 
 		const { summary, firstKeptEntryId, tokensBefore, details } =
 			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
+			(await compact(
+				preparation,
+				model,
+				apiKey,
+				headers,
+				customInstructions,
+				signal,
+				this.thinkingLevel,
+				this.createScopedProviderHooks("compaction").onPayload,
+			));
 
 		if (signal.aborted) {
 			throw new Error("Compaction cancelled");
@@ -8512,6 +8535,7 @@ export class AgentSession {
 			headers,
 			signal,
 			this.thinkingLevel,
+			this.createScopedProviderHooks("auto-refine-review").onPayload,
 		);
 	}
 
@@ -8751,6 +8775,7 @@ export class AgentSession {
 			headers,
 			signal,
 			this.thinkingLevel,
+			this.createScopedProviderHooks("refine").onPayload,
 		);
 		if (this._disposed || signal.aborted) {
 			throw new Error("Refinement cancelled because the session was disposed.");
@@ -10002,6 +10027,14 @@ export class AgentSession {
 		childSessionManager.appendThinkingLevelChange(options.thinkingLevel);
 		childSessionManager.appendServiceTierChange(options.serviceTier);
 
+		// The child's extension hooks must run against the child's own runner, or
+		// every request it makes claims this session's provider identity and the
+		// parent and its children interleave on one provider session key. The
+		// runner only exists once the child AgentSession builds it below, which is
+		// why the hooks resolve it late — the same shape the SDK root uses.
+		const childExtensionRunnerRef: { current?: ExtensionRunner } = {};
+		const childProviderHooks = createExtensionProviderHooks(() => childExtensionRunnerRef.current);
+
 		const childAgent = new Agent({
 			initialState: {
 				systemPrompt: "",
@@ -10011,11 +10044,11 @@ export class AgentSession {
 				tools: [],
 			},
 			convertToLlm: this.agent.convertToLlm,
-			transformContext: this.agent.transformContext,
+			transformContext: childProviderHooks.transformContext,
 			streamFn: this.agent.streamFn,
 			getApiKey: this.agent.getApiKey,
-			onPayload: this.agent.onPayload,
-			onResponse: this.agent.onResponse,
+			onPayload: childProviderHooks.onPayload,
+			onResponse: childProviderHooks.onResponse,
 			steeringMode: this.settingsManager.getSteeringMode(),
 			followUpMode: this.settingsManager.getFollowUpMode(),
 			sessionId: childSessionManager.getSessionId(),
@@ -10035,6 +10068,7 @@ export class AgentSession {
 			resourceLoader: this._resourceLoader,
 			customTools: options.customTools,
 			modelRegistry: this._modelRegistry,
+			extensionRunnerRef: childExtensionRunnerRef,
 			initialActiveToolNames: options.activeToolNames,
 			allowedToolNames: options.allowedToolNames,
 			includeGoals: options.includeGoals,
@@ -12049,6 +12083,7 @@ export class AgentSession {
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
+					onPayload: this.createScopedProviderHooks("branch-summary").onPayload,
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };

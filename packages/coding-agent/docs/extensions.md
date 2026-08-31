@@ -649,6 +649,13 @@ pi.on("before_provider_request", (event, ctx) => {
 
 This is mainly useful for debugging provider serialization and cache behavior.
 
+The hook fires for every provider request the session is responsible for, and `ctx.sessionManager.getSessionId()` identifies the conversation the request belongs to rather than the session you started from:
+
+- A subagent's requests report the subagent's own session id, whether it runs inline or in the daemon. Handlers that key provider state on the session id therefore see one identity per agent instead of the parent's for all of them.
+- Requests that carry a conversation the session never sent report a derived id of the form `<sessionId>/<scope>`: `side:<id>` for a side question, and `compaction`, `branch-summary`, `refine`, or `auto-refine-review` for the summarization passes. Everything else on `ctx.sessionManager` still describes the owning session.
+
+Treat the id as opaque: match on the `<sessionId>` prefix if you need to group derived work with its session.
+
 #### after_provider_response
 
 Fired after an HTTP response is received and before its stream body is consumed. Handlers run in extension load order.

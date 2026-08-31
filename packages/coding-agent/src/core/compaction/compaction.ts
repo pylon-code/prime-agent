@@ -8,6 +8,7 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
+import type { ProviderPayloadHook } from "../extension-provider-hooks.js";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -504,6 +505,10 @@ export function buildSummarizationPrompt(customInstructions?: string, previousSu
 /**
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
+ *
+ * `onPayload` carries the owning session's provider identity so the call is
+ * not anonymous at the provider; it is expected to be scoped, because the
+ * summarization prompt is not the session's own conversation.
  */
 export async function generateSummary(
 	currentMessages: AgentMessage[],
@@ -515,6 +520,7 @@ export async function generateSummary(
 	customInstructions?: string,
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
+	onPayload?: ProviderPayloadHook,
 ): Promise<string> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
@@ -538,8 +544,8 @@ export async function generateSummary(
 
 	const completionOptions =
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers };
+			? { maxTokens, signal, apiKey, headers, onPayload, reasoning: thinkingLevel }
+			: { maxTokens, signal, apiKey, headers, onPayload };
 
 	const response = await completeSimple(
 		model,
@@ -678,6 +684,7 @@ export async function compact(
 	customInstructions?: string,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	onPayload?: ProviderPayloadHook,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -704,6 +711,7 @@ export async function compact(
 						customInstructions,
 						previousSummary,
 						thinkingLevel,
+						onPayload,
 					)
 				: Promise.resolve("No prior history."),
 			generateTurnPrefixSummary(
@@ -714,6 +722,7 @@ export async function compact(
 				headers,
 				signal,
 				thinkingLevel,
+				onPayload,
 			),
 		]);
 		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
@@ -728,6 +737,7 @@ export async function compact(
 			customInstructions,
 			previousSummary,
 			thinkingLevel,
+			onPayload,
 		);
 	}
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
@@ -756,6 +766,7 @@ async function generateTurnPrefixSummary(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	onPayload?: ProviderPayloadHook,
 ): Promise<string> {
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 	const llmMessages = convertToLlm(messages);
@@ -773,8 +784,8 @@ async function generateTurnPrefixSummary(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
+			? { maxTokens, signal, apiKey, headers, onPayload, reasoning: thinkingLevel }
+			: { maxTokens, signal, apiKey, headers, onPayload },
 	);
 
 	if (response.stopReason === "error") {

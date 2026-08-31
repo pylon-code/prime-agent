@@ -20,6 +20,7 @@ export type {
 	ForkHandler,
 	NavigateTreeHandler,
 	NewSessionHandler,
+	ScopedEmitOptions,
 	ShutdownHandler,
 	SwitchSessionHandler,
 } from "./runner.js";
