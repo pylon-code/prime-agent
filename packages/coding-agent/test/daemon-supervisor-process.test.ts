@@ -10,13 +10,14 @@ import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
 import {
 	acquireSessionLease,
+	getProcessStartId,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "../src/core/session-lease.js";
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
-import { createDaemonCommandEnvelope } from "../src/modes/daemon/daemon-protocol.js";
+import { collectDaemonLaunchEnv, createDaemonCommandEnvelope } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
 
@@ -26,6 +27,7 @@ const blockingProcessPath = resolve(__dirname, "fixtures/blocking-process.mjs");
 const tempDirs: string[] = [];
 const children = new Set<ChildProcess>();
 const workerPids = new Set<number>();
+const identityTrackedProcesses = new Map<number, string>();
 const daemonSockets = new Set<string>();
 const childDiagnostics = new WeakMap<ChildProcess, { stdout: string; stderr: string }>();
 const PROCESS_STRESS_WORKERS = Number.parseInt(process.env.PRIME_AGENT_STRESS_WORKERS ?? "10", 10);
@@ -49,6 +51,26 @@ afterEach(async () => {
 		}
 	}
 	children.clear();
+	for (const [pid, processStartId] of identityTrackedProcesses) {
+		const identity = { pid, processStartId };
+		try {
+			signalIdentityVerifiedProcess(identity, "SIGCONT");
+			signalIdentityVerifiedProcess(identity, "SIGTERM");
+		} catch {
+			continue;
+		}
+		try {
+			await waitForProcessGone(pid, 1000);
+		} catch {
+			try {
+				signalIdentityVerifiedProcess(identity, "SIGKILL");
+				await waitForProcessGone(pid, 1000);
+			} catch {
+				// Gone or no longer the process identity tracked by this test.
+			}
+		}
+	}
+	identityTrackedProcesses.clear();
 	for (const pid of workerPids) {
 		try {
 			process.kill(pid, "SIGCONT");
@@ -70,6 +92,19 @@ afterEach(async () => {
 		rmSync(directory, { recursive: true, force: true });
 	}
 });
+
+function signalIdentityVerifiedProcess(
+	identity: { pid?: number; processStartId?: string },
+	signal: NodeJS.Signals,
+): void {
+	const { pid, processStartId } = identity;
+	if (!pid || !processStartId) throw new Error("Process identity is incomplete");
+	const observedProcessStartId = getProcessStartId(pid);
+	if (!observedProcessStartId || observedProcessStartId !== processStartId) {
+		throw new Error("Process identity changed before the requested signal");
+	}
+	process.kill(pid, signal);
+}
 
 function tempDir(): string {
 	const directory = mkdtempSync(join(tmpdir(), "prime-daemon-supervisor-test-"));
@@ -138,6 +173,20 @@ function readWorkerDescriptor(agentDir: string): DaemonWorkerDescriptor {
 		}
 	}
 	throw new Error("Worker descriptor was not persisted");
+}
+
+function readWorkerDescriptors(agentDir: string): DaemonWorkerDescriptor[] {
+	const workersRoot = join(agentDir, "daemon-workers");
+	try {
+		return readdirSync(workersRoot).flatMap((directory) => {
+			const descriptorDirectory = join(workersRoot, directory);
+			return readdirSync(descriptorDirectory)
+				.filter((name) => name.endsWith(".json"))
+				.map((name) => JSON.parse(readFileSync(join(descriptorDirectory, name), "utf8")) as DaemonWorkerDescriptor);
+		});
+	} catch {
+		return [];
+	}
 }
 
 function countWorkerDescriptors(agentDir: string): number {
@@ -451,8 +500,8 @@ async function waitForExit(child: ChildProcess): Promise<void> {
 	});
 }
 
-async function waitForProcessGone(pid: number): Promise<void> {
-	const deadline = Date.now() + 10_000;
+async function waitForProcessGone(pid: number, timeoutMs = 10_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		try {
 			process.kill(pid, 0);
@@ -463,7 +512,7 @@ async function waitForProcessGone(pid: number): Promise<void> {
 		}
 		await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 	}
-	throw new Error(`Worker ${pid} remained alive after daemon shutdown`);
+	throw new Error(`Process ${pid} remained alive after daemon shutdown`);
 }
 
 async function waitForCondition(predicate: () => boolean, failureMessage: string, timeoutMs = 10_000): Promise<void> {
@@ -522,7 +571,15 @@ describe("daemon supervisor resident workers", () => {
 		const client = await connectEventually(socketPath, supervisor);
 		const created = await client.request({
 			type: "create",
-			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			config: {
+				cwd: projectDir,
+				agentDir,
+				sessionDir,
+				provider: "faux",
+				model: "faux",
+				noTools: true,
+				noExtensions: true,
+			},
 		});
 		if (!created.success) throw new Error(created.error);
 		const summary = requireSummary(created.data);
@@ -1018,6 +1075,414 @@ describe("daemon supervisor resident workers", () => {
 		client.close();
 		await waitForSocketGone(socketPath);
 	}, 60_000);
+
+	it.skipIf(process.platform === "win32")(
+		"isolates two caller-owned environments through worker and supervisor recovery",
+		async () => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const socketPath = join(tmpdir(), `prime-issue33-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+			const observerModule = join(root, "observe-launch-env.cjs");
+			mkdirSync(projectDir, { recursive: true });
+			writeFileSync(
+				observerModule,
+				`const fs = require("node:fs");
+const path = process.env.PRIME_AGENT_TEST_ENV_OBSERVATION;
+if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER, hasA: process.env.PRIME_AGENT_TEST_ENV_A !== undefined, hasB: process.env.PRIME_AGENT_TEST_ENV_B !== undefined, hasC: process.env.PRIME_AGENT_TEST_SUPERVISOR_C !== undefined }) + "\\n");
+`,
+			);
+			const sessionDir = join(agentDir, "sessions");
+			const sessionFiles = {
+				A: createSnapshotSessionFile(agentDir, projectDir, "issue #33 owner A"),
+				B: createSnapshotSessionFile(agentDir, projectDir, "issue #33 owner B"),
+			};
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			let replacementSupervisor: ChildProcess | undefined;
+			let daemonRecovery: Promise<void> | undefined;
+			const recoverDaemon = () => {
+				daemonRecovery ??= (async () => {
+					replacementSupervisor = spawnSupervisor(agentDir, socketPath, projectDir, [], {
+						PRIME_AGENT_TEST_SUPERVISOR_C: "ambient-c",
+					});
+					const probe = await connectEventually(socketPath, replacementSupervisor);
+					probe.close();
+				})();
+				return daemonRecovery;
+			};
+			const safeBaseEnvironment = collectDaemonLaunchEnv(process.env);
+			for (const name of Object.keys(safeBaseEnvironment)) {
+				if (name.startsWith("RLM_") || /TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|AUTH|COOKIE/i.test(name)) {
+					delete safeBaseEnvironment[name];
+				}
+			}
+			Object.assign(safeBaseEnvironment, {
+				HOME: process.env.HOME ?? root,
+				PI_OFFLINE: "1",
+				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+				[ENV_AGENT_DIR]: agentDir,
+			});
+			delete safeBaseEnvironment.PRIME_AGENT_TEST_SUPERVISOR_C;
+			delete safeBaseEnvironment.PRIME_AGENT_TEST_ENV_A;
+			delete safeBaseEnvironment.PRIME_AGENT_TEST_ENV_B;
+			const createOwned = async (label: "A" | "B") => {
+				const client = await connectEventually(socketPath, supervisor);
+				const observationPath = join(root, `observed-${label}.jsonl`);
+				const canary = `issue33-private-${label.toLowerCase()}-${randomUUID()}`;
+				const launchEnv = {
+					...safeBaseEnvironment,
+					NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${observerModule}`.trim(),
+					PRIME_AGENT_TEST_ENV_OBSERVATION: observationPath,
+					...(label === "A" ? { PRIME_AGENT_TEST_ENV_A: canary } : { PRIME_AGENT_TEST_ENV_B: canary }),
+				};
+				const created = await client.request({
+					type: "create",
+					lifecycle: "client_owned",
+					sessionPath: sessionFiles[label],
+					launchEnv,
+					launchEnvMode: "replace",
+					config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+				});
+				if (!created.success) throw new Error(created.error);
+				const summary = requireSummary(created.data);
+				if (!summary.workerPid) throw new Error("Owned worker did not expose its pid");
+				const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId ?? summary.id, {
+					ownedSession: true,
+					ownedSessionLaunchEnv: launchEnv,
+					ownedSessionRecoveryConfig: {
+						cwd: projectDir,
+						agentDir,
+						sessionDir,
+						provider: "faux",
+						model: "faux",
+						noTools: true,
+						noExtensions: true,
+					},
+					recoverDaemon,
+					reconnectTimeoutMs: 30_000,
+					supportsExtensionUi: false,
+				});
+				const proof = connection.getOwnedSessionContractProof();
+				if (!proof) throw new Error("Owned attach did not publish the issue #33 contract proof");
+				return { client, connection, summary, launchEnv, observationPath, canary, proof };
+			};
+			const ownerA = await createOwned("A");
+			const ownerB = await createOwned("B");
+			const readObservations = (path: string) => {
+				try {
+					return readFileSync(path, "utf8")
+						.trim()
+						.split("\n")
+						.filter(Boolean)
+						.map(
+							(line) =>
+								JSON.parse(line) as {
+									pid: number;
+									role?: string;
+									hasA: boolean;
+									hasB: boolean;
+									hasC: boolean;
+								},
+						);
+				} catch {
+					return [];
+				}
+			};
+			await waitForCondition(
+				() => readObservations(ownerA.observationPath).some((entry) => entry.role === "1"),
+				"Worker A did not report its launch environment",
+			);
+			await waitForCondition(
+				() => readObservations(ownerB.observationPath).some((entry) => entry.role === "1"),
+				"Worker B did not report its launch environment",
+			);
+			for (const entry of readObservations(ownerA.observationPath).filter(
+				(observation) => observation.role === "1",
+			)) {
+				expect(entry).toMatchObject({ hasA: true, hasB: false, hasC: false });
+			}
+			for (const entry of readObservations(ownerB.observationPath).filter(
+				(observation) => observation.role === "1",
+			)) {
+				expect(entry).toMatchObject({ hasA: false, hasB: true, hasC: false });
+			}
+
+			const activeA = ownerA.summary.activeSessionId ?? ownerA.summary.id;
+			const activeB = ownerB.summary.activeSessionId ?? ownerB.summary.id;
+			const originalDescriptors = readWorkerDescriptors(agentDir);
+			const originalA = originalDescriptors.find((descriptor) => descriptor.rootActiveSessionId === activeA);
+			const originalB = originalDescriptors.find((descriptor) => descriptor.rootActiveSessionId === activeB);
+			if (!originalA?.pid || !originalA.processStartId || !originalB?.pid || !originalB.processStartId) {
+				throw new Error("Owned worker descriptors did not contain complete process identities");
+			}
+			identityTrackedProcesses.set(originalA.pid, originalA.processStartId);
+			identityTrackedProcesses.set(originalB.pid, originalB.processStartId);
+
+			const helloA = ownerA.client.hello;
+			const helloB = ownerB.client.hello;
+			if (
+				!helloA?.supervisorPid ||
+				!helloA.supervisorProcessStartId ||
+				helloB?.supervisorPid !== helloA.supervisorPid ||
+				helloB.supervisorProcessStartId !== helloA.supervisorProcessStartId
+			) {
+				throw new Error("Owned clients did not agree on the authenticated supervisor process identity");
+			}
+			signalIdentityVerifiedProcess(
+				{ pid: helloA.supervisorPid, processStartId: helloA.supervisorProcessStartId },
+				"SIGKILL",
+			);
+			await waitForProcessGone(helloA.supervisorPid);
+			await waitForExit(supervisor);
+			children.delete(supervisor);
+			await waitForCondition(
+				() => {
+					const nextA = ownerA.connection.getOwnedSessionContractProof();
+					const nextB = ownerB.connection.getOwnedSessionContractProof();
+					return (
+						nextA !== undefined &&
+						nextB !== undefined &&
+						nextA.daemon.supervisorGeneration !== ownerA.proof.daemon.supervisorGeneration &&
+						nextB.daemon.supervisorGeneration !== ownerB.proof.daemon.supervisorGeneration
+					);
+				},
+				"Owned connections did not republish proof after supervisor replacement",
+				30_000,
+			);
+			if (!replacementSupervisor) throw new Error("Shared daemon recovery did not spawn a replacement supervisor");
+			const replacementHelloA = ownerA.client.hello;
+			const replacementHelloB = ownerB.client.hello;
+			if (
+				!replacementHelloA?.supervisorPid ||
+				!replacementHelloA.supervisorProcessStartId ||
+				replacementHelloB?.supervisorPid !== replacementHelloA.supervisorPid ||
+				replacementHelloB.supervisorProcessStartId !== replacementHelloA.supervisorProcessStartId ||
+				getProcessStartId(replacementHelloA.supervisorPid) !== replacementHelloA.supervisorProcessStartId
+			) {
+				throw new Error("Replacement supervisor identity was not current and shared");
+			}
+			identityTrackedProcesses.set(replacementHelloA.supervisorPid, replacementHelloA.supervisorProcessStartId);
+
+			const previousAmbientC = process.env.PRIME_AGENT_TEST_SUPERVISOR_C;
+			process.env.PRIME_AGENT_TEST_SUPERVISOR_C = "mutated-c";
+			let recoveredA: DaemonWorkerDescriptor | undefined;
+			try {
+				signalIdentityVerifiedProcess(originalA, "SIGKILL");
+				await waitForProcessGone(originalA.pid);
+				identityTrackedProcesses.delete(originalA.pid);
+				await waitForCondition(
+					() =>
+						readWorkerDescriptors(agentDir).some(
+							(descriptor) =>
+								descriptor.rootActiveSessionId === activeA &&
+								descriptor.pid !== originalA.pid &&
+								descriptor.lifecycle === "ready",
+						),
+					"Worker A was not recovered with a new process after supervisor replacement",
+					20_000,
+				);
+				recoveredA = readWorkerDescriptors(agentDir).find(
+					(descriptor) =>
+						descriptor.rootActiveSessionId === activeA &&
+						descriptor.pid !== originalA.pid &&
+						descriptor.lifecycle === "ready",
+				);
+				if (!recoveredA?.pid || !recoveredA.processStartId) {
+					throw new Error("Recovered worker A descriptor did not contain a complete process identity");
+				}
+				identityTrackedProcesses.set(recoveredA.pid, recoveredA.processStartId);
+				await waitForCondition(
+					() =>
+						readObservations(ownerA.observationPath).filter(
+							(entry) => entry.role === "1" && entry.hasA && !entry.hasB && !entry.hasC,
+						).length >= 2,
+					"Recovered worker A did not retain its exact environment",
+					20_000,
+				);
+			} finally {
+				if (previousAmbientC === undefined) delete process.env.PRIME_AGENT_TEST_SUPERVISOR_C;
+				else process.env.PRIME_AGENT_TEST_SUPERVISOR_C = previousAmbientC;
+			}
+			if (!recoveredA?.pid) throw new Error("Recovered worker A was unavailable after recovery");
+			expect(ownerA.connection.getOwnedSessionContractProof()?.daemon.supervisorGeneration).toBe(
+				replacementHelloA.supervisorGeneration,
+			);
+			expect(ownerB.connection.getOwnedSessionContractProof()?.daemon.supervisorGeneration).toBe(
+				replacementHelloB?.supervisorGeneration,
+			);
+
+			const denied = await ownerB.client.request({
+				type: "complete_owned_session",
+				activeSessionId: activeA,
+			});
+			expect(denied).toMatchObject({
+				success: false,
+				errorInfo: { code: "owned_session_owner_mismatch" },
+			});
+			expect(JSON.stringify(denied)).not.toContain(activeA);
+			for (const descriptor of readWorkerDescriptors(agentDir)) {
+				const serialized = JSON.stringify(descriptor);
+				expect(serialized).not.toContain(ownerA.canary);
+				expect(serialized).not.toContain(ownerB.canary);
+				expect(descriptor.callerOwnedEnvironmentContract).toBe(true);
+				expect(descriptor.createCommand).not.toHaveProperty("launchEnv");
+				expect(descriptor.createCommand).not.toHaveProperty("launchEnvMode");
+			}
+			const daemonLogs = readDaemonLogs(agentDir);
+			expect(daemonLogs).not.toContain(ownerA.canary);
+			expect(daemonLogs).not.toContain(ownerB.canary);
+			expect(JSON.stringify(ownerA.connection.getOwnedSessionContractProof())).not.toContain(ownerA.canary);
+
+			const [cleanupA, cleanupB] = await Promise.all([
+				ownerA.connection.disposeOwnedSession({ timeoutMs: 30_000 }),
+				ownerB.connection.disposeOwnedSession({ timeoutMs: 30_000 }),
+			]);
+			expect(cleanupA.status).toBe("completed");
+			expect(cleanupB.status).toBe("completed");
+			expect(JSON.stringify([cleanupA, cleanupB])).not.toContain("issue33-private");
+			await waitForProcessGone(recoveredA.pid);
+			await waitForProcessGone(originalB.pid);
+			identityTrackedProcesses.delete(recoveredA.pid);
+			identityTrackedProcesses.delete(originalB.pid);
+			const shutdown = await ownerA.client.request({ type: "shutdown" });
+			if (!shutdown.success) throw new Error("Replacement supervisor rejected test shutdown");
+			ownerA.client.close();
+			ownerB.client.close();
+			await waitForSocketGone(socketPath);
+			await waitForProcessGone(replacementHelloA.supervisorPid);
+			identityTrackedProcesses.delete(replacementHelloA.supervisorPid);
+			if (replacementSupervisor.exitCode === null && replacementSupervisor.signalCode === null) {
+				replacementSupervisor.kill("SIGTERM");
+			}
+			await waitForExit(replacementSupervisor);
+			children.delete(replacementSupervisor);
+
+			// Detached launchers admitted during the killed-supervisor window can finish
+			// after the tracked replacement exits. Drain only supervisors authenticated
+			// on this test-owned socket, and require two clients to agree on identity.
+			let unavailableSince = Date.now();
+			const drainDeadline = Date.now() + 5000;
+			while (Date.now() < drainDeadline) {
+				const first = new DaemonClient(socketPath);
+				try {
+					await first.connect(100);
+				} catch {
+					first.close();
+					if (Date.now() - unavailableSince >= 1000) break;
+					await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+					continue;
+				}
+				unavailableSince = Date.now();
+				const second = new DaemonClient(socketPath);
+				try {
+					await second.connect(1000);
+					const firstHello = await first.waitForHello(1000);
+					const secondHello = await second.waitForHello(1000);
+					if (
+						!firstHello.supervisorPid ||
+						!firstHello.supervisorProcessStartId ||
+						secondHello.supervisorPid !== firstHello.supervisorPid ||
+						secondHello.supervisorProcessStartId !== firstHello.supervisorProcessStartId ||
+						getProcessStartId(firstHello.supervisorPid) !== firstHello.supervisorProcessStartId
+					) {
+						throw new Error("Late test supervisor identity was not current and shared");
+					}
+					identityTrackedProcesses.set(firstHello.supervisorPid, firstHello.supervisorProcessStartId);
+					const lateShutdown = await first.request({ type: "shutdown" }, 2000);
+					if (!lateShutdown.success) throw new Error("Late test supervisor rejected shutdown");
+					await waitForProcessGone(firstHello.supervisorPid);
+					identityTrackedProcesses.delete(firstHello.supervisorPid);
+				} finally {
+					first.close();
+					second.close();
+				}
+			}
+			if (Date.now() - unavailableSince < 1000) {
+				throw new Error("Test-owned supervisor socket did not remain unavailable");
+			}
+		},
+		75_000,
+	);
+
+	it.runIf(process.platform === "win32")(
+		"proves exact owned cleanup over a Windows named pipe",
+		async () => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const sessionDir = join(agentDir, "sessions");
+			const sessionFile = createSnapshotSessionFile(agentDir, projectDir, "issue #33 Windows owner");
+			const socketPath = String.raw`\\.\pipe\prime-issue33-${process.pid}-${randomUUID().slice(0, 8)}`;
+			mkdirSync(projectDir, { recursive: true });
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const owner = await connectEventually(socketPath, supervisor);
+			const launchEnv = collectDaemonLaunchEnv(process.env);
+			for (const name of Object.keys(launchEnv)) {
+				if (name.startsWith("RLM_") || /TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|AUTH|COOKIE/i.test(name)) {
+					delete launchEnv[name];
+				}
+			}
+			Object.assign(launchEnv, {
+				PI_OFFLINE: "1",
+				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+				[ENV_AGENT_DIR]: agentDir,
+				PRIME_AGENT_TEST_WINDOWS_ENV_A: "windows-a",
+			});
+			const created = await owner.request({
+				type: "create",
+				lifecycle: "client_owned",
+				sessionPath: sessionFile,
+				launchEnv,
+				launchEnvMode: "replace",
+				config: {
+					cwd: projectDir,
+					agentDir,
+					sessionDir,
+					provider: "faux",
+					model: "faux",
+					noTools: true,
+					noExtensions: true,
+				},
+			});
+			if (!created.success) throw new Error(created.error);
+			const summary = requireSummary(created.data);
+			if (!summary.workerPid) throw new Error("Windows owned worker did not expose its pid");
+			const activeSessionId = summary.activeSessionId ?? summary.id;
+			const descriptor = readWorkerDescriptors(agentDir).find(
+				(candidate) => candidate.rootActiveSessionId === activeSessionId,
+			);
+			if (!descriptor?.pid || !descriptor.processStartId) {
+				throw new Error("Windows owned worker did not expose a complete process identity");
+			}
+			identityTrackedProcesses.set(descriptor.pid, descriptor.processStartId);
+			const connection = await DaemonAgentConnection.attach(owner, activeSessionId, {
+				ownedSession: true,
+				ownedSessionLaunchEnv: launchEnv,
+				ownedSessionRecoveryConfig: {
+					cwd: projectDir,
+					agentDir,
+					sessionDir,
+					provider: "faux",
+					model: "faux",
+					noTools: true,
+					noExtensions: true,
+				},
+				supportsExtensionUi: false,
+			});
+			expect(connection.getOwnedSessionContractProof()).toMatchObject({
+				feature: "caller_owned_session_environment_cleanup_v1",
+				status: "attached",
+			});
+			const cleanup = await connection.disposeOwnedSession({ timeoutMs: 30_000 });
+			expect(cleanup.status).toBe("completed");
+			await waitForProcessGone(descriptor.pid);
+			identityTrackedProcesses.delete(descriptor.pid);
+			await owner.request({ type: "shutdown" });
+			owner.close();
+			await waitForSocketGone(socketPath);
+		},
+		60_000,
+	);
 
 	it("lets a different client prove cleanup after the owner socket disappears", async () => {
 		const root = tempDir();

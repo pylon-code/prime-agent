@@ -2,7 +2,11 @@
  * Run modes for the coding agent.
  */
 
-export { PRIME_AGENT_SDK_FEATURES, type PrimeAgentSdkFeature } from "../sdk-features.js";
+export {
+	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+	PRIME_AGENT_SDK_FEATURES,
+	type PrimeAgentSdkFeature,
+} from "../sdk-features.js";
 export {
 	type AcpModeOptions,
 	acpStopReason,
@@ -29,6 +33,11 @@ export type {
 	AgentConnectionSessionEvent,
 	AgentConnectionSlashCommand,
 	AgentConnectionState,
+	DaemonAgentConnectionOptions,
+	DaemonOwnedSessionContractProof,
+	DaemonOwnedSessionDaemonIdentity,
+	DaemonOwnedSessionDisposeOptions,
+	DaemonOwnedSessionDisposeResult,
 } from "./agent-connection/index.js";
 export { DaemonAgentConnection, InProcessAgentConnection } from "./agent-connection/index.js";
 export { type AgentsViewModeOptions, runAgentsViewMode } from "./agents-view/agents-view-mode.js";
@@ -68,6 +77,7 @@ export {
 	DaemonClient,
 	type DaemonClientMessageListener,
 	type DaemonClientOptions,
+	type DaemonClientRequestOptions,
 	DaemonInboundFrameTooLargeError,
 	DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES,
 } from "./daemon/daemon-client.js";
@@ -87,6 +97,8 @@ export type {
 	DaemonOutbound,
 	DaemonOwnedSessionCleanupResult,
 	DaemonOwnedSessionCleanupStatus,
+	DaemonOwnedSessionCompletionResult,
+	DaemonOwnedSessionCompletionStatus,
 	DaemonProtocolInfo,
 	DaemonProtocolName,
 	DaemonProtocolVersion,

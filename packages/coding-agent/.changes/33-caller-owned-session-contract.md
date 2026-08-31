@@ -1,0 +1,1 @@
+- Added a negotiated caller-owned session environment proof and observable bounded cleanup outcomes for daemon SDK hosts. ([#33](https://github.com/pylon-code/prime-agent/issues/33))

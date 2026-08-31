@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	cloneCallerOwnedSessionLaunchEnv,
+	collectDaemonLaunchEnv,
 	createDaemonCommandEnvelope,
 	createDaemonEventEnvelope,
 	createDaemonEventMeta,
@@ -30,6 +32,7 @@ import {
 	type DaemonWorkerDescriptor,
 	durableDaemonWorkerDescriptor,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
+import { CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE } from "../src/sdk-features.js";
 
 describe("daemon protocol helpers", () => {
 	it("serializes worker descriptors as identity-only version 2 state", () => {
@@ -44,6 +47,7 @@ describe("daemon protocol helpers", () => {
 			supervisorSocketPath: "/tmp/supervisor.sock",
 			authenticationToken: "local-worker-token",
 			rootActiveSessionId: "active",
+			callerOwnedEnvironmentContract: true,
 			sessionFile: "/sessions/root.jsonl",
 			createdAt: "2026-01-01T00:00:00.000Z",
 			updatedAt: "2026-01-01T00:00:00.000Z",
@@ -72,11 +76,109 @@ describe("daemon protocol helpers", () => {
 		expect(durable.createCommand).toEqual({ type: "create", sessionPath: "/sessions/root.jsonl" });
 		expect(durable).toMatchObject({
 			workerId: "worker",
+			callerOwnedEnvironmentContract: true,
 			sessionFile: "/sessions/root.jsonl",
 			sessionDir: "/legacy/sessions",
 			telemetryDisabled: true,
 		});
 		expect(JSON.stringify(durable)).not.toContain("secret-");
+	});
+
+	it("defensively clones exact caller-owned environments without exposing rejected values", () => {
+		const source = { PROVIDER_TOKEN: "secret-a", Path: "/caller/bin" };
+		const snapshot = cloneCallerOwnedSessionLaunchEnv(source, "linux");
+		source.PROVIDER_TOKEN = "secret-c";
+
+		expect(snapshot).toEqual({ PROVIDER_TOKEN: "secret-a", Path: "/caller/bin" });
+		expect(Object.isFrozen(snapshot)).toBe(true);
+		expect(cloneCallerOwnedSessionLaunchEnv({ Path: "a", PATH: "b" }, "linux")).toEqual({
+			Path: "a",
+			PATH: "b",
+		});
+		expect(() => cloneCallerOwnedSessionLaunchEnv({ Path: "a", PATH: "b" }, "win32")).toThrow(
+			"duplicate Windows environment keys",
+		);
+		for (const invalid of [
+			{ "": "value" },
+			{ "BAD=NAME": "value" },
+			{ "BAD\0NAME": "value" },
+			{ BAD_VALUE: "value\0suffix" },
+			{ prime_agent_internal_private: "value" },
+			{ BAD_TYPE: 1 } as unknown as Record<string, string>,
+		]) {
+			expect(() => cloneCallerOwnedSessionLaunchEnv(invalid)).toThrow(TypeError);
+		}
+		const accessor = {} as Record<string, string>;
+		Object.defineProperty(accessor, "PRIVATE", { get: () => "value" });
+		expect(() => cloneCallerOwnedSessionLaunchEnv(accessor)).toThrow(TypeError);
+		const symbolKeyed = {} as Record<string, string>;
+		Object.defineProperty(symbolKeyed, Symbol("private"), { value: "value" });
+		expect(() => cloneCallerOwnedSessionLaunchEnv(symbolKeyed)).toThrow("string environment keys");
+		const inherited = Object.create({ INHERITED_PRIVATE: "ignored" }) as Record<string, string>;
+		expect(cloneCallerOwnedSessionLaunchEnv(inherited)).toEqual({});
+		const reserved = "private-environment-canary";
+		const error = (() => {
+			try {
+				cloneCallerOwnedSessionLaunchEnv({ PRIME_AGENT_INTERNAL_PRIVATE: reserved });
+			} catch (cause) {
+				return cause;
+			}
+		})();
+		expect(error).toBeInstanceOf(TypeError);
+		expect(String(error)).not.toContain(reserved);
+
+		const proxyCanary = "hostile-proxy-private-canary";
+		const hostileProxy = new Proxy(Object.create(null) as Record<string, string>, {
+			ownKeys() {
+				throw new Error(proxyCanary);
+			},
+		});
+		let proxyError: unknown;
+		try {
+			cloneCallerOwnedSessionLaunchEnv(hostileProxy);
+		} catch (cause) {
+			proxyError = cause;
+		}
+		expect(proxyError).toBeInstanceOf(TypeError);
+		expect(String(proxyError)).toBe(
+			"TypeError: ownedSessionLaunchEnv must be an inspectable string environment record",
+		);
+		expect(String(proxyError)).not.toContain(proxyCanary);
+		const revoked = Proxy.revocable(Object.create(null) as Record<string, string>, {});
+		revoked.revoke();
+		expect(() => cloneCallerOwnedSessionLaunchEnv(revoked.proxy)).toThrow(
+			"ownedSessionLaunchEnv must be an inspectable string environment record",
+		);
+
+		for (const key of ["RLM_DEPTH", "rlm_depth", "Rlm_Depth"]) {
+			expect(() => cloneCallerOwnedSessionLaunchEnv({ [key]: "private-depth" })).toThrow(TypeError);
+		}
+		expect(
+			collectDaemonLaunchEnv({ RLM_DEPTH: "1", rlm_depth: "2", KEEP_EXACT: "yes" } as NodeJS.ProcessEnv),
+		).toEqual({ KEEP_EXACT: "yes" });
+	});
+
+	it("capability-gates exact launch replacement without changing legacy commands", () => {
+		const exact = getDaemonCommandCompatibilities({
+			type: "create",
+			lifecycle: "client_owned",
+			launchEnv: { PROVIDER_TOKEN: "private" },
+			launchEnvMode: "replace",
+		});
+		expect(exact).toEqual([
+			{
+				minProtocol: 7,
+				minSchemaRevision: 29,
+				capability: CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+			},
+			{ minProtocol: 7 },
+		]);
+		expect(getDaemonCommandCompatibilities({ type: "create", launchEnv: { PROVIDER_TOKEN: "legacy" } })).toEqual([
+			{ minProtocol: 7 },
+		]);
+		expect(DAEMON_SUPPORTED_CLIENT_CAPABILITIES).toContain(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE);
+		expect(DAEMON_SUPERVISOR_SERVER_CAPABILITIES).toContain(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE);
 	});
 
 	it("keeps the advertised schema identity synchronized with wire type shapes", () => {
@@ -93,8 +195,22 @@ describe("daemon protocol helpers", () => {
 			source.indexOf("export type DaemonOutbound ="),
 			source.indexOf("export const DAEMON_OUTBOUND_COMPATIBILITY"),
 		);
+		const ownedSessionSource = source.slice(
+			source.indexOf("export type DaemonOwnedSessionCleanupStatus"),
+			source.indexOf("export type DaemonServerCapability"),
+		);
+		const launchEnvironmentSource = source.slice(
+			source.indexOf("export type DaemonLaunchEnvMode"),
+			source.indexOf("/**\n * The allowlist of env vars"),
+		);
+		const errorInfoSource = source.slice(
+			source.indexOf("export type DaemonErrorInfo ="),
+			source.indexOf("export type DaemonSessionClosedReason"),
+		);
 		const digest = createHash("sha256")
-			.update(`${commandSource}\n${savedSessionSource}\n${outboundSource}`)
+			.update(
+				`${commandSource}\n${savedSessionSource}\n${outboundSource}\n${ownedSessionSource}\n${launchEnvironmentSource}\n${errorInfoSource}`,
+			)
 			.digest("hex")
 			.slice(0, 12);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
@@ -173,7 +289,7 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("capability- and schema-gates fresh snapshot generation nonces", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(28);
+		expect(DAEMON_SCHEMA_REVISION).toBe(29);
 		expect(DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION).toBe(28);
 		expect(
 			getDaemonCommandCompatibilities({

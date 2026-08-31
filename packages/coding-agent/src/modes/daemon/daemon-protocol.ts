@@ -28,6 +28,7 @@ import type {
 import type { QueuedMessageLane, QueuedMessageMutation } from "../../core/session-action-store.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import { CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE } from "../../sdk-features.js";
 import type {
 	AgentConnectionAgentStatus,
 	AgentConnectionHeartbeat,
@@ -79,8 +80,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 26 correlates snapshot failures that occur before a begin frame can be emitted.
 // Revision 27 adds a capability-gated authoritative owned-session cleanup query.
 // Revision 28 negotiates fresh snapshot generations and adds private worker chunk routing metadata.
-export const DAEMON_SCHEMA_REVISION = 28;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-7c0c21a689b5";
+// Revision 29 capability-gates exact caller-owned launch environments and observable cleanup results.
+export const DAEMON_SCHEMA_REVISION = 29;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-5450eb231171";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -100,7 +102,8 @@ export type DaemonClientCapability =
 	| "chunked_snapshot"
 	| "immutable_snapshot_transfer_v1"
 	| "client_owned_sessions"
-	| "correlated_prompt_lifecycle_v1";
+	| "correlated_prompt_lifecycle_v1"
+	| typeof CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE;
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -108,6 +111,11 @@ export interface DaemonPromptAdmissionCancellationResult {
 export type DaemonOwnedSessionCleanupStatus = "active" | "stopping" | "settled";
 export interface DaemonOwnedSessionCleanupResult {
 	status: DaemonOwnedSessionCleanupStatus;
+}
+
+export type DaemonOwnedSessionCompletionStatus = "completed";
+export interface DaemonOwnedSessionCompletionResult {
+	status: DaemonOwnedSessionCompletionStatus;
 }
 export type DaemonServerCapability =
 	| DaemonClientCapability
@@ -161,10 +169,13 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"immutable_snapshot_transfer_v1",
 	"client_owned_sessions",
 	"correlated_prompt_lifecycle_v1",
+	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
-	...DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
+	...DAEMON_SUPPORTED_CLIENT_CAPABILITIES.filter(
+		(capability) => capability !== CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+	),
 	"delete_rlm_subagent",
 	"heartbeat_catalog",
 	"heartbeat_management",
@@ -187,6 +198,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 export const DAEMON_SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	"authoritative_owned_session_cleanup_v1",
+	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -224,8 +236,12 @@ export interface DaemonClientEnv {
 
 export type DaemonSessionLifecycle = "resident" | "client_owned";
 
+export type DaemonLaunchEnvMode = "replace";
+
 export interface DaemonLaunchEnv {
 	launchEnv?: Record<string, string>;
+	/** Capability-gated: use only this snapshot plus Prime-owned worker bootstrap variables. */
+	launchEnvMode?: DaemonLaunchEnvMode;
 }
 
 /**
@@ -256,11 +272,66 @@ export function collectDaemonClientEnv(source: NodeJS.ProcessEnv = process.env):
 export function collectDaemonLaunchEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(source)) {
-		if (value !== undefined && !key.startsWith("PRIME_AGENT_INTERNAL_")) {
+		const normalizedKey = key.toUpperCase();
+		if (value !== undefined && !normalizedKey.startsWith("PRIME_AGENT_INTERNAL_") && normalizedKey !== "RLM_DEPTH") {
 			env[key] = value;
 		}
 	}
 	return env;
+}
+
+/** Clone an untrusted caller-owned worker environment without retaining or reporting its values. */
+export function cloneCallerOwnedSessionLaunchEnv(
+	source: Readonly<Record<string, string>>,
+	platform: NodeJS.Platform = process.platform,
+): Readonly<Record<string, string>> {
+	if (typeof source !== "object" || source === null) {
+		throw new TypeError("ownedSessionLaunchEnv must be a string environment record");
+	}
+	let descriptors: PropertyDescriptorMap;
+	try {
+		if (Array.isArray(source)) {
+			throw new TypeError("ownedSessionLaunchEnv must be a string environment record");
+		}
+		descriptors = Object.getOwnPropertyDescriptors(source);
+	} catch {
+		throw new TypeError("ownedSessionLaunchEnv must be an inspectable string environment record");
+	}
+	const environment = Object.create(null) as Record<string, string>;
+	const windowsKeys = new Set<string>();
+	for (const key of Reflect.ownKeys(descriptors)) {
+		if (typeof key !== "string") {
+			throw new TypeError("ownedSessionLaunchEnv must use string environment keys");
+		}
+		const descriptor = descriptors[key]!;
+		const value = descriptor.value;
+		if (
+			!("value" in descriptor) ||
+			key.length === 0 ||
+			key.includes("=") ||
+			key.includes("\0") ||
+			key.toUpperCase().startsWith("PRIME_AGENT_INTERNAL_") ||
+			key.toUpperCase() === "RLM_DEPTH" ||
+			typeof value !== "string" ||
+			value.includes("\0")
+		) {
+			throw new TypeError("ownedSessionLaunchEnv must be a string environment record without reserved keys");
+		}
+		if (platform === "win32") {
+			const normalizedKey = key.toUpperCase();
+			if (windowsKeys.has(normalizedKey)) {
+				throw new TypeError("ownedSessionLaunchEnv contains duplicate Windows environment keys");
+			}
+			windowsKeys.add(normalizedKey);
+		}
+		Object.defineProperty(environment, key, {
+			value,
+			enumerable: true,
+			configurable: false,
+			writable: false,
+		});
+	}
+	return Object.freeze(environment);
 }
 
 export interface DaemonReplayInfo {
@@ -744,6 +815,11 @@ const AUTHORITATIVE_OWNED_SESSION_CLEANUP_COMMAND = {
 	minSchemaRevision: 27,
 	capability: "authoritative_owned_session_cleanup_v1",
 } as const;
+const CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 29,
+	capability: CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+} as const;
 const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
@@ -898,6 +974,12 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	if ((command.type === "attach" || command.type === "reattach") && command.recoveryConfig !== undefined) {
 		requirements.push(OWNED_SESSION_RECOVERY_CONTEXT);
 	}
+	if (
+		(command.type === "create" || command.type === "attach" || command.type === "reattach") &&
+		command.launchEnvMode === "replace"
+	) {
+		requirements.push(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_COMMAND);
+	}
 	if (command.type === "attach" && command.snapshotGenerationNonce !== undefined) {
 		requirements.push(SNAPSHOT_GENERATION_NONCE_COMMAND);
 	}
@@ -939,7 +1021,8 @@ export type DaemonErrorInfo =
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
-	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
+	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId }
+	| { code: "owned_session_owner_mismatch" };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 export type DaemonClosingReason = "shutdown" | "update";

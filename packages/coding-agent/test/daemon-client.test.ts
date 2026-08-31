@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+	DaemonAgentConnectionOptions as RootDaemonAgentConnectionOptions,
 	DaemonClientOptions as RootDaemonClientOptions,
+	DaemonClientRequestOptions as RootDaemonClientRequestOptions,
+	DaemonOwnedSessionDisposeResult as RootDaemonOwnedSessionDisposeResult,
 	PrimeAgentSdkFeature as RootPrimeAgentSdkFeature,
 } from "../src/index.js";
 import * as publicSdk from "../src/index.js";
@@ -209,10 +212,28 @@ describe("DaemonClient", () => {
 		const rootFeatures: RootPrimeAgentSdkFeature[] = [
 			"bounded_daemon_ingress_v1",
 			"negotiated_daemon_session_capabilities_v1",
+			"caller_owned_session_environment_cleanup_v1",
 		];
+		const rootConnectionOptions: RootDaemonAgentConnectionOptions = {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private" },
+			ownedSessionRecoveryConfig: {},
+		};
+		const rootRequestOptions: RootDaemonClientRequestOptions = { recoverAcrossReconnect: false };
+		const rootDisposeResult: RootDaemonOwnedSessionDisposeResult = {
+			feature: "caller_owned_session_environment_cleanup_v1",
+			status: "unsupported",
+		};
 		expect(Array.isArray(publicSdk.PRIME_AGENT_SDK_FEATURES)).toBe(true);
 		expect(publicSdk.PRIME_AGENT_SDK_FEATURES).toEqual(rootFeatures);
 		expect(Object.isFrozen(publicSdk.PRIME_AGENT_SDK_FEATURES)).toBe(true);
+		expect(publicSdk.CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE).toBe(
+			"caller_owned_session_environment_cleanup_v1",
+		);
+		expect(rootConnectionOptions.ownedSession).toBe(true);
+		expect(rootConnectionOptions.ownedSessionRecoveryConfig).toEqual({});
+		expect(rootRequestOptions.recoverAcrossReconnect).toBe(false);
+		expect(rootDisposeResult.status).toBe("unsupported");
 		expect(publicSdk.DaemonClient).toBe(DaemonClient);
 		expect(publicSdk.DaemonInboundFrameTooLargeError).toBe(DaemonInboundFrameTooLargeError);
 		expect(publicSdk.DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES).toBe(
@@ -628,6 +649,46 @@ describe("DaemonClient", () => {
 		).rejects.toThrow("does not support session_input_admission");
 		expect(socket.writes).toEqual([]);
 		client.close();
+	});
+
+	it("gates exact caller-owned launch replacement while preserving legacy launch commands", async () => {
+		const oldClient = new DaemonClient("/tmp/prime-agent-old.sock");
+		const oldConnect = oldClient.connect();
+		const oldSocket = netMock.sockets.at(-1)!;
+		oldSocket.emit("connect");
+		await oldConnect;
+		emitHello(oldSocket, DAEMON_PROTOCOL_VERSION, ["client_owned_sessions"], 28);
+
+		await expect(
+			oldClient.request({
+				type: "create",
+				lifecycle: "client_owned",
+				launchEnv: { PROVIDER_TOKEN: "private" },
+				launchEnvMode: "replace",
+			}),
+		).rejects.toThrow("does not support caller_owned_session_environment_cleanup_v1");
+		expect(oldSocket.writes).toEqual([]);
+		oldClient.close();
+
+		const legacyClient = new DaemonClient("/tmp/prime-agent-new.sock");
+		const legacyConnect = legacyClient.connect();
+		const legacySocket = netMock.sockets.at(-1)!;
+		legacySocket.emit("connect");
+		await legacyConnect;
+		emitHello(
+			legacySocket,
+			DAEMON_PROTOCOL_VERSION,
+			["client_owned_sessions", "caller_owned_session_environment_cleanup_v1"],
+			DAEMON_SCHEMA_REVISION,
+		);
+		const request = legacyClient.request({
+			type: "create",
+			lifecycle: "client_owned",
+			launchEnv: { PROVIDER_TOKEN: "legacy" },
+		});
+		await vi.waitFor(() => expect(legacySocket.writes).toHaveLength(1));
+		legacyClient.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
 	it("field-gates prompt admissionId before writing raw commands", async () => {
@@ -1142,6 +1203,37 @@ describe("DaemonClient", () => {
 			`${JSON.stringify({ id: firstEnvelope.id, type: "response", command: "prompt", success: true })}\n`,
 		);
 		await expect(response).resolves.toMatchObject({ id: firstEnvelope.id, success: true });
+		client.close();
+	});
+
+	it("rejects only requests that opt out of reconnect recovery while preserving legacy replay", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket);
+
+		const ordinary = client.request({ type: "list" });
+		const ordinaryWireData = firstSocket.writes[0]!;
+		const ordinaryEnvelope = JSON.parse(ordinaryWireData) as { id: string };
+		const transportBound = client.request({ type: "list" }, 30_000, { recoverAcrossReconnect: false });
+		expect(firstSocket.writes).toHaveLength(2);
+		firstSocket.emit("close");
+
+		await expect(transportBound).rejects.toThrow("Connection to the Prime Agent daemon closed");
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(secondSocket);
+		expect(secondSocket.writes).toEqual([ordinaryWireData]);
+		secondSocket.emit(
+			"data",
+			`${JSON.stringify({ id: ordinaryEnvelope.id, type: "response", command: "list", success: true })}\n`,
+		);
+		await expect(ordinary).resolves.toMatchObject({ id: ordinaryEnvelope.id, success: true });
 		client.close();
 	});
 

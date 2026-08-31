@@ -75,7 +75,11 @@ import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
 import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "./modes/daemon/daemon-catalog-process.js";
 import { deserializeDaemonError } from "./modes/daemon/daemon-errors.js";
-import { collectDaemonClientEnv, collectDaemonLaunchEnv } from "./modes/daemon/daemon-protocol.js";
+import {
+	cloneCallerOwnedSessionLaunchEnv,
+	collectDaemonClientEnv,
+	collectDaemonLaunchEnv,
+} from "./modes/daemon/daemon-protocol.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	isDaemonWorkerProcess,
@@ -111,6 +115,7 @@ import { ExtensionSelectorComponent } from "./modes/interactive/components/exten
 import { shouldRunOnboarding } from "./modes/interactive/onboarding.js";
 import { initTheme, preloadCodeHighlighter, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
 import { handleConfigCommand } from "./package-manager-cli.js";
+import { CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE } from "./sdk-features.js";
 import { isLocalPath } from "./utils/paths.js";
 
 /**
@@ -956,17 +961,28 @@ async function createDaemonClientConnection(options: {
 	noSession?: boolean;
 	supportsExtensionUi?: boolean;
 }): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
+	// Capture before the first await so attach and every later recovery use one caller-owned snapshot.
+	const callerOwnedLaunchEnv =
+		options.clientOwned && options.activeSessionId === undefined
+			? cloneCallerOwnedSessionLaunchEnv(collectDaemonLaunchEnv())
+			: undefined;
 	// Caller must have awaited ensureInteractiveDaemonRunning for this socket.
 	const client = new DaemonClient(options.socketPath);
 	await client.connect();
 
 	try {
+		await client.waitForHello();
+		const supportsCallerOwnedEnvironmentContract =
+			callerOwnedLaunchEnv !== undefined &&
+			client.supportsServerCapability(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE) &&
+			client.supportsServerCapability("authoritative_owned_session_cleanup_v1");
 		const attach = async (summary: SessionSummary) => {
 			const connection = await DaemonAgentConnection.attach(client, getDaemonSummaryActiveSessionId(summary), {
 				closeClientOnDispose: true,
 				sendClientEnv: true,
 				ownedSession: options.clientOwned,
 				ownedSessionRecoveryConfig: options.clientOwned ? options.config : undefined,
+				ownedSessionLaunchEnv: supportsCallerOwnedEnvironmentContract ? callerOwnedLaunchEnv : undefined,
 				supportsExtensionUi: options.supportsExtensionUi,
 				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 				telemetryDisabled: options.config.telemetryDisabled,
@@ -989,7 +1005,6 @@ async function createDaemonClientConnection(options: {
 			}
 		}
 		if (options.clientOwned) {
-			await client.waitForHello();
 			if (!client.supportsServerCapability("client_owned_sessions")) {
 				throw new DaemonCapabilityUnavailableError("create", "client_owned_sessions");
 			}
@@ -1003,7 +1018,10 @@ async function createDaemonClientConnection(options: {
 			noSession: options.noSession,
 			env: collectDaemonClientEnv(),
 			lifecycle: options.clientOwned ? "client_owned" : "resident",
-			launchEnv: collectDaemonLaunchEnv(),
+			launchEnv: supportsCallerOwnedEnvironmentContract
+				? (callerOwnedLaunchEnv as Record<string, string>)
+				: collectDaemonLaunchEnv(),
+			launchEnvMode: supportsCallerOwnedEnvironmentContract ? "replace" : undefined,
 		});
 		if (!response.success) {
 			throw deserializeDaemonError(response);

@@ -188,10 +188,36 @@ jobs:
         working-directory: ${{ matrix.package }}
         run: ${{ matrix.command }}
 
+  owned-session-contract-windows:
+    name: Caller-owned session contract (Windows named pipe)
+    needs: trust
+    if: needs.trust.outputs.allowed == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test named-pipe owned cleanup
+        working-directory: packages/coding-agent
+        run: npx tsx ../../node_modules/vitest/dist/cli.js --run test/daemon-supervisor-process.test.ts -t "proves exact owned cleanup over a Windows named pipe"
+
   build-check-test:
     name: build-check-test
     if: always() && (needs.trust.outputs.allowed == 'true' || inputs.require_trusted)
-    needs: [trust, build-check, test]
+    needs: [trust, build-check, test, owned-session-contract-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Verify CI results
@@ -199,7 +225,9 @@ jobs:
           TRUST_ALLOWED: ${{ needs.trust.outputs.allowed }}
           BUILD_CHECK_RESULT: ${{ needs.build-check.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          WINDOWS_OWNED_SESSION_RESULT: ${{ needs.owned-session-contract-windows.result }}
         run: |
           test "$TRUST_ALLOWED" = true
           test "$BUILD_CHECK_RESULT" = success
           test "$TEST_RESULT" = success
+          test "$WINDOWS_OWNED_SESSION_RESULT" = success

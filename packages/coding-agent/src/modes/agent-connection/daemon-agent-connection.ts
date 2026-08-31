@@ -32,6 +32,7 @@ import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { SessionStats } from "../../core/session-stats.js";
+import { CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE, PRIME_AGENT_SDK_FEATURES } from "../../sdk-features.js";
 import {
 	DaemonCapabilityUnavailableError,
 	type DaemonClient,
@@ -39,8 +40,11 @@ import {
 } from "../daemon/daemon-client.js";
 import { deserializeDaemonError } from "../daemon/daemon-errors.js";
 import {
+	cloneCallerOwnedSessionLaunchEnv,
 	collectDaemonClientEnv,
 	collectDaemonLaunchEnv,
+	DAEMON_PROTOCOL_NAME,
+	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION,
 	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonAttachResult,
@@ -48,7 +52,10 @@ import {
 	type DaemonCommand,
 	type DaemonEventCursor,
 	type DaemonOutbound,
+	type DaemonOwnedSessionCleanupResult,
+	type DaemonOwnedSessionCompletionResult,
 	type DaemonReplayInfo,
+	type DaemonResponse,
 	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
 	isUnknownDaemonCommandError,
@@ -196,10 +203,36 @@ const MAX_COMPLETED_SNAPSHOTS = 128;
 const PROMPT_LIFECYCLE_TERMINAL_RETENTION = 256;
 const PROMPT_LIFECYCLE_TOMBSTONE_RETENTION = 256;
 const OWNED_SESSION_DISPOSE_RECONNECT_WAIT_MS = 10_000;
+const OWNED_SESSION_DISPOSE_POLL_MS = 50;
 const updateTransportReconnects = new WeakMap<DaemonClient, Promise<void>>();
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function safeDaemonAppVersion(value: unknown): string | undefined {
+	return typeof value === "string" &&
+		value.length <= 64 &&
+		/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(value)
+		? value
+		: undefined;
+}
+
+function safeDaemonBuildId(value: unknown, appVersion: string | undefined): string | undefined {
+	if (typeof value !== "string" || value.length > 128) return undefined;
+	if (appVersion && value === `release-${appVersion}`) return value;
+	if (/^pylon-build-g[0-9a-f]{12}-r[1-9]\d*$/.test(value)) return value;
+	return /^(?:v?\d+\.\d+\.\d+-\d+-g)?[0-9a-f]{7,40}(?:-dirty)?$/.test(value) ? value : undefined;
+}
+
+function isSafeSupervisorGeneration(value: unknown): value is string {
+	return (
+		typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+	);
+}
+
+function isUnknownActiveSessionError(error: unknown): boolean {
+	return error instanceof Error && error.message.startsWith("Unknown active session");
 }
 
 function formatErrorSentence(error: unknown): string {
@@ -312,10 +345,97 @@ export interface DaemonAgentConnectionOptions {
 	supportsExtensionUi?: boolean;
 	/** Dispose the connection by stopping its hidden worker instead of detaching. */
 	ownedSession?: boolean;
-	/** Fresh runtime context used only if the owned worker must be relaunched. */
+	/**
+	 * Fresh runtime context used only if the owned worker must be relaunched.
+	 * Required whenever `ownedSessionLaunchEnv` is supplied.
+	 */
 	ownedSessionRecoveryConfig?: AgentSessionRuntimeConfig;
+	/**
+	 * Immutable caller-owned worker environment used for every owned attach and recovery.
+	 * Requires `ownedSessionRecoveryConfig`. The SDK clones it once and never exposes it
+	 * through contract proof or cleanup results.
+	 */
+	ownedSessionLaunchEnv?: Readonly<Record<string, string>>;
 	/** Require the target worker to have been created with telemetry disabled. */
 	telemetryDisabled?: true;
+}
+
+export interface DaemonOwnedSessionDaemonIdentity {
+	readonly protocolName: typeof DAEMON_PROTOCOL_NAME;
+	readonly protocolVersion: number;
+	readonly schemaRevision: number;
+	readonly appVersion?: string;
+	readonly buildId?: string;
+	readonly supervisorGeneration: string;
+	readonly transportGeneration: number;
+}
+
+export interface DaemonOwnedSessionContractProof {
+	readonly feature: typeof CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE;
+	readonly status: "attached";
+	readonly daemon: DaemonOwnedSessionDaemonIdentity;
+}
+
+interface DaemonOwnedSessionDisposeBase {
+	readonly feature: typeof CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE;
+	readonly started?: DaemonOwnedSessionContractProof;
+	readonly observed?: DaemonOwnedSessionDaemonIdentity;
+}
+
+export type DaemonOwnedSessionDisposeResult =
+	| (DaemonOwnedSessionDisposeBase & {
+			readonly status: "completed" | "already_completed";
+			readonly started: DaemonOwnedSessionContractProof;
+			readonly observed: DaemonOwnedSessionDaemonIdentity;
+			readonly daemonReplaced: boolean;
+	  })
+	| (DaemonOwnedSessionDisposeBase & {
+			readonly status: "replacement_settled";
+			readonly started: DaemonOwnedSessionContractProof;
+			readonly observed: DaemonOwnedSessionDaemonIdentity;
+			readonly daemonReplaced: true;
+	  })
+	| (DaemonOwnedSessionDisposeBase & { readonly status: "owner_mismatch" })
+	| (DaemonOwnedSessionDisposeBase & {
+			readonly status: "uncertain";
+			readonly reason: "active" | "stopping";
+	  })
+	| (DaemonOwnedSessionDisposeBase & { readonly status: "transport_failure" | "unsupported" });
+
+export interface DaemonOwnedSessionDisposeOptions {
+	/** One total deadline for observation, side-question aborts, and finalization. */
+	readonly timeoutMs?: number;
+}
+
+interface DaemonOwnedSessionCleanupAttachProof {
+	readonly activeSessionId: string;
+	readonly supervisorGeneration: string;
+	readonly transportGeneration: number;
+}
+
+class OwnedSessionCleanupDeadlineError extends Error {
+	constructor() {
+		super("Owned session cleanup deadline elapsed");
+		this.name = "OwnedSessionCleanupDeadlineError";
+	}
+}
+
+class OwnedSessionCleanupTransportFenceError extends Error {
+	constructor() {
+		super("Owned session cleanup transport changed during the request");
+		this.name = "OwnedSessionCleanupTransportFenceError";
+	}
+}
+
+function hasSameOwnedSessionDaemonTransport(
+	left: DaemonOwnedSessionDaemonIdentity,
+	right: DaemonOwnedSessionDaemonIdentity | undefined,
+): boolean {
+	return (
+		right !== undefined &&
+		left.supervisorGeneration === right.supervisorGeneration &&
+		left.transportGeneration === right.transportGeneration
+	);
 }
 
 /**
@@ -418,6 +538,18 @@ function isCorrelatedPromptRuntimeFrame(message: DaemonOutbound): boolean {
 }
 
 export class DaemonAgentConnection implements AgentConnection {
+	private readonly client: DaemonClient;
+	private activeSessionId: string;
+	private readonly options: DaemonAgentConnectionOptions;
+	private ownedSessionLaunchEnv: Readonly<Record<string, string>> | undefined;
+	private currentOwnedSessionContractProof: DaemonOwnedSessionContractProof | undefined;
+	private currentOwnedSessionContractProofActiveSessionId: string | undefined;
+	private lastOwnedSessionContractProof: DaemonOwnedSessionContractProof | undefined;
+	private lastOwnedSessionContractProofActiveSessionId: string | undefined;
+	private ownedSessionDisposePromise: Promise<DaemonOwnedSessionDisposeResult> | undefined;
+	private ownedSessionDisposeResult: DaemonOwnedSessionDisposeResult | undefined;
+	private ownedSessionCleanupAttachProof: DaemonOwnedSessionCleanupAttachProof | undefined;
+	private ownedSessionDisposeDeadline: number | undefined;
 	private readonly listeners = new Set<AgentConnectionEventListener>();
 	private readonly unsubscribeDaemonMessages: () => void;
 	private readonly unsubscribeDaemonClose: () => void;
@@ -546,11 +678,19 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
-	constructor(
-		private readonly client: DaemonClient,
-		private activeSessionId: string,
-		private readonly options: DaemonAgentConnectionOptions = {},
-	) {
+	constructor(client: DaemonClient, activeSessionId: string, options: DaemonAgentConnectionOptions = {}) {
+		const { ownedSessionLaunchEnv, ...connectionOptions } = options;
+		if (ownedSessionLaunchEnv !== undefined && options.ownedSession !== true) {
+			throw new Error("ownedSessionLaunchEnv requires ownedSession");
+		}
+		if (ownedSessionLaunchEnv !== undefined && options.ownedSessionRecoveryConfig === undefined) {
+			throw new Error("ownedSessionLaunchEnv requires ownedSessionRecoveryConfig");
+		}
+		this.client = client;
+		this.activeSessionId = activeSessionId;
+		this.options = connectionOptions;
+		this.ownedSessionLaunchEnv =
+			ownedSessionLaunchEnv === undefined ? undefined : cloneCallerOwnedSessionLaunchEnv(ownedSessionLaunchEnv);
 		if (options.recoverDaemon) {
 			this.client.enableRequestRecovery();
 		}
@@ -604,6 +744,46 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.terminalCloseEmitted = true;
 			void this.emit({ type: "closed", error: this.formatDaemonConnectionClosedError(error) });
 		});
+	}
+
+	private hasCallerOwnedSessionEnvironmentContract(): boolean {
+		return (
+			this.options.ownedSession === true &&
+			this.options.ownedSessionRecoveryConfig !== undefined &&
+			this.ownedSessionLaunchEnv !== undefined &&
+			PRIME_AGENT_SDK_FEATURES.includes(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE)
+		);
+	}
+
+	private serverOffersCallerOwnedSessionEnvironmentContract(): boolean {
+		return (
+			this.client.supportsServerCapability(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE) &&
+			this.client.supportsServerCapability("authoritative_owned_session_cleanup_v1")
+		);
+	}
+
+	private ownedSessionLaunchFields(): {
+		launchEnv?: Record<string, string>;
+		launchEnvMode?: "replace";
+	} {
+		if (!this.options.ownedSession) return {};
+		if (this.ownedSessionLaunchEnv) {
+			return {
+				launchEnv: this.ownedSessionLaunchEnv as Record<string, string>,
+				launchEnvMode: "replace",
+			};
+		}
+		return { launchEnv: collectDaemonLaunchEnv() };
+	}
+
+	private ownedSessionRecoveryFields(): {
+		recoveryConfig?: AgentSessionRuntimeConfig;
+	} {
+		return this.options.ownedSession &&
+			this.options.ownedSessionRecoveryConfig &&
+			this.client.supportsServerCapability("owned_session_recovery_context")
+			? { recoveryConfig: this.options.ownedSessionRecoveryConfig }
+			: {};
 	}
 
 	static async attach(
@@ -691,6 +871,9 @@ export class DaemonAgentConnection implements AgentConnection {
 			"chunked_snapshot",
 			...(this.supportsCorrelatedPromptLifecycle() ? (["correlated_prompt_lifecycle_v1"] as const) : []),
 			...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
+			...(this.hasCallerOwnedSessionEnvironmentContract() && this.serverOffersCallerOwnedSessionEnvironmentContract()
+				? ([CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE] as const)
+				: []),
 		];
 		const attachmentEpoch = this.advanceAttachmentEpoch();
 		this.reserveSharedAttachment(requestedActiveSessionId);
@@ -714,12 +897,8 @@ export class DaemonAgentConnection implements AgentConnection {
 					clientId: this.clientId,
 					capabilities,
 					env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
-					launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
-					...(this.options.ownedSession &&
-					this.options.ownedSessionRecoveryConfig &&
-					this.client.supportsServerCapability("owned_session_recovery_context")
-						? { recoveryConfig: this.options.ownedSessionRecoveryConfig }
-						: {}),
+					...this.ownedSessionLaunchFields(),
+					...this.ownedSessionRecoveryFields(),
 					telemetryDisabled: this.options.telemetryDisabled,
 					resumeCursor:
 						resumeCursor === undefined
@@ -802,7 +981,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				allowWhileDisposing,
 			);
 			this.commitStagedSnapshot(staged);
-			if (!this.disposing) this.publishNegotiatedCapabilityProof(negotiatedCapabilities, transportGeneration);
+			this.publishNegotiatedCapabilityProof(negotiatedCapabilities, transportGeneration);
 		} else {
 			validateSummaryIdentity(result, nextActiveSessionId);
 			this.assertAttachmentCommit(
@@ -818,7 +997,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.attachedSessionFile = result.sessionFile;
 			this.latestSnapshot = undefined;
 			this.latestSnapshotIsFresh = false;
-			if (!this.disposing) this.publishNegotiatedCapabilityProof(negotiatedCapabilities, transportGeneration);
+			this.publishNegotiatedCapabilityProof(negotiatedCapabilities, transportGeneration);
 		}
 		this.captureDaemonLogPath();
 		this.updateReconnectFailed = false;
@@ -962,6 +1141,20 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	supportsAcpMcpServers(): boolean {
 		return this.client.supportsServerCapability("acp_mcp_servers");
+	}
+
+	/** Current secret-free proof that this owned attachment uses the caller-owned environment contract. */
+	getOwnedSessionContractProof(): DaemonOwnedSessionContractProof | undefined {
+		if (
+			this.disposing ||
+			this.disposed ||
+			!this.currentOwnedSessionContractProof ||
+			this.currentOwnedSessionContractProofActiveSessionId !== this.activeSessionId ||
+			!this.supportsNegotiatedCapability(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE)
+		) {
+			return undefined;
+		}
+		return this.currentOwnedSessionContractProof;
 	}
 
 	/**
@@ -1959,6 +2152,10 @@ export class DaemonAgentConnection implements AgentConnection {
 				"chunked_snapshot",
 				...(this.supportsCorrelatedPromptLifecycle() ? (["correlated_prompt_lifecycle_v1"] as const) : []),
 				...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
+				...(this.hasCallerOwnedSessionEnvironmentContract() &&
+				this.client.supportsServerCapability(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE)
+					? ([CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE] as const)
+					: []),
 			];
 			let result!: DaemonAttachResult;
 			let snapshot!: DaemonSessionSnapshot;
@@ -1980,7 +2177,8 @@ export class DaemonAgentConnection implements AgentConnection {
 									clientId: this.clientId,
 									capabilities,
 									env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
-									launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
+									...this.ownedSessionLaunchFields(),
+									...this.ownedSessionRecoveryFields(),
 									telemetryDisabled: this.options.telemetryDisabled,
 								}
 							: {
@@ -1991,6 +2189,8 @@ export class DaemonAgentConnection implements AgentConnection {
 									clientId: this.clientId,
 									capabilities,
 									env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
+									...this.ownedSessionLaunchFields(),
+									...this.ownedSessionRecoveryFields(),
 									telemetryDisabled: this.options.telemetryDisabled,
 								},
 					);
@@ -2198,10 +2398,204 @@ export class DaemonAgentConnection implements AgentConnection {
 		};
 	}
 
-	async dispose(): Promise<void> {
+	async disposeOwnedSession(options: DaemonOwnedSessionDisposeOptions = {}): Promise<DaemonOwnedSessionDisposeResult> {
+		if (this.ownedSessionDisposeResult) return this.ownedSessionDisposeResult;
+		if (this.ownedSessionDisposePromise) return this.ownedSessionDisposePromise;
+		const timeoutMs = options.timeoutMs ?? OWNED_SESSION_DISPOSE_RECONNECT_WAIT_MS;
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+			throw new RangeError("timeoutMs must be a positive safe integer");
+		}
+		const deadline = Date.now() + timeoutMs;
+		const operation = this.disposeOwnedSessionUnserialized(deadline).then((result) => {
+			this.ownedSessionDisposeResult = result;
+			return result;
+		});
+		this.ownedSessionDisposePromise = operation;
+		return operation;
+	}
+
+	private async disposeOwnedSessionUnserialized(deadline: number): Promise<DaemonOwnedSessionDisposeResult> {
+		const feature = CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE;
+		const started = this.lastOwnedSessionContractProof;
+		const startedActiveSessionId = this.lastOwnedSessionContractProofActiveSessionId;
 		if (this.disposed || this.disposing) {
+			return Object.freeze({ feature, status: "unsupported", ...(started ? { started } : {}) });
+		}
+		this.ownedSessionDisposeDeadline = deadline;
+		const serverRoutedActiveSessionId = this.serverRoutedActiveSessionId();
+		if (
+			this.currentOwnedSessionContractProof &&
+			this.currentOwnedSessionContractProofActiveSessionId === serverRoutedActiveSessionId
+		) {
+			this.ownedSessionCleanupAttachProof = {
+				activeSessionId: serverRoutedActiveSessionId,
+				supervisorGeneration: this.currentOwnedSessionContractProof.daemon.supervisorGeneration,
+				transportGeneration: this.currentOwnedSessionContractProof.daemon.transportGeneration,
+			};
+		}
+		this.disposing = true;
+		this.advanceAttachmentEpoch();
+		let result: DaemonOwnedSessionDisposeResult;
+		if (
+			!this.hasCallerOwnedSessionEnvironmentContract() ||
+			!started ||
+			startedActiveSessionId !== serverRoutedActiveSessionId
+		) {
+			result = Object.freeze({ feature, status: "unsupported", ...(started ? { started } : {}) });
+			const action = this.options.ownedSession
+				? started && startedActiveSessionId !== serverRoutedActiveSessionId
+					? "none"
+					: "complete"
+				: "detach";
+			await this.finalizeDisposedConnection(serverRoutedActiveSessionId, action);
+			return result;
+		}
+		try {
+			result = await this.observeOwnedSessionCleanup(started, serverRoutedActiveSessionId, deadline);
+		} catch {
+			result = Object.freeze({ feature, status: "transport_failure", started });
+		}
+		await this.finalizeDisposedConnection(serverRoutedActiveSessionId, "none");
+		return result;
+	}
+
+	private async observeOwnedSessionCleanup(
+		started: DaemonOwnedSessionContractProof,
+		activeSessionId: string,
+		deadline: number,
+	): Promise<DaemonOwnedSessionDisposeResult> {
+		const feature = CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE;
+		let lastStatus: DaemonOwnedSessionCleanupResult["status"] | undefined;
+		let lastObserved: DaemonOwnedSessionDaemonIdentity | undefined;
+		let completionAttempted = false;
+		while (Date.now() < deadline) {
+			if (!this.client.isConnected) {
+				const reconnect = this.reconnectPromise;
+				if (!reconnect) {
+					return Object.freeze({
+						feature,
+						status: "transport_failure",
+						started,
+						...(lastObserved ? { observed: lastObserved } : {}),
+					});
+				}
+				await this.awaitOwnedSessionDisposeDeadline(reconnect.catch(() => undefined)).catch(() => undefined);
+				if (!this.client.isConnected) continue;
+			}
+			const observed = this.currentOwnedSessionDaemonIdentity();
+			if (!observed) {
+				return Object.freeze({ feature, status: "unsupported", started });
+			}
+			lastObserved = observed;
+			const cleanupAttachProof = this.ownedSessionCleanupAttachProof;
+			const hasCurrentAttachProof =
+				cleanupAttachProof?.activeSessionId === activeSessionId &&
+				cleanupAttachProof.supervisorGeneration === observed.supervisorGeneration &&
+				cleanupAttachProof.transportGeneration === observed.transportGeneration;
+			try {
+				const cleanup = await this.requestData<DaemonOwnedSessionCleanupResult>({
+					type: "get_owned_session_cleanup",
+					activeSessionId,
+				});
+				if (!hasSameOwnedSessionDaemonTransport(observed, this.currentOwnedSessionDaemonIdentity())) {
+					throw new OwnedSessionCleanupTransportFenceError();
+				}
+				if (cleanup.status !== "active" && cleanup.status !== "stopping" && cleanup.status !== "settled") {
+					return Object.freeze({ feature, status: "transport_failure", started, observed });
+				}
+				lastStatus = cleanup.status;
+				const daemonReplaced = started.daemon.supervisorGeneration !== observed.supervisorGeneration;
+				if (cleanup.status === "settled") {
+					if (daemonReplaced) {
+						return Object.freeze({
+							feature,
+							status: "replacement_settled",
+							started,
+							observed,
+							daemonReplaced: true,
+						});
+					}
+					return Object.freeze({
+						feature,
+						status: completionAttempted ? "completed" : "already_completed",
+						started,
+						observed,
+						daemonReplaced: false,
+					});
+				}
+				if (cleanup.status === "active" && hasCurrentAttachProof) {
+					completionAttempted = true;
+					const completion = await this.completeOwnedSessionWithStructuredFailure(activeSessionId, observed);
+					if (completion === "owner_mismatch") {
+						return Object.freeze({ feature, status: "owner_mismatch", started, observed });
+					}
+					if (completion === "completed") {
+						return Object.freeze({
+							feature,
+							status: "completed",
+							started,
+							observed,
+							daemonReplaced,
+						});
+					}
+				}
+			} catch (error) {
+				if (error instanceof OwnedSessionCleanupDeadlineError) break;
+				if (!this.client.isConnected && !this.reconnectPromise) {
+					return Object.freeze({ feature, status: "transport_failure", started, observed });
+				}
+			}
+			const remainingMs = deadline - Date.now();
+			if (remainingMs > 0) await delay(Math.min(OWNED_SESSION_DISPOSE_POLL_MS, remainingMs));
+		}
+		if (lastStatus === "active" || lastStatus === "stopping") {
+			return Object.freeze({
+				feature,
+				status: "uncertain",
+				reason: lastStatus,
+				started,
+				...(lastObserved ? { observed: lastObserved } : {}),
+			});
+		}
+		return Object.freeze({
+			feature,
+			status: "transport_failure",
+			started,
+			...(lastObserved ? { observed: lastObserved } : {}),
+		});
+	}
+
+	private async completeOwnedSessionWithStructuredFailure(
+		activeSessionId: string,
+		expectedDaemon: DaemonOwnedSessionDaemonIdentity,
+	): Promise<"completed" | "owner_mismatch"> {
+		if (!hasSameOwnedSessionDaemonTransport(expectedDaemon, this.currentOwnedSessionDaemonIdentity())) {
+			throw new OwnedSessionCleanupTransportFenceError();
+		}
+		const response = await this.requestDaemonCommandWithinOwnedSessionDeadline({
+			type: "complete_owned_session",
+			activeSessionId,
+		});
+		if (!hasSameOwnedSessionDaemonTransport(expectedDaemon, this.currentOwnedSessionDaemonIdentity())) {
+			throw new OwnedSessionCleanupTransportFenceError();
+		}
+		if (!response.success) {
+			if (response.errorInfo?.code === "owned_session_owner_mismatch") return "owner_mismatch";
+			const error = deserializeDaemonError(response);
+			this.definitiveRequestErrors.add(error);
+			throw error;
+		}
+		const completion = response.data as DaemonOwnedSessionCompletionResult | undefined;
+		if (completion === undefined || completion.status === "completed") return "completed";
+		throw new Error("Daemon returned invalid owned session completion result");
+	}
+
+	async dispose(): Promise<void> {
+		if (this.ownedSessionDisposePromise) {
+			await this.ownedSessionDisposePromise;
 			return;
 		}
+		if (this.disposed || this.disposing) return;
 		this.disposing = true;
 		this.advanceAttachmentEpoch();
 		if (this.options.ownedSession && !this.client.isConnected && this.reconnectPromise) {
@@ -2209,26 +2603,42 @@ export class DaemonAgentConnection implements AgentConnection {
 				() => undefined,
 			);
 		}
+		await this.finalizeDisposedConnection(
+			this.serverRoutedActiveSessionId(),
+			this.options.ownedSession ? "complete" : "detach",
+		);
+	}
+
+	private serverRoutedActiveSessionId(): string {
+		return [...this.pendingReattachActiveSessionIds].at(-1) ?? this.activeSessionId;
+	}
+
+	private async finalizeDisposedConnection(
+		serverRoutedActiveSessionId: string,
+		action: "complete" | "detach" | "none",
+	): Promise<void> {
 		this.disposed = true;
 		this.invalidateNegotiatedCapabilityProof();
 		this.updateRestartPending = false;
 		await Promise.allSettled([...this.activeSideQuestionIds].map((id) => this.abortSideQuestion(id)));
 		this.unsubscribeDaemonMessages();
 		this.unsubscribeDaemonClose();
-		const pendingActiveSessionId = [...this.pendingReattachActiveSessionIds].at(-1);
-		const serverRoutedActiveSessionId = pendingActiveSessionId ?? this.activeSessionId;
 		this.invalidateSharedAttachment(serverRoutedActiveSessionId);
-		if (this.options.ownedSession) {
+		if (action === "complete") {
 			await this.requestOk({ type: "complete_owned_session", activeSessionId: serverRoutedActiveSessionId }).catch(
 				() => undefined,
 			);
-		} else {
+		} else if (action === "detach") {
 			await this.requestOk({ type: "detach", activeSessionId: serverRoutedActiveSessionId }).catch(() => undefined);
 		}
-		if (this.options.closeClientOnDispose) {
-			this.client.close();
-		}
+		if (this.options.closeClientOnDispose) this.client.close();
 		this.rejectSnapshotAssemblies(new Error("Daemon connection disposed during snapshot transfer"));
+		this.ownedSessionLaunchEnv = undefined;
+		this.currentOwnedSessionContractProof = undefined;
+		this.currentOwnedSessionContractProofActiveSessionId = undefined;
+		this.lastOwnedSessionContractProof = undefined;
+		this.lastOwnedSessionContractProofActiveSessionId = undefined;
+		this.ownedSessionCleanupAttachProof = undefined;
 	}
 
 	async promoteToResident(): Promise<void> {
@@ -2244,6 +2654,11 @@ export class DaemonAgentConnection implements AgentConnection {
 			const result = await operation(promoteOwnedSession);
 			if (promoteOwnedSession) {
 				this.options.ownedSession = false;
+				this.ownedSessionLaunchEnv = undefined;
+				this.currentOwnedSessionContractProof = undefined;
+				this.currentOwnedSessionContractProofActiveSessionId = undefined;
+				this.lastOwnedSessionContractProof = undefined;
+				this.lastOwnedSessionContractProofActiveSessionId = undefined;
 			}
 			return result;
 		});
@@ -2309,6 +2724,14 @@ export class DaemonAgentConnection implements AgentConnection {
 					return;
 				} catch (error) {
 					lastError = error instanceof Error ? error : new Error(String(error));
+					if (
+						this.disposing &&
+						this.options.ownedSession === true &&
+						this.client.isConnected &&
+						isUnknownActiveSessionError(lastError)
+					) {
+						return;
+					}
 					if (this.client.isClosed) {
 						this.emitOwnerClosedTerminal();
 						return;
@@ -2337,6 +2760,43 @@ export class DaemonAgentConnection implements AgentConnection {
 		return this.reconnectPromise;
 	}
 
+	private awaitOwnedSessionDisposeDeadline<T>(operation: Promise<T>): Promise<T> {
+		const deadline = this.ownedSessionDisposeDeadline;
+		if (deadline === undefined) return operation;
+		const remainingMs = deadline - Date.now();
+		if (remainingMs <= 0) return Promise.reject(new OwnedSessionCleanupDeadlineError());
+		return new Promise<T>((resolveOperation, rejectOperation) => {
+			const timer = setTimeout(() => rejectOperation(new OwnedSessionCleanupDeadlineError()), remainingMs);
+			operation.then(
+				(value) => {
+					clearTimeout(timer);
+					resolveOperation(value);
+				},
+				(error) => {
+					clearTimeout(timer);
+					rejectOperation(error);
+				},
+			);
+		});
+	}
+
+	private requestDaemonCommandWithinOwnedSessionDeadline(
+		command: DaemonCommandBody,
+		timeoutMs?: number,
+		options?: Parameters<DaemonClient["request"]>[2],
+	): Promise<DaemonResponse> {
+		const deadline = this.ownedSessionDisposeDeadline;
+		let effectiveTimeoutMs = timeoutMs;
+		let effectiveOptions = options;
+		if (deadline !== undefined) {
+			const remainingMs = deadline - Date.now();
+			if (remainingMs <= 0) return Promise.reject(new OwnedSessionCleanupDeadlineError());
+			effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs ?? remainingMs, remainingMs));
+			effectiveOptions = { ...options, recoverAcrossReconnect: false };
+		}
+		return this.awaitOwnedSessionDisposeDeadline(this.client.request(command, effectiveTimeoutMs, effectiveOptions));
+	}
+
 	private async requestOk(command: DaemonCommandBody): Promise<void> {
 		await this.requestData<unknown>(command);
 	}
@@ -2346,7 +2806,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		timeoutMs?: number,
 		options?: Parameters<DaemonClient["request"]>[2],
 	): Promise<T> {
-		const response = await this.client.request(command, timeoutMs, options);
+		const response = await this.requestDaemonCommandWithinOwnedSessionDeadline(command, timeoutMs, options);
 		if (!response.success) {
 			const error = deserializeDaemonError(response);
 			this.definitiveRequestErrors.add(error);
@@ -2987,6 +3447,8 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	private invalidateNegotiatedCapabilityProof(clearRuntimeCapabilities = true): void {
 		this.attachmentInvalidationRevision++;
+		this.currentOwnedSessionContractProof = undefined;
+		this.currentOwnedSessionContractProofActiveSessionId = undefined;
 		this.negotiatedCapabilities = new Set();
 		this.negotiatedTransportGeneration = undefined;
 		if (clearRuntimeCapabilities) {
@@ -3062,12 +3524,82 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (this.replacementReconciliationFailed) {
 			throw new Error("Daemon connection replacement reconciliation has failed");
 		}
+		if (this.disposing) {
+			this.discardUnsolicitedRuntimeSnapshots = true;
+			this.negotiatedCapabilities = new Set();
+			this.negotiatedTransportGeneration = undefined;
+			this.negotiatedRuntimeCapabilities = new Set();
+			this.negotiatedRuntimeTransportGeneration = undefined;
+			this.currentOwnedSessionContractProof = undefined;
+			this.currentOwnedSessionContractProofActiveSessionId = undefined;
+			const daemon = capabilities.has(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE)
+				? this.currentOwnedSessionDaemonIdentity()
+				: undefined;
+			this.ownedSessionCleanupAttachProof = daemon
+				? {
+						activeSessionId: this.activeSessionId,
+						supervisorGeneration: daemon.supervisorGeneration,
+						transportGeneration: daemon.transportGeneration,
+					}
+				: undefined;
+			this.pendingNegotiatedRuntimeFrames = [];
+			this.pendingNegotiatedRuntimeFrameWeight = 0;
+			return;
+		}
 		this.discardUnsolicitedRuntimeSnapshots = false;
 		this.negotiatedCapabilities = capabilities;
 		this.negotiatedTransportGeneration = transportGeneration;
 		this.negotiatedRuntimeCapabilities = capabilities;
 		this.negotiatedRuntimeTransportGeneration = transportGeneration;
+		this.currentOwnedSessionContractProof = capabilities.has(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE)
+			? this.createOwnedSessionContractProof()
+			: undefined;
+		this.currentOwnedSessionContractProofActiveSessionId = this.currentOwnedSessionContractProof
+			? this.activeSessionId
+			: undefined;
+		if (this.currentOwnedSessionContractProof) {
+			this.lastOwnedSessionContractProof = this.currentOwnedSessionContractProof;
+			this.lastOwnedSessionContractProofActiveSessionId = this.activeSessionId;
+		}
 		this.releasePendingNegotiatedRuntimeFrames();
+	}
+
+	private currentOwnedSessionDaemonIdentity(): DaemonOwnedSessionDaemonIdentity | undefined {
+		const hello = this.client.hello;
+		if (
+			!hello ||
+			!this.hasCallerOwnedSessionEnvironmentContract() ||
+			!this.serverOffersCallerOwnedSessionEnvironmentContract() ||
+			hello.protocol.name !== DAEMON_PROTOCOL_NAME ||
+			!Number.isSafeInteger(hello.protocol.version) ||
+			hello.protocol.version < DAEMON_PROTOCOL_VERSION ||
+			!Number.isSafeInteger(hello.schemaRevision) ||
+			(hello.schemaRevision ?? 0) < 29 ||
+			!isSafeSupervisorGeneration(hello.supervisorGeneration)
+		) {
+			return undefined;
+		}
+		const appVersion = safeDaemonAppVersion(hello.appVersion);
+		const buildId = safeDaemonBuildId(hello.runtime?.buildId, appVersion);
+		return Object.freeze({
+			protocolName: DAEMON_PROTOCOL_NAME,
+			protocolVersion: hello.protocol.version,
+			schemaRevision: hello.schemaRevision!,
+			...(appVersion === undefined ? {} : { appVersion }),
+			...(buildId === undefined ? {} : { buildId }),
+			supervisorGeneration: hello.supervisorGeneration,
+			transportGeneration: this.client.getTransportGeneration(),
+		});
+	}
+
+	private createOwnedSessionContractProof(): DaemonOwnedSessionContractProof | undefined {
+		const daemon = this.currentOwnedSessionDaemonIdentity();
+		if (!daemon) return undefined;
+		return Object.freeze({
+			feature: CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+			status: "attached",
+			daemon,
+		});
 	}
 
 	private negotiatedCapabilitiesFromAttach(
