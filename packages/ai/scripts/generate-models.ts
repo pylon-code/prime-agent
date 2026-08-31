@@ -21,6 +21,10 @@ import {
 } from "../src/types.js";
 import { MODELS as EXISTING_MODELS } from "../src/models.generated.js";
 
+if (process.env.PYLON_RELEASE_OFFLINE === "1") {
+	throw new Error("Pylon release builds must use committed model data and cannot refresh live catalogs.");
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageRoot = join(__dirname, "..");

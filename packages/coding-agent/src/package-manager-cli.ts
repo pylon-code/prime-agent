@@ -37,6 +37,7 @@ import {
 	getSelfUpdateCommand,
 	getSelfUpdateUnavailableInstruction,
 	PACKAGE_NAME,
+	PYLON_DISTRIBUTION,
 	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	type SelfUpdateCommand,
@@ -425,6 +426,12 @@ function printSelfUpdateUnavailable(
 
 function printSelfUpdateFallback(command: SelfUpdateCommand): void {
 	console.error(chalk.dim(`If this keeps failing, run this command yourself: ${command.display}`));
+}
+
+function printPylonDistributionUpdate(): void {
+	console.error("error: this Pylon Prime build does not use Prime Agent's stock self-updater.");
+	console.error("Install a verified Pylon build through Pylon or visit:");
+	console.error("https://github.com/pylon-code/prime-agent/releases");
 }
 
 interface SelfUpdatePlan {
@@ -1602,6 +1609,11 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 					}
 				}
 				if (updateTargetIncludesSelf(target)) {
+					if (PYLON_DISTRIBUTION) {
+						printPylonDistributionUpdate();
+						process.exitCode = 1;
+						return true;
+					}
 					const selfUpdatePlan = await getSelfUpdatePlan(options.force);
 					if (!selfUpdatePlan.shouldRun) {
 						setSelfUpdateNoChangeExitCode();

@@ -11,6 +11,7 @@ import {
 	getSelfUpdateUnavailableInstruction,
 	getSessionsDir,
 	getUpdateInstruction,
+	parsePylonDistribution,
 } from "../src/config.js";
 import { getDefaultSessionDir } from "../src/core/session-manager.js";
 
@@ -455,5 +456,45 @@ describe("getDaemonLogPath", () => {
 		}
 
 		expect(getDaemonLogPath("/a//b.sock")).toBe(getDaemonLogPath("/a/b.sock"));
+	});
+});
+
+describe("Pylon distribution metadata", () => {
+	const sourceCommit = "0123456789abcdef0123456789abcdef01234567";
+	const sourceTree = "89abcdef0123456789abcdef0123456789abcdef";
+	const packageLockSha256 = "a".repeat(64);
+
+	test("accepts immutable exact-build provenance", () => {
+		const provenance = {
+			schemaVersion: 1,
+			repository: "https://github.com/pylon-code/prime-agent",
+			sourceCommit,
+			sourceTree,
+			buildId: `pylon-build-g${sourceCommit.slice(0, 12)}-r1`,
+			recipeRevision: 1,
+			node: "22.23.2",
+			npm: "11.10.1",
+			packageLockSha256,
+		} as const;
+		expect(parsePylonDistribution(provenance)).toEqual(provenance);
+	});
+
+	test("rejects mutable, mismatched, or foreign provenance", () => {
+		const valid = {
+			schemaVersion: 1,
+			repository: "https://github.com/pylon-code/prime-agent",
+			sourceCommit,
+			sourceTree,
+			buildId: `pylon-build-g${sourceCommit.slice(0, 12)}-r1`,
+			recipeRevision: 1,
+			node: "22.23.2",
+			npm: "11.10.1",
+			packageLockSha256,
+		};
+		expect(parsePylonDistribution({ ...valid, repository: "https://example.test/prime-agent" })).toBeUndefined();
+		expect(parsePylonDistribution({ ...valid, buildId: "pylon-stable" })).toBeUndefined();
+		expect(parsePylonDistribution({ ...valid, recipeRevision: 2 })).toBeUndefined();
+		expect(parsePylonDistribution({ ...valid, packageLockSha256: "latest" })).toBeUndefined();
+		expect(parsePylonDistribution({ ...valid, channel: "stable" })).toBeUndefined();
 	});
 });

@@ -5,6 +5,7 @@ import {
 	getLatestPiRelease,
 	getLatestPiVersion,
 	isNewerPackageVersion,
+	shouldCheckForPrimeAgentUpdates,
 } from "../src/utils/version-check.js";
 
 const defaultPrimeAgentDownloadBaseUrl = "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev";
@@ -84,6 +85,22 @@ describe("version checks", () => {
 			packageName: "prime-agent",
 			version: "1.2.4",
 		});
+	});
+
+	it("disables the stock update feed for Pylon distributions", () => {
+		expect(
+			shouldCheckForPrimeAgentUpdates({
+				schemaVersion: 1,
+				repository: "https://github.com/pylon-code/prime-agent",
+				sourceCommit: "0123456789abcdef0123456789abcdef01234567",
+				sourceTree: "89abcdef0123456789abcdef0123456789abcdef",
+				buildId: "pylon-build-g0123456789ab-r1",
+				recipeRevision: 1,
+				node: "22.23.2",
+				npm: "11.10.1",
+				packageLockSha256: "a".repeat(64),
+			}),
+		).toBe(false);
 	});
 
 	it("skips api calls when version checks are disabled", async () => {

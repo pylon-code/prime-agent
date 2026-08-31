@@ -1,0 +1,9 @@
+{
+	"schemaVersion": 1,
+	"recipeRevision": 1,
+	"sourceRepository": "https://github.com/pylon-code/prime-agent",
+	"nodeVersion": "22.23.2",
+	"npmVersion": "11.10.1",
+	"minimumNodeVersion": "22.8.0",
+	"buildTagPattern": "pylon-build-g{commit12}-r{recipeRevision}"
+}

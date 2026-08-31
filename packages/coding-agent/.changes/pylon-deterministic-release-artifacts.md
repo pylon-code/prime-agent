@@ -1,0 +1,1 @@
+- Added deterministic Pylon release artifacts that preserve Prime Agent compatibility and keep fork builds on the Pylon update path ([#28](https://github.com/pylon-code/prime-agent/issues/28)).

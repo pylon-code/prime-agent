@@ -1,3 +1,4 @@
+import { PYLON_DISTRIBUTION } from "../config.js";
 import { getPiUserAgent } from "./pi-user-agent.js";
 
 const DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL = "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev";
@@ -85,6 +86,10 @@ export function isNewerPackageVersion(candidateVersion: string, currentVersion: 
 	return candidateVersion.trim() !== currentVersion.trim();
 }
 
+export function shouldCheckForPrimeAgentUpdates(distribution: typeof PYLON_DISTRIBUTION = PYLON_DISTRIBUTION): boolean {
+	return distribution === undefined;
+}
+
 function getPrimeAgentDownloadBaseUrl(): string {
 	return (process.env.PRIME_AGENT_DOWNLOAD_BASE_URL?.trim() || DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL).replace(
 		/\/+$/,
@@ -115,7 +120,8 @@ export async function getLatestPiRelease(
 	currentVersion: string,
 	options: { timeoutMs?: number } = {},
 ): Promise<LatestPiRelease | undefined> {
-	if (process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE) return undefined;
+	if (!shouldCheckForPrimeAgentUpdates() || process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE)
+		return undefined;
 
 	const baseUrl = getPrimeAgentDownloadBaseUrl();
 	const response = await fetch(`${baseUrl}/${getReleaseManifestPath(currentVersion)}`, {
