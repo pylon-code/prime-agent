@@ -3292,7 +3292,7 @@ describe("daemon mode helpers", () => {
 		expect(client.catchupActiveSessionIds).toEqual(new Set());
 	});
 
-	it("terminates a failed catch-up attempt without an unbounded self-retry", async () => {
+	it("emits one worker pre-begin catch-up failure without an unbounded self-retry", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -3355,6 +3355,18 @@ describe("daemon mode helpers", () => {
 			}),
 			expect.objectContaining({ type: "session_resynced", activeSessionId: secondState.activeSessionId }),
 		]);
+		expect(
+			messages.filter(
+				(message) =>
+					message.activeSessionId === firstState.activeSessionId && message.type === "session_snapshot_failed",
+			),
+		).toHaveLength(1);
+		expect(
+			messages.some(
+				(message) =>
+					message.activeSessionId === firstState.activeSessionId && message.type === "session_snapshot_begin",
+			),
+		).toBe(false);
 	});
 
 	it("clears a scheduled catch-up retry when the client disconnects", async () => {

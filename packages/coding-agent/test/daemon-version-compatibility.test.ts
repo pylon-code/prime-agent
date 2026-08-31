@@ -15,7 +15,7 @@ import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js"
  * The artifact must be built from the pinned git tag v0.8.1, not a protocol mock.
  */
 const historicalCli = process.env.PRIME_AGENT_HISTORICAL_081_CLI;
-const currentCli = resolve(__dirname, "../dist/bundle/cli.js");
+const currentCli = process.env.PRIME_AGENT_CURRENT_CLI ?? resolve(__dirname, "../dist/bundle/cli.js");
 const compiledCli = process.env.PRIME_AGENT_COMPILED_CLI;
 const processTests = historicalCli ? describe : describe.skip;
 const children = new Set<ChildProcess>();
@@ -24,14 +24,8 @@ const roots: string[] = [];
 
 function scrubbedEnvironment(agentDir: string): NodeJS.ProcessEnv {
 	const environment = { ...process.env, [ENV_AGENT_DIR]: agentDir, PI_OFFLINE: "1" };
-	for (const name of [
-		"PRIME_AGENT_INTERNAL_DAEMON_WORKER",
-		"PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN",
-		"PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID",
-		"PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET",
-		"PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL",
-	]) {
-		delete environment[name];
+	for (const name of Object.keys(environment)) {
+		if (name.startsWith("PRIME_AGENT_INTERNAL_DAEMON_") || name.startsWith("RLM_")) delete environment[name];
 	}
 	return environment;
 }
@@ -165,6 +159,7 @@ afterEach(async () => {
 
 processTests("stock v0.8.1 daemon entrypoint compatibility", () => {
 	it.each([
+		["new supervisor adopts a new worker", currentCli, currentCli],
 		["new supervisor adopts a stock 0.8.1 worker", historicalCli!, currentCli],
 		["stock 0.8.1 supervisor adopts a new worker", currentCli, historicalCli!],
 	] as const)(
@@ -282,9 +277,11 @@ performanceTests("compiled snapshot process performance", () => {
 
 		const supervisor = launch(compiledCli!, agentDir, socketPath, projectDir);
 		const client = await connectEventually(socketPath, supervisor);
+		const transferClient = await connectEventually(socketPath, supervisor);
+		const probeClient = await connectEventually(socketPath, supervisor);
 		const created = await client.request({
 			type: "create",
-			sessionPath: sessionFile,
+			noSession: true,
 			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
 		});
 		if (!created.success || !created.data || typeof created.data !== "object") {
@@ -294,30 +291,95 @@ performanceTests("compiled snapshot process performance", () => {
 		if (!summary.activeSessionId || !summary.workerPid || !supervisor.pid) {
 			throw new Error("Compiled snapshot processes were incomplete");
 		}
-		const baselineRss = residentSetBytes(supervisor.pid) + residentSetBytes(summary.workerPid);
+		const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
+			supportsExtensionUi: false,
+		});
+		let replacementTimeout: NodeJS.Timeout | undefined;
+		const replacement = new Promise<void>((resolveReplacement, rejectReplacement) => {
+			const unsubscribe = connection.subscribe((event) => {
+				if (event.type !== "session_replaced") return;
+				unsubscribe();
+				if (replacementTimeout) clearTimeout(replacementTimeout);
+				resolveReplacement();
+			});
+			replacementTimeout = setTimeout(() => {
+				unsubscribe();
+				rejectReplacement(new Error("Compiled snapshot replacement did not finish"));
+			}, 30_000);
+			replacementTimeout.unref();
+		});
+		await connection.switchSession(sessionFile);
+		await replacement;
+		const initialLargeSnapshot = await connection.getInitialSnapshot();
+		expect(initialLargeSnapshot.messages[0]).toMatchObject({ role: "user", content: largePrompt });
+
+		const corruptedCacheFiles = readdirSync(agentDir, { recursive: true, encoding: "utf8" }).filter(
+			(entry) => entry.includes("snapshot-cache") && entry.endsWith(".jsonl"),
+		);
+		expect(corruptedCacheFiles.length).toBeGreaterThan(0);
+		for (const entry of corruptedCacheFiles) rmSync(join(agentDir, entry));
+
+		const baselineSupervisorRss = residentSetBytes(supervisor.pid);
+		const baselineWorkerRss = residentSetBytes(summary.workerPid);
+		const baselineRss = baselineSupervisorRss + baselineWorkerRss;
+		let peakSupervisorRss = baselineSupervisorRss;
+		let peakWorkerRss = baselineWorkerRss;
 		let peakRss = baselineRss;
-		let maxEventLoopDelayMs = 0;
+		let maxClientEventLoopDelayMs = 0;
+		let maxWorkerRoundTripMs = 0;
+		let monitorActive = true;
 		let previousTick = performance.now();
 		const monitor = setInterval(() => {
 			const current = performance.now();
-			maxEventLoopDelayMs = Math.max(maxEventLoopDelayMs, current - previousTick - 25);
+			maxClientEventLoopDelayMs = Math.max(maxClientEventLoopDelayMs, current - previousTick - 25);
 			previousTick = current;
-			peakRss = Math.max(peakRss, residentSetBytes(supervisor.pid!) + residentSetBytes(summary.workerPid!));
+			const supervisorRss = residentSetBytes(supervisor.pid!);
+			const workerRss = residentSetBytes(summary.workerPid!);
+			peakSupervisorRss = Math.max(peakSupervisorRss, supervisorRss);
+			peakWorkerRss = Math.max(peakWorkerRss, workerRss);
+			peakRss = Math.max(peakRss, supervisorRss + workerRss);
 		}, 25);
+		const probe = (async () => {
+			while (monitorActive) {
+				const startedAt = performance.now();
+				const state = await probeClient.request(
+					{ type: "get_state", activeSessionId: summary.activeSessionId! },
+					3_000,
+				);
+				if (!state.success) throw new Error(state.error);
+				maxWorkerRoundTripMs = Math.max(maxWorkerRoundTripMs, performance.now() - startedAt);
+				await new Promise<void>((resolveYield) => setImmediate(resolveYield));
+			}
+		})();
+		let retriedConnection: DaemonAgentConnection | undefined;
 		try {
-			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
+			retriedConnection = await DaemonAgentConnection.attach(transferClient, summary.activeSessionId, {
 				supportsExtensionUi: false,
 			});
-			const snapshot = await connection.getInitialSnapshot();
+			const snapshot = await retriedConnection.getInitialSnapshot();
 			expect(snapshot.messages[0]).toMatchObject({ role: "user", content: largePrompt });
-			await connection.dispose();
 		} finally {
+			monitorActive = false;
 			clearInterval(monitor);
+			await probe;
 		}
-		expect(peakRss - baselineRss).toBeLessThan(192 * 1024 * 1024);
-		expect(maxEventLoopDelayMs).toBeLessThan(500);
+		const rssDeltaBytes = peakRss - baselineRss;
+		console.info(
+			`snapshot process metrics: rssDeltaMiB=${(rssDeltaBytes / 1024 / 1024).toFixed(1)} ` +
+				`supervisorDeltaMiB=${((peakSupervisorRss - baselineSupervisorRss) / 1024 / 1024).toFixed(1)} ` +
+				`workerDeltaMiB=${((peakWorkerRss - baselineWorkerRss) / 1024 / 1024).toFixed(1)} ` +
+				`clientEventLoopDelayMs=${maxClientEventLoopDelayMs.toFixed(1)} ` +
+				`workerRoundTripMs=${maxWorkerRoundTripMs.toFixed(1)}`,
+		);
+		expect(rssDeltaBytes).toBeLessThan(192 * 1024 * 1024);
+		expect(maxClientEventLoopDelayMs).toBeLessThan(500);
+		expect(maxWorkerRoundTripMs).toBeLessThan(1_000);
+		await retriedConnection?.dispose();
+		await connection.dispose();
 		await client.request({ type: "shutdown" });
 		client.close();
+		transferClient.close();
+		probeClient.close();
 		await stopSupervisor(supervisor);
 	}, 120_000);
 });

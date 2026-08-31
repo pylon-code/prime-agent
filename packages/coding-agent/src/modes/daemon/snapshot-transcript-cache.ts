@@ -167,7 +167,7 @@ interface SnapshotTranscriptChunkLifecycle {
 	dispose?(): void;
 }
 
-export type SnapshotTranscriptWireChunk = Buffer | readonly Buffer[];
+export type SnapshotTranscriptWireChunk = Buffer | (readonly Buffer[] & { readonly snapshotMessageCount?: number });
 export type SnapshotTranscriptChunkSource = (
 	| Iterable<SnapshotTranscriptWireChunk>
 	| AsyncIterable<SnapshotTranscriptWireChunk>
@@ -203,17 +203,10 @@ export function createImmutableSnapshotMessages(messages: readonly AgentMessage[
 	return cloneSnapshotValue([...messages]);
 }
 
-function createGenerationGuard(
-	source: readonly AgentMessage[],
-	selected: readonly AgentMessage[],
-	validate?: () => void,
-): () => void {
-	return () => {
-		validate?.();
-		if (!isDeepStrictEqual(source, selected)) {
-			throw new Error("Session snapshot generation changed during transcript preparation");
-		}
-	};
+function assertSnapshotSourceUnchanged(source: readonly AgentMessage[], selected: readonly AgentMessage[]): void {
+	if (!isDeepStrictEqual(source, selected)) {
+		throw new Error("Session snapshot generation changed during transcript preparation");
+	}
 }
 
 interface JsonParts {
@@ -221,21 +214,25 @@ interface JsonParts {
 	bytes: number;
 }
 
+interface IncrementalJsonYieldState {
+	bytesSinceYield: number;
+}
+
 class IncrementalJsonEncoder {
 	private readonly parts: Buffer[] = [];
 	private bytes = 0;
-	private bytesSinceYield = 0;
 	private readonly ancestors = new Set<object>();
 
 	constructor(
 		private readonly signal: AbortSignal | undefined,
-		private readonly assertGeneration: () => void,
+		private readonly validateGeneration: () => void,
+		private readonly yieldState: IncrementalJsonYieldState,
 	) {}
 
 	async encode(value: unknown): Promise<JsonParts> {
 		const encoded = await this.encodeValue(value, "", false);
 		if (!encoded) throw new Error("Snapshot message is not JSON serializable");
-		await this.yieldIfNeeded(true);
+		await this.yieldIfNeeded();
 		return { parts: this.parts, bytes: this.bytes };
 	}
 
@@ -244,15 +241,15 @@ class IncrementalJsonEncoder {
 		if (buffer.length === 0) return;
 		this.parts.push(buffer);
 		this.bytes += buffer.length;
-		this.bytesSinceYield += buffer.length;
+		this.yieldState.bytesSinceYield += buffer.length;
 	}
 
-	private async yieldIfNeeded(force = false): Promise<void> {
-		if (!force && this.bytesSinceYield < SNAPSHOT_PREPARATION_YIELD_BYTES) return;
-		this.bytesSinceYield = 0;
+	private async yieldIfNeeded(): Promise<void> {
+		if (this.yieldState.bytesSinceYield < SNAPSHOT_PREPARATION_YIELD_BYTES) return;
+		this.yieldState.bytesSinceYield = 0;
 		await new Promise<void>((resolveYield) => setImmediate(resolveYield));
 		this.signal?.throwIfAborted();
-		this.assertGeneration();
+		this.validateGeneration();
 	}
 
 	private resolveJsonValue(value: unknown, key: string): unknown {
@@ -412,9 +409,12 @@ export class SnapshotTranscriptPayloadCache {
 		signal?: AbortSignal,
 		validateGeneration?: () => void,
 	): Promise<void> {
-		signal?.throwIfAborted();
-		const assertGeneration = createGenerationGuard(sourceMessages, selectedMessages, validateGeneration);
-		assertGeneration();
+		const validatePreparation = () => {
+			signal?.throwIfAborted();
+			validateGeneration?.();
+		};
+		validatePreparation();
+		const yieldState: IncrementalJsonYieldState = { bytesSinceYield: 0 };
 		let currentParts: Buffer[] = [];
 		let currentBytes = 0;
 		let currentMessages = 0;
@@ -426,8 +426,8 @@ export class SnapshotTranscriptPayloadCache {
 			currentMessages = 0;
 		};
 		for (const message of selectedMessages) {
-			signal?.throwIfAborted();
-			const encoded = await new IncrementalJsonEncoder(signal, assertGeneration).encode(message);
+			validatePreparation();
+			const encoded = await new IncrementalJsonEncoder(signal, validatePreparation, yieldState).encode(message);
 			const separatorBytes = currentMessages > 0 ? 1 : 0;
 			if (currentMessages > 0 && currentBytes + separatorBytes + encoded.bytes > this.targetChunkBytes) {
 				await flush();
@@ -440,10 +440,11 @@ export class SnapshotTranscriptPayloadCache {
 			currentBytes += encoded.bytes;
 			currentMessages++;
 			this.messageTotal++;
-			assertGeneration();
+			validatePreparation();
 		}
 		await flush();
-		assertGeneration();
+		validatePreparation();
+		assertSnapshotSourceUnchanged(sourceMessages, selectedMessages);
 	}
 
 	async readPayloadChunk(index: number): Promise<Buffer> {
@@ -496,7 +497,11 @@ export class SnapshotTranscriptPayloadCache {
 						const prefix =
 							`{"type":"session_snapshot_chunk","activeSessionId":${JSON.stringify(activeSessionId)},` +
 							`"snapshotId":${JSON.stringify(snapshotId)},"index":${index},"messages":[`;
-						yield [Buffer.from(prefix), payload, Buffer.from("]}\n")];
+						const parts = [Buffer.from(prefix), payload, Buffer.from("]}\n")] as Buffer[] & {
+							snapshotMessageCount: number;
+						};
+						parts.snapshotMessageCount = this.chunkMessageCount(index);
+						yield parts;
 					}
 				} finally {
 					release();
@@ -822,7 +827,7 @@ export class SnapshotTranscriptCache {
 		const prefix =
 			`{"type":"session_snapshot_chunk","activeSessionId":${JSON.stringify(this.activeSessionId)},` +
 			`"snapshotId":${JSON.stringify(snapshotId)},"index":${index},"messages":[`;
-		return Buffer.concat([Buffer.from(prefix), chunk.subarray(payloadStart, payloadEnd), Buffer.from("]}\n")]);
+		return [Buffer.from(prefix), chunk.subarray(payloadStart, payloadEnd), Buffer.from("]}\n")];
 	}
 
 	retain(): () => void {
@@ -912,8 +917,7 @@ export class SnapshotTranscriptCache {
 		const index = this.chunks.length - 1;
 		const waiters = this.chunkWaiters.get(index);
 		if (waiters) {
-			const stored = this.readChunk(index);
-			for (const waiter of waiters) waiter.resolve(stored);
+			for (const waiter of waiters) waiter.resolve(buffer);
 			this.chunkWaiters.delete(index);
 		}
 	}

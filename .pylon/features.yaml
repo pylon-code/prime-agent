@@ -194,17 +194,19 @@ decisions:
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/11
       - https://github.com/pylon-code/prime-agent/pull/14
+      - https://github.com/pylon-code/prime-agent/issues/21
+      - https://github.com/pylon-code/prime-agent/pull/19
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/issues/1229
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1845
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1847
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1756
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1864
-    fork_change: immutable-snapshot-transfer-and-isolated-retry
-    upstream_support: Prime now provides one RLM child projection, tolerant legacy topology recovery, recovery-aware session reuse, and ownership checks for in-flight opens, but still reuses the event cursor as snapshot transfer identity, serializes selected message objects lazily, and closes a healthy worker on an isolated duplicate-transfer mismatch.
+    fork_change: immutable-snapshot-transfer-isolated-retry-and-fresh-generation-v1
+    upstream_support: Prime through c382f09856d4 still lacks a capability-gated fresh snapshot-generation identity, attachment-local retry containment, and bounded large-transcript framing that preserve a healthy resident worker across mixed-version catch-up failures.
     revisit_when:
-      - Prime gives each transfer immutable bytes and a unique identity while preserving the event cursor as ordering metadata.
-      - Prime retries an isolated bad snapshot generation without closing the resident worker control channel.
+      - Prime gives every mixed-version transfer immutable bytes and a unique generation identity while preserving the event cursor as ordering metadata.
+      - Prime isolates one malformed or changing snapshot generation without recycling the healthy worker and bounds preparation, framing, drain waits, and spill ownership.
 
   authoritative-owned-session-cleanup:
     area: runtime-reliability
@@ -247,12 +249,14 @@ decisions:
 
   negotiated-daemon-session-capabilities:
     area: runtime-reliability
-    state: candidate
+    state: shipped
     owner: shared
     decision: retain
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/17
+      - https://github.com/pylon-code/prime-agent/pull/18
       - https://github.com/pylon-code/pylon/issues/190
+      - https://github.com/pylon-code/pylon/pull/191
       - https://github.com/rynfar/comet/issues/7
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/tree/a903d4b6768f484bd6d459b7b0aa7dee38e461e2

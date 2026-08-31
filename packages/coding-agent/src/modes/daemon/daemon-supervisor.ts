@@ -74,6 +74,7 @@ import {
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
+	DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION,
 	DAEMON_SUPERVISOR_SERVER_CAPABILITIES,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
@@ -169,6 +170,24 @@ function waitForAbortable<T>(promise: Promise<T>, signal: AbortSignal | undefine
 		signal.addEventListener("abort", onAbort, { once: true });
 		void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
 	});
+}
+
+function hasCanonicalSnapshotChunkEnvelope(
+	payload: Buffer,
+	activeSessionId: string,
+	snapshotId: string,
+	index: number,
+): boolean {
+	const prefix = Buffer.from(
+		`{"type":"session_snapshot_chunk","activeSessionId":${JSON.stringify(activeSessionId)},` +
+			`"snapshotId":${JSON.stringify(snapshotId)},"index":${index},"messages":[`,
+	);
+	const suffix = Buffer.from("]}\n");
+	return (
+		payload.length >= prefix.length + suffix.length &&
+		payload.subarray(0, prefix.length).equals(prefix) &&
+		payload.subarray(payload.length - suffix.length).equals(suffix)
+	);
 }
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
@@ -4550,7 +4569,12 @@ export class DaemonSupervisor {
 							{
 								type: "attach",
 								activeSessionId,
-								snapshotGenerationNonce: randomUUID(),
+								...(workerClient.supportsServerCapability?.(
+									"snapshot_generation_nonce_v1",
+									DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION,
+								)
+									? { snapshotGenerationNonce: randomUUID() }
+									: {}),
 								capabilities: workerCapabilities,
 								supportsExtensionUi: false,
 								env: command.env ?? collectDaemonClientEnv(),
@@ -5447,25 +5471,47 @@ export class DaemonSupervisor {
 			return;
 		}
 		if (outboundType === "session_snapshot_chunk" && activeSessionId) {
-			let chunk: Extract<DaemonOutbound, { type: "session_snapshot_chunk" }>;
+			const routedIndex = frame.header.snapshotChunkIndex;
+			const routedMessageCount = frame.header.snapshotChunkMessageCount;
+			let snapshotId = frameSnapshotId;
+			let chunkIndex: number;
+			let chunkMessageCount: number;
+			if (snapshotId && !this.snapshotGeneration(worker, activeSessionId, snapshotId)?.incoming) return;
 			try {
-				chunk = JSON.parse(frame.payload.toString("utf8")) as typeof chunk;
+				if (snapshotId && routedIndex !== undefined && routedMessageCount !== undefined) {
+					if (!hasCanonicalSnapshotChunkEnvelope(frame.payload, activeSessionId, snapshotId, routedIndex)) {
+						throw new Error(`Snapshot ${snapshotId} returned an invalid canonical chunk envelope`);
+					}
+					chunkIndex = routedIndex;
+					chunkMessageCount = routedMessageCount;
+				} else {
+					const chunk = JSON.parse(frame.payload.toString("utf8")) as Extract<
+						DaemonOutbound,
+						{ type: "session_snapshot_chunk" }
+					>;
+					snapshotId ??= typeof chunk.snapshotId === "string" ? chunk.snapshotId : undefined;
+					if (
+						chunk.type !== "session_snapshot_chunk" ||
+						chunk.activeSessionId !== activeSessionId ||
+						chunk.snapshotId !== snapshotId ||
+						!Number.isSafeInteger(chunk.index) ||
+						chunk.index < 0 ||
+						!Array.isArray(chunk.messages)
+					) {
+						throw new Error(`Snapshot ${snapshotId ?? "unknown"} returned an invalid chunk frame`);
+					}
+					chunkIndex = chunk.index;
+					chunkMessageCount = chunk.messages.length;
+				}
 			} catch (error) {
 				const frameError = error instanceof Error ? error : new Error(String(error));
-				if (frameSnapshotId) {
-					this.failCorrelatedSnapshotAttempt(
-						worker,
-						activeSessionId,
-						frameSnapshotId,
-						frameError,
-						snapshotPurpose,
-					);
+				if (snapshotId) {
+					this.failCorrelatedSnapshotAttempt(worker, activeSessionId, snapshotId, frameError, snapshotPurpose);
 				} else {
 					this.failWorkerSnapshotCache(worker, activeSessionId, frameError, true);
 				}
 				return;
 			}
-			const snapshotId = frameSnapshotId ?? (typeof chunk.snapshotId === "string" ? chunk.snapshotId : undefined);
 			if (!snapshotId) {
 				this.failWorkerSnapshotCache(
 					worker,
@@ -5476,23 +5522,15 @@ export class DaemonSupervisor {
 				return;
 			}
 			const generation = this.snapshotGeneration(worker, activeSessionId, snapshotId);
-			if (!generation?.incoming) {
-				return;
-			}
+			if (!generation?.incoming) return;
 			try {
 				const duplicateIndex = generation.duplicateChunkIndex;
 				const expectedIndex = duplicateIndex ?? generation.transcript.chunkCount;
-				if (
-					chunk.type !== "session_snapshot_chunk" ||
-					chunk.activeSessionId !== activeSessionId ||
-					chunk.snapshotId !== generation.transcript.snapshotId ||
-					chunk.index !== expectedIndex ||
-					!Array.isArray(chunk.messages)
-				) {
+				if (chunkIndex !== expectedIndex) {
 					throw new Error(`Snapshot ${generation.transcript.snapshotId} returned an invalid chunk frame`);
 				}
 				if (duplicateIndex === undefined) {
-					const receivedMessageCount = (generation.receivedMessageCount ?? 0) + chunk.messages.length;
+					const receivedMessageCount = (generation.receivedMessageCount ?? 0) + chunkMessageCount;
 					if (receivedMessageCount > (generation.result.snapshotStream?.messageCount ?? Number.MAX_SAFE_INTEGER)) {
 						throw new Error(`Snapshot ${generation.transcript.snapshotId} exceeded its declared message count`);
 					}

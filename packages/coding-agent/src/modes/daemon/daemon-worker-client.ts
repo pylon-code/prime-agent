@@ -78,8 +78,11 @@ export class DaemonWorkerClient {
 		socket.on("close", () => this.notifyClosed(socket, new Error("Daemon worker socket closed")));
 	}
 
-	supportsServerCapability(capability: DaemonServerCapability): boolean {
-		return this.hello?.serverCapabilities.includes(capability) === true;
+	supportsServerCapability(capability: DaemonServerCapability, minSchemaRevision = 0): boolean {
+		return (
+			this.hello?.serverCapabilities.includes(capability) === true &&
+			(this.hello.schemaRevision ?? 0) >= minSchemaRevision
+		);
 	}
 
 	waitForHello(timeoutMs = 3000): Promise<DaemonHello> {

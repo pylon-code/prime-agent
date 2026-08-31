@@ -1,6 +1,7 @@
 import type { Duplex } from "node:stream";
 
 const FRAME_PREFIX_BYTES = 8;
+const FRAME_BUFFER_COMPACTION_MIN_HEAD = 1024;
 
 export interface PrivateFrameLimits {
 	maxHeaderBytes: number;
@@ -69,6 +70,7 @@ export function encodePrivateFrame<THeader extends object>(
 
 export class PrivateFrameDecoder<THeader extends object> {
 	private readonly buffers: Buffer[] = [];
+	private headIndex = 0;
 	private headOffset = 0;
 	private totalBufferedBytes = 0;
 	private totalCoalescedBytes = 0;
@@ -139,24 +141,21 @@ export class PrivateFrameDecoder<THeader extends object> {
 
 	private consume(length: number): Buffer {
 		if (length === 0) return Buffer.alloc(0);
-		const first = this.buffers[0];
+		const first = this.buffers[this.headIndex];
 		if (!first) throw new Error("Private frame decoder buffer underflow");
 		const firstAvailable = first.length - this.headOffset;
 		if (firstAvailable >= length) {
 			const value = first.subarray(this.headOffset, this.headOffset + length);
 			this.headOffset += length;
 			this.totalBufferedBytes -= length;
-			if (this.headOffset === first.length) {
-				this.buffers.shift();
-				this.headOffset = 0;
-			}
+			if (this.headOffset === first.length) this.releaseHeadBuffer();
 			return value;
 		}
 		const value = Buffer.allocUnsafe(length);
 		this.totalCoalescedBytes += length;
 		let written = 0;
 		while (written < length) {
-			const current = this.buffers[0];
+			const current = this.buffers[this.headIndex];
 			if (!current) throw new Error("Private frame decoder buffer underflow");
 			const available = current.length - this.headOffset;
 			const selected = Math.min(available, length - written);
@@ -164,12 +163,23 @@ export class PrivateFrameDecoder<THeader extends object> {
 			written += selected;
 			this.headOffset += selected;
 			this.totalBufferedBytes -= selected;
-			if (this.headOffset === current.length) {
-				this.buffers.shift();
-				this.headOffset = 0;
-			}
+			if (this.headOffset === current.length) this.releaseHeadBuffer();
 		}
 		return value;
+	}
+
+	private releaseHeadBuffer(): void {
+		this.headIndex++;
+		this.headOffset = 0;
+		if (this.headIndex === this.buffers.length) {
+			this.buffers.length = 0;
+			this.headIndex = 0;
+			return;
+		}
+		if (this.headIndex >= FRAME_BUFFER_COMPACTION_MIN_HEAD && this.headIndex * 2 >= this.buffers.length) {
+			this.buffers.splice(0, this.headIndex);
+			this.headIndex = 0;
+		}
 	}
 }
 export type PrivateFrameListener<THeader extends object> = (frame: PrivateFrame<THeader>) => void;

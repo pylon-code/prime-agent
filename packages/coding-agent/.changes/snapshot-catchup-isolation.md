@@ -1,0 +1,1 @@
+- Isolated daemon snapshot catch-up failures so corrupt or stalled transfers retry once without closing healthy worker sessions ([#21](https://github.com/pylon-code/prime-agent/issues/21)).

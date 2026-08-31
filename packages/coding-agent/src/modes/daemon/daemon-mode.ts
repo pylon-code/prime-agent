@@ -5465,12 +5465,16 @@ export class AgentDaemon {
 	}
 
 	private encodeWorkerPrivateFrameParts(
-		line: string | Buffer | readonly Buffer[],
+		line: string | SnapshotTranscriptWireChunk,
 		message: DaemonOutbound,
 		payloadEncoding: "jsonl" | "assistant-delta",
 		snapshotPurpose?: "attach" | "replacement" | "catchup",
 	): Buffer[] {
 		const payloadParts = typeof line === "string" ? [Buffer.from(line)] : Buffer.isBuffer(line) ? [line] : [...line];
+		const snapshotChunkMessageCount =
+			message.type === "session_snapshot_chunk" && typeof line !== "string" && !Buffer.isBuffer(line)
+				? line.snapshotMessageCount
+				: undefined;
 		return encodePrivateFrameParts<DaemonWorkerFrameHeader>(
 			{
 				kind: "outbound",
@@ -5481,6 +5485,12 @@ export class AgentDaemon {
 					? { snapshotId: message.snapshotId }
 					: {}),
 				...(message.type === "session_event" ? { sessionEventType: message.event.type } : {}),
+				...(message.type === "session_snapshot_chunk"
+					? {
+							snapshotChunkIndex: message.index,
+							...(snapshotChunkMessageCount === undefined ? {} : { snapshotChunkMessageCount }),
+						}
+					: {}),
 				payloadEncoding,
 				...(snapshotPurpose ? { snapshotPurpose } : {}),
 			},

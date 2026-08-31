@@ -30,6 +30,9 @@ export type DaemonWorkerFrameHeader =
 			sessionEventType?: string;
 			payloadEncoding?: "jsonl" | "assistant-delta";
 			snapshotPurpose?: "attach" | "replacement" | "catchup";
+			/** Additive routing metadata avoids reparsing large canonical snapshot chunks. */
+			snapshotChunkIndex?: number;
+			snapshotChunkMessageCount?: number;
 	  };
 
 export type DaemonCreateCommand = Extract<DaemonCommand, { type: "create" }>;
@@ -212,6 +215,11 @@ export function isDaemonWorkerFrameHeader(value: unknown): value is DaemonWorker
 		(candidate.activeSessionId === undefined || typeof candidate.activeSessionId === "string") &&
 		(candidate.snapshotId === undefined || typeof candidate.snapshotId === "string") &&
 		(candidate.sessionEventType === undefined || typeof candidate.sessionEventType === "string") &&
+		(candidate.snapshotChunkIndex === undefined ||
+			(Number.isSafeInteger(candidate.snapshotChunkIndex) && (candidate.snapshotChunkIndex as number) >= 0)) &&
+		(candidate.snapshotChunkMessageCount === undefined ||
+			(Number.isSafeInteger(candidate.snapshotChunkMessageCount) &&
+				(candidate.snapshotChunkMessageCount as number) >= 0)) &&
 		(candidate.snapshotPurpose === undefined ||
 			candidate.snapshotPurpose === "attach" ||
 			candidate.snapshotPurpose === "replacement" ||

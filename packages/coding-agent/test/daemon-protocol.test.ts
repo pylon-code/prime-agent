@@ -15,6 +15,7 @@ import {
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
+	DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION,
 	DAEMON_SUPERVISOR_SERVER_CAPABILITIES,
 	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonCommand,
@@ -169,6 +170,22 @@ describe("daemon protocol helpers", () => {
 	it("schema-gates the RLM max depth commands at their introducing revision", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.get_rlm_max_depth_status).toEqual({ minProtocol: 7, minSchemaRevision: 11 });
 		expect(DAEMON_COMMAND_COMPATIBILITY.set_rlm_max_depth).toEqual({ minProtocol: 7, minSchemaRevision: 11 });
+	});
+
+	it("capability- and schema-gates fresh snapshot generation nonces", () => {
+		expect(DAEMON_SCHEMA_REVISION).toBe(28);
+		expect(DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION).toBe(28);
+		expect(
+			getDaemonCommandCompatibilities({
+				type: "attach",
+				activeSessionId: "active-1",
+				snapshotGenerationNonce: "nonce-1",
+			}),
+		).toEqual([
+			{ minProtocol: 7, minSchemaRevision: 28, capability: "snapshot_generation_nonce_v1" },
+			{ minProtocol: 7 },
+		]);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("snapshot_generation_nonce_v1");
 	});
 
 	it("schema-gates session commands that carry the telemetry policy", () => {

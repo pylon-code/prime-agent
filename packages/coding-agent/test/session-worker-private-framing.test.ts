@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer, type Socket } from "node:net";
+import { performance } from "node:perf_hooks";
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
@@ -45,6 +46,24 @@ describe("private worker framing", () => {
 			{ header: { type: "response", requestId: "two" }, payload: Buffer.from("payload") },
 		]);
 	});
+
+	it("decodes a frame fragmented into more than 100,000 one-byte chunks without quadratic queue work", () => {
+		const payload = Buffer.alloc(128 * 1024, 0x61);
+		const frame = encodePrivateFrame({ type: "snapshot", requestId: "heavily-fragmented" }, payload);
+		const decoder = new PrivateFrameDecoder(isTestHeader);
+		const frames = [];
+		const started = performance.now();
+
+		for (let offset = 0; offset < frame.length; offset++) {
+			frames.push(...decoder.push(frame.subarray(offset, offset + 1)));
+		}
+		const elapsedMs = performance.now() - started;
+		decoder.finish();
+
+		expect(frames).toEqual([{ header: { type: "snapshot", requestId: "heavily-fragmented" }, payload }]);
+		expect(decoder.coalescedBytes).toBeLessThanOrEqual(frame.length);
+		expect(elapsedMs).toBeLessThan(5_000);
+	}, 10_000);
 
 	it("coalesces a 36 MiB fragmented payload at most once", () => {
 		const payload = Buffer.alloc(36 * 1024 * 1024, 0x61);
