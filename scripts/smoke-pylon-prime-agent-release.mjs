@@ -29,6 +29,10 @@ function parseArgs(args) {
 	throw new Error("Usage: node scripts/smoke-pylon-prime-agent-release.mjs [--artifact-dir path]");
 }
 
+export function releaseInstallTimeoutMs(platform = process.platform) {
+	return platform === "win32" ? 360_000 : 180_000;
+}
+
 function runCli(command, args, options = {}) {
 	return spawnSync(command, args, {
 		cwd: options.cwd,
@@ -850,8 +854,14 @@ export async function smokePylonPrimeAgentRelease(artifactsDir) {
 				"--no-audit",
 				"--no-fund",
 				"--package-lock=false",
+				"--loglevel=verbose",
 			],
-			{ cwd: prefix, env: process.env, timeoutMs: 180_000 },
+			{
+				cwd: prefix,
+				env: process.env,
+				stdio: "inherit",
+				timeoutMs: releaseInstallTimeoutMs(),
+			},
 		);
 		const packageDir = join(prefix, "node_modules", "prime-agent");
 		const installedPackage = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));
