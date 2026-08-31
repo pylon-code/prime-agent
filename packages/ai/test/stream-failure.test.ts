@@ -5,7 +5,9 @@ import {
 	classifyStreamFailure,
 	extractStreamFailureInfo,
 	formatStreamFailureMessage,
+	parseRetryAfterMs,
 	recordStreamFailure,
+	retryAfterMsFromHeaders,
 	StreamFailureError,
 	streamFailureFromStopReason,
 } from "../src/utils/stream-failure.js";
@@ -102,9 +104,61 @@ describe("extractStreamFailureInfo", () => {
 		expect(extractStreamFailureInfo(awsError)).toMatchObject({ requestId: "aws_req" });
 	});
 
+	test("carries Retry-After from rate-limit response headers", () => {
+		const sdkError = Object.assign(new Error("429 rate limited"), {
+			status: 429,
+			headers: new Headers({ "retry-after": "30", "request-id": "req_429" }),
+		});
+		expect(extractStreamFailureInfo(sdkError)).toMatchObject({
+			kind: "rate_limit",
+			status: 429,
+			requestId: "req_429",
+			retryAfterMs: 30_000,
+		});
+	});
+
+	test("leaves retryAfterMs unset when the provider sent no Retry-After", () => {
+		const sdkError = Object.assign(new Error("529 overloaded"), { status: 529 });
+		expect(extractStreamFailureInfo(sdkError).retryAfterMs).toBeUndefined();
+	});
+
 	test("falls back to classifying the message text", () => {
 		expect(extractStreamFailureInfo(new Error("provider overloaded, retry later")).kind).toBe("overloaded");
 		expect(extractStreamFailureInfo("not an error").kind).toBe("unknown");
+	});
+});
+
+describe("parseRetryAfterMs", () => {
+	test("reads delta-seconds", () => {
+		expect(parseRetryAfterMs("30")).toBe(30_000);
+		expect(parseRetryAfterMs(" 1.5 ")).toBe(1500);
+	});
+
+	test("clamps non-positive delta-seconds to zero", () => {
+		expect(parseRetryAfterMs("0")).toBe(0);
+		expect(parseRetryAfterMs("-5")).toBe(0);
+	});
+
+	test("reads an HTTP-date relative to now", () => {
+		const now = Date.parse("2026-01-01T00:00:00Z");
+		expect(parseRetryAfterMs("Thu, 01 Jan 2026 00:00:45 GMT", now)).toBe(45_000);
+		expect(parseRetryAfterMs("Wed, 31 Dec 2025 23:59:00 GMT", now)).toBe(0);
+	});
+
+	test("returns undefined for missing or unparseable values", () => {
+		expect(parseRetryAfterMs(undefined)).toBeUndefined();
+		expect(parseRetryAfterMs(null)).toBeUndefined();
+		expect(parseRetryAfterMs("   ")).toBeUndefined();
+		expect(parseRetryAfterMs("soon")).toBeUndefined();
+	});
+});
+
+describe("retryAfterMsFromHeaders", () => {
+	test("reads Headers objects and plain records", () => {
+		expect(retryAfterMsFromHeaders(new Headers({ "retry-after": "12" }))).toBe(12_000);
+		expect(retryAfterMsFromHeaders({ "Retry-After": "12" })).toBe(12_000);
+		expect(retryAfterMsFromHeaders({})).toBeUndefined();
+		expect(retryAfterMsFromHeaders(undefined)).toBeUndefined();
 	});
 });
 
@@ -157,6 +211,21 @@ describe("recordStreamFailure", () => {
 			model: "claude-fable-5",
 			kind: "overloaded",
 			requestId: "req_9",
+		});
+	});
+
+	test("persists Retry-After in the diagnostic so session retry can honor it", () => {
+		setLogSink(() => {});
+		const output = makeOutput({ errorMessage: "Provider rate limit exceeded" });
+		recordStreamFailure(
+			model,
+			output,
+			new StreamFailureError("x", { kind: "rate_limit", status: 429, retryAfterMs: 30_000 }),
+		);
+
+		expect(output.diagnostics?.[0]).toMatchObject({
+			type: "provider_stream_failure",
+			details: { kind: "rate_limit", retryAfterMs: 30_000 },
 		});
 	});
 

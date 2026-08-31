@@ -51,7 +51,7 @@ describe("issue #4491 provider stale after repeated 401", () => {
 		}
 	});
 
-	it("retries structured provider auth failures once, then marks current auth stale", async () => {
+	it("stops on the first structured provider auth failure and marks current auth stale", async () => {
 		const harness = await createHarness({
 			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
 		});
@@ -60,8 +60,8 @@ describe("issue #4491 provider stale after repeated 401", () => {
 
 		await harness.session.prompt("hello");
 
-		expect(harness.faux.state.callCount).toBe(2);
-		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1]);
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
 		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([false]);
 		expect(harness.eventsOfType("auth_stale")).toHaveLength(1);
 
@@ -148,7 +148,7 @@ describe("issue #4491 provider stale after repeated 401", () => {
 			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 100 } },
 		});
 		harnesses.push(harness);
-		harness.setResponses([provider401Message(), provider401Message()]);
+		harness.setResponses([bareProvider401Message(), bareProvider401Message()]);
 
 		const sawRetryStart = new Promise<void>((resolve) => {
 			const unsubscribe = harness.session.subscribe((event) => {
@@ -176,7 +176,7 @@ describe("issue #4491 provider stale after repeated 401", () => {
 			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 5 } },
 		});
 		harnesses.push(harness);
-		harness.setResponses([provider401Message(), provider401Message()]);
+		harness.setResponses([bareProvider401Message(), bareProvider401Message()]);
 
 		let changedCredentials = false;
 		harness.session.subscribe((event) => {
@@ -204,7 +204,7 @@ describe("issue #4491 provider stale after repeated 401", () => {
 			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
 		});
 		harnesses.push(harness);
-		harness.setResponses([provider401Message(), provider500Message(), provider500Message()]);
+		harness.setResponses([bareProvider401Message(), provider500Message(), provider500Message()]);
 
 		await harness.session.prompt("hello");
 

@@ -112,7 +112,6 @@ export function startSideQuestion(
 		sessionId: parent.sessionId === undefined ? undefined : `${parent.sessionId}/side:${id}`,
 		thinkingBudgets: parent.thinkingBudgets,
 		transport: "sse",
-		maxRetryDelayMs: parent.maxRetryDelayMs,
 		toolExecution: parent.toolExecution,
 	});
 

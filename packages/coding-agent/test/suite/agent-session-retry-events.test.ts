@@ -264,7 +264,20 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([true]);
 	});
 
-	for (const kind of ["auth", "invalid_request", "refusal"] as const) {
+	it("does not retry structured provider auth failures at all", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		harness.setResponses([structuredProviderFailure("auth"), fauxAssistantMessage("unused")]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([false]);
+		expect(harness.session.isRetrying).toBe(false);
+	});
+
+	for (const kind of ["invalid_request", "refusal"] as const) {
 		it(`retries structured permanent provider ${kind} failures once`, async () => {
 			const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 			harnesses.push(harness);

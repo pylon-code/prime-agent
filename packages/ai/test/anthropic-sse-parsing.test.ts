@@ -153,6 +153,51 @@ describe("Anthropic raw SSE parsing", () => {
 		expect(result.usage.cost.cacheWrite).toBeCloseTo(testCase.expectedCacheWriteCost);
 	});
 
+	it("carries Retry-After from an overload delivered as a mid-stream SSE error", async () => {
+		const model = getModel("anthropic", "claude-haiku-4-5");
+		const response = new Response(
+			`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })}\n`,
+			{ status: 200, headers: { "content-type": "text/event-stream", "retry-after": "30" } },
+		);
+
+		const result = await streamAnthropic(
+			model,
+			{ messages: [{ role: "user", content: "Say hello.", timestamp: Date.now() }] },
+			{ client: createFakeAnthropicClient(response) },
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.diagnostics?.[0]).toMatchObject({
+			type: "provider_stream_failure",
+			details: { kind: "overloaded", retryAfterMs: 30_000 },
+		});
+	});
+
+	it("prefers an in-frame retry_after over the response header for a mid-stream SSE error", async () => {
+		const model = getModel("anthropic", "claude-haiku-4-5");
+		// A stream's headers go out before the failure is known, so proxies
+		// (e.g. Meridian) put the wait in the error frame itself, in seconds.
+		const response = new Response(
+			`event: error\ndata: ${JSON.stringify({
+				type: "error",
+				error: { type: "rate_limit_error", message: "Rate limited", retry_after: 45 },
+			})}\n`,
+			{ status: 200, headers: { "content-type": "text/event-stream", "retry-after": "30" } },
+		);
+
+		const result = await streamAnthropic(
+			model,
+			{ messages: [{ role: "user", content: "Say hello.", timestamp: Date.now() }] },
+			{ client: createFakeAnthropicClient(response) },
+		).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.diagnostics?.[0]).toMatchObject({
+			type: "provider_stream_failure",
+			details: { kind: "rate_limit", retryAfterMs: 45_000 },
+		});
+	});
+
 	it("preserves configured cache write pricing for non-Anthropic models", async () => {
 		const model = getModel("minimax", "MiniMax-M2.7-highspeed");
 		const response = createSseResponse(

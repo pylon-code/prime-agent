@@ -1,0 +1,3 @@
+- Fixed rate-limit and overload retries hammering an already-degraded provider: they now back off from a longer base with jitter, honor an upstream `Retry-After`, and fail fast when the requested wait exceeds `retry.provider.maxRetryDelayMs` ([#24](https://github.com/pylon-code/prime-agent/issues/24)).
+- Changed provider authentication failures to stop retrying immediately instead of burning the retry ladder on a credential that cannot recover by waiting ([#24](https://github.com/pylon-code/prime-agent/issues/24)).
+- Changed provider/SDK retries to default to 0 while agent-level retry is enabled, so the two retry layers no longer multiply into repeated upstream requests per failed turn ([#24](https://github.com/pylon-code/prime-agent/issues/24)).

@@ -226,6 +226,7 @@ import {
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
+import { computeRetryBackoff } from "./retry-backoff.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -10054,7 +10055,6 @@ export class AgentSession {
 			sessionId: childSessionManager.getSessionId(),
 			thinkingBudgets: this.settingsManager.getThinkingBudgets(),
 			transport: this.settingsManager.getTransport(),
-			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 			toolExecution: this.agent.toolExecution,
 		});
 
@@ -11360,6 +11360,12 @@ export class AgentSession {
 		return typeof kind === "string" ? kind : undefined;
 	}
 
+	private _getProviderStreamFailureRetryAfterMs(message: AssistantMessage): number | undefined {
+		const value = this._getProviderStreamFailureDetails(message)?.retryAfterMs;
+		const parsed = typeof value === "string" ? Number(value) : typeof value === "number" ? value : Number.NaN;
+		return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+	}
+
 	private _isStructuredPermanentProviderFailure(message: AssistantMessage): boolean {
 		const kind = this._getProviderStreamFailureKind(message);
 		return kind === "auth" || kind === "invalid_request" || kind === "refusal";
@@ -11507,8 +11513,24 @@ export class AgentSession {
 
 		this._retryAttempt++;
 
-		if (this._retryAttempt > settings.maxRetries) {
+		// The ladder is exhausted, or the failure kind/Retry-After says waiting
+		// cannot help. Either way this is the last word on the turn.
+		const decision =
+			this._retryAttempt > settings.maxRetries
+				? undefined
+				: computeRetryBackoff({
+						kind: this._getProviderStreamFailureKind(message),
+						attempt: this._retryAttempt,
+						baseDelayMs: settings.baseDelayMs,
+						maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+						retryAfterMs: this._getProviderStreamFailureRetryAfterMs(message),
+					});
+
+		if (decision === undefined || decision.type === "abort") {
 			this._markProviderAuthStaleForRetryFailure(message, options);
+			if (decision?.type === "abort" && message.errorMessage) {
+				message.errorMessage = `${message.errorMessage} (${decision.reason})`;
+			}
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
@@ -11521,7 +11543,7 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		const delayMs = decision.delayMs;
 
 		this._emit({
 			type: "auto_retry_start",

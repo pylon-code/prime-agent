@@ -36,6 +36,7 @@ import {
 	classifyStreamFailure,
 	formatStreamFailureMessage,
 	recordStreamFailure,
+	retryAfterMsFromHeaders,
 	StreamFailureError,
 	streamFailureFromStopReason,
 	streamFailureMessage,
@@ -384,15 +385,25 @@ async function* iterateSseMessages(
 }
 
 /** Turn an in-stream `error` SSE event (how Anthropic delivers overloads etc.) into a classified failure. */
-function anthropicSseError(data: string, requestId?: string): StreamFailureError {
+function anthropicSseError(data: string, requestId?: string, retryAfterMs?: number): StreamFailureError {
 	let errorType: string | undefined;
 	let detail: string | undefined;
 	try {
-		const parsed = parseJsonWithRepair<{ error?: { type?: string; message?: string }; request_id?: string }>(data);
+		const parsed = parseJsonWithRepair<{
+			error?: { type?: string; message?: string; retry_after?: number };
+			request_id?: string;
+		}>(data);
 		errorType = parsed.error?.type;
 		detail = parsed.error?.message;
 		// Proxies may strip the request-id header; the error body carries it too.
 		requestId ??= typeof parsed.request_id === "string" ? parsed.request_id : undefined;
+		// A stream's headers are sent before the error is known, so proxies that
+		// compute a wait mid-stream (e.g. Meridian) carry it in the frame as
+		// seconds. The in-frame value describes this exact failure; prefer it.
+		const frameRetryAfter = parsed.error?.retry_after;
+		if (typeof frameRetryAfter === "number" && Number.isFinite(frameRetryAfter) && frameRetryAfter >= 0) {
+			retryAfterMs = Math.round(frameRetryAfter * 1000);
+		}
 	} catch {
 		detail = data;
 	}
@@ -400,6 +411,7 @@ function anthropicSseError(data: string, requestId?: string): StreamFailureError
 		kind: classifyStreamFailure(errorType),
 		providerErrorType: errorType,
 		requestId,
+		retryAfterMs,
 		raw: truncateRawPayload(data),
 	};
 	return new StreamFailureError(streamFailureMessage(info, detail), info);
@@ -416,10 +428,13 @@ async function* iterateAnthropicEvents(
 
 	let sawMessageStart = false;
 	let sawMessageEnd = false;
+	// Overload/rate-limit SSE errors arrive on an otherwise-200 response, so the
+	// only Retry-After the caller ever sees is the one on the response headers.
+	const retryAfterMs = retryAfterMsFromHeaders(response.headers);
 
 	for await (const sse of iterateSseMessages(response.body, signal)) {
 		if (sse.event === "error") {
-			throw anthropicSseError(sse.data, requestId);
+			throw anthropicSseError(sse.data, requestId, retryAfterMs);
 		}
 
 		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event ?? "")) {
