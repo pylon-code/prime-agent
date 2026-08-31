@@ -1722,18 +1722,21 @@ describe("AgentSession rlm recursion", () => {
 		await root.runRlmChild("finish during ACP close", { name: "paused-terminal-worker" });
 		await childStarted.promise;
 		const inputPause = root.acquireSessionInputPause();
-		root.requestAbort();
-		await expect(root.prompt("external prompt", { resumeIfIdle: false })).rejects.toThrow(
-			"session input admission is paused",
-		);
-
-		childCompletion.resolve();
 		const internals = root as unknown as InspectableRlmSession;
 		const deferredNotices = () =>
 			root
 				.getPendingNextTurnMessageSnapshots()
 				.filter((message) => message.customType === "rlm_child_terminal_notice");
+		// The child settles under the input pause. requestAbort cancels live child runs
+		// and suppresses their notices, so retention across the scheduler cut only
+		// applies to a notice that already exists.
+		childCompletion.resolve();
 		await vi.waitFor(() => expect(deferredNotices()).toHaveLength(1));
+		root.requestAbort();
+		await expect(root.prompt("external prompt", { resumeIfIdle: false })).rejects.toThrow(
+			"session input admission is paused",
+		);
+		expect(deferredNotices()).toHaveLength(1);
 		expect(synthesizedAgentMessageSend).not.toHaveBeenCalled();
 		const restartSnapshot = root.getPendingNextTurnMessageSnapshots();
 		await vi.waitFor(() => expect(internals._unsettledRlmChildRuns.size).toBe(0));
@@ -3001,7 +3004,7 @@ describe("AgentSession rlm recursion", () => {
 		expect(promptAndWait).not.toHaveBeenCalled();
 	});
 
-	it("does not cancel active rlm children when only the parent turn is interrupted", async () => {
+	it("cancels active rlm children when the parent turn is interrupted", async () => {
 		let releaseChild: () => void = () => {};
 		const release = new Promise<void>((resolve) => {
 			releaseChild = resolve;
@@ -3025,14 +3028,22 @@ describe("AgentSession rlm recursion", () => {
 		await waitFor(() => childStarted);
 		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
 		expect(runs.size).toBe(1);
-		const run = [...runs.values()][0];
+		const childId = [...runs.keys()][0];
+		if (!childId) {
+			throw new Error("Missing child run id");
+		}
+		const run = runs.get(childId);
 
 		root.requestAbort();
 
-		expect(run.status).toBe("running");
-		expect(run.error).toBeUndefined();
+		expect(run?.status).toBe("cancelled");
+		expect(run?.error).toBe("Parent session aborted");
+		// The cut is authoritative: a cancelled child neither blocks the next strong
+		// barrier nor injects a terminal notice into a later turn.
+		expect(run?.abandonedForQuiescence).toBe(true);
 		releaseChild();
-		await waitFor(() => run.status === "done");
+		await waitFor(() => !runs.has(childId));
+		expect(root.hasRunningRlmChildren()).toBe(false);
 	});
 
 	it("cancels a single rlm child run by id and reports unknown ids", async () => {

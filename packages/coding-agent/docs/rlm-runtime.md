@@ -168,6 +168,8 @@ audit = await rlm("slow independent audit", name="audit-reviewer")
 
 End the turn instead of waiting for completion. Children send requested answers with `await agent_message.send(message, receiver_role="parent")`, and replies arrive as ordinary agent messages over later turns. A child may instead write results to files for the parent to read. The host runs each admitted child as an independent `AgentSession`; daemon-backed children can be retained as independently addressable session workers.
 
+A run admitted this way still belongs to the parent session's lifecycle: cancelling the parent turn cancels every child run that has not finished, so a cancel does not leave a fleet streaming. Children that already finished stay retained and addressable, and keep running any later work of their own.
+
 ## Parent-Scoped Sub-Agent Registry
 
 The TypeScript parent maintains the authoritative direct-child registry. `await rlm.list_subagents()` returns stable child IDs, active-session IDs when daemon-backed, session IDs, names, directories, and running/completed status.
@@ -248,6 +250,7 @@ Provider credentials are resolved by the TypeScript host. The bounded model cata
 | Requested model unavailable | Spawn fails instead of substituting another model. |
 | Host connection closed | Pending `host_request` calls fail with `RuntimeError` so awaiting cells unblock. |
 | Child cancellation | Host aborts the child and removes failed/cancelled registry entries. |
+| Parent turn cancelled | Every in-flight child run is cancelled, including one admitted by an earlier turn. Retained child sessions keep running; stop one with `rlm.delete_subagent()` or the interactive per-child stop. |
 | Parent teardown | Active descendants are cancelled and their runtimes are closed. |
 
 ## Focused Validation

@@ -1,0 +1,1 @@
+- Fixed cancelling a turn so in-flight subagent runs stop with it instead of continuing to consume provider capacity; retained subagents keep running and are still cancelled individually ([#25](https://github.com/pylon-code/prime-agent/issues/25)).
