@@ -35,6 +35,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import { resolveVolatileContext } from "../utils/volatile-context.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -624,6 +625,10 @@ function buildParams(
 		applyAnthropicCacheControl(messages, params.tools, cacheControl);
 	}
 
+	// Appended after the cache markers (and after the automatically cached prefix of
+	// providers without markers) so volatile content cannot cold-cache the request.
+	appendVolatileContext(messages, resolveVolatileContext(context), compat);
+
 	if (options?.toolChoice) {
 		params.tool_choice = options.toolChoice;
 	}
@@ -694,6 +699,36 @@ function getCompatCacheControl(
 
 	const ttl = cacheRetention === "long" && compat.supportsLongCacheRetention ? "1h" : undefined;
 	return { type: "ephemeral", ...(ttl ? { ttl } : {}) };
+}
+
+/**
+ * Append volatile content as the last thing the request carries, after any
+ * cache markers applied by {@link applyAnthropicCacheControl}.
+ */
+function appendVolatileContext(
+	messages: ChatCompletionMessageParam[],
+	volatileContext: string | undefined,
+	compat: ResolvedOpenAICompletionsCompat,
+): void {
+	if (!volatileContext) return;
+
+	const text = sanitizeSurrogates(volatileContext);
+	const lastMessage = messages[messages.length - 1];
+	if (lastMessage?.role === "user") {
+		lastMessage.content =
+			typeof lastMessage.content === "string"
+				? [
+						{ type: "text", text: lastMessage.content },
+						{ type: "text", text },
+					]
+				: [...lastMessage.content, { type: "text", text }];
+		return;
+	}
+
+	if (compat.requiresAssistantAfterToolResult && lastMessage?.role === "tool") {
+		messages.push({ role: "assistant", content: "I have processed the tool results." });
+	}
+	messages.push({ role: "user", content: text });
 }
 
 function applyAnthropicCacheControl(

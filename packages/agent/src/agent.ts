@@ -72,6 +72,7 @@ function createMutableAgentState(
 
 	return {
 		systemPrompt: initialState?.systemPrompt ?? "",
+		volatileContext: initialState?.volatileContext,
 		model: initialState?.model ?? DEFAULT_MODEL,
 		thinkingLevel: initialState?.thinkingLevel ?? "off",
 		serviceTier: initialState?.serviceTier ?? "default",
@@ -451,6 +452,7 @@ export class Agent {
 	private createContextSnapshot(): AgentContext {
 		return {
 			systemPrompt: this._state.systemPrompt,
+			volatileContext: this._state.volatileContext,
 			messages: this._state.messages.slice(),
 			tools: this._state.tools.slice(),
 		};
@@ -475,6 +477,7 @@ export class Agent {
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getSystemPrompt: () => this._state.systemPrompt,
+			getVolatileContext: () => this._state.volatileContext,
 			getApiKey: this.getApiKey,
 			getSteeringMessages: async () => {
 				if (skipInitialSteeringPoll) {

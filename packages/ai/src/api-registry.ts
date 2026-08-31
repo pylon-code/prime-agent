@@ -7,6 +7,7 @@ import type {
 	StreamFunction,
 	StreamOptions,
 } from "./types.js";
+import { foldVolatileContext, foldVolatileContextIntoSystemPrompt } from "./utils/volatile-context.js";
 
 export type ApiStreamFunction = (
 	model: Model<Api>,
@@ -24,6 +25,12 @@ export interface ApiProvider<TApi extends Api = Api, TOptions extends StreamOpti
 	api: TApi;
 	stream: StreamFunction<TApi, TOptions>;
 	streamSimple: StreamFunction<TApi, SimpleStreamOptions>;
+	/**
+	 * Set when the provider positions `Context.volatileContext` itself, after its
+	 * final prompt-cache breakpoint. Providers that leave this unset receive the
+	 * volatile content folded into the end of `Context.messages`.
+	 */
+	handlesVolatileContext?: boolean;
 }
 
 interface ApiProviderInternal {
@@ -39,27 +46,45 @@ type RegisteredApiProvider = {
 
 const apiProviderRegistry = new Map<string, RegisteredApiProvider>();
 
+/**
+ * Decide where `Context.volatileContext` goes before the provider sees it.
+ *
+ * Prefix-cached backends want it after the last cache breakpoint, which the
+ * provider places. Session-cached `appendOnlyHistory` backends need the message
+ * array untouched, so it goes into the system prompt instead.
+ */
+function resolveVolatilePlacement(model: Model<Api>, context: Context, handlesVolatileContext: boolean): Context {
+	if (model.appendOnlyHistory) {
+		return foldVolatileContextIntoSystemPrompt(context);
+	}
+	return handlesVolatileContext ? context : foldVolatileContext(context);
+}
+
 function wrapStream<TApi extends Api, TOptions extends StreamOptions>(
 	api: TApi,
 	stream: StreamFunction<TApi, TOptions>,
+	handlesVolatileContext: boolean,
 ): ApiStreamFunction {
 	return (model, context, options) => {
 		if (model.api !== api) {
 			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
 		}
-		return stream(model as Model<TApi>, context, options as TOptions);
+		const resolved = resolveVolatilePlacement(model, context, handlesVolatileContext);
+		return stream(model as Model<TApi>, resolved, options as TOptions);
 	};
 }
 
 function wrapStreamSimple<TApi extends Api>(
 	api: TApi,
 	streamSimple: StreamFunction<TApi, SimpleStreamOptions>,
+	handlesVolatileContext: boolean,
 ): ApiStreamSimpleFunction {
 	return (model, context, options) => {
 		if (model.api !== api) {
 			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
 		}
-		return streamSimple(model as Model<TApi>, context, options);
+		const resolved = resolveVolatilePlacement(model, context, handlesVolatileContext);
+		return streamSimple(model as Model<TApi>, resolved, options);
 	};
 }
 
@@ -67,11 +92,12 @@ export function registerApiProvider<TApi extends Api, TOptions extends StreamOpt
 	provider: ApiProvider<TApi, TOptions>,
 	sourceId?: string,
 ): void {
+	const handlesVolatileContext = provider.handlesVolatileContext === true;
 	apiProviderRegistry.set(provider.api, {
 		provider: {
 			api: provider.api,
-			stream: wrapStream(provider.api, provider.stream),
-			streamSimple: wrapStreamSimple(provider.api, provider.streamSimple),
+			stream: wrapStream(provider.api, provider.stream, handlesVolatileContext),
+			streamSimple: wrapStreamSimple(provider.api, provider.streamSimple, handlesVolatileContext),
 		},
 		sourceId,
 	});

@@ -344,12 +344,14 @@ export function registerBuiltInApiProviders(): void {
 		api: "anthropic-messages",
 		stream: streamAnthropic,
 		streamSimple: streamSimpleAnthropic,
+		handlesVolatileContext: true,
 	});
 
 	registerApiProvider({
 		api: "openai-completions",
 		stream: streamOpenAICompletions,
 		streamSimple: streamSimpleOpenAICompletions,
+		handlesVolatileContext: true,
 	});
 
 	registerApiProvider({

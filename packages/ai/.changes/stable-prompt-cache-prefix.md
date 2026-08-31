@@ -1,0 +1,2 @@
+- Added `Context.volatileContext` for content that must stay out of every cached prompt prefix; Anthropic and OpenAI-completions place it after their cache breakpoints and other providers receive it appended to the message list ([#26](https://github.com/pylon-code/prime-agent/issues/26)).
+- Added the `Model.appendOnlyHistory` flag for session-cached backends, which routes volatile content into the system prompt so the request message array stays byte-identical to the persisted history ([#26](https://github.com/pylon-code/prime-agent/issues/26)).

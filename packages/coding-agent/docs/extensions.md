@@ -1648,6 +1648,34 @@ pi.registerProvider("corporate-ai", {
 - `oauth` - OAuth provider config for `/login` support. When provided, the provider appears in the login menu.
 - `streamSimple` - Custom streaming implementation for non-standard APIs.
 
+**Model definitions: `appendOnlyHistory`**
+
+Set `appendOnlyHistory: true` on a model when the backend keeps its own session cache keyed on the request message array, rather than caching by request prefix. Proxies in front of an agent SDK work this way: they match the incoming history against the history they already hold and resume that session, so they only tolerate an append.
+
+The flag controls where Prime Agent puts volatile prompt content — continual harness state and the current date. By default that content is appended after the message list so a change cannot invalidate a prefix cache. A session-cached backend reads the same append as a modified history and replays the whole conversation instead, so the flag routes the content into the system prompt and leaves the message array byte-identical to the persisted conversation.
+
+```typescript
+pi.registerProvider("my-sdk-proxy", {
+  baseUrl: "https://proxy.example.com",
+  apiKey: "PROXY_API_KEY",
+  api: "anthropic-messages",
+  models: [
+    {
+      id: "claude-opus-4-6",
+      name: "Claude Opus 4.6 (via SDK proxy)",
+      reasoning: true,
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 32000,
+      appendOnlyHistory: true
+    }
+  ]
+});
+```
+
+Leave it unset for direct provider APIs, including Anthropic and OpenAI-compatible endpoints that cache by prefix. `models.json` accepts the same field on a model definition or a `modelOverrides` entry.
+
 See [custom-provider.md](custom-provider.md) for advanced topics: custom streaming APIs, OAuth details, model definition reference.
 
 ### pi.unregisterProvider(name)

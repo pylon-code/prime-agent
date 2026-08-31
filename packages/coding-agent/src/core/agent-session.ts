@@ -282,7 +282,7 @@ import {
 	type SlashCommandInfo,
 } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
-import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
+import { type BuildSystemPromptOptions, buildSystemPrompt, buildVolatileContext } from "./system-prompt.js";
 import { THINKING_LEVELS } from "./thinking-levels.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
@@ -1233,6 +1233,8 @@ export class AgentSession {
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
 	private _toolPromptSnippets: Map<string, string> = new Map();
 	private _toolPromptGuidelines: Map<string, string[]> = new Map();
+	/** First-activation slot per tool name; keeps the serialized tool order stable. */
+	private readonly _toolOrderSlots: Map<string, number> = new Map();
 
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
@@ -4510,9 +4512,22 @@ export class AgentSession {
 		return this._toolDefinitions.get(name)?.definition;
 	}
 
+	/**
+	 * Slot a tool name occupies in the serialized tool list, assigned the first
+	 * time the session activates it.
+	 */
+	private _toolOrderSlot(name: string): number {
+		const existing = this._toolOrderSlots.get(name);
+		if (existing !== undefined) {
+			return existing;
+		}
+		const slot = this._toolOrderSlots.size;
+		this._toolOrderSlots.set(name, slot);
+		return slot;
+	}
+
 	setActiveToolsByName(toolNames: string[]): void {
-		const tools: AgentTool[] = [];
-		const validToolNames: string[] = [];
+		const selected: Array<{ tool: AgentTool; name: string; slot: number }> = [];
 		const seenToolNames = new Set<string>();
 		for (const name of toolNames) {
 			if (seenToolNames.has(name)) {
@@ -4521,13 +4536,17 @@ export class AgentSession {
 			const tool = this._toolRegistry.get(name);
 			if (tool) {
 				seenToolNames.add(name);
-				tools.push(tool);
-				validToolNames.push(name);
+				selected.push({ tool, name, slot: this._toolOrderSlot(name) });
 			}
 		}
-		this.agent.state.tools = tools;
+		// Pin each tool to the slot it first occupied. A registry refresh, an
+		// extension reload, or a removed-then-restored tool then serializes the same
+		// tool set to the same bytes, so the provider's cache breakpoint on the last
+		// tool definition survives.
+		selected.sort((left, right) => left.slot - right.slot);
+		this.agent.state.tools = selected.map((entry) => entry.tool);
 
-		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
+		this._baseSystemPrompt = this._rebuildSystemPrompt(selected.map((entry) => entry.name));
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
@@ -4699,6 +4718,10 @@ export class AgentSession {
 			harnessState: this._loadMergedHarnessState(),
 			genericMcpServers: this._mcpManager?.getEnabledGenericServers(),
 		};
+		// Harness state and the current date are refreshed here alongside the stable
+		// prompt, but travel separately so a refine or a date flip cannot change the
+		// bytes of the provider's cached tools/system/history prefix.
+		this.agent.state.volatileContext = buildVolatileContext(this._baseSystemPromptOptions);
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
 

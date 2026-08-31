@@ -1,0 +1,1 @@
+- Added `AgentState.volatileContext`, resolved before each model request and forwarded to the provider outside the cached prompt prefix ([#26](https://github.com/pylon-code/prime-agent/issues/26)).

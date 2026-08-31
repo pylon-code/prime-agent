@@ -1,0 +1,3 @@
+- Fixed prompt-cache churn by sending continual harness state and the current date outside the cached prompt prefix, so a harness refinement or a midnight date flip no longer re-caches a long-running session ([#26](https://github.com/pylon-code/prime-agent/issues/26)).
+- Pinned each tool to the slot it first occupied so a tool-registry refresh serializes an unchanged tool set to identical bytes ([#26](https://github.com/pylon-code/prime-agent/issues/26)).
+- Added the `appendOnlyHistory` model flag so proxy-backed providers registered by extensions keep an append-only request history and receive volatile prompt content in the system prompt ([#26](https://github.com/pylon-code/prime-agent/issues/26)).
