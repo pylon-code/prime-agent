@@ -1,6 +1,6 @@
 # Pylon Prime release artifacts
 
-Pylon builds Prime Agent from the protected `pylon` branch without changing the installed package or command identity. This document defines the deterministic candidate artifact boundary. Publication, attestation, Pylon-side verification, and installation are separate changes.
+Pylon builds Prime Agent from the protected `pylon` branch without changing the installed package or command identity. This document defines the deterministic candidate artifact boundary. Protected GitHub publication and attestation are defined in `docs/pylon-publication.md`; Pylon-side receipt verification and managed installation remain separate changes.
 
 ## Frozen recipe
 
@@ -71,4 +71,6 @@ Matching CI packs are evidence for the pinned source, recipe, toolchain, and run
 
 Issue #28 creates no tag or GitHub Release and needs only `contents: read`. Its artifact jobs receive no repository secrets, and their Actions uploads are short-lived CI transport. They must not use npm publish, R2, `contents: write`, OIDC, or attestations.
 
-Issue #29 owns protected preview publication, keyless attestations, stable promotion, rollback, and yanking. Pylon issues #193 and #194 own signed receipt verification and opt-in side-by-side install/update/rollback/switch-back. Until those land, the artifacts are build candidates, not a managed Pylon installation channel.
+Issue #29 adds protected preview publication, six exact keyless attestations, manual byte-preserving stable promotion, and append-only withdrawal. Preview releases contain the four tarballs, this build manifest, and `pylon-preview-channel-v1.json`; stable releases contain only a signed `pylon-stable-channel-v1.json` sequence record and use permanent N-only reservation refs for global sequence uniqueness. Exact formats, environment gates, promotion/withdrawal operations, and independent verification commands live in `docs/pylon-publication.md`.
+
+Pylon issues #193 and #194 own signed receipt verification and opt-in side-by-side install/update/rollback/switch-back. Until those land, published artifacts are verifiable release inputs, not a managed Pylon installation channel.

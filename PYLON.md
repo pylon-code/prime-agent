@@ -45,7 +45,7 @@ Only workflows explicitly reviewed and approved for Pylon may run from the defau
 
 Mirroring upstream must not publish packages, binaries, or beta releases. The `pylon` branch intentionally omits the inherited release workflow, and the fork must never expose upstream-known release secrets at repository scope. Do not restore that workflow during upstream merges.
 
-The `pylon` branch owns a separate offline deterministic artifact recipe. It emits channel-neutral Pylon-named tarballs and an immutable source/toolchain/digest manifest while preserving the installed `prime-agent` package and command identity. CI artifacts are unsigned candidates, not releases, signed provenance, or permission to install. Protected GitHub publication and attestation, Pylon-side receipt verification, and managed install/update/rollback remain separate reviewed changes. Never restore upstream R2/npm publication or infer runtime capabilities from fork metadata.
+The `pylon` branch owns a separate offline deterministic artifact recipe. It emits channel-neutral Pylon-named tarballs and an immutable source/toolchain/digest manifest while preserving the installed `prime-agent` package and command identity. CI artifacts are unsigned candidates, not releases, signed provenance, or permission to install. Protected publication creates immutable preview releases with exact keyless provenance, and manual promotion creates signed append-only stable-manifest sequences without rebuilding; see `docs/pylon-publication.md`. Pylon-side receipt verification and managed install/update/rollback remain separate reviewed changes. Never restore upstream R2/npm publication or infer runtime capabilities from fork metadata.
 
 ## Product integration principles
 

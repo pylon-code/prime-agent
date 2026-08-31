@@ -1,0 +1,808 @@
+name: Pylon stable promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      preview_tag:
+        description: Existing immutable preview tag to promote
+        required: true
+        type: string
+      operation:
+        description: Promote, or withdraw one prior stable sequence while promoting this build
+        required: true
+        default: promote
+        type: choice
+        options: [promote, withdraw]
+      revoke_stable_tag:
+        description: Existing stable tag to append to the revocation list for withdrawal
+        required: false
+        type: string
+      reason:
+        description: Deterministic lowercase withdrawal reason code
+        required: false
+        default: withdrawn
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: pylon-stable-publication
+  cancel-in-progress: false
+
+env:
+  PYLON_RELEASE_NODE: 22.23.2
+  PYLON_RELEASE_NPM: 11.10.1
+
+jobs:
+  admission:
+    name: Stable source admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    outputs:
+      source_sha: ${{ steps.admit.outputs.source_sha }}
+      source_tree: ${{ steps.admit.outputs.source_tree }}
+    steps:
+      - name: Require protected pylon and an exact verified preview source
+        id: admit
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          PREVIEW_TAG: ${{ inputs.preview_tag }}
+          OPERATION: ${{ inputs.operation }}
+          REVOKE_STABLE_TAG: ${{ inputs.revoke_stable_tag }}
+          REASON: ${{ inputs.reason }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repository = `${owner}/${repo}`;
+            const previewTag = process.env.PREVIEW_TAG;
+            if (
+              repository !== "pylon-code/prime-agent" || context.eventName !== "workflow_dispatch" ||
+              context.ref !== "refs/heads/pylon" || !/^[0-9a-f]{40}$/.test(context.sha) ||
+              !/^pylon-build-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(previewTag)
+            ) throw new Error("Stable promotion requires a canonical pylon dispatch and preview tag.");
+            if (
+              !["promote", "withdraw"].includes(process.env.OPERATION) ||
+              (process.env.OPERATION === "promote" && process.env.REVOKE_STABLE_TAG) ||
+              (process.env.OPERATION === "withdraw" && !/^pylon-stable-[0-9]{6}-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(process.env.REVOKE_STABLE_TAG)) ||
+              (process.env.OPERATION === "withdraw" && !/^[a-z0-9][a-z0-9-]{2,63}$/.test(process.env.REASON))
+            ) throw new Error("Stable withdrawal inputs are malformed.");
+            const pylon = await github.rest.git.getRef({ owner, repo, ref: "heads/pylon" });
+            if (pylon.data.object.type !== "commit" || pylon.data.object.sha !== context.sha) {
+              throw new Error("Stable dispatch is stale relative to protected pylon.");
+            }
+            const release = (await github.rest.repos.getReleaseByTag({ owner, repo, tag: previewTag })).data;
+            if (release.draft || release.prerelease !== true || release.immutable !== true || release.assets.length !== 6) {
+              throw new Error("Preview release is not an immutable six-subject prerelease.");
+            }
+            const tag = await github.rest.git.getRef({ owner, repo, ref: `tags/${previewTag}` });
+            if (tag.data.object.type !== "commit" || !/^[0-9a-f]{40}$/.test(tag.data.object.sha)) {
+              throw new Error("Preview tag is not a lightweight exact-commit tag.");
+            }
+            const sourceSha = tag.data.object.sha;
+            if (release.target_commitish !== sourceSha || previewTag !== `pylon-build-g${sourceSha.slice(0, 12)}-r${previewTag.split("-r").at(-1)}`) {
+              throw new Error("Preview release metadata is not bound to its exact tag target.");
+            }
+            const comparison = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${sourceSha}...${context.sha}`,
+            });
+            if (!['ahead', 'identical'].includes(comparison.data.status) || comparison.data.merge_base_commit.sha !== sourceSha) {
+              throw new Error("Preview source is not reachable from protected pylon.");
+            }
+            const commit = await github.rest.git.getCommit({ owner, repo, commit_sha: sourceSha });
+            const protection = await github.graphql(
+              `query($owner:String!,$repo:String!,$ref:String!){repository(owner:$owner,name:$repo){ref(qualifiedName:$ref){branchProtectionRule{requiresStatusChecks requiredStatusChecks{context app{databaseId}}}}}}`,
+              { owner, repo, ref: "refs/heads/pylon" },
+            );
+            const rule = protection.repository?.ref?.branchProtectionRule;
+            const required = rule?.requiredStatusChecks;
+            if (!rule?.requiresStatusChecks || !Array.isArray(required) || required.length === 0) {
+              throw new Error("Protected pylon required-check policy is unavailable.");
+            }
+            const checks = await github.paginate(github.rest.checks.listForRef, {
+              owner, repo, ref: sourceSha, filter: "latest", per_page: 100,
+            });
+            const statuses = (await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sourceSha })).data.statuses;
+            for (const requirement of required) {
+              const appId = requirement.app?.databaseId ?? null;
+              if (appId === null) {
+                if (!statuses.some((status) => status.context === requirement.context && status.state === "success" && status.sha === sourceSha)) {
+                  throw new Error(`Required status ${requirement.context} is not green on the preview source.`);
+                }
+              } else {
+                const candidates = checks.filter((check) =>
+                  check.name === requirement.context && check.head_sha === sourceSha && check.app?.id === appId &&
+                  check.status === "completed" && check.conclusion === "success"
+                );
+                let proved = false;
+                for (const check of candidates) {
+                  const runId = /^https:\/\/github\.com\/pylon-code\/prime-agent\/actions\/runs\/([0-9]+)(?:\/job\/[0-9]+)?$/.exec(check.details_url ?? "")?.[1];
+                  if (!runId) continue;
+                  const suite = (await github.rest.checks.getSuite({ owner, repo, check_suite_id: check.check_suite.id })).data;
+                  const run = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(runId) })).data;
+                  const workflow = (await github.rest.actions.getWorkflow({ owner, repo, workflow_id: run.workflow_id })).data;
+                  const expectedPath = {
+                    "build-check-test": ".github/workflows/ci.yml",
+                    "Check changelog fragment": ".github/workflows/changelog-merged-proof.yml",
+                  }[requirement.context];
+                  if (
+                    suite.app?.id === appId && suite.head_sha === sourceSha && suite.status === "completed" && suite.conclusion === "success" &&
+                    run.check_suite_id === suite.id && run.repository?.id === 1349002285 && run.repository?.full_name === repository &&
+                    run.head_repository?.id === 1349002285 && run.head_repository?.full_name === repository && run.event === "push" &&
+                    run.head_branch === "pylon" && run.head_sha === sourceSha && run.status === "completed" && run.conclusion === "success" &&
+                    workflow.path.startsWith(".github/workflows/") && (!expectedPath || workflow.path === expectedPath)
+                  ) { proved = true; break; }
+                }
+                if (!proved) throw new Error(`Required check ${requirement.context} lacks an exact canonical push workflow proof.`);
+              }
+            }
+            core.setOutput("source_sha", sourceSha);
+            core.setOutput("source_tree", commit.data.tree.sha);
+
+  verify-preview:
+    name: Verify immutable preview provenance
+    needs: admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout protected verifier source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download immutable preview assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_TAG: ${{ inputs.preview_tag }}
+        run: |
+          mkdir -p .npm/pylon-stable/preview
+          gh release download "$PREVIEW_TAG" --repo pylon-code/prime-agent --dir .npm/pylon-stable/preview
+
+      - name: Verify release, manifests, digests, signer, source, and Rekor inclusion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_TAG: ${{ inputs.preview_tag }}
+          SOURCE_SHA: ${{ needs.admission.outputs.source_sha }}
+          SOURCE_TREE: ${{ needs.admission.outputs.source_tree }}
+        run: |
+          gh release verify "$PREVIEW_TAG" --repo pylon-code/prime-agent
+          receipt="$(npm run --silent release:pylon:verify-preview -- --artifact-dir .npm/pylon-stable/preview | tail -n 1)"
+          test "$(node -e 'const x=JSON.parse(process.argv[1]); console.log(x.source.commit)' "$receipt")" = "$SOURCE_SHA"
+          test "$(node -e 'const x=JSON.parse(process.argv[1]); console.log(x.source.tree)' "$receipt")" = "$SOURCE_TREE"
+          npm run release:pylon:verify-attestations -- \
+            --artifact-dir .npm/pylon-stable/preview \
+            --source-sha "$SOURCE_SHA" \
+            --source-tree "$SOURCE_TREE"
+
+      - name: Upload verified preview bytes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-stable-preview
+          path: .npm/pylon-stable/preview
+          if-no-files-found: error
+          retention-days: 3
+
+  install:
+    name: Stable candidate installed artifact (${{ matrix.os }})
+    needs: [admission, verify-preview]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    steps:
+      - name: Checkout exact preview source for isolated smoke only
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.admission.outputs.source_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Setup pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.PYLON_RELEASE_NODE }}
+
+      - name: Install pinned npm
+        run: npm install --global "npm@${{ env.PYLON_RELEASE_NPM }}"
+
+      - name: Verify workflow artifact provenance
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;
+            const workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;
+            if (
+              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" || run.repository?.id !== 1349002285 ||
+              run.repository?.full_name !== "pylon-code/prime-agent" || run.head_repository?.id !== 1349002285 ||
+              run.head_repository?.full_name !== "pylon-code/prime-agent" || run.event !== context.eventName ||
+              run.head_sha !== context.sha || run.head_branch !== "pylon" || context.ref !== "refs/heads/pylon" ||
+              workflow.path !== ".github/workflows/pylon-stable-release.yml"
+            ) throw new Error("Artifact workflow provenance is not canonical.");
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: context.runId, per_page: 100,
+            });
+            const matches = artifacts.filter((artifact) => artifact.name === "verified-stable-preview");
+            if (matches.length !== 1 || matches[0].expired || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest ?? "")) {
+              throw new Error("Artifact is ambiguous, expired, or lacks a SHA-256 transport digest.");
+            }
+
+      - name: Download verified preview bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified-stable-preview
+          path: .npm/pylon-release/artifacts
+
+      - name: Install the same exact preview bytes
+        run: |
+          npm run release:pylon:verify-preview
+          node -e "require('node:fs').unlinkSync('.npm/pylon-release/artifacts/pylon-preview-channel-v1.json')"
+          npm run release:pylon:smoke
+
+  prepare:
+    name: Prepare monotonic stable manifest
+    needs: [admission, verify-preview, install]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      publish: ${{ steps.prepare.outputs.publish }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      source_sha: ${{ steps.prepare.outputs.source_sha }}
+      source_tree: ${{ steps.prepare.outputs.source_tree }}
+      sequence: ${{ steps.prepare.outputs.sequence }}
+    steps:
+      - name: Checkout protected promotion policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify workflow artifact provenance
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;
+            const workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;
+            if (
+              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" || run.repository?.id !== 1349002285 ||
+              run.repository?.full_name !== "pylon-code/prime-agent" || run.head_repository?.id !== 1349002285 ||
+              run.head_repository?.full_name !== "pylon-code/prime-agent" || run.event !== context.eventName ||
+              run.head_sha !== context.sha || run.head_branch !== "pylon" || context.ref !== "refs/heads/pylon" ||
+              workflow.path !== ".github/workflows/pylon-stable-release.yml"
+            ) throw new Error("Artifact workflow provenance is not canonical.");
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: context.runId, per_page: 100,
+            });
+            const matches = artifacts.filter((artifact) => artifact.name === "verified-stable-preview");
+            if (matches.length !== 1 || matches[0].expired || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest ?? "")) {
+              throw new Error("Artifact is ambiguous, expired, or lacks a SHA-256 transport digest.");
+            }
+
+      - name: Download verified preview bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified-stable-preview
+          path: .npm/pylon-stable/preview
+
+      - name: Build the next append-only stable state
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          OPERATION: ${{ inputs.operation }}
+          REVOKE_STABLE_TAG: ${{ inputs.revoke_stable_tag }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          policy_tree="$(git rev-parse 'HEAD^{tree}')"
+          args=(
+            --artifact-dir .npm/pylon-stable/preview
+            --out-dir .npm/pylon-stable/output
+            --operation "$OPERATION"
+            --policy-sha "${{ github.sha }}"
+            --policy-tree "$policy_tree"
+          )
+          if [ "$OPERATION" = withdraw ]; then
+            args+=(--revoke-tag "$REVOKE_STABLE_TAG" --reason "$REASON")
+          fi
+          node scripts/prepare-pylon-stable-manifest.mjs "${args[@]}"
+
+      - name: Upload new stable manifest
+        if: steps.prepare.outputs.publish == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pylon-stable-manifest
+          path: .npm/pylon-stable/output/pylon-stable-channel-v1.json
+          if-no-files-found: error
+          retention-days: 3
+
+  attest:
+    name: Attest stable channel manifest
+    if: needs.prepare.outputs.publish == 'true'
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Verify workflow artifact provenance
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;
+            const workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;
+            if (
+              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" || run.repository?.id !== 1349002285 ||
+              run.repository?.full_name !== "pylon-code/prime-agent" || run.head_repository?.id !== 1349002285 ||
+              run.head_repository?.full_name !== "pylon-code/prime-agent" || run.event !== context.eventName ||
+              run.head_sha !== context.sha || run.head_branch !== "pylon" || context.ref !== "refs/heads/pylon" ||
+              workflow.path !== ".github/workflows/pylon-stable-release.yml"
+            ) throw new Error("Artifact workflow provenance is not canonical.");
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: context.runId, per_page: 100,
+            });
+            const matches = artifacts.filter((artifact) => artifact.name === "pylon-stable-manifest");
+            if (matches.length !== 1 || matches[0].expired || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest ?? "")) {
+              throw new Error("Artifact is ambiguous, expired, or lacks a SHA-256 transport digest.");
+            }
+
+      - name: Download stable manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pylon-stable-manifest
+          path: publication
+
+      - name: Validate exact stable subject before signing
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+          const dir = "publication";
+          const name = "pylon-stable-channel-v1.json";
+          const names = fs.readdirSync(dir);
+          if (names.length !== 1 || names[0] !== name) throw new Error("Stable attestation requires exactly one manifest.");
+          const file = path.join(dir, name);
+          if (!fs.lstatSync(file).isFile()) throw new Error("Stable attestation subject is not a regular file.");
+          const bytes = fs.readFileSync(file);
+          const manifest = JSON.parse(bytes);
+          const canonical = (value) => {
+            if (value === null || ["string", "boolean"].includes(typeof value)) return value;
+            if (typeof value === "number" && Number.isFinite(value)) return value;
+            if (Array.isArray(value)) return value.map(canonical);
+            if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) throw new Error("Unsupported manifest value.");
+            return Object.fromEntries(Object.keys(value).sort().map((key) => {
+              if (value[key] === undefined) throw new Error("Undefined manifest value.");
+              return [key, canonical(value[key])];
+            }));
+          };
+          if (bytes.toString("utf8") !== `${JSON.stringify(canonical(manifest), null, 2)}\n`) throw new Error("Stable manifest is not canonical JSON.");
+          if (
+            manifest.schemaVersion !== 1 || manifest.channel !== "stable" ||
+            manifest.repository !== "https://github.com/pylon-code/prime-agent" ||
+            !/^pylon-stable-[0-9]{6}-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(manifest.tag)
+          ) throw new Error("Stable manifest identity is malformed.");
+          NODE
+
+      - name: Generate stable manifest provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: publication/pylon-stable-channel-v1.json
+
+  verify-attestation:
+    name: Verify stable manifest provenance
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout protected verification policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download stable manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pylon-stable-manifest
+          path: publication
+
+      - name: Verify exact stable signer and Rekor inclusion
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          policy_tree="$(git rev-parse 'HEAD^{tree}')"
+          npm run release:pylon:verify-stable-attestation -- \
+            --manifest publication/pylon-stable-channel-v1.json \
+            --promotion-sha "${{ github.sha }}" \
+            --promotion-tree "$policy_tree"
+
+  publish:
+    name: Publish immutable stable sequence
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [admission, verify-preview, install, prepare, attest, verify-attestation]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: pylon-stable
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+    steps:
+      - name: Verify workflow artifact provenance
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;
+            const workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;
+            if (
+              context.repo.owner !== "pylon-code" || context.repo.repo !== "prime-agent" || run.repository?.id !== 1349002285 ||
+              run.repository?.full_name !== "pylon-code/prime-agent" || run.head_repository?.id !== 1349002285 ||
+              run.head_repository?.full_name !== "pylon-code/prime-agent" || run.event !== context.eventName ||
+              run.head_sha !== context.sha || run.head_branch !== "pylon" || context.ref !== "refs/heads/pylon" ||
+              workflow.path !== ".github/workflows/pylon-stable-release.yml"
+            ) throw new Error("Artifact workflow provenance is not canonical.");
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: context.runId, per_page: 100,
+            });
+            const matches = artifacts.filter((artifact) => artifact.name === "pylon-stable-manifest");
+            if (matches.length !== 1 || matches[0].expired || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest ?? "")) {
+              throw new Error("Artifact is ambiguous, expired, or lacks a SHA-256 transport digest.");
+            }
+
+      - name: Download attested stable manifest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pylon-stable-manifest
+          path: publication
+
+      - name: Recheck monotonic state and publish once
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          STABLE_MANIFEST: publication/pylon-stable-channel-v1.json
+        with:
+          script: |
+            const fs = require("node:fs");
+            const crypto = require("node:crypto");
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repository = `${owner}/${repo}`;
+            if (repository !== "pylon-code/prime-agent" || context.eventName !== "workflow_dispatch" || context.ref !== "refs/heads/pylon") {
+              throw new Error("Stable publisher requires a canonical pylon dispatch.");
+            }
+            const pylon = await github.rest.git.getRef({ owner, repo, ref: "heads/pylon" });
+            if (pylon.data.object.type !== "commit" || pylon.data.object.sha !== context.sha) {
+              throw new Error("Stable promotion became stale while verification ran.");
+            }
+            const policyCommit = await github.rest.git.getCommit({ owner, repo, commit_sha: context.sha });
+            const bytes = fs.readFileSync(process.env.STABLE_MANIFEST);
+            const manifest = JSON.parse(bytes);
+            const canonical = (value) => {
+              if (value === null || ["string", "boolean"].includes(typeof value)) return value;
+              if (typeof value === "number" && Number.isFinite(value)) return value;
+              if (Array.isArray(value)) return value.map(canonical);
+              if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) throw new Error("Unsupported stable manifest value.");
+              return Object.fromEntries(Object.keys(value).sort().map((key) => {
+                if (value[key] === undefined) throw new Error("Undefined stable manifest value.");
+                return [key, canonical(value[key])];
+              }));
+            };
+            if (bytes.toString("utf8") !== `${JSON.stringify(canonical(manifest), null, 2)}\n`) {
+              throw new Error("Stable manifest bytes are not canonical JSON.");
+            }
+            const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+            const match = /^pylon-stable-([0-9]{6})-g([0-9a-f]{12})-r([1-9][0-9]*)$/.exec(manifest.tag);
+            if (
+              manifest.schemaVersion !== 1 || manifest.channel !== "stable" ||
+              manifest.repository !== "https://github.com/pylon-code/prime-agent" || !match ||
+              Number.parseInt(match[1], 10) !== manifest.sequence ||
+              match[2] !== manifest.build.source.commit.slice(0, 12) ||
+              Number.parseInt(match[3], 10) !== manifest.build.recipeRevision ||
+              manifest.build.previewTag !== manifest.build.id || manifest.promotion?.policyCommit !== context.sha || manifest.promotion?.policyTree !== policyCommit.data.tree.sha
+            ) throw new Error("Stable manifest identity is malformed.");
+            if (
+              manifest.history?.highWater !== manifest.sequence - 1 ||
+              (manifest.sequence === 1 ? manifest.history.previous !== null :
+                Number.parseInt(/^pylon-stable-([0-9]{6})-/.exec(manifest.history?.previous?.tag ?? "")?.[1] ?? "0", 10) !== manifest.sequence - 1 ||
+                !/^[0-9a-f]{64}$/.test(manifest.history?.previous?.sha256 ?? ""))
+            ) throw new Error("Stable manifest high-water or previous-digest claim is malformed.");
+            const sourceSha = manifest.build.source.commit;
+            const comparison = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${sourceSha}...${context.sha}`,
+            });
+            if (!['ahead', 'identical'].includes(comparison.data.status) || comparison.data.merge_base_commit.sha !== sourceSha) {
+              throw new Error("Stable build source is no longer reachable from protected pylon.");
+            }
+            const commit = await github.rest.git.getCommit({ owner, repo, commit_sha: sourceSha });
+            if (commit.data.tree.sha !== manifest.build.source.tree) throw new Error("Stable build source tree changed.");
+            const previewRelease = (await github.rest.repos.getReleaseByTag({ owner, repo, tag: manifest.build.previewTag })).data;
+            const previewBody = [
+              "Pylon Prime preview publication.", "", `Tag: ${manifest.build.previewTag}`, `Source: ${sourceSha}`,
+              `Tree: ${manifest.build.source.tree}`, `Recipe: r${manifest.build.recipeRevision}`, "",
+              "Verify the immutable release and artifact attestations before use.",
+            ].join("\n");
+            const previewExpected = new Map(manifest.build.assets.map((asset) => [asset.file, { size: asset.size, digest: `sha256:${asset.sha256}` }]));
+            previewExpected.set("pylon-prime-agent-release-v1.json", { digest: `sha256:${manifest.build.releaseManifest.sha256}` });
+            previewExpected.set("pylon-preview-channel-v1.json", { digest: `sha256:${manifest.build.previewManifest.sha256}` });
+            if (
+              previewRelease.immutable !== true || previewRelease.draft || previewRelease.prerelease !== true ||
+              previewRelease.tag_name !== manifest.build.previewTag || previewRelease.name !== `Pylon Prime preview ${manifest.build.previewTag}` ||
+              previewRelease.body !== previewBody || previewRelease.target_commitish !== sourceSha ||
+              previewRelease.assets.length !== previewExpected.size
+            ) throw new Error("Immutable preview identity changed before stable publication.");
+            for (const asset of previewRelease.assets) {
+              const expected = previewExpected.get(asset.name);
+              if (!expected || asset.digest !== expected.digest || (expected.size !== undefined && asset.size !== expected.size)) {
+                throw new Error(`Immutable preview asset changed before stable publication: ${asset.name}`);
+              }
+              previewExpected.delete(asset.name);
+            }
+            if (previewExpected.size !== 0) throw new Error("Immutable preview is missing an exact subject.");
+            const previewRef = await github.rest.git.getRef({ owner, repo, ref: `tags/${manifest.build.previewTag}` });
+            if (previewRef.data.object.type !== "commit" || previewRef.data.object.sha !== sourceSha) {
+              throw new Error("Immutable preview tag changed before stable publication.");
+            }
+            const protection = await github.graphql(
+              `query($owner:String!,$repo:String!,$ref:String!){repository(owner:$owner,name:$repo){ref(qualifiedName:$ref){branchProtectionRule{requiresStatusChecks requiredStatusChecks{context app{databaseId}}}}}}`,
+              { owner, repo, ref: "refs/heads/pylon" },
+            );
+            const rule = protection.repository?.ref?.branchProtectionRule;
+            const required = rule?.requiredStatusChecks;
+            if (!rule?.requiresStatusChecks || !Array.isArray(required) || required.length === 0) {
+              throw new Error("Protected pylon required-check policy is unavailable.");
+            }
+            const checks = await github.paginate(github.rest.checks.listForRef, {
+              owner, repo, ref: sourceSha, filter: "latest", per_page: 100,
+            });
+            const statuses = (await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sourceSha })).data.statuses;
+            for (const requirement of required) {
+              const appId = requirement.app?.databaseId ?? null;
+              if (appId === null) {
+                if (!statuses.some((status) => status.context === requirement.context && status.state === "success" && status.sha === sourceSha)) {
+                  throw new Error(`Required status ${requirement.context} is not green on the stable source.`);
+                }
+              } else {
+                const candidates = checks.filter((check) =>
+                  check.name === requirement.context && check.head_sha === sourceSha && check.app?.id === appId &&
+                  check.status === "completed" && check.conclusion === "success"
+                );
+                let proved = false;
+                for (const check of candidates) {
+                  const runId = /^https:\/\/github\.com\/pylon-code\/prime-agent\/actions\/runs\/([0-9]+)(?:\/job\/[0-9]+)?$/.exec(check.details_url ?? "")?.[1];
+                  if (!runId) continue;
+                  const suite = (await github.rest.checks.getSuite({ owner, repo, check_suite_id: check.check_suite.id })).data;
+                  const run = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(runId) })).data;
+                  const workflow = (await github.rest.actions.getWorkflow({ owner, repo, workflow_id: run.workflow_id })).data;
+                  const expectedPath = {
+                    "build-check-test": ".github/workflows/ci.yml",
+                    "Check changelog fragment": ".github/workflows/changelog-merged-proof.yml",
+                  }[requirement.context];
+                  if (
+                    suite.app?.id === appId && suite.head_sha === sourceSha && suite.status === "completed" && suite.conclusion === "success" &&
+                    run.check_suite_id === suite.id && run.repository?.id === 1349002285 && run.repository?.full_name === repository &&
+                    run.head_repository?.id === 1349002285 && run.head_repository?.full_name === repository && run.event === "push" &&
+                    run.head_branch === "pylon" && run.head_sha === sourceSha && run.status === "completed" && run.conclusion === "success" &&
+                    workflow.path.startsWith(".github/workflows/") && (!expectedPath || workflow.path === expectedPath)
+                  ) { proved = true; break; }
+                }
+                if (!proved) throw new Error(`Required check ${requirement.context} lacks an exact canonical push workflow proof.`);
+              }
+            }
+            const allReleases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            const stableReleases = allReleases.filter((release) => release.tag_name?.startsWith("pylon-stable-"));
+            const sequences = stableReleases.map((release) => {
+              const parsed = /^pylon-stable-([0-9]{6})-/.exec(release.tag_name);
+              if (!parsed) throw new Error(`Malformed existing stable release tag ${release.tag_name}.`);
+              return Number.parseInt(parsed[1], 10);
+            }).sort((left, right) => left - right);
+            for (let index = 0; index < sequences.length; index += 1) {
+              if (sequences[index] !== index + 1) throw new Error("Existing stable release sequence has a gap or duplicate.");
+            }
+            const stableRefs = await github.paginate(github.rest.git.listMatchingRefs, { owner, repo, ref: "tags/pylon-stable-", per_page: 100 });
+            const releaseRefs = stableRefs.filter((ref) => /^refs\/tags\/pylon-stable-[0-9]{6}-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(ref.ref));
+            const reservationRefs = stableRefs.filter((ref) => /^refs\/tags\/pylon-stable-sequence-[0-9]{6}$/.test(ref.ref));
+            const published = stableReleases.filter((release) => !release.draft);
+            if (
+              releaseRefs.length !== published.length ||
+              !published.every((release) => releaseRefs.some((ref) => ref.ref === `refs/tags/${release.tag_name}`))
+            ) throw new Error("Stable release tags and published release history differ.");
+            const reservedSequences = reservationRefs.map((ref) => Number.parseInt(ref.ref.slice(-6), 10)).sort((left, right) => left - right);
+            for (let index = 0; index < reservedSequences.length; index += 1) {
+              if (reservedSequences[index] !== index + 1) throw new Error("Stable sequence reservations have a gap or duplicate.");
+            }
+            for (const release of published) {
+              const sequence = Number.parseInt(/^pylon-stable-([0-9]{6})-/.exec(release.tag_name)[1], 10);
+              const reservation = reservationRefs.find((ref) => ref.ref === `refs/tags/pylon-stable-sequence-${String(sequence).padStart(6, "0")}`);
+              if (!reservation || reservation.object.type !== "tag") throw new Error(`Stable release ${release.tag_name} lacks an annotated reservation.`);
+              const annotation = (await github.rest.git.getTag({ owner, repo, tag_sha: reservation.object.sha })).data;
+              if (
+                annotation.object.type !== "commit" || annotation.object.sha !== release.target_commitish ||
+                !annotation.message.includes(`Sequence: ${String(sequence).padStart(6, "0")}\n`) ||
+                !annotation.message.includes(`Policy: ${release.target_commitish}\n`) ||
+                !annotation.message.includes(`Stable tag: ${release.tag_name}\n`) ||
+                !annotation.message.includes(`Manifest: ${release.assets?.[0]?.digest ?? "missing"}\n`)
+              ) throw new Error(`Stable release ${release.tag_name} lacks its exact policy and manifest reservation.`);
+            }
+            if (manifest.sequence > 1) {
+              const previousRelease = stableReleases.find((release) => release.tag_name === manifest.history.previous.tag);
+              const previousAsset = previousRelease?.assets?.[0];
+              if (
+                !previousRelease || previousRelease.immutable !== true || previousRelease.draft || previousRelease.assets.length !== 1 ||
+                previousAsset.name !== "pylon-stable-channel-v1.json" ||
+                previousAsset.digest !== `sha256:${manifest.history.previous.sha256}`
+              ) throw new Error("Stable manifest does not chain from the current immutable high-water release.");
+            }
+            let existing;
+            try {
+              existing = (await github.rest.repos.getReleaseByTag({ owner, repo, tag: manifest.tag })).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            const name = `Pylon Prime stable ${manifest.tag}`;
+            const body = [
+              "Pylon Prime stable publication.", "", `Tag: ${manifest.tag}`, `Source: ${sourceSha}`,
+              `Tree: ${manifest.build.source.tree}`, `Policy: ${manifest.promotion.policyCommit}`,
+              `Policy tree: ${manifest.promotion.policyTree}`, `Recipe: r${manifest.build.recipeRevision}`, "",
+              "Verify the immutable release and artifact attestations before use.",
+            ].join("\n");
+            const exact = async (release) => {
+              const asset = release.assets?.[0];
+              if (
+                release.immutable !== true || release.draft !== false || release.prerelease !== false ||
+                release.tag_name !== manifest.tag || release.name !== name || release.body !== body ||
+                release.target_commitish !== manifest.promotion.policyCommit || release.assets.length !== 1 ||
+                asset.name !== "pylon-stable-channel-v1.json" || asset.size !== bytes.byteLength ||
+                asset.digest !== `sha256:${sha256}`
+              ) throw new Error("Existing stable release is mutable or differs from the exact sequence manifest.");
+              const tag = await github.rest.git.getRef({ owner, repo, ref: `tags/${manifest.tag}` });
+              if (tag.data.object.type !== "commit" || tag.data.object.sha !== manifest.promotion.policyCommit) {
+                throw new Error("Existing stable tag does not target the exact protected promotion policy.");
+              }
+            };
+            const reservationTag = `pylon-stable-sequence-${String(manifest.sequence).padStart(6, "0")}`;
+            const reservationMessage = [
+              "Pylon stable sequence reservation", `Sequence: ${String(manifest.sequence).padStart(6, "0")}`,
+              `Policy: ${manifest.promotion.policyCommit}`, `Policy tree: ${manifest.promotion.policyTree}`,
+              `Stable tag: ${manifest.tag}`, `Preview: ${manifest.build.previewTag}`, `Manifest: sha256:${sha256}`, "",
+            ].join("\n");
+            let reservation = reservationRefs.find((ref) => ref.ref === `refs/tags/${reservationTag}`);
+            const requireReservation = async () => {
+              if (!reservation || reservation.object.type !== "tag") {
+                throw new Error("Stable sequence reservation is missing its immutable annotated identity.");
+              }
+              const annotation = (await github.rest.git.getTag({ owner, repo, tag_sha: reservation.object.sha })).data;
+              if (
+                annotation.tag !== reservationTag || annotation.message !== reservationMessage ||
+                annotation.object.type !== "commit" || annotation.object.sha !== manifest.promotion.policyCommit
+              ) throw new Error("Stable sequence is reserved by a different policy, build, or manifest identity.");
+            };
+            if (!existing) {
+              const matching = stableReleases.filter((release) => release.tag_name === manifest.tag);
+              if (matching.length > 1) throw new Error("Stable tag resolves to multiple releases.");
+              existing = matching[0];
+            }
+            const sameSequence = stableReleases.filter((release) =>
+              Number.parseInt(/^pylon-stable-([0-9]{6})-/.exec(release.tag_name)[1], 10) === manifest.sequence
+            );
+            if (sameSequence.length > 1 || (sameSequence.length === 1 && sameSequence[0].tag_name !== manifest.tag)) {
+              throw new Error("Stable sequence was claimed by a different build identity after preparation.");
+            }
+            if (existing && !existing.draft) {
+              await exact(existing);
+              await requireReservation();
+              core.info(`Immutable stable ${manifest.tag} already contains identical metadata.`);
+              return;
+            }
+            if (manifest.sequence !== sequences.filter((sequence) => sequence < manifest.sequence).length + 1) {
+              throw new Error("Stable manifest is not the next monotonic sequence.");
+            }
+            if (reservation) {
+              await requireReservation();
+            } else {
+              if (reservedSequences.length !== manifest.sequence - 1) throw new Error("Stable reservation high-water changed before publication.");
+              try {
+                const annotated = (await github.rest.git.createTag({
+                  owner, repo, tag: reservationTag, message: reservationMessage,
+                  object: manifest.promotion.policyCommit, type: "commit",
+                  tagger: {
+                    name: "github-actions[bot]", email: "41898282+github-actions[bot]@users.noreply.github.com",
+                    date: new Date().toISOString(),
+                  },
+                })).data;
+                reservation = (await github.rest.git.createRef({
+                  owner, repo, ref: `refs/tags/${reservationTag}`, sha: annotated.sha,
+                })).data;
+              } catch (error) {
+                if (error.status === 422) {
+                  try { reservation = (await github.rest.git.getRef({ owner, repo, ref: `tags/${reservationTag}` })).data; } catch {}
+                  throw new Error("Stable sequence reservation raced (422); refetched state and stopped without choosing another sequence.");
+                }
+                throw error;
+              }
+              await requireReservation();
+            }
+            let draft = existing;
+            if (draft) {
+              const asset = draft.assets?.[0];
+              if (
+                draft.immutable === true || draft.tag_name !== manifest.tag || draft.name !== name || draft.body !== body ||
+                draft.prerelease !== false || draft.target_commitish !== manifest.promotion.policyCommit || draft.assets.length > 1 ||
+                (asset && (asset.name !== "pylon-stable-channel-v1.json" || asset.size !== bytes.byteLength || asset.digest !== `sha256:${sha256}`))
+              ) throw new Error("Partial stable draft identity or asset differs; refusing to edit it.");
+            } else {
+              try {
+                await github.rest.git.getRef({ owner, repo, ref: `tags/${manifest.tag}` });
+                throw new Error("Stable tag exists without its exact immutable release.");
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+              try {
+                draft = (await github.rest.repos.createRelease({
+                  owner, repo, tag_name: manifest.tag, target_commitish: manifest.promotion.policyCommit, name, body, draft: true, prerelease: false, make_latest: "false",
+                })).data;
+              } catch (error) {
+                if (error.status === 422) {
+                  try { await github.rest.repos.getReleaseByTag({ owner, repo, tag: manifest.tag }); } catch {}
+                  throw new Error("Stable sequence reservation raced (422); refusing to skip to another sequence.");
+                }
+                throw error;
+              }
+            }
+            if (draft.assets.length === 0) {
+              await github.request("POST /repos/{owner}/{repo}/releases/{release_id}/assets", {
+                owner, repo, release_id: draft.id, name: "pylon-stable-channel-v1.json", data: bytes,
+                headers: { "content-type": "application/json", "content-length": bytes.byteLength },
+              });
+            }
+            await github.rest.repos.updateRelease({ owner, repo, release_id: draft.id, draft: false });
+            await exact((await github.rest.repos.getRelease({ owner, repo, release_id: draft.id })).data);
+            reservation = (await github.rest.git.getRef({ owner, repo, ref: `tags/${reservationTag}` })).data;
+            await requireReservation();
+            const after = (await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 }))
+              .filter((release) => /^pylon-stable-[0-9]{6}-/.test(release.tag_name ?? ""));
+            if (after.filter((release) => Number.parseInt(/^pylon-stable-([0-9]{6})-/.exec(release.tag_name)[1], 10) === manifest.sequence).length !== 1) {
+              throw new Error("Stable publication did not retain a globally unique sequence.");
+            }
+
+      - name: Verify GitHub immutable-release attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(node -e "console.log(JSON.parse(require('node:fs').readFileSync('publication/pylon-stable-channel-v1.json')).tag)")"
+          verified=false
+          for attempt in 1 2 3 4 5 6; do
+            if gh release verify "$tag" --repo pylon-code/prime-agent; then
+              verified=true
+              break
+            fi
+            if [ "$attempt" = 6 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+          test "$verified" = true
+          for asset in publication/pylon-stable-channel-v1.json; do
+            gh release verify-asset "$tag" "$asset" --repo pylon-code/prime-agent
+          done
