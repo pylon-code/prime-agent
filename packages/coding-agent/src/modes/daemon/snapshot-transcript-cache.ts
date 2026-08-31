@@ -66,10 +66,15 @@ function assertSafeSnapshotCacheParent(parentRoot: string): void {
 	if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
 		throw new Error(`Snapshot cache parent is not a private directory: ${parentRoot}`);
 	}
-	if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+	const getuid = process.getuid;
+	const supportsPosixOwnership = typeof getuid === "function";
+	if (supportsPosixOwnership && metadata.uid !== getuid()) {
 		throw new Error(`Snapshot cache parent is not owned by the current user: ${parentRoot}`);
 	}
-	if ((metadata.mode & 0o077) !== 0) {
+	// Node does not expose Windows DACLs through mode bits, and chmod cannot
+	// make those synthesized bits private. Windows still rejects links here;
+	// access is governed by the containing directory's DACL, which this code does not inspect.
+	if (supportsPosixOwnership && (metadata.mode & 0o077) !== 0) {
 		chmodSync(parentRoot, 0o700);
 		const secured = lstatSync(parentRoot);
 		if (!secured.isDirectory() || secured.isSymbolicLink() || (secured.mode & 0o077) !== 0) {
@@ -118,7 +123,7 @@ export function createSnapshotCacheProcessRoot(parentRoot: string, ownerToken = 
 		}
 		throw new Error(`Snapshot cache process root is unsafe: ${root}`);
 	}
-	if ((metadata.mode & 0o077) !== 0) chmodSync(root, 0o700);
+	if (typeof process.getuid === "function" && (metadata.mode & 0o077) !== 0) chmodSync(root, 0o700);
 	return root;
 }
 
