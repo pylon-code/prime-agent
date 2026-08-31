@@ -2463,6 +2463,7 @@ export class AgentDaemon {
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		sessionManager.newSession({
 			parentSession: options.parentSession.sessionFile,
+			parentSessionId: options.parentSession.sessionId,
 			rlmDepth: options.rlmDepth,
 		});
 		let stateRef: ActiveSessionState | undefined;

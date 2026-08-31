@@ -236,13 +236,16 @@ const noOpUIContext: ExtensionUIContext = {
  * Read-only session view whose id identifies work derived from a session
  * rather than the session itself. Everything else still reports the owning
  * session, so an extension keyed on `getSessionId()` gets a distinct provider
- * identity without losing access to the real transcript.
+ * identity without losing access to the real transcript. Notably
+ * `getParentSessionId()` still reports the owner's parent: scoped work belongs
+ * to the same place in the agent tree as the session that derived it.
  */
 function scopedSessionManagerView(base: SessionManager, scope: string): ReadonlySessionManager {
 	return {
 		getCwd: () => base.getCwd(),
 		getSessionDir: () => base.getSessionDir(),
 		getSessionId: () => `${base.getSessionId()}/${scope}`,
+		getParentSessionId: () => base.getParentSessionId(),
 		getSessionFile: () => base.getSessionFile(),
 		getLeafId: () => base.getLeafId(),
 		getLeafEntry: () => base.getLeafEntry(),

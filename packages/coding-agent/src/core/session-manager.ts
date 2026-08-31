@@ -79,6 +79,12 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	/**
+	 * Session id of the agent that spawned this one, set only for RLM children.
+	 * `parentSession` is a file pointer that also records fork and new-session
+	 * lineage, so it cannot answer "which live agent owns this child".
+	 */
+	parentSessionId?: string;
 	rlmDepth?: number;
 	git?: GitContext;
 }
@@ -86,6 +92,7 @@ export interface SessionHeader {
 export interface NewSessionOptions {
 	id?: string;
 	parentSession?: string;
+	parentSessionId?: string;
 	rlmDepth?: number;
 }
 
@@ -272,6 +279,7 @@ export type ReadonlySessionManager = Pick<
 	| "getEntries"
 	| "getTree"
 	| "getSessionName"
+	| "getParentSessionId"
 >;
 
 function createSessionId(): string {
@@ -1216,6 +1224,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
+			parentSessionId: options?.parentSessionId,
 			rlmDepth,
 			git,
 		};
@@ -1310,6 +1319,16 @@ export class SessionManager {
 		return this.sessionId;
 	}
 
+	/**
+	 * Session id of the agent that spawned this session, or undefined for a root
+	 * session. Names the immediate parent, not the root of a deeper RLM tree, so
+	 * a consumer holding every session can walk the chain. Lives in the session
+	 * header, so a resumed child still reports its parent.
+	 */
+	getParentSessionId(): string | undefined {
+		return this.getHeader()?.parentSessionId;
+	}
+
 	getSessionFile(): string | undefined {
 		return this.sessionFile;
 	}
@@ -1337,6 +1356,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: previousHeader?.parentSession,
+			parentSessionId: previousHeader?.parentSessionId,
 			rlmDepth: resolveSessionRlmDepth(previousHeader ?? {}, target.sessionFile),
 			git,
 		};

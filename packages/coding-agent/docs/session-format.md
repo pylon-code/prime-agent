@@ -196,6 +196,12 @@ For sessions with a parent (created via `/fork`, `/clone`, or `newSession({ pare
 {"type":"session","version":3,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/path/to/project","parentSession":"/path/to/original/session.jsonl"}
 ```
 
+Subagent sessions also record `parentSessionId`, the session id of the agent that spawned them. `parentSession` is a file pointer that fork and new-session lineage share, so only `parentSessionId` identifies the immediate parent in an agent tree. It survives resume and is read back with `getParentSessionId()`.
+
+```json
+{"type":"session","version":3,"id":"uuid","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/path/to/project","parentSession":"/path/to/parent/session.jsonl","parentSessionId":"parent-uuid","rlmDepth":1}
+```
+
 ### SessionMessageEntry
 
 A message in the conversation. The `message` field contains an `AgentMessage`.

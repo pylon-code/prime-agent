@@ -656,6 +656,24 @@ The hook fires for every provider request the session is responsible for, and `c
 
 Treat the id as opaque: match on the `<sessionId>` prefix if you need to group derived work with its session.
 
+`ctx.sessionManager.getParentSessionId()` names the agent that spawned the session, so a handler can stamp the whole tree edge and not just one node:
+
+```typescript
+pi.on("before_provider_request", (event, ctx) => {
+  return {
+    ...event.payload,
+    metadata: {
+      user_id: JSON.stringify({
+        session_id: ctx.sessionManager.getSessionId(),
+        parent_session_id: ctx.sessionManager.getParentSessionId(),
+      }),
+    },
+  };
+});
+```
+
+See [ctx.sessionManager](#ctxsessionmanager) for what the parent id does and does not cover.
+
 #### after_provider_response
 
 Fired after an HTTP response is received and before its stream body is consumed. Handlers run in extension load order.
@@ -916,7 +934,17 @@ For `tool_call`, this state is synchronized through the current assistant messag
 ctx.sessionManager.getEntries()       // All entries
 ctx.sessionManager.getBranch()        // Current branch
 ctx.sessionManager.getLeafId()        // Current leaf entry ID
+ctx.sessionManager.getSessionId()     // Identity of the conversation this request belongs to
+ctx.sessionManager.getParentSessionId() // Session that spawned this one, or undefined
 ```
+
+`getParentSessionId()` describes the agent tree:
+
+- A root session returns `undefined`. A subagent returns the session id of the agent that spawned it, inline or in the daemon.
+- It names the **immediate** parent. A grandchild reports its own parent, not the root, so a handler holding several sessions can walk the chain.
+- It is recorded in the session header, so a resumed or reattached subagent still reports its parent.
+- Scoped requests (`<sessionId>/side:<id>`, `<sessionId>/compaction`, ...) report the parent of the session that owns them. The scope changes `getSessionId()` only.
+- Forking or branching a session does not carry the linkage: the result is an independent session with its own provider identity, not a live child of a running parent.
 
 ### ctx.modelRegistry / ctx.model
 
