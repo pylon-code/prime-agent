@@ -29,8 +29,8 @@ export interface AutoRefineSettings {
 
 export interface ProviderRetrySettings {
 	timeoutMs?: number; // SDK/provider request timeout in milliseconds
-	maxRetries?: number; // SDK/provider retry attempts
-	maxRetryDelayMs?: number; // default: 60000 (max server-requested delay before failing)
+	maxRetries?: number; // SDK/provider retry attempts; defaults to 0 while agent-level retry is enabled
+	maxRetryDelayMs?: number; // default: 60000 (max provider-requested delay the agent will wait before failing)
 }
 
 export interface RetrySettings {

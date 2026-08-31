@@ -281,3 +281,18 @@ decisions:
     revisit_when:
       - Prime routes subagent and derived-request provider hooks through the owning session's extension runner.
       - An upstream extension contract exposes per-agent provider identity that supersedes the scoped session-id view.
+  kind-aware-provider-retry:
+    area: runtime-reliability
+    state: shipped
+    owner: pylon-prime-integration
+    decision: redesign
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/22
+      - https://github.com/pylon-code/prime-agent/issues/24
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/tree/a903d4b6768f484bd6d459b7b0aa7dee38e461e2
+    fork_change: kind-aware-session-retry-v1
+    upstream_support: Prime through a903d4b6768f classifies provider stream failures but retries every one of them on the same fixed 2s/4s/8s ladder, stacks provider SDK retries underneath the session loop, never reads Retry-After, and threads maxRetryDelayMs through StreamOptions, Agent, and the proxy without any provider reading it.
+    revisit_when:
+      - Prime upstream makes the session retry loop failure-kind aware and honors Retry-After with a delay ceiling.
+      - Prime upstream makes exactly one retry layer own policy so provider SDK retries cannot multiply session retries.

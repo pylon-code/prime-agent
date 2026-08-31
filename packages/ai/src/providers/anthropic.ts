@@ -36,6 +36,7 @@ import {
 	classifyStreamFailure,
 	formatStreamFailureMessage,
 	recordStreamFailure,
+	retryAfterMsFromHeaders,
 	StreamFailureError,
 	streamFailureFromStopReason,
 	streamFailureMessage,
@@ -384,7 +385,7 @@ async function* iterateSseMessages(
 }
 
 /** Turn an in-stream `error` SSE event (how Anthropic delivers overloads etc.) into a classified failure. */
-function anthropicSseError(data: string, requestId?: string): StreamFailureError {
+function anthropicSseError(data: string, requestId?: string, retryAfterMs?: number): StreamFailureError {
 	let errorType: string | undefined;
 	let detail: string | undefined;
 	try {
@@ -400,6 +401,7 @@ function anthropicSseError(data: string, requestId?: string): StreamFailureError
 		kind: classifyStreamFailure(errorType),
 		providerErrorType: errorType,
 		requestId,
+		retryAfterMs,
 		raw: truncateRawPayload(data),
 	};
 	return new StreamFailureError(streamFailureMessage(info, detail), info);
@@ -416,10 +418,13 @@ async function* iterateAnthropicEvents(
 
 	let sawMessageStart = false;
 	let sawMessageEnd = false;
+	// Overload/rate-limit SSE errors arrive on an otherwise-200 response, so the
+	// only Retry-After the caller ever sees is the one on the response headers.
+	const retryAfterMs = retryAfterMsFromHeaders(response.headers);
 
 	for await (const sse of iterateSseMessages(response.body, signal)) {
 		if (sse.event === "error") {
-			throw anthropicSseError(sse.data, requestId);
+			throw anthropicSseError(sse.data, requestId, retryAfterMs);
 		}
 
 		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event ?? "")) {

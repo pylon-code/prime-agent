@@ -1,0 +1,2 @@
+- Added upstream `Retry-After` capture to provider stream-failure diagnostics, including Anthropic overloads delivered as mid-stream SSE errors, so higher-level retry can honor it ([#24](https://github.com/pylon-code/prime-agent/issues/24)).
+- Removed the unused `maxRetryDelayMs` stream option; no provider ever read it ([#24](https://github.com/pylon-code/prime-agent/issues/24)).

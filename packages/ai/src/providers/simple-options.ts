@@ -15,7 +15,6 @@ export function buildBaseOptions(model: Model<Api>, options?: SimpleStreamOption
 		onResponse: options?.onResponse,
 		timeoutMs: options?.timeoutMs,
 		maxRetries: options?.maxRetries,
-		maxRetryDelayMs: options?.maxRetryDelayMs,
 		metadata: options?.metadata,
 	};
 }

@@ -1,0 +1,1 @@
+- Removed the unused `maxRetryDelayMs` agent and proxy option; it was threaded to providers that never read it ([#24](https://github.com/pylon-code/prime-agent/issues/24)).
