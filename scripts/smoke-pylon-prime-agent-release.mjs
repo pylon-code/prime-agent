@@ -393,12 +393,14 @@ try {
   if (!client.hello?.serverCapabilities?.includes("correlated_prompt_lifecycle_v1")) throw new Error("Daemon did not offer correlated lifecycle.");
   if (!client.hello?.serverCapabilities?.includes("caller_owned_session_environment_cleanup_v1")) throw new Error("Daemon did not offer caller-owned environment cleanup.");
   const launchEnv = Object.fromEntries(
-    Object.entries(process.env).filter(
-      ([name, value]) =>
+    Object.entries(process.env).filter(([name, value]) => {
+      const normalizedName = name.toUpperCase();
+      return (
         typeof value === "string" &&
-        !name.startsWith("PRIME_AGENT_INTERNAL_DAEMON_") &&
-        !name.startsWith("RLM_"),
-    ),
+        !normalizedName.startsWith("PRIME_AGENT_INTERNAL_") &&
+        normalizedName !== "RLM_DEPTH"
+      );
+    }),
   );
   launchEnv.PRIME_AGENT_CODING_AGENT_DIR = agentDir;
   const sessionConfig = {
