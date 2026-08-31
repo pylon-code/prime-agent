@@ -38,7 +38,7 @@ const workerLaunchTestState = vi.hoisted(() => ({
 	gateMarkerPath: "",
 	tsxCliPath: "",
 	cliEntrypoint: "",
-	spawned: [] as Array<{ child: ChildProcess; args: readonly string[] }>,
+	spawned: [] as Array<{ child: ChildProcess; args: readonly string[]; options: SpawnOptions }>,
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -50,7 +50,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 		spawn(command: string, args: readonly string[], options: SpawnOptions): ChildProcess {
 			const child = actual.spawn(command, args, options);
 			if (workerLaunchTestState.capture) {
-				workerLaunchTestState.spawned.push({ child, args });
+				workerLaunchTestState.spawned.push({ child, args, options });
 			}
 			return child;
 		},
@@ -514,6 +514,82 @@ describe("daemon worker supervisor monitoring", () => {
 		releaseOldAssertion();
 		await staleCommand;
 		expect(handleWorkerCommand).not.toHaveBeenCalled();
+	});
+
+	it("replaces ambient supervisor env only for capability-marked caller-owned launches", async () => {
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.fixtureMode = "rollback-gate";
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-exact-env-test-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		const launchOnce = async (exact: boolean) => {
+			let assertionCount = 0;
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				...createSupervisorSnapshotState(),
+				defaultSessionConfig: { cwd: root, agentDir: root },
+				descriptorDir,
+				socketPath: join(root, `${exact ? "exact" : "legacy"}.sock`),
+				workers: new Map(),
+				assertRecoveryAllowed: vi.fn(async () => {
+					assertionCount++;
+					if (assertionCount === 3) throw new Error("stop after env capture");
+				}),
+				log: vi.fn(),
+			}) as {
+				launchWorker(command: {
+					type: "create";
+					config: { cwd: string; agentDir: string };
+					lifecycle: "client_owned";
+					launchEnv: Record<string, string>;
+					launchEnvMode?: "replace";
+				}): Promise<unknown>;
+			};
+			await expect(
+				supervisor.launchWorker({
+					type: "create",
+					config: { cwd: root, agentDir: root },
+					lifecycle: "client_owned",
+					launchEnv: { CALLER_ENV_A: "a" },
+					...(exact ? { launchEnvMode: "replace" as const } : {}),
+				}),
+			).rejects.toThrow("stop after env capture");
+		};
+		const previousAmbient = process.env.SUPERVISOR_ENV_C;
+		const previousExecArgv = process.execArgv;
+		process.env.SUPERVISOR_ENV_C = "c";
+		process.execArgv = [...previousExecArgv, "--import=tsx"];
+		try {
+			await launchOnce(true);
+			await launchOnce(false);
+		} finally {
+			process.execArgv = previousExecArgv;
+			if (previousAmbient === undefined) delete process.env.SUPERVISOR_ENV_C;
+			else process.env.SUPERVISOR_ENV_C = previousAmbient;
+		}
+
+		const exactEnvironment = workerLaunchTestState.spawned[0]?.options.env;
+		const legacyEnvironment = workerLaunchTestState.spawned[1]?.options.env;
+		expect(exactEnvironment).toMatchObject({ CALLER_ENV_A: "a", PRIME_AGENT_INTERNAL_DAEMON_WORKER: "1" });
+		expect(Object.keys(exactEnvironment ?? {}).sort()).toEqual(
+			[
+				"CALLER_ENV_A",
+				"PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET",
+				"PRIME_AGENT_INTERNAL_DAEMON_WORKER",
+				"PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID",
+				"PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL",
+				"PRIME_AGENT_INTERNAL_DAEMON_WORKER_STARTUP_GATE_FD",
+				"PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN",
+				"PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL",
+				"PRIME_AGENT_INTERNAL_SESSION_LEASES",
+				"PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID",
+			].sort(),
+		);
+		expect(exactEnvironment).not.toHaveProperty("SUPERVISOR_ENV_C");
+		expect(exactEnvironment).not.toHaveProperty("TSX_TSCONFIG_PATH");
+		expect(legacyEnvironment).toMatchObject({ CALLER_ENV_A: "a", SUPERVISOR_ENV_C: "c" });
+		expect(legacyEnvironment).toHaveProperty("TSX_TSCONFIG_PATH");
+		expect(JSON.stringify(exactEnvironment)).not.toContain("private");
 	});
 
 	it.each([
@@ -2469,6 +2545,65 @@ describe("daemon worker supervisor monitoring", () => {
 		if (worker.ownerCleanupTimer) clearTimeout(worker.ownerCleanupTimer);
 	});
 
+	it("returns structured completion ownership without claiming arbitrary settlement", async () => {
+		const owner = { id: "socket-owner" } as DaemonSocketClient;
+		const stranger = { id: "socket-stranger" } as DaemonSocketClient;
+		const worker = {
+			descriptor: {
+				workerId: "owned-worker",
+				ownerClientId: "protocol-owner",
+				rootActiveSessionId: "active-owned",
+			},
+			summaries: new Map([
+				[
+					"active-owned",
+					{
+						id: "session-owned",
+						sessionId: "session-owned",
+						activeSessionId: "active-owned",
+						sessionName: "owned-friendly",
+					},
+				],
+			]),
+			ownerCleanupTimer: undefined,
+		};
+		const stopWorker = vi.fn(async () => undefined);
+		const protocolClientIds = new WeakMap<object, string>([
+			[owner, "protocol-owner"],
+			[stranger, "protocol-stranger"],
+		]);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			protocolClientIds,
+			stopWorker,
+		}) as {
+			handleCommand(
+				client: DaemonSocketClient,
+				command: { type: "complete_owned_session"; activeSessionId: string },
+			): Promise<{ success: boolean; data?: unknown }>;
+		};
+
+		const wrongOwner = await supervisor.handleCommand(stranger, {
+			type: "complete_owned_session",
+			activeSessionId: "active-owned",
+		});
+		expect(wrongOwner).toMatchObject({
+			success: false,
+			error: "Session is not owned by this client",
+			errorInfo: { code: "owned_session_owner_mismatch" },
+		});
+		expect(wrongOwner).not.toHaveProperty("data");
+		expect(JSON.stringify(wrongOwner)).not.toContain("active-owned");
+		expect(stopWorker).not.toHaveBeenCalled();
+		await expect(
+			supervisor.handleCommand(owner, { type: "complete_owned_session", activeSessionId: "owned-friendly" }),
+		).resolves.toMatchObject({ success: true, data: { status: "completed" } });
+		expect(stopWorker).toHaveBeenCalledWith(worker, true);
+		await expect(
+			supervisor.handleCommand(owner, { type: "complete_owned_session", activeSessionId: "never-owned" }),
+		).rejects.toThrow("Unknown active session: never-owned");
+	});
+
 	it("joins an admitted recovery before proving exact cleanup settled", async () => {
 		const recoveryGate = createDeferred<void>();
 		let staleRecoveryRejected = false;
@@ -3928,6 +4063,7 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "worker-owned-recovery",
 				ownerClientId: "client-1",
+				callerOwnedEnvironmentContract: true,
 				rootActiveSessionId: activeSessionId,
 				lifecycle: "failed",
 				consecutiveFailures: 1,
@@ -3938,11 +4074,13 @@ describe("daemon worker supervisor monitoring", () => {
 			intentionalStop: false,
 			stopRevision: 0,
 			launchEnv: undefined as Record<string, string> | undefined,
+			launchEnvMode: "replace" as "replace" | undefined,
+			exactEnvironmentAwaitingOwner: true,
 			transientCreateCommand: undefined as Record<string, unknown> | undefined,
 		};
 		const client = {
 			id: "client-1",
-			capabilities: new Set<string>(),
+			capabilities: new Set<string>(["caller_owned_session_environment_cleanup_v1"]),
 			supportsExtensionUi: false,
 			attachedActiveSessionIds: new Set<string>(),
 		};
@@ -3963,6 +4101,8 @@ describe("daemon worker supervisor monitoring", () => {
 					activeSessionId: string;
 					recoveryConfig: { cwd: string };
 					launchEnv: Record<string, string>;
+					launchEnvMode: "replace";
+					capabilities: readonly ["caller_owned_session_environment_cleanup_v1"];
 					env: Record<string, string>;
 				},
 			): Promise<unknown>;
@@ -3974,6 +4114,8 @@ describe("daemon worker supervisor monitoring", () => {
 				activeSessionId,
 				recoveryConfig: { cwd: "/tmp/fresh-owner" },
 				launchEnv: { OWNER_SECRET: "fresh" },
+				launchEnvMode: "replace",
+				capabilities: ["caller_owned_session_environment_cleanup_v1"],
 				env: { HERDR_PANE_ID: "pane-1" },
 			}),
 		).rejects.toThrow("stop after reconstruction");
@@ -3983,10 +4125,140 @@ describe("daemon worker supervisor monitoring", () => {
 			config: { cwd: "/tmp/fresh-owner", telemetryDisabled: true },
 			env: { HERDR_PANE_ID: "pane-1" },
 			launchEnv: { OWNER_SECRET: "fresh" },
+			launchEnvMode: "replace",
 			lifecycle: "client_owned",
 		});
 		expect(worker.launchEnv).toEqual({ OWNER_SECRET: "fresh" });
+		expect(worker.launchEnvMode).toBe("replace");
 		expect(recoverWorker).toHaveBeenCalledWith(worker);
+	});
+
+	it("stages exact recovery for an already-ready adopted worker and rejects environment rebinding", async () => {
+		const activeSessionId = "active-owned-adopted";
+		const summary = { id: "session-adopted", sessionId: "session-adopted", activeSessionId };
+		const worker = {
+			descriptor: {
+				workerId: "worker-owned-adopted",
+				ownerClientId: "client-adopted",
+				callerOwnedEnvironmentContract: true,
+				rootActiveSessionId: activeSessionId,
+				lifecycle: "ready",
+				consecutiveFailures: 0,
+				createCommand: { type: "create" as const, sessionPath: "/tmp/adopted.jsonl" },
+			},
+			client: {},
+			summaries: new Map([[activeSessionId, summary]]),
+			launchEnv: undefined as Record<string, string> | undefined,
+			launchEnvMode: "replace" as const,
+			exactEnvironmentAwaitingOwner: true,
+			transientCreateCommand: undefined as Record<string, unknown> | undefined,
+		};
+		const client = {
+			id: "client-adopted",
+			capabilities: new Set<string>(),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set<string>(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([client]),
+			protocolClientIds: new WeakMap(),
+			findWorkerForClient: vi.fn(async () => ({ worker, summary })),
+			requireAvailableWorkerClient: vi.fn(() => {
+				throw new Error("stop after ready staging");
+			}),
+		}) as {
+			attachClient(attachClient: typeof client, command: Record<string, unknown>): Promise<unknown>;
+		};
+		const attach = (launchEnv: Record<string, string>) =>
+			supervisor.attachClient(client, {
+				type: "attach",
+				activeSessionId,
+				recoveryConfig: { cwd: "/tmp/adopted-owner" },
+				launchEnv,
+				launchEnvMode: "replace",
+				capabilities: ["caller_owned_session_environment_cleanup_v1"],
+			});
+
+		const stranger = { ...client, id: "client-stranger", attachedActiveSessionIds: new Set<string>() };
+		await expect(
+			supervisor.attachClient(stranger, {
+				type: "attach",
+				activeSessionId,
+				capabilities: ["caller_owned_session_environment_cleanup_v1"],
+			}),
+		).rejects.toThrow(`Unknown active session: ${activeSessionId}`);
+
+		await expect(
+			supervisor.attachClient(client, {
+				type: "attach",
+				activeSessionId,
+				launchEnv: { OWNER_SECRET: "original" },
+				launchEnvMode: "replace",
+				capabilities: ["caller_owned_session_environment_cleanup_v1"],
+			}),
+		).rejects.toThrow("requires a contract-created owned session and recovery context");
+		expect(worker.launchEnv).toBeUndefined();
+		expect(worker.exactEnvironmentAwaitingOwner).toBe(true);
+
+		await expect(attach({ OWNER_SECRET: "original" })).rejects.toThrow("stop after ready staging");
+		expect(worker.launchEnv).toEqual({ OWNER_SECRET: "original" });
+		expect(worker.exactEnvironmentAwaitingOwner).toBe(false);
+		expect(worker.transientCreateCommand).toMatchObject({
+			config: { cwd: "/tmp/adopted-owner" },
+			launchEnv: { OWNER_SECRET: "original" },
+			launchEnvMode: "replace",
+			lifecycle: "client_owned",
+		});
+		await expect(attach({ OWNER_SECRET: "replacement" })).rejects.toThrow(
+			"Caller-owned launch environment does not match the established snapshot",
+		);
+		expect(worker.launchEnv).toEqual({ OWNER_SECRET: "original" });
+	});
+
+	it("refuses exact proof for a legacy-owned worker", async () => {
+		const activeSessionId = "active-legacy-owned";
+		const worker = {
+			descriptor: {
+				workerId: "worker-legacy-owned",
+				ownerClientId: "client-1",
+				rootActiveSessionId: activeSessionId,
+				lifecycle: "ready",
+				consecutiveFailures: 0,
+				createCommand: { type: "create" as const },
+			},
+		};
+		const client = {
+			id: "client-1",
+			capabilities: new Set<string>(["caller_owned_session_environment_cleanup_v1"]),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set<string>(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			protocolClientIds: new WeakMap(),
+		}) as {
+			attachClient(
+				attachClient: typeof client,
+				command: {
+					type: "attach";
+					activeSessionId: string;
+					launchEnv: Record<string, string>;
+					launchEnvMode: "replace";
+					capabilities: readonly ["caller_owned_session_environment_cleanup_v1"];
+				},
+			): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.attachClient(client, {
+				type: "attach",
+				activeSessionId,
+				launchEnv: { OWNER_ONLY: "snapshot" },
+				launchEnvMode: "replace",
+				capabilities: ["caller_owned_session_environment_cleanup_v1"],
+			}),
+		).rejects.toThrow("contract-created owned session");
 	});
 
 	it("rejects an opted-out attach to a telemetry-enabled worker", async () => {

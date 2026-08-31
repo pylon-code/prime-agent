@@ -1,0 +1,2 @@
+- Added a negotiated caller-owned session environment proof and observable bounded cleanup outcomes for daemon SDK hosts. ([#33](https://github.com/pylon-code/prime-agent/issues/33))
+- Fixed Windows daemon startup so snapshot cache validation does not treat synthesized filesystem mode bits as POSIX permissions. ([#33](https://github.com/pylon-code/prime-agent/issues/33))

@@ -108,6 +108,8 @@ export interface DaemonWorkerDescriptor {
 	rootActiveSessionId: string;
 	/** Stable protocol client that owns this worker. Omitted for resident sessions. */
 	ownerClientId?: string;
+	/** Non-secret marker that the current owned worker process was launched from an exact caller snapshot. */
+	callerOwnedEnvironmentContract?: true;
 	rootSessionId?: string;
 	sessionFile?: string;
 	sessionDir?: string;
@@ -151,6 +153,7 @@ export function durableDaemonWorkerDescriptor(descriptor: DaemonWorkerDescriptor
 		authenticationToken: descriptor.authenticationToken,
 		rootActiveSessionId: descriptor.rootActiveSessionId,
 		...(descriptor.ownerClientId !== undefined ? { ownerClientId: descriptor.ownerClientId } : {}),
+		...(descriptor.callerOwnedEnvironmentContract === true ? { callerOwnedEnvironmentContract: true as const } : {}),
 		...(descriptor.rootSessionId !== undefined ? { rootSessionId: descriptor.rootSessionId } : {}),
 		...(descriptor.sessionFile !== undefined ? { sessionFile: descriptor.sessionFile } : {}),
 		...(sessionDir !== undefined ? { sessionDir } : {}),

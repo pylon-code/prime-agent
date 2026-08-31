@@ -4,6 +4,7 @@ import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync,
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
+import { isDeepStrictEqual } from "node:util";
 import { getLogger } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -56,6 +57,7 @@ import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } fr
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { looksLikeSessionPath } from "../../core/session-resolver.js";
 import { SettingsManager } from "../../core/settings-manager.js";
+import { CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE } from "../../sdk-features.js";
 import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
@@ -66,6 +68,7 @@ import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import {
+	cloneCallerOwnedSessionLaunchEnv,
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
 	DAEMON_COMMAND_COMPATIBILITY,
@@ -344,6 +347,8 @@ interface ResidentWorker {
 	intentionalStop: boolean;
 	stopRevision: number;
 	launchEnv?: Record<string, string>;
+	launchEnvMode?: "replace";
+	exactEnvironmentAwaitingOwner?: boolean;
 	transientCreateCommand?: DaemonCreateCommand;
 	stopOperation?: Promise<void>;
 	stopFinalization?: {
@@ -545,8 +550,19 @@ function withoutCommandId(command: DaemonCommand): DaemonCommandBody {
 }
 
 function withoutSupervisorCreateFields(command: DaemonCreateCommand): DaemonCreateCommand {
-	const { launchEnv: _launchEnv, lifecycle: _lifecycle, ...workerCommand } = command;
+	const { launchEnv: _launchEnv, launchEnvMode: _launchEnvMode, lifecycle: _lifecycle, ...workerCommand } = command;
 	return workerCommand;
+}
+
+function prepareCallerOwnedCreateEnvironment(command: DaemonCreateCommand): DaemonCreateCommand {
+	if (command.launchEnvMode === undefined) return command;
+	if (command.launchEnvMode !== "replace" || command.lifecycle !== "client_owned" || command.launchEnv === undefined) {
+		throw new Error("Exact caller-owned launch environment requires a client-owned session snapshot");
+	}
+	return {
+		...command,
+		launchEnv: cloneCallerOwnedSessionLaunchEnv(command.launchEnv) as Record<string, string>,
+	};
 }
 
 function responseWithId(response: DaemonResponse, id: string | undefined): DaemonResponse {
@@ -577,6 +593,7 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		(descriptor.pid ?? 0) > 0 &&
 		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string") &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
+		(descriptor.callerOwnedEnvironmentContract === undefined || descriptor.callerOwnedEnvironmentContract === true) &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
 		typeof descriptor.rootActiveSessionId === "string" &&
@@ -1109,6 +1126,8 @@ export class DaemonSupervisor {
 					authorizedActiveSessionIds: new Set([durableDescriptor.rootActiveSessionId]),
 					intentionalStop: durableDescriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
+					launchEnvMode: durableDescriptor.callerOwnedEnvironmentContract === true ? "replace" : undefined,
+					exactEnvironmentAwaitingOwner: durableDescriptor.callerOwnedEnvironmentContract === true,
 				};
 				this.workers.set(durableDescriptor.workerId, worker);
 				try {
@@ -1887,20 +1906,21 @@ export class DaemonSupervisor {
 			case "list_saved_sessions":
 				return this.handleSavedSessionList(client, command);
 			case "create": {
-				const worker = await this.createOrReuseWorker(this.protocolClientId(client), command);
+				const createCommand = prepareCallerOwnedCreateEnvironment(command);
+				const worker = await this.createOrReuseWorker(this.protocolClientId(client), createCommand);
 				// The owner may disconnect while creation is waiting for daemon readiness,
 				// process launch, or session materialization. Re-evaluate ownership only
 				// after the worker is registered so the disconnect edge cannot be missed.
 				this.scheduleOwnedWorkerCleanup(worker);
-				const requestedSummary = command.sessionPath
-					? this.findSummaryInWorker(worker, command.sessionPath)
+				const requestedSummary = createCommand.sessionPath
+					? this.findSummaryInWorker(worker, createCommand.sessionPath)
 					: undefined;
 				if (
 					requestedSummary &&
 					(requestedSummary.activeSessionId ?? requestedSummary.id) !== worker.descriptor.rootActiveSessionId
 				) {
 					// A create forwarded to a recovering worker still surfaces an opaque lifecycle error.
-					const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(command));
+					const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(createCommand));
 					if (response.success && isSessionSummary(response.data)) {
 						await this.refreshWorkerSummaries(worker);
 						return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
@@ -2133,16 +2153,18 @@ export class DaemonSupervisor {
 			case "get_owned_session_cleanup":
 				return success(command.id, command.type, this.getOwnedSessionCleanup(command.activeSessionId));
 			case "complete_owned_session": {
-				const match = await this.findWorkerForClient(client, command.activeSessionId);
+				const match = await this.findWorker(command.activeSessionId);
 				if (match.worker.descriptor.ownerClientId !== this.protocolClientId(client)) {
-					throw new Error("Session is not owned by this client");
+					return failure(command.id, command.type, "Session is not owned by this client", {
+						code: "owned_session_owner_mismatch",
+					});
 				}
 				if (match.worker.ownerCleanupTimer) {
 					clearTimeout(match.worker.ownerCleanupTimer);
 					match.worker.ownerCleanupTimer = undefined;
 				}
 				await this.stopWorker(match.worker, true);
-				return success(command.id, command.type);
+				return success(command.id, command.type, { status: "completed" as const });
 			}
 			case "promote_owned_session": {
 				const match = await this.findWorkerForClient(client, command.activeSessionId);
@@ -2834,7 +2856,8 @@ export class DaemonSupervisor {
 			throw new Error("Session is not owned by this client");
 		}
 		const previousDescriptor = worker.descriptor;
-		worker.descriptor = { ...previousDescriptor, ownerClientId: undefined };
+		const { callerOwnedEnvironmentContract: _contract, ...promotedDescriptor } = previousDescriptor;
+		worker.descriptor = { ...promotedDescriptor, ownerClientId: undefined };
 		try {
 			this.persistWorker(worker);
 		} catch (error) {
@@ -2847,6 +2870,8 @@ export class DaemonSupervisor {
 			worker.ownerCleanupTimer = undefined;
 		}
 		worker.launchEnv = undefined;
+		worker.launchEnvMode = undefined;
+		worker.exactEnvironmentAwaitingOwner = undefined;
 		worker.transientCreateCommand = undefined;
 	}
 
@@ -2864,7 +2889,15 @@ export class DaemonSupervisor {
 			}
 		};
 		assertLaunchCurrent();
-		const launchEnv = command.launchEnv ?? existing?.launchEnv;
+		const launchEnvMode = command.launchEnvMode ?? existing?.launchEnvMode;
+		const candidateLaunchEnv = command.launchEnv ?? existing?.launchEnv;
+		const launchEnv =
+			launchEnvMode === "replace" && candidateLaunchEnv
+				? (cloneCallerOwnedSessionLaunchEnv(candidateLaunchEnv) as Record<string, string>)
+				: candidateLaunchEnv;
+		if (launchEnvMode === "replace" && !launchEnv) {
+			throw new Error("Exact caller-owned launch environment snapshot is unavailable");
+		}
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
 			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
@@ -2880,9 +2913,9 @@ export class DaemonSupervisor {
 		const orphanProcessJournalPath =
 			existing?.descriptor.orphanProcessJournalPath ?? join(this.descriptorDir, `${workerId}.orphans.jsonl`);
 		const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
-		const workerEnvironment = createCliSubprocessEnv({
-			...process.env,
-			...launchEnv,
+		const workerEnvironmentSource = {
+			...(launchEnvMode === "replace" ? launchEnv : { ...process.env, ...launchEnv }),
+			// Prime-owned worker authentication, recovery, startup, lease, and orphan-cleanup bootstrap.
 			[DAEMON_WORKER_ROLE_ENV]: "1",
 			[DAEMON_WORKER_TOKEN_ENV]: token,
 			[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: rootActiveSessionId,
@@ -2892,8 +2925,10 @@ export class DaemonSupervisor {
 			[ORPHAN_PROCESS_JOURNAL_ENV]: orphanProcessJournalPath,
 			[SESSION_LEASES_ENABLED_ENV]: "1",
 			[SESSION_LEASE_OWNER_ID_ENV]: rootActiveSessionId,
-		});
-		delete workerEnvironment.RLM_DEPTH;
+		};
+		const workerEnvironment: NodeJS.ProcessEnv =
+			launchEnvMode === "replace" ? workerEnvironmentSource : createCliSubprocessEnv(workerEnvironmentSource);
+		if (launchEnvMode !== "replace") delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
 		assertLaunchCurrent();
 		const child: ChildProcess = spawn(launch.command, launch.args, {
@@ -2946,6 +2981,9 @@ export class DaemonSupervisor {
 				authenticationToken: token,
 				rootActiveSessionId,
 				ownerClientId: existing?.descriptor.ownerClientId ?? ownerClientId,
+				...(launchEnvMode === "replace" || existing?.descriptor.callerOwnedEnvironmentContract === true
+					? { callerOwnedEnvironmentContract: true as const }
+					: {}),
 				sessionDir: createCommand.config?.sessionDir,
 				telemetryDisabled: createCommand.config?.telemetryDisabled,
 				createdAt: existing?.descriptor.createdAt ?? now,
@@ -2967,13 +3005,21 @@ export class DaemonSupervisor {
 				intentionalStop: false,
 				stopRevision: 0,
 				launchEnv,
-				transientCreateCommand: ownerClientId ? createCommand : undefined,
+				launchEnvMode,
+				exactEnvironmentAwaitingOwner: false,
+				transientCreateCommand: ownerClientId
+					? { ...createCommand, launchEnv, ...(launchEnvMode ? { launchEnvMode } : {}) }
+					: undefined,
 			};
 			await this.assertRecoveryAllowed();
 			assertLaunchCurrent();
 			worker.descriptor = descriptor;
 			worker.launchEnv = launchEnv;
-			worker.transientCreateCommand = descriptor.ownerClientId ? createCommand : undefined;
+			worker.launchEnvMode = launchEnvMode;
+			worker.exactEnvironmentAwaitingOwner = false;
+			worker.transientCreateCommand = descriptor.ownerClientId
+				? { ...createCommand, launchEnv, ...(launchEnvMode ? { launchEnvMode } : {}) }
+				: undefined;
 			descriptorAssigned = true;
 			this.persistWorker(worker);
 			worker.intentionalStop = false;
@@ -3885,7 +3931,8 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		recovery: ReadonlyMap<string, WorkerSessionRecovery>,
 	): Promise<void> {
-		const client = this.requireAvailableWorkerClient(worker);
+		const client = worker.client;
+		if (!client) throw new Error("Session worker is not connected");
 		for (const [activeSessionId, recovered] of recovery) {
 			const summary = worker.summaries.get(activeSessionId);
 			if (!summary || summary.sessionId !== recovered.sessionId) {
@@ -4472,14 +4519,71 @@ export class DaemonSupervisor {
 				(worker.descriptor.rootActiveSessionId === command.activeSessionId ||
 					worker.descriptor.rootSessionId === command.activeSessionId),
 		);
+		if (
+			ownedWorker?.descriptor.ownerClientId !== undefined &&
+			ownedWorker.descriptor.ownerClientId !== this.protocolClientId(client)
+		) {
+			throw new Error(`Unknown active session: ${command.activeSessionId}`);
+		}
+		const requestsExactEnvironment =
+			command.capabilities?.includes(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE) === true;
+		if (requestsExactEnvironment !== (command.launchEnvMode === "replace")) {
+			throw new Error("Caller-owned environment capability and launch mode must agree");
+		}
+		if (requestsExactEnvironment && !ownedWorker) {
+			throw new Error("Unknown active session");
+		}
+		if (
+			requestsExactEnvironment &&
+			(command.launchEnv === undefined ||
+				command.recoveryConfig === undefined ||
+				ownedWorker?.descriptor.callerOwnedEnvironmentContract !== true)
+		) {
+			throw new Error(
+				"Exact caller-owned launch environment requires a contract-created owned session and recovery context",
+			);
+		}
+		const exactLaunchEnv = requestsExactEnvironment
+			? (cloneCallerOwnedSessionLaunchEnv(command.launchEnv!) as Record<string, string>)
+			: undefined;
 		if (ownedWorker) {
-			if (ownedWorker.descriptor.ownerClientId !== this.protocolClientId(client)) {
-				throw new Error(`Unknown active session: ${command.activeSessionId}`);
-			}
 			this.assertTelemetryAttachAllowed(ownedWorker, command.telemetryDisabled);
-			ownedWorker.launchEnv = command.launchEnv ?? ownedWorker.launchEnv;
+			if (exactLaunchEnv) {
+				if (ownedWorker.launchEnv) {
+					if (!isDeepStrictEqual(ownedWorker.launchEnv, exactLaunchEnv)) {
+						throw new Error("Caller-owned launch environment does not match the established snapshot");
+					}
+				} else {
+					if (ownedWorker.exactEnvironmentAwaitingOwner !== true) {
+						throw new Error("Caller-owned launch environment cannot be rebound");
+					}
+					ownedWorker.launchEnv = exactLaunchEnv;
+					ownedWorker.exactEnvironmentAwaitingOwner = false;
+				}
+				ownedWorker.transientCreateCommand = {
+					...ownedWorker.descriptor.createCommand,
+					config: {
+						...command.recoveryConfig!,
+						...(ownedWorker.descriptor.telemetryDisabled === true ? { telemetryDisabled: true } : {}),
+					},
+					env: command.env,
+					launchEnv: ownedWorker.launchEnv,
+					launchEnvMode: "replace",
+					lifecycle: "client_owned",
+				};
+				if (
+					ownedWorker.launchEnvMode !== "replace" ||
+					ownedWorker.descriptor.callerOwnedEnvironmentContract !== true ||
+					!ownedWorker.launchEnv ||
+					!ownedWorker.transientCreateCommand.config
+				) {
+					throw new Error("Caller-owned environment recovery state is incomplete");
+				}
+			} else if (ownedWorker.launchEnvMode !== "replace") {
+				ownedWorker.launchEnv = command.launchEnv ?? ownedWorker.launchEnv;
+			}
 			if (!ownedWorker.client || ownedWorker.descriptor.lifecycle !== "ready") {
-				if (command.recoveryConfig) {
+				if (!requestsExactEnvironment && command.recoveryConfig) {
 					ownedWorker.transientCreateCommand = {
 						...ownedWorker.descriptor.createCommand,
 						config: {
@@ -4503,6 +4607,7 @@ export class DaemonSupervisor {
 				await this.recoverWorker(ownedWorker);
 			}
 		}
+
 		const match = await this.findWorkerForClient(client, command.activeSessionId);
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
 		this.requireAvailableWorkerClient(match.worker);

@@ -7,6 +7,7 @@ import { SessionImportFileNotFoundError } from "../src/core/session-import-error
 import {
 	DAEMON_REFINE_REQUEST_TIMEOUT_MS,
 	DaemonAgentConnection,
+	type DaemonOwnedSessionContractProof,
 } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import type {
 	AgentConnectionEvent,
@@ -37,6 +38,7 @@ import {
 class FakeDaemonClient {
 	readonly requests: DaemonCommand[] = [];
 	readonly requestTimeouts: number[] = [];
+	readonly requestOptions: DaemonClientRequestOptions[] = [];
 	attachResultFactory: ((command: Extract<DaemonCommand, { type: "attach" }>) => DaemonAttachResult) | undefined;
 	reattachResultFactory: ((command: Extract<DaemonCommand, { type: "reattach" }>) => DaemonAttachResult) | undefined;
 	switchSessionActiveSessionId: string | undefined;
@@ -53,6 +55,7 @@ class FakeDaemonClient {
 	resetTransportCount = 0;
 	reconnectError: Error | undefined;
 	attachFailures = 0;
+	attachError: Error | undefined;
 	connectionStateGate: Promise<void> | undefined;
 	connectionStateFactory: ((activeSessionId: string) => AgentConnectionState) | undefined;
 	rlmChildren: AgentConnectionRlmChildAgentSnapshot[] = [];
@@ -75,6 +78,12 @@ class FakeDaemonClient {
 	cancelCorrelatedPromptResponse: unknown;
 	cancelPromptAdmissionStatus: "cancelled" | "owned" | "unknown" = "owned";
 	serverCapabilities = new Set<string>();
+	ownedSessionCleanupStatus: "active" | "stopping" | "settled" = "active";
+	ownedSessionCompletionStatus: "completed" | "owner_mismatch" | "invalid" = "completed";
+	ownedSessionCleanupTransportFailure = false;
+	ownedSessionCleanupGate: Promise<void> | undefined;
+	ownedSessionCompletionGate: Promise<void> | undefined;
+	sideQuestionAbortGate: Promise<void> | undefined;
 	updateRestartSessions: Array<Record<string, unknown>> = [];
 	hello: DaemonHello | undefined = {
 		type: "daemon_hello",
@@ -94,6 +103,7 @@ class FakeDaemonClient {
 	): Promise<DaemonResponse> {
 		this.requests.push(command);
 		this.requestTimeouts.push(timeoutMs);
+		this.requestOptions.push(options);
 		switch (command.type) {
 			case "prompt":
 				if (this.promptGate) await this.promptGate;
@@ -166,6 +176,7 @@ class FakeDaemonClient {
 				};
 			case "attach":
 				if (this.attachGate) await this.attachGate;
+				if (this.attachError) throw this.attachError;
 				if (this.attachFailures > 0) {
 					this.attachFailures--;
 					throw new Error("attach failed");
@@ -500,6 +511,9 @@ class FakeDaemonClient {
 				return { type: "response", command: command.type, success: true };
 			case "start_side_question":
 				return { type: "response", command: command.type, success: true };
+			case "abort_side_question":
+				await this.sideQuestionAbortGate;
+				return { type: "response", command: command.type, success: true, data: { aborted: true } };
 			case "delete_saved_session":
 				return {
 					type: "response",
@@ -583,6 +597,35 @@ class FakeDaemonClient {
 						filePath: "/tmp/not-found.jsonl",
 					},
 				};
+			case "get_owned_session_cleanup":
+				await this.ownedSessionCleanupGate;
+				if (this.ownedSessionCleanupTransportFailure) {
+					this.connected = false;
+					throw new Error("private cleanup transport canary");
+				}
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { status: this.ownedSessionCleanupStatus },
+				};
+			case "complete_owned_session":
+				await this.ownedSessionCompletionGate;
+				if (this.ownedSessionCompletionStatus === "owner_mismatch") {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Session is not owned by this client",
+						errorInfo: { code: "owned_session_owner_mismatch" },
+					};
+				}
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: this.ownedSessionCompletionStatus === "invalid" ? { status: "invalid" } : { status: "completed" },
+				};
 			default:
 				throw new Error(`Unexpected command: ${command.type}`);
 		}
@@ -626,6 +669,10 @@ class FakeDaemonClient {
 
 	getTransportGeneration(): number {
 		return this.transportGeneration;
+	}
+
+	get isConnected(): boolean {
+		return this.connected;
 	}
 
 	get isClosed(): boolean {
@@ -697,6 +744,23 @@ class FakeDaemonClient {
 
 function asDaemonClient(client: FakeDaemonClient): DaemonClient {
 	return client as unknown as DaemonClient;
+}
+
+const SUPERVISOR_GENERATION_A = "11111111-1111-4111-8111-111111111111";
+const SUPERVISOR_GENERATION_B = "22222222-2222-4222-8222-222222222222";
+
+function enableCallerOwnedSessionContract(
+	client: FakeDaemonClient,
+	supervisorGeneration = SUPERVISOR_GENERATION_A,
+): void {
+	client.serverCapabilities.add("caller_owned_session_environment_cleanup_v1");
+	client.serverCapabilities.add("authoritative_owned_session_cleanup_v1");
+	client.hello = {
+		...client.hello!,
+		schemaRevision: 29,
+		appVersion: "0.8.1-test",
+		supervisorGeneration,
+	};
 }
 
 function createConnectionState(activeSessionId: string, sessionId: string): AgentConnectionState {
@@ -819,7 +883,9 @@ function createAttachResult(
 					capability === "extension_ui" ||
 					capability === "slim_attach" ||
 					capability === "chunked_snapshot" ||
-					capability === "correlated_prompt_lifecycle_v1",
+					capability === "correlated_prompt_lifecycle_v1" ||
+					capability === "client_owned_sessions" ||
+					capability === "caller_owned_session_environment_cleanup_v1",
 			),
 		},
 	};
@@ -989,6 +1055,263 @@ describe("DaemonAgentConnection", () => {
 		const request = fakeClient.requests[0];
 		if (supported) expect(request).toMatchObject({ recoveryConfig });
 		else expect(request).not.toHaveProperty("recoveryConfig");
+	});
+
+	it("clones one caller-owned environment snapshot and publishes only a secret-free attach proof", async () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient);
+		const source = { PROVIDER_TOKEN: "private-env-a", PATH: "/caller/a" };
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: source,
+			ownedSessionRecoveryConfig: {},
+		});
+		source.PROVIDER_TOKEN = "private-env-c";
+		source.PATH = "/ambient/c";
+
+		await connection.attach();
+
+		const attach = fakeClient.requests[0];
+		expect(attach).toMatchObject({
+			type: "attach",
+			launchEnv: { PROVIDER_TOKEN: "private-env-a", PATH: "/caller/a" },
+			launchEnvMode: "replace",
+			capabilities: expect.arrayContaining(["caller_owned_session_environment_cleanup_v1"]),
+		});
+		const proof = connection.getOwnedSessionContractProof();
+		expect(proof).toMatchObject({
+			feature: "caller_owned_session_environment_cleanup_v1",
+			status: "attached",
+			daemon: {
+				protocolName: "prime-agent.daemon",
+				protocolVersion: 7,
+				schemaRevision: 29,
+				appVersion: "0.8.1-test",
+				supervisorGeneration: SUPERVISOR_GENERATION_A,
+				transportGeneration: 1,
+			},
+		});
+		const serializedProof = JSON.stringify(proof);
+		expect(serializedProof).not.toContain("private-env");
+		expect(serializedProof).not.toContain("/caller");
+		expect(serializedProof).not.toContain("fake.sock");
+	});
+
+	it("omits unshaped daemon identity strings and rejects an unshaped generation", async () => {
+		const identityCanary = "private-daemon-identity-canary/path";
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient);
+		fakeClient.hello = {
+			...fakeClient.hello!,
+			appVersion: identityCanary,
+			runtime: { buildId: identityCanary, executablePath: identityCanary },
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private" },
+			ownedSessionRecoveryConfig: {},
+		});
+		await connection.attach();
+		const proof = connection.getOwnedSessionContractProof();
+		expect(proof).toBeDefined();
+		expect(proof?.daemon).not.toHaveProperty("appVersion");
+		expect(proof?.daemon).not.toHaveProperty("buildId");
+		expect(JSON.stringify(proof)).not.toContain(identityCanary);
+
+		const unsafeGenerationClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(unsafeGenerationClient, identityCanary);
+		const unsafeGenerationConnection = new DaemonAgentConnection(
+			asDaemonClient(unsafeGenerationClient),
+			"active-owned",
+			{
+				ownedSession: true,
+				ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private" },
+				ownedSessionRecoveryConfig: {},
+			},
+		);
+		await unsafeGenerationConnection.attach();
+		expect(unsafeGenerationConnection.getOwnedSessionContractProof()).toBeUndefined();
+
+		const oldProtocolClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(oldProtocolClient);
+		oldProtocolClient.hello = {
+			...oldProtocolClient.hello!,
+			protocol: { ...oldProtocolClient.hello!.protocol, version: 6 },
+		};
+		const oldProtocolConnection = new DaemonAgentConnection(asDaemonClient(oldProtocolClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private" },
+			ownedSessionRecoveryConfig: {},
+		});
+		await oldProtocolConnection.attach();
+		expect(oldProtocolConnection.getOwnedSessionContractProof()).toBeUndefined();
+	});
+
+	it("allows only the fixed Pylon artifact build diagnostic shape", async () => {
+		const attachWithBuildId = async (buildId: string, enableContract = true) => {
+			const fakeClient = new FakeDaemonClient();
+			if (enableContract) enableCallerOwnedSessionContract(fakeClient);
+			fakeClient.hello = { ...fakeClient.hello!, runtime: { buildId, executablePath: "/not-exposed" } };
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+				ownedSession: true,
+				ownedSessionLaunchEnv: { OWNER_ENV: "private" },
+				ownedSessionRecoveryConfig: {},
+			});
+			await connection.attach();
+			return connection.getOwnedSessionContractProof();
+		};
+
+		await expect(attachWithBuildId("pylon-build-g0123456789ab-r17")).resolves.toMatchObject({
+			daemon: { buildId: "pylon-build-g0123456789ab-r17" },
+		});
+		for (const unsafe of [
+			"pylon-build-g0123456789AB-r17",
+			"pylon-build-g0123456789ab-r0",
+			"pylon-build-g0123456789ab-r17/private",
+		]) {
+			const proof = await attachWithBuildId(unsafe);
+			expect(proof?.daemon).not.toHaveProperty("buildId");
+		}
+		expect(await attachWithBuildId("pylon-build-g0123456789ab-r17", false)).toBeUndefined();
+	});
+
+	it("preserves the exact snapshot across attach retry and transport recovery", async () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient);
+		fakeClient.attachFailures = 1;
+		const source = { PROVIDER_TOKEN: "private-env-a", PATH: "/caller/a" };
+		const recoverDaemon = vi.fn(async () => undefined);
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: source,
+			ownedSessionRecoveryConfig: {},
+			recoverDaemon,
+			reconnectTimeoutMs: 2000,
+		});
+		source.PROVIDER_TOKEN = "private-env-c";
+
+		await connection.attach();
+		fakeClient.connected = false;
+		fakeClient.emitClose(new Error("private transport canary"));
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(3),
+		);
+		await vi.waitFor(() => expect(connection.getOwnedSessionContractProof()).toBeDefined());
+
+		for (const request of fakeClient.requests.filter((command) => command.type === "attach")) {
+			expect(request.launchEnv).toEqual({ PROVIDER_TOKEN: "private-env-a", PATH: "/caller/a" });
+			expect(request.launchEnvMode).toBe("replace");
+			expect(JSON.stringify(request)).not.toContain("private-env-c");
+		}
+		expect(recoverDaemon).toHaveBeenCalledOnce();
+		expect(connection.getOwnedSessionContractProof()?.daemon.transportGeneration).toBe(2);
+	});
+
+	it("preserves the exact snapshot and recovery context on reattach direct fallback", async () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient);
+		fakeClient.serverCapabilities.add("owned_session_recovery_context");
+		fakeClient.reattachResultFactory = (command) => {
+			const full = createAttachResult(command.targetActiveSessionId, command.clientId, command.capabilities, 1);
+			const snapshotId = "owned-reattach-failure";
+			const { messages: _messages, ...snapshot } = full.snapshot;
+			queueMicrotask(() => {
+				fakeClient.emitMessage({
+					type: "session_snapshot_begin",
+					activeSessionId: command.targetActiveSessionId,
+					snapshotId,
+					snapshot,
+					messageCount: 1,
+					targetChunkBytes: 512 * 1024,
+					purpose: "replacement",
+				});
+				fakeClient.emitMessage({
+					type: "session_snapshot_failed",
+					activeSessionId: command.targetActiveSessionId,
+					snapshotId,
+					error: "forced transfer failure",
+					purpose: "replacement",
+				});
+			});
+			return {
+				...full,
+				snapshot: { ...full.snapshot, messages: [] },
+				snapshotStream: { id: snapshotId, messageCount: 1, targetChunkBytes: 512 * 1024 },
+			};
+		};
+		const recoveryConfig = { cwd: "/caller/project", agentDir: "/caller/home" };
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-source", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private-env-a", PATH: "/caller/a" },
+			ownedSessionRecoveryConfig: recoveryConfig,
+		});
+		await connection.attach();
+
+		await (
+			connection as unknown as {
+				reattachSession(source: string, target: string): Promise<{ cancelled: false }>;
+			}
+		).reattachSession("active-source", "active-target");
+
+		const recoveryRequests = fakeClient.requests.filter(
+			(request) =>
+				request.type === "reattach" || (request.type === "attach" && request.activeSessionId === "active-target"),
+		);
+		expect(recoveryRequests.map((request) => request.type)).toEqual(["reattach", "attach"]);
+		for (const request of recoveryRequests) {
+			expect(request).toMatchObject({
+				launchEnv: { PROVIDER_TOKEN: "private-env-a", PATH: "/caller/a" },
+				launchEnvMode: "replace",
+				recoveryConfig,
+				capabilities: expect.arrayContaining(["caller_owned_session_environment_cleanup_v1"]),
+			});
+		}
+	});
+
+	it("rejects an exact environment without recovery context before advertising the contract", () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient);
+		expect(
+			() =>
+				new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+					ownedSession: true,
+					ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private" },
+				}),
+		).toThrow("ownedSessionLaunchEnv requires ownedSessionRecoveryConfig");
+		expect(fakeClient.requests).toEqual([]);
+	});
+
+	it("does not advertise or prove the contract when the server offer is absent", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private" },
+			ownedSessionRecoveryConfig: {},
+		});
+
+		await connection.attach();
+
+		const attach = fakeClient.requests[0];
+		if (attach?.type !== "attach") throw new Error("Missing attach request");
+		expect(attach.capabilities).not.toContain("caller_owned_session_environment_cleanup_v1");
+		expect(connection.getOwnedSessionContractProof()).toBeUndefined();
+	});
+
+	it("fails closed when the contract token is offered without authoritative cleanup", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("caller_owned_session_environment_cleanup_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private" },
+			ownedSessionRecoveryConfig: {},
+		});
+
+		await connection.attach();
+
+		const attach = fakeClient.requests[0];
+		if (attach?.type !== "attach") throw new Error("Missing attach request");
+		expect(attach.capabilities).not.toContain("caller_owned_session_environment_cleanup_v1");
+		expect(connection.getOwnedSessionContractProof()).toBeUndefined();
 	});
 
 	it("forwards queueIfBusy for prompt admission", async () => {
@@ -1776,6 +2099,339 @@ describe("DaemonAgentConnection", () => {
 
 		await expect(switching).rejects.toThrow("Daemon connection attachment changed during attach");
 		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
+	});
+
+	it("returns fixed observable owned-session cleanup outcomes", async () => {
+		const createConnection = async (
+			cleanup: FakeDaemonClient["ownedSessionCleanupStatus"],
+			completion: FakeDaemonClient["ownedSessionCompletionStatus"] = "completed",
+		) => {
+			const fakeClient = new FakeDaemonClient();
+			enableCallerOwnedSessionContract(fakeClient);
+			fakeClient.ownedSessionCleanupStatus = cleanup;
+			fakeClient.ownedSessionCompletionStatus = completion;
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+				ownedSession: true,
+				ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private-cleanup-canary" },
+				ownedSessionRecoveryConfig: {},
+			});
+			await connection.attach();
+			return { connection, fakeClient };
+		};
+
+		const completed = await createConnection("active");
+		await expect(completed.connection.disposeOwnedSession({ timeoutMs: 100 })).resolves.toMatchObject({
+			status: "completed",
+			daemonReplaced: false,
+		});
+
+		const already = await createConnection("settled");
+		await expect(already.connection.disposeOwnedSession({ timeoutMs: 100 })).resolves.toMatchObject({
+			status: "already_completed",
+			daemonReplaced: false,
+		});
+		expect(already.fakeClient.requests.filter((request) => request.type === "complete_owned_session")).toEqual([]);
+
+		const mismatch = await createConnection("active", "owner_mismatch");
+		await expect(mismatch.connection.disposeOwnedSession({ timeoutMs: 100 })).resolves.toMatchObject({
+			status: "owner_mismatch",
+		});
+
+		const active = await createConnection("active", "invalid");
+		await expect(active.connection.disposeOwnedSession({ timeoutMs: 5 })).resolves.toMatchObject({
+			status: "uncertain",
+			reason: "active",
+		});
+
+		const stopping = await createConnection("stopping");
+		await expect(stopping.connection.disposeOwnedSession({ timeoutMs: 5 })).resolves.toMatchObject({
+			status: "uncertain",
+			reason: "stopping",
+		});
+
+		const failed = await createConnection("active");
+		failed.fakeClient.ownedSessionCleanupTransportFailure = true;
+		const failedResult = await failed.connection.disposeOwnedSession({ timeoutMs: 100 });
+		expect(failedResult).toMatchObject({ status: "transport_failure" });
+		expect(JSON.stringify(failedResult)).not.toContain("private cleanup transport canary");
+		expect(JSON.stringify(failedResult)).not.toContain("private-cleanup-canary");
+
+		const unsupportedClient = new FakeDaemonClient();
+		const unsupported = new DaemonAgentConnection(asDaemonClient(unsupportedClient), "active-owned", {
+			ownedSession: true,
+		});
+		await unsupported.attach();
+		await expect(unsupported.disposeOwnedSession({ timeoutMs: 100 })).resolves.toEqual({
+			feature: "caller_owned_session_environment_cleanup_v1",
+			status: "unsupported",
+		});
+	});
+
+	it("uses one total owned cleanup deadline for hung side-question aborts", async () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient);
+		fakeClient.ownedSessionCleanupStatus = "settled";
+		fakeClient.sideQuestionAbortGate = new Promise<void>(() => {});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { OWNER_ENV: "exact" },
+			ownedSessionRecoveryConfig: {},
+		});
+		await connection.attach();
+		await connection.startSideQuestion("side-hung", "question", []);
+
+		const startedAt = Date.now();
+		await expect(connection.disposeOwnedSession({ timeoutMs: 20 })).resolves.toMatchObject({
+			status: "already_completed",
+		});
+		expect(Date.now() - startedAt).toBeLessThan(250);
+		const abortIndex = fakeClient.requests.findIndex((request) => request.type === "abort_side_question");
+		expect(abortIndex).toBeGreaterThanOrEqual(0);
+		expect(fakeClient.requestTimeouts[abortIndex]).toBeGreaterThan(0);
+		expect(fakeClient.requestTimeouts[abortIndex]).toBeLessThanOrEqual(20);
+		expect(fakeClient.requestOptions[abortIndex]?.recoverAcrossReconnect).toBe(false);
+	});
+
+	it("bounds unsupported peer completion by the same total cleanup deadline", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.ownedSessionCompletionGate = new Promise<void>(() => {});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-legacy", {
+			ownedSession: true,
+		});
+		await connection.attach();
+
+		const startedAt = Date.now();
+		await expect(connection.disposeOwnedSession({ timeoutMs: 20 })).resolves.toMatchObject({ status: "unsupported" });
+		expect(Date.now() - startedAt).toBeLessThan(250);
+		const completionIndex = fakeClient.requests.findIndex((request) => request.type === "complete_owned_session");
+		expect(completionIndex).toBeGreaterThanOrEqual(0);
+		expect(fakeClient.requestTimeouts[completionIndex]).toBeGreaterThan(0);
+		expect(fakeClient.requestTimeouts[completionIndex]).toBeLessThanOrEqual(20);
+		expect(fakeClient.requestOptions[completionIndex]?.recoverAcrossReconnect).toBe(false);
+	});
+
+	it("does not reuse an owned cleanup proof for a different pending route", async () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient);
+		fakeClient.ownedSessionCleanupStatus = "settled";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-a", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private" },
+			ownedSessionRecoveryConfig: {},
+		});
+		await connection.attach();
+		(connection as unknown as { pendingReattachActiveSessionIds: Set<string> }).pendingReattachActiveSessionIds.add(
+			"active-b",
+		);
+
+		await expect(connection.disposeOwnedSession({ timeoutMs: 100 })).resolves.toMatchObject({
+			status: "unsupported",
+		});
+		expect(fakeClient.requests.filter((request) => request.type === "get_owned_session_cleanup")).toEqual([]);
+		expect(fakeClient.requests.filter((request) => request.type === "complete_owned_session")).toEqual([]);
+	});
+
+	it("joins concurrent observable cleanup calls into one completion", async () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient);
+		let releaseCompletion!: () => void;
+		fakeClient.ownedSessionCompletionGate = new Promise<void>((resolve) => {
+			releaseCompletion = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private" },
+			ownedSessionRecoveryConfig: {},
+		});
+		await connection.attach();
+
+		const first = connection.disposeOwnedSession({ timeoutMs: 1000 });
+		const second = connection.disposeOwnedSession({ timeoutMs: 1000 });
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "complete_owned_session")).toHaveLength(1),
+		);
+		releaseCompletion();
+
+		const [firstResult, secondResult] = await Promise.all([first, second]);
+		expect(firstResult).toEqual(secondResult);
+		expect(firstResult.status).toBe("completed");
+		expect(fakeClient.requests.filter((request) => request.type === "complete_owned_session")).toHaveLength(1);
+	});
+
+	it("invalidates proof on disconnect and proves replacement settlement only after reattach", async () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient, SUPERVISOR_GENERATION_A);
+		fakeClient.ownedSessionCleanupStatus = "settled";
+		let releaseCleanup!: () => void;
+		fakeClient.ownedSessionCleanupGate = new Promise<void>((resolve) => {
+			releaseCleanup = resolve;
+		});
+		let releaseRecovery!: () => void;
+		const recoveryGate = new Promise<void>((resolve) => {
+			releaseRecovery = resolve;
+		});
+		const recoverDaemon = vi.fn(async () => {
+			await recoveryGate;
+			fakeClient.hello = { ...fakeClient.hello!, supervisorGeneration: SUPERVISOR_GENERATION_B };
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { PROVIDER_TOKEN: "private" },
+			ownedSessionRecoveryConfig: {},
+			recoverDaemon,
+			reconnectTimeoutMs: 2000,
+		});
+		await connection.attach();
+		expect(connection.getOwnedSessionContractProof()).toBeDefined();
+		fakeClient.connected = false;
+		fakeClient.emitClose(new Error("replacement"));
+		expect(connection.getOwnedSessionContractProof()).toBeUndefined();
+		await vi.waitFor(() => expect(recoverDaemon).toHaveBeenCalledOnce());
+
+		const disposing = connection.disposeOwnedSession({ timeoutMs: 1000 });
+		releaseRecovery();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2),
+		);
+		expect(connection.getOwnedSessionContractProof()).toBeUndefined();
+		expect(
+			(connection as unknown as { currentOwnedSessionContractProof?: unknown }).currentOwnedSessionContractProof,
+		).toBeUndefined();
+		expect(
+			(connection as unknown as { lastOwnedSessionContractProof?: DaemonOwnedSessionContractProof })
+				.lastOwnedSessionContractProof?.daemon.supervisorGeneration,
+		).toBe(SUPERVISOR_GENERATION_A);
+		releaseCleanup();
+		await expect(disposing).resolves.toMatchObject({
+			status: "replacement_settled",
+			daemonReplaced: true,
+			started: { daemon: { supervisorGeneration: SUPERVISOR_GENERATION_A } },
+			observed: { supervisorGeneration: SUPERVISOR_GENERATION_B },
+		});
+		expect(connection.getOwnedSessionContractProof()).toBeUndefined();
+	});
+
+	it("fences an in-flight completion to its proved transport and queries replacement state fresh", async () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient, SUPERVISOR_GENERATION_A);
+		fakeClient.ownedSessionCleanupStatus = "active";
+		let releaseCompletion!: () => void;
+		fakeClient.ownedSessionCompletionGate = new Promise<void>((resolve) => {
+			releaseCompletion = resolve;
+		});
+		const recoverDaemon = vi.fn(async () => {
+			fakeClient.hello = { ...fakeClient.hello!, supervisorGeneration: SUPERVISOR_GENERATION_B };
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { OWNER_ENV: "private" },
+			ownedSessionRecoveryConfig: {},
+			recoverDaemon,
+			reconnectTimeoutMs: 2000,
+		});
+		await connection.attach();
+
+		const disposing = connection.disposeOwnedSession({ timeoutMs: 1000 });
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "complete_owned_session")).toHaveLength(1),
+		);
+		fakeClient.connected = false;
+		fakeClient.emitClose(new Error("completion transport closed"));
+		fakeClient.ownedSessionCleanupStatus = "settled";
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "attach")).toHaveLength(2),
+		);
+		expect(connection.getOwnedSessionContractProof()).toBeUndefined();
+		expect(fakeClient.requests.filter((request) => request.type === "get_owned_session_cleanup")).toHaveLength(1);
+		releaseCompletion();
+
+		await expect(disposing).resolves.toMatchObject({
+			status: "replacement_settled",
+			daemonReplaced: true,
+			observed: { supervisorGeneration: SUPERVISOR_GENERATION_B },
+		});
+		expect(fakeClient.requests.filter((request) => request.type === "complete_owned_session")).toHaveLength(1);
+		expect(fakeClient.requests.filter((request) => request.type === "get_owned_session_cleanup")).toHaveLength(2);
+		for (let index = 1; index < fakeClient.requests.length; index++) {
+			const request = fakeClient.requests[index]!;
+			if (
+				request.type === "attach" ||
+				request.type === "get_owned_session_cleanup" ||
+				request.type === "complete_owned_session"
+			) {
+				expect(fakeClient.requestOptions[index]?.recoverAcrossReconnect).toBe(false);
+			}
+		}
+	});
+
+	it("reports same-supervisor reconnect settlement without treating transport churn as replacement", async () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient, SUPERVISOR_GENERATION_A);
+		fakeClient.ownedSessionCleanupStatus = "settled";
+		let releaseRecovery!: () => void;
+		const recoveryGate = new Promise<void>((resolve) => {
+			releaseRecovery = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { OWNER_ENV: "private" },
+			ownedSessionRecoveryConfig: {},
+			recoverDaemon: async () => recoveryGate,
+			reconnectTimeoutMs: 2000,
+		});
+		await connection.attach();
+		fakeClient.connected = false;
+		fakeClient.emitClose(new Error("same supervisor reconnect"));
+		await vi.waitFor(() => expect(connection.getOwnedSessionContractProof()).toBeUndefined());
+
+		const disposing = connection.disposeOwnedSession({ timeoutMs: 1000 });
+		releaseRecovery();
+		await expect(disposing).resolves.toMatchObject({
+			status: "already_completed",
+			daemonReplaced: false,
+			started: { daemon: { supervisorGeneration: SUPERVISOR_GENERATION_A, transportGeneration: 1 } },
+			observed: { supervisorGeneration: SUPERVISOR_GENERATION_A, transportGeneration: 2 },
+		});
+		expect(connection.getOwnedSessionContractProof()).toBeUndefined();
+		expect(fakeClient.requests.filter((request) => request.type === "complete_owned_session")).toEqual([]);
+	});
+
+	it("uses a replacement transport for read-only settlement when the owned worker is gone", async () => {
+		const fakeClient = new FakeDaemonClient();
+		enableCallerOwnedSessionContract(fakeClient, SUPERVISOR_GENERATION_A);
+		fakeClient.ownedSessionCleanupStatus = "settled";
+		let releaseRecovery!: () => void;
+		const recoveryGate = new Promise<void>((resolve) => {
+			releaseRecovery = resolve;
+		});
+		const recoverDaemon = vi.fn(async () => {
+			await recoveryGate;
+			fakeClient.hello = { ...fakeClient.hello!, supervisorGeneration: SUPERVISOR_GENERATION_B };
+			fakeClient.attachError = new Error("Unknown active session");
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionLaunchEnv: { OWNER_ENV: "private" },
+			ownedSessionRecoveryConfig: {},
+			recoverDaemon,
+			reconnectTimeoutMs: 2000,
+		});
+		await connection.attach();
+		fakeClient.connected = false;
+		fakeClient.emitClose(new Error("replacement without worker"));
+		await vi.waitFor(() => expect(recoverDaemon).toHaveBeenCalledOnce());
+
+		const disposing = connection.disposeOwnedSession({ timeoutMs: 1000 });
+		releaseRecovery();
+		await expect(disposing).resolves.toMatchObject({
+			status: "replacement_settled",
+			daemonReplaced: true,
+			observed: { supervisorGeneration: SUPERVISOR_GENERATION_B },
+		});
+		expect(connection.getOwnedSessionContractProof()).toBeUndefined();
+		expect(fakeClient.requests.filter((request) => request.type === "get_owned_session_cleanup")).toHaveLength(1);
+		expect(fakeClient.requests.filter((request) => request.type === "complete_owned_session")).toEqual([]);
+		expect(fakeClient.resetTransportCount).toBe(0);
 	});
 
 	it("rejects attach re-entry throughout the owned-session dispose wait", async () => {

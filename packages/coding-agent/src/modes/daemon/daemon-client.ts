@@ -50,6 +50,8 @@ export class DaemonInboundFrameTooLargeError extends Error {
 
 export interface DaemonClientRequestOptions {
 	onProgress?: DaemonClientProgressListener;
+	/** Preserve and replay this request after reconnect. Defaults to true. */
+	recoverAcrossReconnect?: boolean;
 }
 
 interface PendingDaemonRequest {
@@ -62,6 +64,7 @@ interface PendingDaemonRequest {
 	wireData: string;
 	awaitingReconnect: boolean;
 	acknowledgeResult: boolean;
+	recoverAcrossReconnect: boolean;
 	/** Re-checked against the new hello before a reconnect replay. */
 	compatibilities: readonly DaemonCommandCompatibility[];
 }
@@ -456,6 +459,7 @@ export class DaemonClient {
 				wireData,
 				awaitingReconnect: false,
 				acknowledgeResult,
+				recoverAcrossReconnect: options.recoverAcrossReconnect !== false,
 				compatibilities,
 			};
 			this.pendingRequests.set(id, pending);
@@ -616,7 +620,7 @@ export class DaemonClient {
 
 	private rejectAll(error: Error, preservePendingRequests = false): void {
 		for (const [id, pending] of this.pendingRequests) {
-			if (preservePendingRequests) {
+			if (preservePendingRequests && pending.recoverAcrossReconnect) {
 				if (pending.timeout) {
 					clearTimeout(pending.timeout);
 					pending.timeout = undefined;

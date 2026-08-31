@@ -293,6 +293,11 @@ export {
 	type AgentConnectionSlashCommand,
 	type AgentConnectionState,
 	DaemonAgentConnection,
+	type DaemonAgentConnectionOptions,
+	type DaemonOwnedSessionContractProof,
+	type DaemonOwnedSessionDaemonIdentity,
+	type DaemonOwnedSessionDisposeOptions,
+	type DaemonOwnedSessionDisposeResult,
 	type ExpiredPromptLifecycle,
 	InProcessAgentConnection,
 	type PromptEventAttribution,
@@ -318,6 +323,7 @@ export {
 	type DaemonClientId,
 	type DaemonClientMessageListener,
 	type DaemonClientOptions,
+	type DaemonClientRequestOptions,
 	type DaemonCommand,
 	type DaemonCommandEnvelope,
 	type DaemonCommandId,
@@ -330,6 +336,8 @@ export {
 	type DaemonOutbound,
 	type DaemonOwnedSessionCleanupResult,
 	type DaemonOwnedSessionCleanupStatus,
+	type DaemonOwnedSessionCompletionResult,
+	type DaemonOwnedSessionCompletionStatus,
 	type DaemonProtocolInfo,
 	type DaemonProtocolName,
 	type DaemonProtocolVersion,
@@ -413,7 +421,11 @@ export {
 	Theme,
 	type ThemeColor,
 } from "./modes/interactive/theme/theme.js";
-export { PRIME_AGENT_SDK_FEATURES, type PrimeAgentSdkFeature } from "./sdk-features.js";
+export {
+	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+	PRIME_AGENT_SDK_FEATURES,
+	type PrimeAgentSdkFeature,
+} from "./sdk-features.js";
 // Clipboard utilities
 export { copyToClipboard } from "./utils/clipboard.js";
 export { parseFrontmatter, stripFrontmatter } from "./utils/frontmatter.js";
