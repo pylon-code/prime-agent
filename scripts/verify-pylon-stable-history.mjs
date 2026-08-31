@@ -1,13 +1,11 @@
 #!/usr/bin/env node
 
-import { randomUUID } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
-import { lstat, open, readFile, rename, rm } from "node:fs/promises";
-import { basename, dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { PYLON_RELEASE_REPOSITORY } from "./lib/pylon-release.mjs";
-import { syncConsumerStateDirectory, withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
+import { withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 import {
 	canonicalJson,
 	parseStableTag,
@@ -44,34 +42,15 @@ function validateConsumerState(state) {
 	return state;
 }
 
-async function readCanonicalState(statePath) {
-	const stat = await lstat(statePath);
-	if (!stat.isFile()) throw new Error("Consumer stable high-water state is not one regular file.");
-	if (stat.size < 1 || stat.size > STATE_MAX_BYTES) throw new Error("Consumer stable high-water state is malformed.");
-	const bytes = await readFile(statePath);
+function readCanonicalState(bytes) {
+	if (!Buffer.isBuffer(bytes) || bytes.length < 1 || bytes.length > STATE_MAX_BYTES) {
+		throw new Error("Consumer stable high-water state is malformed.");
+	}
 	const state = validateConsumerState(JSON.parse(bytes));
 	if (bytes.toString("utf8") !== canonicalJson(state)) {
 		throw new Error("Consumer stable high-water state is not canonical JSON.");
 	}
 	return state;
-}
-
-async function writeStateAtomically(statePath, state) {
-	const directory = dirname(statePath);
-	const temporary = resolve(directory, `.${basename(statePath)}.${process.pid}.${randomUUID()}.tmp`);
-	let handle;
-	try {
-		handle = await open(temporary, "wx", 0o600);
-		await handle.writeFile(canonicalJson(state));
-		await handle.sync();
-		await handle.close();
-		handle = undefined;
-		await rename(temporary, statePath);
-		await syncConsumerStateDirectory(directory);
-	} finally {
-		if (handle !== undefined) await handle.close();
-		await rm(temporary, { force: true });
-	}
 }
 
 function verifiedManifestFiles(paths) {
@@ -100,22 +79,14 @@ export async function verifyStableHistoryWithState(paths, { statePath, initializ
 		tag: latest.tag,
 		sha256: witnessed.get(latest.sequence).sha256,
 	};
-	return withConsumerStateLock(absoluteStatePath, async () => {
-		let stateEntry;
-		try {
-			stateEntry = await lstat(absoluteStatePath);
-		} catch (error) {
-			if (error?.code !== "ENOENT") throw error;
-		}
-		const stateExists = stateEntry !== undefined;
-		if (stateExists && !stateEntry.isFile()) {
-			throw new Error("Consumer stable high-water state is not one regular file.");
-		}
+	return withConsumerStateLock(absoluteStatePath, async (_lockedPath, transaction) => {
+		const priorBytes = transaction.readStateBytes();
+		const stateExists = priorBytes !== null;
 		if (!stateExists && !initialize) {
 			throw new Error("No consumer high-water state exists. Inspect the full history, then use --initialize once to accept its witnessed high-water.");
 		}
 		if (stateExists && initialize) throw new Error("Consumer high-water state already exists; --initialize cannot reset it.");
-		const priorState = stateExists ? await readCanonicalState(absoluteStatePath) : null;
+		const priorState = stateExists ? readCanonicalState(priorBytes) : null;
 		if (priorState) {
 			if (latest.sequence < priorState.highWater.sequence) {
 				throw new Error("Verified stable history is older than the persisted consumer high-water mark.");
@@ -136,9 +107,9 @@ export async function verifyStableHistoryWithState(paths, { statePath, initializ
 			highWater,
 		};
 		const advanced = !priorState || highWater.sequence > priorState.highWater.sequence;
-		if (advanced) await writeStateAtomically(absoluteStatePath, state);
+		if (advanced) await transaction.commitState(Buffer.from(canonicalJson(state)));
 		return { history, state: advanced ? state : priorState, advanced };
-	});
+	}, { stateMaxBytes: STATE_MAX_BYTES });
 }
 
 function parseArgs(args) {

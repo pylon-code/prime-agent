@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { watch } from "node:fs/promises";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire } from "node:module";
@@ -388,6 +387,21 @@ test("consumer stable high-water requires explicit initialization, is idempotent
 		const advanced = await verifyStableHistoryWithState([firstPath, secondPath], { statePath });
 		assert.equal(advanced.advanced, true);
 		assert.equal(advanced.state.highWater.sequence, 2);
+		writeFileSync(statePath, witnessedBytes);
+		const repairedRollback = await verifyStableHistoryWithState([firstPath, secondPath], { statePath });
+		assert.equal(repairedRollback.state.highWater.sequence, 2, "the immutable transaction tip outranks a rolled-back projection");
+		assert.equal(JSON.parse(readFileSync(statePath, "utf8")).highWater.sequence, 2);
+		rmSync(statePath);
+		await verifyStableHistoryWithState([firstPath, secondPath], { statePath });
+		assert.equal(JSON.parse(readFileSync(statePath, "utf8")).highWater.sequence, 2, "a deleted projection is repaired from the journal");
+		writeFileSync(statePath, "");
+		await verifyStableHistoryWithState([firstPath, secondPath], { statePath });
+		assert.equal(JSON.parse(readFileSync(statePath, "utf8")).highWater.sequence, 2, "an empty projection is repaired from the journal");
+		const legacyPath = join(fixture, "legacy.json");
+		writeFileSync(legacyPath, canonicalJson(initialized.state));
+		const migrated = await verifyStableHistoryWithState([firstPath], { statePath: legacyPath });
+		assert.equal(migrated.advanced, false);
+		assert.equal(readdirSync(`${legacyPath}.transactions`).filter((name) => !name.startsWith(".")).length, 1);
 		await assert.rejects(() => verifyStableHistoryWithState([firstPath, secondPath], { statePath, initialize: true }), /cannot reset/);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
@@ -441,7 +455,7 @@ test("consumer stable high-water rejects malformed, noncanonical, symlinked, and
 		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath }), /not canonical/);
 		rmSync(statePath);
 		symlinkSync(manifestPath, statePath);
-		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath }), /regular file/);
+		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath }), /regular.*file/);
 		rmSync(statePath);
 		const realDirectory = join(fixture, "real-state-directory");
 		const linkedDirectory = join(fixture, "linked-state-directory");
@@ -451,8 +465,25 @@ test("consumer stable high-water rejects malformed, noncanonical, symlinked, and
 			() => verifyStableHistoryWithState([manifestPath], { statePath: join(linkedDirectory, "stable.json"), initialize: true }),
 			/canonical real directory/,
 		);
-		mkdirSync(`${statePath}.lock`);
-		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /locked/);
+		const badLockState = join(fixture, "bad-lock.json");
+		symlinkSync(realDirectory, `${badLockState}.lock`);
+		await assert.rejects(
+			() => verifyStableHistoryWithState([manifestPath], { statePath: badLockState, initialize: true }),
+			/metadata path.*real directory/,
+		);
+		const badTransactionState = join(fixture, "bad-transactions.json");
+		symlinkSync(realDirectory, `${badTransactionState}.transactions`);
+		await assert.rejects(
+			() => verifyStableHistoryWithState([manifestPath], { statePath: badTransactionState, initialize: true }),
+			/metadata path.*real directory/,
+		);
+		const badLockEntryState = join(fixture, "bad-lock-entry.json");
+		mkdirSync(`${badLockEntryState}.lock`);
+		writeFileSync(join(`${badLockEntryState}.lock`, "unexpected"), "bad\n");
+		await assert.rejects(
+			() => verifyStableHistoryWithState([manifestPath], { statePath: badLockEntryState, initialize: true }),
+			/lock directory contains a malformed entry/,
+		);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
@@ -898,7 +929,33 @@ test("recipe and publication policy registries close independent immutable ident
 	);
 });
 
-test("consumer lock heartbeat prevents stale-equivalent theft and dead stale locks recover", async () => {
+test("consumer state locking, recovery, transaction fencing, durability, and path boundary are deterministic", async () => {
+	const deferred = () => {
+		let resolvePromise;
+		let rejectPromise;
+		const promise = new Promise((resolve, reject) => {
+			resolvePromise = resolve;
+			rejectPromise = reject;
+		});
+		return { promise, resolve: resolvePromise, reject: rejectPromise };
+	};
+	const manualRuntime = (clock, hooks = {}) => {
+		const beats = [];
+		return {
+			stale: 20,
+			update: 10,
+			stateMaxBytes: 1024,
+			now: () => clock.value,
+			hooks,
+			startHeartbeat: ({ beat }) => {
+				beats.push(beat);
+				return async () => {};
+			},
+			beats,
+		};
+	};
+	const bytes = (value) => Buffer.from(`${JSON.stringify({ value })}\n`);
+
 	const virtualRoot = resolve("/");
 	const first = join(virtualRoot, "pylon-durable-state-test");
 	const second = join(first, "nested");
@@ -922,40 +979,246 @@ test("consumer lock heartbeat prevents stale-equivalent theft and dead stale loc
 	]);
 	durabilityEvents.length = 0;
 	await ensureDurableConsumerStateDirectory(second, operations);
-	assert.deepEqual(durabilityEvents, [], "an existing real directory needs no new durability mutation");
+	assert.deepEqual(durabilityEvents, [`sync:${virtualRoot}`, `sync:${first}`]);
+
+	const creatorReachedSync = deferred();
+	const letCreatorSync = deferred();
+	const concurrentExisting = new Set([virtualRoot]);
+	const creatorOperations = {
+		lstatEntry: async (path) => {
+			if (!concurrentExisting.has(path)) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+			return { isDirectory: () => true };
+		},
+		makeDirectory: async (path) => concurrentExisting.add(path),
+		syncDirectory: async (path) => {
+			if (path === virtualRoot) {
+				creatorReachedSync.resolve();
+				await letCreatorSync.promise;
+			}
+		},
+	};
+	const creator = ensureDurableConsumerStateDirectory(first, creatorOperations);
+	await creatorReachedSync.promise;
+	let observerSynced = false;
+	await ensureDurableConsumerStateDirectory(first, {
+		...creatorOperations,
+		syncDirectory: async (path) => {
+			assert.equal(path, virtualRoot);
+			observerSynced = true;
+		},
+	});
+	assert.equal(observerSynced, true, "an observer flushes the concurrent creator's ancestor entry before returning");
+	letCreatorSync.resolve();
+	await creator;
 
 	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-consumer-lock-")));
-	const timing = { stale: 2_000, update: 1_000 };
 	try {
-		for (const name of ["preview.json", "stable.json"]) {
-			const statePath = join(fixture, name);
-			const acquiredAt = Date.now();
-			await withConsumerStateLock(statePath, async () => {
-				const events = watch(`${statePath}.lock`, { signal: AbortSignal.timeout(7_000) });
-				let heartbeats = 0;
-				try {
-					for await (const event of events) {
-						if (event.eventType === "change" && ++heartbeats === 3) break;
-					}
-				} finally {
-					await events.return();
-				}
-				assert.ok(Date.now() - acquiredAt >= timing.stale, "owner must remain live beyond one stale interval");
-				await assert.rejects(
-					() => withConsumerStateLock(statePath, async () => writeFileSync(statePath, "stolen\n"), timing),
-					/actively locked/,
-				);
-				writeFileSync(statePath, "owner\n");
-			}, timing);
-			assert.equal(readFileSync(statePath, "utf8"), "owner\n");
+		const activePath = join(fixture, "active.json");
+		const activeClock = { value: 1 };
+		const activeOptions = manualRuntime(activeClock);
+		const releaseOwner = deferred();
+		const ownerEntered = deferred();
+		const owner = withConsumerStateLock(activePath, async (_path, transaction) => {
+			ownerEntered.resolve();
+			await releaseOwner.promise;
+			await transaction.commitState(bytes("owner"));
+		}, activeOptions);
+		await ownerEntered.promise;
+		activeClock.value = 16;
+		assert.equal(await activeOptions.beats[0](), true);
+		activeClock.value = 31;
+		assert.equal(await activeOptions.beats[0](), true);
+		activeClock.value = 45;
+		await assert.rejects(
+			() => withConsumerStateLock(activePath, async () => {}, manualRuntime(activeClock)),
+			/actively locked/,
+		);
+		releaseOwner.resolve();
+		await owner;
+		assert.deepEqual(JSON.parse(readFileSync(activePath, "utf8")), { value: "owner" });
 
-			mkdirSync(`${statePath}.lock`);
-			const stale = new Date(Date.now() - timing.stale - 5_000);
-			utimesSync(`${statePath}.lock`, stale, stale);
-			let recovered = false;
-			await withConsumerStateLock(statePath, async () => { recovered = true; }, timing);
-			assert.equal(recovered, true);
+		const racePath = join(fixture, "recoverers.json");
+		const raceClock = { value: 1 };
+		const oldRelease = deferred();
+		const oldEntered = deferred();
+		const oldOwner = withConsumerStateLock(racePath, async () => {
+			oldEntered.resolve();
+			await oldRelease.promise;
+		}, manualRuntime(raceClock));
+		const oldOwnerRejected = assert.rejects(oldOwner, /retired/);
+		await oldEntered.promise;
+		raceClock.value = 100;
+		const observedBoth = deferred();
+		const releaseObserved = deferred();
+		const retiredBoth = deferred();
+		const releaseRetired = deferred();
+		let observed = 0;
+		let retired = 0;
+		const recoveryHooks = {
+			afterObserveStale: async () => {
+				observed += 1;
+				if (observed === 2) observedBoth.resolve();
+				await releaseObserved.promise;
+			},
+			afterRetire: async () => {
+				retired += 1;
+				if (retired === 2) retiredBoth.resolve();
+				await releaseRetired.promise;
+			},
+		};
+		let recoveryActions = 0;
+		const winnerRelease = deferred();
+		const winnerEntered = deferred();
+		const recover = () => withConsumerStateLock(racePath, async () => {
+			recoveryActions += 1;
+			winnerEntered.resolve();
+			await winnerRelease.promise;
+		}, manualRuntime(raceClock, recoveryHooks));
+		const recoveryRejected = deferred();
+		const trackRecovery = (promise) => promise.catch((error) => {
+			recoveryRejected.resolve(error);
+			throw error;
+		});
+		const firstRecoverer = trackRecovery(recover());
+		const secondRecoverer = trackRecovery(recover());
+		const recoveriesPromise = Promise.allSettled([firstRecoverer, secondRecoverer]);
+		await observedBoth.promise;
+		releaseObserved.resolve();
+		await retiredBoth.promise;
+		releaseRetired.resolve();
+		await winnerEntered.promise;
+		assert.match((await recoveryRejected.promise).message, /actively locked/);
+		winnerRelease.resolve();
+		const recoveries = await recoveriesPromise;
+		assert.equal(recoveryActions, 1, "only one simultaneous stale recoverer enters the next generation");
+		assert.deepEqual(recoveries.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
+		assert.match(recoveries.find((result) => result.status === "rejected").reason.message, /actively locked/);
+		oldRelease.resolve();
+		await oldOwnerRejected;
+		const raceClaims = readdirSync(`${racePath}.lock`).filter((name) => name.startsWith("claim-"));
+		assert.equal(raceClaims.length, 2);
+
+		const fencedPath = join(fixture, "fenced.json");
+		const fencedClock = { value: 1 };
+		const oldDecisionReached = deferred();
+		const letOldDecide = deferred();
+		const retiredWriter = withConsumerStateLock(fencedPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("retired"));
+		}, manualRuntime(fencedClock, {
+			beforeCommitDecision: async () => {
+				oldDecisionReached.resolve();
+				await letOldDecide.promise;
+			},
+		}));
+		await oldDecisionReached.promise;
+		fencedClock.value = 100;
+		await withConsumerStateLock(fencedPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("winner"));
+		}, manualRuntime(fencedClock));
+		letOldDecide.resolve();
+		await assert.rejects(retiredWriter, /lost ownership/);
+		assert.deepEqual(JSON.parse(readFileSync(fencedPath, "utf8")), { value: "winner" });
+		assert.equal(
+			readdirSync(`${fencedPath}.transactions`).filter((name) => !name.startsWith(".")).length,
+			1,
+			"a retired writer cannot publish a sibling transition from GENESIS",
+		);
+
+		const projectionPath = join(fixture, "projection.json");
+		const projectionClock = { value: 1 };
+		const staleProjectionReady = deferred();
+		const letStaleProjectionRename = deferred();
+		let blockedProjection = false;
+		const firstProjection = withConsumerStateLock(projectionPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("one"));
+		}, manualRuntime(projectionClock, {
+			afterProjectionFileSync: async () => {
+				if (blockedProjection) return;
+				blockedProjection = true;
+				staleProjectionReady.resolve();
+				await letStaleProjectionRename.promise;
+			},
+		}));
+		await staleProjectionReady.promise;
+		await withConsumerStateLock(projectionPath, async (_path, transaction) => {
+			assert.deepEqual(JSON.parse(transaction.readStateBytes()), { value: "one" });
+			await transaction.commitState(bytes("two"));
+		}, manualRuntime(projectionClock));
+		await withConsumerStateLock(projectionPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("three"));
+		}, manualRuntime(projectionClock));
+		letStaleProjectionRename.resolve();
+		await firstProjection;
+		assert.deepEqual(JSON.parse(readFileSync(projectionPath, "utf8")), { value: "three" });
+		assert.equal(readdirSync(`${projectionPath}.transactions`).filter((name) => !name.startsWith(".")).length, 3);
+		writeFileSync(join(`${projectionPath}.transactions`, `${"f".repeat(64)}.json`), "{}\n");
+		await assert.rejects(
+			() => withConsumerStateLock(projectionPath, async () => {}, manualRuntime(projectionClock)),
+			/unreachable transition/,
+		);
+
+		for (const crashPoint of [
+			["afterFileSync", "claim"],
+			["afterMetadataLink", "claim"],
+			["afterMetadataDirectorySync", "claim"],
+			["afterFileSync", "terminal-commit"],
+			["afterMetadataLink", "terminal-commit"],
+			["afterMetadataDirectorySync", "terminal-commit"],
+			["afterCommitDecision", null],
+			["afterFileSync", "transition"],
+			["afterMetadataLink", "transition"],
+			["afterMetadataDirectorySync", "transition"],
+			["afterProjectionFileSync", null],
+			["afterProjectionRename", null],
+			["afterProjectionDirectorySync", null],
+			["afterApplied", null],
+		]) {
+			const [hookName, wantedKind] = crashPoint;
+			const crashPath = join(fixture, `crash-${hookName}-${wantedKind ?? "projection"}.json`);
+			const crashClock = { value: 1 };
+			const reached = deferred();
+			const crash = deferred();
+			let armed = true;
+			const hooks = {
+				[hookName]: async (event = {}) => {
+					if (!armed || (wantedKind !== null && event.kind !== wantedKind)) return;
+					armed = false;
+					reached.resolve();
+					await crash.promise;
+				},
+			};
+			const interrupted = withConsumerStateLock(crashPath, async (_path, transaction) => {
+				await transaction.commitState(bytes("interrupted"));
+			}, manualRuntime(crashClock, hooks));
+			await reached.promise;
+			crashClock.value = 100;
+			await withConsumerStateLock(crashPath, async (_path, transaction) => {
+				await transaction.commitState(bytes("recovered"));
+			}, manualRuntime(crashClock));
+			crash.reject(new Error(`simulated crash at ${hookName}`));
+			await assert.rejects(interrupted, /simulated crash|retired/);
+			await withConsumerStateLock(crashPath, async () => {}, manualRuntime(crashClock));
+			assert.deepEqual(JSON.parse(readFileSync(crashPath, "utf8")), { value: "recovered" });
 		}
+
+		const swapRoot = join(fixture, "swap-root");
+		const swapDirectory = join(swapRoot, "state");
+		const movedDirectory = join(swapRoot, "state-moved");
+		mkdirSync(swapDirectory, { recursive: true });
+		const swapPath = join(swapDirectory, "state.json");
+		let swapped = false;
+		await assert.rejects(
+			() => withConsumerStateLock(swapPath, async () => {}, manualRuntime({ value: 1 }, {
+				beforePathOperation: async ({ operation }) => {
+					if (swapped || operation !== "scan-claims") return;
+					swapped = true;
+					renameSync(swapDirectory, movedDirectory);
+					symlinkSync(movedDirectory, swapDirectory);
+				},
+			})),
+			/canonical real directory/,
+		);
+		assert.equal(swapped, true, "the injected component swap reached the immediate path revalidation boundary");
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}

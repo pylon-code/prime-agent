@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 
-import { randomUUID } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
-import { lstat, open, readFile, rename, rm } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -13,7 +11,7 @@ import {
 	sha256Bytes,
 } from "./lib/pylon-publication.mjs";
 import { PYLON_RELEASE_REPOSITORY } from "./lib/pylon-release.mjs";
-import { syncConsumerStateDirectory, withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
+import { withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 import { verifyPreviewAttestations } from "./verify-pylon-publication-attestations.mjs";
 
 const STATE_SCHEMA_VERSION = 1;
@@ -38,29 +36,10 @@ function validateState(state) {
 	return state;
 }
 
-async function atomicWrite(statePath, state) {
-	const directory = dirname(statePath);
-	const temporary = resolve(directory, `.${basename(statePath)}.${process.pid}.${randomUUID()}.tmp`);
-	let handle;
-	try {
-		handle = await open(temporary, "wx", 0o600);
-		await handle.writeFile(canonicalJson(state));
-		await handle.sync();
-		await handle.close();
-		handle = undefined;
-		await rename(temporary, statePath);
-		await syncConsumerStateDirectory(directory);
-	} finally {
-		if (handle !== undefined) await handle.close();
-		await rm(temporary, { force: true });
+function readState(bytes) {
+	if (!Buffer.isBuffer(bytes) || bytes.length < 1 || bytes.length > STATE_MAX_BYTES) {
+		throw new Error("Consumer preview high-water state is malformed.");
 	}
-}
-
-async function readState(path) {
-	const stat = await lstat(path);
-	if (!stat.isFile()) throw new Error("Consumer preview high-water state is not one regular file.");
-	if (stat.size < 1 || stat.size > STATE_MAX_BYTES) throw new Error("Consumer preview high-water state is malformed.");
-	const bytes = await readFile(path);
 	const state = validateState(JSON.parse(bytes));
 	if (bytes.toString("utf8") !== canonicalJson(state)) throw new Error("Consumer preview high-water state is not canonical JSON.");
 	return state;
@@ -82,17 +61,11 @@ export async function recordPreviewHighWater(previewManifest, previewBytes, { st
 		sha256: sha256Bytes(previewBytes),
 		workflowRunId: previewManifest.workflowRunId,
 	};
-	return withConsumerStateLock(path, async () => {
-		let entry;
-		try {
-			entry = await lstat(path);
-		} catch (error) {
-			if (error?.code !== "ENOENT") throw error;
-		}
-		if (entry && !entry.isFile()) throw new Error("Consumer preview high-water state is not one regular file.");
-		if (!entry && !initialize) throw new Error("No consumer preview high-water exists. Verify the release, then use --initialize once.");
-		if (entry && initialize) throw new Error("Consumer preview high-water already exists; --initialize cannot reset it.");
-		const prior = entry ? await readState(path) : null;
+	return withConsumerStateLock(path, async (_lockedPath, transaction) => {
+		const priorBytes = transaction.readStateBytes();
+		if (priorBytes === null && !initialize) throw new Error("No consumer preview high-water exists. Verify the release, then use --initialize once.");
+		if (priorBytes !== null && initialize) throw new Error("Consumer preview high-water already exists; --initialize cannot reset it.");
+		const prior = priorBytes === null ? null : readState(priorBytes);
 		if (prior) {
 			if (prior.sequenceEpoch !== previewManifest.sequenceEpoch) throw new Error("Preview sequence epoch changed without a new signed state schema.");
 			if (highWater.sequence < prior.highWater.sequence) throw new Error("Verified preview is older than the consumer high-water sequence.");
@@ -110,9 +83,9 @@ export async function recordPreviewHighWater(previewManifest, previewBytes, { st
 			sequenceEpoch: previewManifest.sequenceEpoch,
 			highWater,
 		};
-		await atomicWrite(path, state);
+		await transaction.commitState(Buffer.from(canonicalJson(state)));
 		return { state, advanced: true };
-	});
+	}, { stateMaxBytes: STATE_MAX_BYTES });
 }
 
 function parseArgs(args) {

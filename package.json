@@ -64,8 +64,7 @@
 	"version": "0.8.1",
 	"dependencies": {
 		"@earendil-works/pi-coding-agent": "^0.8.1",
-		"get-east-asian-width": "^1.6.0",
-		"proper-lockfile": "4.1.2"
+		"get-east-asian-width": "^1.6.0"
 	},
 	"overrides": {
 		"rimraf": "6.1.2",
