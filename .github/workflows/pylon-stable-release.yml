@@ -485,6 +485,7 @@ jobs:
               --operation "$OPERATION"
               --policy-sha "${{ github.sha }}"
               --policy-tree "$policy_tree"
+              --publication-policy-revision 1
             )
             if [ "$OPERATION" = withdraw ]; then
               args+=(--revoke-tag "$REVOKE_STABLE_TAG" --reason "$REASON")
@@ -568,6 +569,7 @@ jobs:
           if (
             manifest.schemaVersion !== 1 || manifest.channel !== "stable" ||
             manifest.repository !== "https://github.com/pylon-code/prime-agent" ||
+            manifest.promotion?.publicationPolicyRevision !== 1 ||
             !/^pylon-stable-[0-9]{6}-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(manifest.tag)
           ) throw new Error("Stable manifest identity is malformed.");
           NODE
@@ -673,7 +675,8 @@ jobs:
             if (
               !parsed || !preview || Number(parsed[1]) !== manifest.sequence || parsed[2] !== manifest.build.source?.commit?.slice(0, 12) ||
               Number(parsed[3]) !== manifest.build.recipeRevision || preview[1] !== parsed[2] || Number(preview[2]) !== manifest.build.recipeRevision ||
-              manifest.build.previewTag !== manifest.build.id || manifest.promotion?.policyCommit !== context.sha
+              manifest.build.previewTag !== manifest.build.id || ![1].includes(manifest.build.publicationPolicyRevision) ||
+              manifest.promotion?.policyCommit !== context.sha || manifest.promotion?.publicationPolicyRevision !== 1
             ) throw new Error("Stable draft identity is malformed or not signed by this policy commit.");
             const name = `Pylon Prime stable ${tag}`;
             const encoded = bytes.toString("base64");
@@ -847,7 +850,8 @@ jobs:
               Number(previewMatch[2]) !== manifest.build?.recipeRevision || manifest.build.previewTag !== manifest.build.id ||
               manifest.build.previewSequence?.sequenceEpoch !== 1 || !Number.isSafeInteger(manifest.build.previewSequence?.sequence) ||
               manifest.build.previewSequence.sequence < 1 || !/^[1-9][0-9]*$/.test(manifest.build.previewSequence?.workflowRunId ?? "") ||
-              manifest.build.previewTag !== process.env.PREVIEW_TAG || manifest.promotion?.kind !== operation ||
+              manifest.build.previewTag !== process.env.PREVIEW_TAG || ![1].includes(manifest.build.publicationPolicyRevision) ||
+              manifest.promotion?.kind !== operation || manifest.promotion?.publicationPolicyRevision !== 1 ||
               manifest.promotion?.policyCommit !== process.env.POLICY_SHA || manifest.promotion?.policyTree !== process.env.POLICY_TREE
             ) throw new Error("Stable manifest, preview recipe, operator request, or policy identity differs.");
             if (operation === "withdraw") {
@@ -905,8 +909,9 @@ jobs:
               Object.keys(manifest.build.previewSequence).sort().join(",") !== "sequence,sequenceEpoch,workflowRunId" ||
               previewManifest.sequenceEpoch !== manifest.build.previewSequence.sequenceEpoch ||
               previewManifest.sequence !== manifest.build.previewSequence.sequence ||
-              previewManifest.workflowRunId !== manifest.build.previewSequence.workflowRunId
-            ) throw new Error("Stable manifest does not copy the immutable preview sequence identity.");
+              previewManifest.workflowRunId !== manifest.build.previewSequence.workflowRunId ||
+              previewManifest.publicationPolicyRevision !== manifest.build.publicationPolicyRevision
+            ) throw new Error("Stable manifest does not copy the immutable preview sequence and policy identity.");
             const previewRef = await github.rest.git.getRef({ owner, repo, ref: `tags/${manifest.build.previewTag}` });
             if (previewRef.data.object.type !== "commit" || previewRef.data.object.sha !== manifest.build.source.commit) throw new Error("Immutable preview tag changed before stable CAS.");
 

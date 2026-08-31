@@ -37,16 +37,20 @@ function parseArgs(args) {
 	const operation = values.get("--operation") ?? "promote";
 	const policySha = values.get("--policy-sha") ?? "";
 	const policyTree = values.get("--policy-tree") ?? "";
+	const publicationPolicyRevision = Number(values.get("--publication-policy-revision"));
 	const revokeTag = values.get("--revoke-tag") ?? "";
 	const reason = values.get("--reason") ?? "withdrawn";
 	if (!["promote", "withdraw"].includes(operation)) throw new Error("Stable operation must be promote or withdraw.");
 	if (!/^[0-9a-f]{40}$/.test(policySha)) throw new Error("Stable preparation requires an exact --policy-sha.");
 	if (!/^[0-9a-f]{40}$/.test(policyTree)) throw new Error("Stable preparation requires an exact --policy-tree.");
+	if (!Number.isSafeInteger(publicationPolicyRevision) || publicationPolicyRevision < 1) {
+		throw new Error("Stable preparation requires an exact positive --publication-policy-revision.");
+	}
 	if (operation === "promote" && (revokeTag || values.has("--reason"))) {
 		throw new Error("A normal promotion cannot carry withdrawal metadata.");
 	}
 	if (operation === "withdraw" && !revokeTag) throw new Error("Withdrawal requires --revoke-tag.");
-	return { artifactDir, outDir, operation, policySha, policyTree, revokeTag, reason };
+	return { artifactDir, outDir, operation, policySha, policyTree, publicationPolicyRevision, revokeTag, reason };
 }
 
 function apiHeaders(accept = "application/vnd.github+json") {
@@ -222,7 +226,12 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
 		} else {
 			const sequence = nextStableSequence(history);
 			const revocations = latest ? structuredClone(latest.revocations) : [];
-			let promotion = { kind: "promote", policyCommit: args.policySha, policyTree: args.policyTree };
+			let promotion = {
+				kind: "promote",
+				policyCommit: args.policySha,
+				policyTree: args.policyTree,
+				publicationPolicyRevision: args.publicationPolicyRevision,
+			};
 			if (args.operation === "withdraw") {
 				const revoked = history.find((manifest) => manifest.tag === args.revokeTag);
 				if (!revoked) throw new Error("Withdrawal can revoke only an existing stable sequence.");
@@ -236,7 +245,13 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
 					revokedBySequence: sequence,
 				};
 				revocations.push(revocation);
-				promotion = { kind: "withdraw", policyCommit: args.policySha, policyTree: args.policyTree, revocation };
+				promotion = {
+					kind: "withdraw",
+					policyCommit: args.policySha,
+					policyTree: args.policyTree,
+					publicationPolicyRevision: args.publicationPolicyRevision,
+					revocation,
+				};
 			}
 			stableManifest = createStableManifest({
 				previewManifest: verified.previewManifest,

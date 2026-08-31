@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { watch } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire } from "node:module";
@@ -55,7 +56,7 @@ import { validatePreviewWorkflowRunEvidence, verifyGhAttestationResult } from ".
 import { recordPreviewHighWater } from "./verify-pylon-preview-history.mjs";
 import { verifyStableHistoryWithState } from "./verify-pylon-stable-history.mjs";
 import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
-import { PYLON_CONSUMER_LOCK_STALE_MS, withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
+import { withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 import { isExactWithdrawalReplay, selectStableHistoryReleases } from "./prepare-pylon-stable-manifest.mjs";
 import { recoverStableDraft } from "./recover-pylon-stable-manifest.mjs";
 
@@ -68,7 +69,12 @@ const source = {
 	tree: "89abcdef0123456789abcdef0123456789abcdef",
 };
 const version = "0.8.1";
-const invocation = { sequenceEpoch: 1, sequence: 17, workflowRunId: "33428882721" };
+const invocation = {
+	sequenceEpoch: 1,
+	sequence: 17,
+	workflowRunId: "33428882721",
+	publicationPolicyRevision: 1,
+};
 
 function fakeReleaseManifest() {
 	return createReleaseManifest({
@@ -109,7 +115,7 @@ function firstStable() {
 		previewManifestBytes: previewBytes,
 		sequence: 1,
 		previous: null,
-		promotion: { kind: "promote", policyCommit: source.commit, policyTree: source.tree },
+		promotion: { kind: "promote", policyCommit: source.commit, policyTree: source.tree, publicationPolicyRevision: 1 },
 	});
 }
 
@@ -128,7 +134,7 @@ function secondStable(previous = firstStable(), options = {}) {
 		sequence,
 		previous: { tag: previous.tag, sha256: sha256Bytes(Buffer.from(canonicalJson(previous))) },
 		revocations: options.withdraw ? [revocation] : [],
-		promotion: options.withdraw ? { kind: "withdraw", policyCommit: source.commit, policyTree: source.tree, revocation } : { kind: "promote", policyCommit: source.commit, policyTree: source.tree },
+		promotion: options.withdraw ? { kind: "withdraw", policyCommit: source.commit, policyTree: source.tree, publicationPolicyRevision: 1, revocation } : { kind: "promote", policyCommit: source.commit, policyTree: source.tree, publicationPolicyRevision: 1 },
 	});
 }
 
@@ -207,6 +213,11 @@ test("preview manifest binds the full source tree, build, recipe, and build-mani
 		{ ...invocation, sequence: 0 },
 		{ ...invocation, workflowRunId: "01" },
 	]) assert.throws(() => createPreviewManifest(release, releaseBytes, invalid), /sequence identity/);
+	for (const invalid of [
+		{ ...invocation, publicationPolicyRevision: 0 },
+		{ ...invocation, publicationPolicyRevision: 2 },
+		{ sequenceEpoch: 1, sequence: 17, workflowRunId: "33428882721" },
+	]) assert.throws(() => createPreviewManifest(release, releaseBytes, invalid), /policy revision/);
 	for (const mutate of [
 		(value) => (value.build.source.commit = "f".repeat(40)),
 		(value) => (value.build.source.tree = "f".repeat(40)),
@@ -226,10 +237,6 @@ test("current policy validates an older supported closed recipe without executin
 		nodeVersion: "20.19.1",
 		npmVersion: "10.8.2",
 		minimumNodeVersion: "20.12.0",
-		previewWorkflowPath: ".github/workflows/pylon-preview-release.yml",
-		previewWorkflowSha256: "a".repeat(64),
-		stableWorkflowPath: ".github/workflows/pylon-stable-release.yml",
-		stableWorkflowSha256: "b".repeat(64),
 	};
 	const release = fakeReleaseManifest();
 	release.build.id = `pylon-build-g${source.commit.slice(0, 12)}-r7`;
@@ -255,28 +262,28 @@ test("current policy validates an older supported closed recipe without executin
 		previewManifest: preview,
 		previewManifestBytes: Buffer.from(canonicalJson(preview)),
 		sequence: 1,
-		promotion: { kind: "promote", policyCommit: source.commit, policyTree: source.tree },
+		promotion: { kind: "promote", policyCommit: source.commit, policyTree: source.tree, publicationPolicyRevision: 1 },
 	});
 	assert.equal(validateStableManifest(stable, [oldRecipe]), stable);
 	assert.throws(() => validateStableManifest(stable), /closed|malformed/i);
 });
 
-test("consumer preview high-water allows gaps but rejects rollback and same-sequence equivocation", () => {
+test("consumer preview high-water allows gaps but rejects rollback and same-sequence equivocation", async () => {
 	const fixture = mkdtempSync(join(tmpdir(), "pylon-preview-state-"));
 	try {
 		const { preview, previewBytes } = manifests();
 		const statePath = join(fixture, "consumer", "preview.json");
-		assert.throws(() => recordPreviewHighWater(preview, previewBytes, { statePath }), /--initialize/);
-		assert.equal(recordPreviewHighWater(preview, previewBytes, { statePath, initialize: true }).advanced, true);
-		assert.equal(recordPreviewHighWater(preview, previewBytes, { statePath }).advanced, false);
+		await assert.rejects(() => recordPreviewHighWater(preview, previewBytes, { statePath }), /--initialize/);
+		assert.equal((await recordPreviewHighWater(preview, previewBytes, { statePath, initialize: true })).advanced, true);
+		assert.equal((await recordPreviewHighWater(preview, previewBytes, { statePath })).advanced, false);
 		const later = structuredClone(preview);
 		later.sequence += 3;
 		later.workflowRunId = String(Number(later.workflowRunId) + 3);
-		assert.equal(recordPreviewHighWater(later, Buffer.from(canonicalJson(later)), { statePath }).state.highWater.sequence, later.sequence);
-		assert.throws(() => recordPreviewHighWater(preview, previewBytes, { statePath }), /older/);
+		assert.equal((await recordPreviewHighWater(later, Buffer.from(canonicalJson(later)), { statePath })).state.highWater.sequence, later.sequence);
+		await assert.rejects(() => recordPreviewHighWater(preview, previewBytes, { statePath }), /older/);
 		const equivocation = structuredClone(later);
 		equivocation.build.releaseManifest.sha256 = "f".repeat(64);
-		assert.throws(
+		await assert.rejects(
 			() => recordPreviewHighWater(equivocation, Buffer.from(canonicalJson(equivocation)), { statePath }),
 			/equivocates/,
 		);
@@ -288,7 +295,12 @@ test("consumer preview high-water allows gaps but rejects rollback and same-sequ
 test("stable history is contiguous, previous-digest chained, high-water marked, sorted, and append-only", () => {
 	const first = firstStable();
 	const second = secondStable(first, { withdraw: true });
-	assert.deepEqual(first.build.previewSequence, invocation);
+	assert.deepEqual(first.build.previewSequence, {
+		sequenceEpoch: invocation.sequenceEpoch,
+		sequence: invocation.sequence,
+		workflowRunId: invocation.workflowRunId,
+	});
+	assert.equal(first.build.publicationPolicyRevision, invocation.publicationPolicyRevision);
 	assert.equal(first.history.highWater, 0);
 	assert.equal(second.history.highWater, 1);
 	assert.equal(nextStableSequence([second, first]), 3);
@@ -308,7 +320,7 @@ test("stable history is contiguous, previous-digest chained, high-water marked, 
 	assert.throws(() => validateStableHistory([first, second, third]), /append-only/);
 });
 
-test("consumer stable high-water requires explicit initialization, is idempotent, and advances atomically", () => {
+test("consumer stable high-water requires explicit initialization, is idempotent, and advances atomically", async () => {
 	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-state-"));
 	try {
 		const first = firstStable();
@@ -318,24 +330,24 @@ test("consumer stable high-water requires explicit initialization, is idempotent
 		const statePath = join(fixture, "consumer", "stable.json");
 		writeFileSync(firstPath, canonicalJson(first));
 		writeFileSync(secondPath, canonicalJson(second));
-		assert.throws(() => verifyStableHistoryWithState([firstPath], { statePath }), /--initialize/);
-		const initialized = verifyStableHistoryWithState([firstPath], { statePath, initialize: true });
+		await assert.rejects(() => verifyStableHistoryWithState([firstPath], { statePath }), /--initialize/);
+		const initialized = await verifyStableHistoryWithState([firstPath], { statePath, initialize: true });
 		assert.equal(initialized.advanced, true);
 		assert.equal(initialized.state.highWater.sequence, 1);
 		const witnessedBytes = readFileSync(statePath, "utf8");
-		const repeated = verifyStableHistoryWithState([firstPath], { statePath });
+		const repeated = await verifyStableHistoryWithState([firstPath], { statePath });
 		assert.equal(repeated.advanced, false);
 		assert.equal(readFileSync(statePath, "utf8"), witnessedBytes);
-		const advanced = verifyStableHistoryWithState([firstPath, secondPath], { statePath });
+		const advanced = await verifyStableHistoryWithState([firstPath, secondPath], { statePath });
 		assert.equal(advanced.advanced, true);
 		assert.equal(advanced.state.highWater.sequence, 2);
-		assert.throws(() => verifyStableHistoryWithState([firstPath, secondPath], { statePath, initialize: true }), /cannot reset/);
+		await assert.rejects(() => verifyStableHistoryWithState([firstPath, secondPath], { statePath, initialize: true }), /cannot reset/);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
 });
 
-test("consumer stable high-water rejects rollback and a rewritten witnessed sequence", () => {
+test("consumer stable high-water rejects rollback and a rewritten witnessed sequence", async () => {
 	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-state-"));
 	try {
 		const first = firstStable();
@@ -345,53 +357,53 @@ test("consumer stable high-water rejects rollback and a rewritten witnessed sequ
 		const statePath = join(fixture, "stable.json");
 		writeFileSync(firstPath, canonicalJson(first));
 		writeFileSync(secondPath, canonicalJson(second));
-		verifyStableHistoryWithState([firstPath, secondPath], { statePath, initialize: true });
-		assert.throws(() => verifyStableHistoryWithState([firstPath], { statePath }), /older than/);
+		await verifyStableHistoryWithState([firstPath, secondPath], { statePath, initialize: true });
+		await assert.rejects(() => verifyStableHistoryWithState([firstPath], { statePath }), /older than/);
 		const rewrittenFirst = structuredClone(first);
 		rewrittenFirst.promotion.policyTree = "f".repeat(40);
 		writeFileSync(firstPath, canonicalJson(rewrittenFirst));
-		assert.throws(() => verifyStableHistoryWithState([firstPath], { statePath }), /older than|rewrites/);
+		await assert.rejects(() => verifyStableHistoryWithState([firstPath], { statePath }), /older than|rewrites/);
 		const rewrittenSecond = createStableManifest({
 			previewManifest: manifests().preview,
 			previewManifestBytes: manifests().previewBytes,
 			sequence: 2,
 			previous: { tag: rewrittenFirst.tag, sha256: sha256Bytes(Buffer.from(canonicalJson(rewrittenFirst))) },
-			promotion: { kind: "promote", policyCommit: source.commit, policyTree: "e".repeat(40) },
+			promotion: { kind: "promote", policyCommit: source.commit, policyTree: "e".repeat(40), publicationPolicyRevision: 1 },
 		});
 		writeFileSync(secondPath, canonicalJson(rewrittenSecond));
-		assert.throws(() => verifyStableHistoryWithState([firstPath, secondPath], { statePath }), /rewrites/);
+		await assert.rejects(() => verifyStableHistoryWithState([firstPath, secondPath], { statePath }), /rewrites/);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
 });
 
-test("consumer stable high-water rejects malformed, noncanonical, symlinked, and locked local state", () => {
+test("consumer stable high-water rejects malformed, noncanonical, symlinked, and locked local state", async () => {
 	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-state-"));
 	try {
 		const manifestPath = join(fixture, "first.json");
 		const statePath = join(fixture, "stable.json");
 		writeFileSync(manifestPath, canonicalJson(firstStable()));
 		writeFileSync(statePath, "{}\n");
-		assert.throws(() => verifyStableHistoryWithState([manifestPath], { statePath }), /malformed/);
+		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath }), /malformed/);
 		writeFileSync(statePath, JSON.stringify({
 			schemaVersion: 1,
 			repository: "https://github.com/pylon-code/prime-agent",
 			channel: "stable",
 			highWater: { sequence: 1, tag: firstStable().tag, sha256: sha256Bytes(Buffer.from(canonicalJson(firstStable()))) },
 		}));
-		assert.throws(() => verifyStableHistoryWithState([manifestPath], { statePath }), /not canonical/);
+		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath }), /not canonical/);
 		rmSync(statePath);
 		symlinkSync(manifestPath, statePath);
-		assert.throws(() => verifyStableHistoryWithState([manifestPath], { statePath }), /regular file/);
+		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath }), /regular file/);
 		rmSync(statePath);
 		mkdirSync(`${statePath}.lock`);
-		assert.throws(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /locked/);
+		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /locked/);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
 });
 
-test("consumer stable high-water requires canonical regular manifest files", () => {
+test("consumer stable high-water requires canonical regular manifest files", async () => {
 	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-state-"));
 	try {
 		const target = join(fixture, "target.json");
@@ -399,10 +411,10 @@ test("consumer stable high-water requires canonical regular manifest files", () 
 		const statePath = join(fixture, "stable.json");
 		writeFileSync(target, canonicalJson(firstStable()));
 		symlinkSync(target, manifestPath);
-		assert.throws(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /regular file/);
+		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /regular file/);
 		rmSync(manifestPath);
 		writeFileSync(manifestPath, JSON.stringify(firstStable()));
-		assert.throws(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /not canonical/);
+		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /not canonical/);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
@@ -418,6 +430,8 @@ test("stable manifest nested schema rejects extras, malformed identities, unsafe
 		(value) => (value.build.source.commit = "abc"),
 		(value) => (value.build.source.tree = "abc"),
 		(value) => (value.build.recipeRevision = 2),
+		(value) => delete value.build.publicationPolicyRevision,
+		(value) => (value.build.publicationPolicyRevision = 2),
 		(value) => (value.build.releaseManifest.file = "other.json"),
 		(value) => (value.build.previewManifest.file = "other.json"),
 		(value) => (value.build.assets[0].file = "../escape.tgz"),
@@ -426,6 +440,8 @@ test("stable manifest nested schema rejects extras, malformed identities, unsafe
 		(value) => value.build.assets.push(structuredClone(value.build.assets[0])),
 		(value) => value.build.assets.reverse(),
 		(value) => (value.promotion.policyTree = "abc"),
+		(value) => delete value.promotion.publicationPolicyRevision,
+		(value) => (value.promotion.publicationPolicyRevision = 2),
 	]) {
 		const changed = structuredClone(stable);
 		mutate(changed);
@@ -734,50 +750,130 @@ test("standalone preview verification rejects tamper, extras, symlinks, and nonc
 	}
 });
 
-test("recipe registry closes exact workflow bytes and rejects extras and duplicate JSON keys", () => {
+test("recipe and publication policy registries close independent immutable identities", () => {
 	const registryText = readFileSync(join(root, "scripts/pylon-prime-supported-release-recipes-v1.json"), "utf8");
 	const registry = parseSupportedReleaseRecipeRegistry(registryText);
-	const recipe = registry.recipes[0];
-	const preview = readFileSync(join(root, recipe.previewWorkflowPath), "utf8");
-	const stable = readFileSync(join(root, recipe.stableWorkflowPath), "utf8");
-	assert.deepEqual(validateApprovedWorkflowBytes(recipe.previewWorkflowPath, preview, "preview", recipe.recipeRevision), {
-		workflow: recipe.previewWorkflowPath, environment: "pylon-preview",
-	});
-	assert.deepEqual(validateApprovedWorkflowBytes(recipe.stableWorkflowPath, stable, "stable", recipe.recipeRevision), {
-		workflow: recipe.stableWorkflowPath, environment: "pylon-stable",
-	});
+	const policy = registry.publicationPolicies[0];
+	const preview = readFileSync(join(root, policy.previewWorkflowPath), "utf8");
+	const stable = readFileSync(join(root, policy.stableWorkflowPath), "utf8");
+	assert.deepEqual(validateApprovedWorkflowBytes(
+		policy.previewWorkflowPath,
+		preview,
+		"preview",
+		policy.publicationPolicyRevision,
+	), { workflow: policy.previewWorkflowPath, environment: "pylon-preview" });
+	assert.deepEqual(validateApprovedWorkflowBytes(
+		policy.stableWorkflowPath,
+		stable,
+		"stable",
+		policy.publicationPolicyRevision,
+	), { workflow: policy.stableWorkflowPath, environment: "pylon-stable" });
 	for (const changed of [
 		`${preview}\n  rogue:\n    permissions: write-all\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo arbitrary\n`,
 		`${stable}\n  rogue-oidc:\n    permissions:\n      id-token: write\n      attestations: write\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo sign\n`,
 		preview.replace("jobs:\n", "jobs:\n  publish:\n    permissions: write-all\n"),
 		preview.replace("permissions: {}", "permissions: {}\npermissions: write-all"),
-	]) assert.throws(() => validateApprovedWorkflowBytes(recipe.previewWorkflowPath, changed, "preview", recipe.recipeRevision), /bytes differ/);
-	assert.throws(() => validateApprovedWorkflowBytes(recipe.previewWorkflowPath, preview, "preview", 999), /Unsupported/);
-	const extraRoot = structuredClone(registry);
-	extraRoot.extra = true;
-	assert.throws(() => parseSupportedReleaseRecipeRegistry(JSON.stringify(extraRoot)), /malformed/);
-	const extraRecipe = structuredClone(registry);
-	extraRecipe.recipes[0].extra = true;
-	assert.throws(() => parseSupportedReleaseRecipeRegistry(JSON.stringify(extraRecipe)), /malformed/);
+	]) assert.throws(() => validateApprovedWorkflowBytes(
+		policy.previewWorkflowPath,
+		changed,
+		"preview",
+		policy.publicationPolicyRevision,
+	), /bytes differ/);
+	assert.throws(() => validateApprovedWorkflowBytes(policy.previewWorkflowPath, preview, "preview", 999), /Unsupported/);
+
+	const stableR2 = stable
+		.replace("--publication-policy-revision 1", "--publication-policy-revision 2")
+		.replaceAll("promotion?.publicationPolicyRevision !== 1", "promotion?.publicationPolicyRevision !== 2");
+	assert.notEqual(stableR2, stable);
+	assert.match(stableR2, /--publication-policy-revision 2/);
+	assert.match(stableR2, /promotion\?\.publicationPolicyRevision !== 2/);
+	assert.match(stableR2, /!\[1\]\.includes\(manifest\.build\.publicationPolicyRevision\)/);
+	const policyR2 = {
+		...policy,
+		publicationPolicyRevision: 2,
+		stableWorkflowSha256: sha256Bytes(Buffer.from(stableR2)),
+	};
+	const policies = [policy, policyR2];
+	assert.deepEqual(validateApprovedWorkflowBytes(
+		policyR2.stableWorkflowPath,
+		stableR2,
+		"stable",
+		2,
+		policies,
+	), { workflow: policyR2.stableWorkflowPath, environment: "pylon-stable" });
+	assert.throws(() => validateApprovedWorkflowBytes(policy.stableWorkflowPath, stableR2, "stable", 1, policies), /bytes differ/);
+	const promotedByR2 = firstStable();
+	promotedByR2.promotion.publicationPolicyRevision = 2;
+	assert.equal(validateStableManifest(promotedByR2, registry.recipes, policies), promotedByR2);
+	assert.equal(promotedByR2.build.recipeRevision, 1);
+	assert.equal(promotedByR2.build.publicationPolicyRevision, 1);
+	assert.equal(promotedByR2.promotion.publicationPolicyRevision, 2);
+	const stableVerifier = readFileSync(join(root, "scripts/verify-pylon-stable-attestation.mjs"), "utf8");
+	assert.match(stableVerifier, /manifest\.promotion\.publicationPolicyRevision/);
+	assert.doesNotMatch(stableVerifier, /"stable",\s*manifest\.build\.recipeRevision/);
+	const previewVerifier = readFileSync(join(root, "scripts/verify-pylon-publication-attestations.mjs"), "utf8");
+	assert.match(previewVerifier, /verified\.previewManifest\.publicationPolicyRevision/);
+	for (const mutate of [
+		(value) => delete value.promotion.publicationPolicyRevision,
+		(value) => (value.promotion.publicationPolicyRevision = 3),
+		(value) => (value.promotion.publicationPolicyRevision = 0),
+		(value) => delete value.build.publicationPolicyRevision,
+	]) {
+		const changed = structuredClone(promotedByR2);
+		mutate(changed);
+		assert.throws(() => validateStableManifest(changed, registry.recipes, policies), /policy revision/);
+	}
+
+	for (const mutate of [
+		(value) => (value.extra = true),
+		(value) => (value.recipes[0].extra = true),
+		(value) => value.recipes.push(structuredClone(value.recipes[0])),
+		(value) => (value.recipes[0].recipeRevision = 0),
+		(value) => (value.publicationPolicies[0].extra = true),
+		(value) => value.publicationPolicies.push(structuredClone(value.publicationPolicies[0])),
+		(value) => (value.publicationPolicies[0].publicationPolicyRevision = 0),
+	]) {
+		const changed = structuredClone(registry);
+		mutate(changed);
+		assert.throws(() => parseSupportedReleaseRecipeRegistry(JSON.stringify(changed)), /malformed/);
+	}
 	assert.throws(
-		() => parseSupportedReleaseRecipeRegistry('{"schemaVersion":1,"schemaVersion":1,"recipes":[]}'),
+		() => parseSupportedReleaseRecipeRegistry('{"schemaVersion":1,"schemaVersion":1,"recipes":[],"publicationPolicies":[]}'),
 		/duplicate keys/,
 	);
 });
 
-test("consumer locks recover stale owners without sleep and reject active contention", () => {
+test("consumer lock heartbeat prevents stale-equivalent theft and dead stale locks recover", async () => {
 	const fixture = mkdtempSync(join(tmpdir(), "pylon-consumer-lock-"));
+	const timing = { stale: 2_000, update: 1_000 };
 	try {
 		for (const name of ["preview.json", "stable.json"]) {
 			const statePath = join(fixture, name);
-			withConsumerStateLock(statePath, () => {
-				assert.throws(() => withConsumerStateLock(statePath, () => {}), /actively locked/);
-			});
+			const acquiredAt = Date.now();
+			await withConsumerStateLock(statePath, async () => {
+				const events = watch(`${statePath}.lock`, { signal: AbortSignal.timeout(7_000) });
+				let heartbeats = 0;
+				try {
+					for await (const event of events) {
+						if (event.eventType === "change" && ++heartbeats === 3) break;
+					}
+				} finally {
+					await events.return();
+				}
+				assert.ok(Date.now() - acquiredAt >= timing.stale, "owner must remain live beyond one stale interval");
+				await assert.rejects(
+					() => withConsumerStateLock(statePath, async () => writeFileSync(statePath, "stolen\n"), timing),
+					/actively locked/,
+				);
+				writeFileSync(statePath, "owner\n");
+			}, timing);
+			assert.equal(readFileSync(statePath, "utf8"), "owner\n");
+
 			mkdirSync(`${statePath}.lock`);
-			const stale = new Date(Date.now() - PYLON_CONSUMER_LOCK_STALE_MS - 5_000);
+			const stale = new Date(Date.now() - timing.stale - 5_000);
 			utimesSync(`${statePath}.lock`, stale, stale);
 			let recovered = false;
-			withConsumerStateLock(statePath, () => { recovered = true; });
+			await withConsumerStateLock(statePath, async () => { recovered = true; }, timing);
 			assert.equal(recovered, true);
 		}
 	} finally {
@@ -882,7 +978,7 @@ test("withdrawal replay is a no-op only for the exact latest promotion tuple and
 		{ ...request, previewTag: "pylon-build-gffffffffffff-r1" },
 	]) assert.equal(isExactWithdrawalReplay(latest, changed), false);
 	const laterPromotion = structuredClone(latest);
-	laterPromotion.promotion = { kind: "promote", policyCommit: source.commit, policyTree: source.tree };
+	laterPromotion.promotion = { kind: "promote", policyCommit: source.commit, policyTree: source.tree, publicationPolicyRevision: 1 };
 	assert.equal(isExactWithdrawalReplay(laterPromotion, request), false);
 	const message = stableReservationMessage(latest, sha256Bytes(Buffer.from(canonicalJson(latest))), 51);
 	for (const field of ["Withdraw stable tag", "Withdraw build tag", "Withdraw reason"]) assert.match(message, new RegExp(`^${field}:`, "m"));

@@ -109,7 +109,7 @@ jobs:
       - name: Verify and prepare six exact subjects
         run: |
           npm run release:pylon:verify
-          npm run release:pylon:preview
+          npm run release:pylon:preview -- --publication-policy-revision 1
           npm run release:pylon:verify-preview
 
       - name: Upload isolated preview subjects
@@ -305,8 +305,8 @@ jobs:
             if (
               release.source?.commit !== context.sha || release.source?.tree !== preview.build?.source?.tree ||
               release.build?.id !== tag || preview.build?.tag !== tag || preview.build?.releaseManifest?.sha256 !== sha256(releaseBytes) ||
-              preview.sequenceEpoch !== 1 || preview.sequence !== Number(process.env.GITHUB_RUN_NUMBER) ||
-              preview.workflowRunId !== process.env.GITHUB_RUN_ID
+              preview.publicationPolicyRevision !== 1 || preview.sequenceEpoch !== 1 ||
+              preview.sequence !== Number(process.env.GITHUB_RUN_NUMBER) || preview.workflowRunId !== process.env.GITHUB_RUN_ID
             ) throw new Error("Preview draft manifests do not bind the exact source and workflow sequence.");
             const expectedNames = [...release.assets.map((asset) => asset.file), "pylon-prime-agent-release-v1.json", "pylon-preview-channel-v1.json"].sort();
             if (names.join("\n") !== expectedNames.join("\n")) throw new Error("Preview draft file set differs.");
@@ -641,8 +641,8 @@ jobs:
               previewManifest.build.source.commit !== sourceSha ||
               previewManifest.build.source.tree !== releaseManifest.source.tree ||
               previewManifest.build.releaseManifest.sha256 !== sha256(releaseBytes) ||
-              previewManifest.sequenceEpoch !== 1 || previewManifest.sequence !== Number(process.env.GITHUB_RUN_NUMBER) ||
-              previewManifest.workflowRunId !== process.env.GITHUB_RUN_ID
+              previewManifest.publicationPolicyRevision !== 1 || previewManifest.sequenceEpoch !== 1 ||
+              previewManifest.sequence !== Number(process.env.GITHUB_RUN_NUMBER) || previewManifest.workflowRunId !== process.env.GITHUB_RUN_ID
             ) {
               throw new Error("Downloaded preview metadata is not bound to this exact push and workflow sequence.");
             }

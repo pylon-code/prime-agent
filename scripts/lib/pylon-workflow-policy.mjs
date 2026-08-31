@@ -5,7 +5,7 @@ import {
 	PYLON_PREVIEW_WORKFLOW,
 	PYLON_PUBLICATION_REPOSITORY,
 	PYLON_STABLE_WORKFLOW,
-	PYLON_SUPPORTED_RELEASE_RECIPES,
+	PYLON_SUPPORTED_PUBLICATION_POLICIES,
 } from "./pylon-publication.mjs";
 
 export const ATTEST_BUILD_PROVENANCE_ACTION = "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8";
@@ -197,24 +197,34 @@ export function readWorkflowAtSignerDigest(workflowPath, signerDigest) {
 	return Buffer.from(response.content.replaceAll("\n", ""), "base64");
 }
 
-export function validateApprovedWorkflowBytes(workflowPath, workflow, channel, recipeRevision) {
+export function validateApprovedWorkflowBytes(
+	workflowPath,
+	workflow,
+	channel,
+	publicationPolicyRevision,
+	supportedPublicationPolicies = PYLON_SUPPORTED_PUBLICATION_POLICIES,
+) {
 	const workflowBytes = Buffer.isBuffer(workflow) ? workflow : Buffer.from(workflow, "utf8");
 	const workflowText = workflowBytes.toString("utf8");
 	if (!Buffer.from(workflowText, "utf8").equals(workflowBytes)) throw new Error("Signer workflow is not exact UTF-8 bytes.");
-	if (!Number.isSafeInteger(recipeRevision) || recipeRevision < 1) throw new Error("Workflow policy needs an exact positive recipe revision.");
-	const recipe = PYLON_SUPPORTED_RELEASE_RECIPES.find((candidate) => candidate.recipeRevision === recipeRevision);
-	if (!recipe) throw new Error(`Unsupported historical release recipe revision: ${recipeRevision}`);
-	const expectedPath = channel === "preview" ? recipe.previewWorkflowPath : channel === "stable" ? recipe.stableWorkflowPath : "";
-	const expectedDigest = channel === "preview" ? recipe.previewWorkflowSha256 : channel === "stable" ? recipe.stableWorkflowSha256 : "";
-	if (workflowPath !== expectedPath || !expectedPath) throw new Error("Signer workflow path differs from the exact recipe channel.");
+	if (!Number.isSafeInteger(publicationPolicyRevision) || publicationPolicyRevision < 1) {
+		throw new Error("Workflow policy needs an exact positive publication policy revision.");
+	}
+	const policy = supportedPublicationPolicies.find(
+		(candidate) => candidate.publicationPolicyRevision === publicationPolicyRevision,
+	);
+	if (!policy) throw new Error(`Unsupported publication policy revision: ${publicationPolicyRevision}`);
+	const expectedPath = channel === "preview" ? policy.previewWorkflowPath : channel === "stable" ? policy.stableWorkflowPath : "";
+	const expectedDigest = channel === "preview" ? policy.previewWorkflowSha256 : channel === "stable" ? policy.stableWorkflowSha256 : "";
+	if (workflowPath !== expectedPath || !expectedPath) throw new Error("Signer workflow path differs from the exact publication policy channel.");
 	const actualDigest = createHash("sha256").update(workflowBytes).digest("hex");
 	if (actualDigest !== expectedDigest) {
-		throw new Error(`Signer workflow bytes differ from recipe r${recipeRevision} for ${channel}.`);
+		throw new Error(`Signer workflow bytes differ from publication policy p${publicationPolicyRevision} for ${channel}.`);
 	}
 	return validateApprovedAttestationWorkflow(workflowText, channel);
 }
 
-export function verifyApprovedWorkflowAtSignerDigest(workflowPath, signerDigest, channel, recipeRevision) {
+export function verifyApprovedWorkflowAtSignerDigest(workflowPath, signerDigest, channel, publicationPolicyRevision) {
 	const workflow = readWorkflowAtSignerDigest(workflowPath, signerDigest);
-	return validateApprovedWorkflowBytes(workflowPath, workflow, channel, recipeRevision);
+	return validateApprovedWorkflowBytes(workflowPath, workflow, channel, publicationPolicyRevision);
 }

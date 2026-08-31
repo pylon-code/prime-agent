@@ -41,32 +41,40 @@ function compactJsonSource(text) {
 			result += character;
 		} else if (!/\s/.test(character)) result += character;
 	}
-	if (quoted || escaped) throw new Error("Pylon historical release recipe registry has truncated JSON.");
+	if (quoted || escaped) throw new Error("Pylon historical release recipe/publication policy registry has truncated JSON.");
 	return result;
 }
 
 export function parseSupportedReleaseRecipeRegistry(text) {
-	if (typeof text !== "string") throw new Error("Pylon historical release recipe registry must be JSON text.");
+	if (typeof text !== "string") throw new Error("Pylon historical release recipe/publication policy registry must be JSON text.");
 	const registry = JSON.parse(text);
 	if (compactJsonSource(text) !== JSON.stringify(registry)) {
-		throw new Error("Pylon historical release recipe registry has duplicate keys or noncanonical JSON tokens.");
+		throw new Error("Pylon historical release recipe/publication policy registry has duplicate keys or noncanonical JSON tokens.");
 	}
 	const recipeKeys = [
 		"recipeRevision", "manifestSchemaVersion", "nodeVersion", "npmVersion", "minimumNodeVersion",
-		"previewWorkflowPath", "previewWorkflowSha256", "stableWorkflowPath", "stableWorkflowSha256",
+	];
+	const publicationPolicyKeys = [
+		"publicationPolicyRevision", "previewWorkflowPath", "previewWorkflowSha256", "stableWorkflowPath", "stableWorkflowSha256",
 	];
 	if (
-		!registry || Object.keys(registry).sort().join(",") !== "recipes,schemaVersion" ||
+		!registry || Object.keys(registry).sort().join(",") !== "publicationPolicies,recipes,schemaVersion" ||
 		registry.schemaVersion !== 1 || !Array.isArray(registry.recipes) || registry.recipes.length === 0 ||
+		!Array.isArray(registry.publicationPolicies) || registry.publicationPolicies.length === 0 ||
 		registry.recipes.some((recipe) =>
 			!recipe || Object.keys(recipe).sort().join(",") !== recipeKeys.toSorted().join(",") ||
 			!Number.isSafeInteger(recipe.recipeRevision) || recipe.recipeRevision < 1 || recipe.manifestSchemaVersion !== 1 ||
-			![recipe.nodeVersion, recipe.npmVersion, recipe.minimumNodeVersion].every((value) => /^\d+\.\d+\.\d+$/.test(value)) ||
-			recipe.previewWorkflowPath !== PYLON_PREVIEW_WORKFLOW || recipe.stableWorkflowPath !== PYLON_STABLE_WORKFLOW ||
-			![recipe.previewWorkflowSha256, recipe.stableWorkflowSha256].every((value) => /^[0-9a-f]{64}$/.test(value))
+			![recipe.nodeVersion, recipe.npmVersion, recipe.minimumNodeVersion].every((value) => /^\d+\.\d+\.\d+$/.test(value))
 		) ||
-		new Set(registry.recipes.map((recipe) => recipe.recipeRevision)).size !== registry.recipes.length
-	) throw new Error("Pylon historical release recipe registry is malformed.");
+		registry.publicationPolicies.some((policy) =>
+			!policy || Object.keys(policy).sort().join(",") !== publicationPolicyKeys.toSorted().join(",") ||
+			!Number.isSafeInteger(policy.publicationPolicyRevision) || policy.publicationPolicyRevision < 1 ||
+			policy.previewWorkflowPath !== PYLON_PREVIEW_WORKFLOW || policy.stableWorkflowPath !== PYLON_STABLE_WORKFLOW ||
+			![policy.previewWorkflowSha256, policy.stableWorkflowSha256].every((value) => /^[0-9a-f]{64}$/.test(value))
+		) ||
+		new Set(registry.recipes.map((recipe) => recipe.recipeRevision)).size !== registry.recipes.length ||
+		new Set(registry.publicationPolicies.map((policy) => policy.publicationPolicyRevision)).size !== registry.publicationPolicies.length
+	) throw new Error("Pylon historical release recipe/publication policy registry is malformed.");
 	return registry;
 }
 
@@ -75,6 +83,9 @@ const supportedRecipeRegistry = parseSupportedReleaseRecipeRegistry(
 );
 export const PYLON_SUPPORTED_RELEASE_RECIPES = Object.freeze(
 	supportedRecipeRegistry.recipes.map((recipe) => Object.freeze({ ...recipe })),
+);
+export const PYLON_SUPPORTED_PUBLICATION_POLICIES = Object.freeze(
+	supportedRecipeRegistry.publicationPolicies.map((policy) => Object.freeze({ ...policy })),
 );
 
 const previewTagPattern = /^pylon-build-g([0-9a-f]{12})-r([1-9][0-9]*)$/;
@@ -184,7 +195,6 @@ export function validatePublishedReleaseManifest(manifest, supportedRecipes = PY
 	if (
 		!recipe || !exactKeys(recipe, [
 			"recipeRevision", "manifestSchemaVersion", "nodeVersion", "npmVersion", "minimumNodeVersion",
-			"previewWorkflowPath", "previewWorkflowSha256", "stableWorkflowPath", "stableWorkflowSha256",
 		]) ||
 		manifest.schemaVersion !== recipe.manifestSchemaVersion ||
 		!exactKeys(source, ["repository", "commit", "tree"]) || source.repository !== PYLON_RELEASE_REPOSITORY ||
@@ -240,16 +250,27 @@ function isCanonicalPositiveDecimal(value) {
 	return typeof value === "string" && /^[1-9][0-9]*$/.test(value);
 }
 
-function previewManifestFor(releaseManifest, releaseManifestBytes, invocation) {
+function publicationPolicyFor(revision, supportedPublicationPolicies) {
+	if (!Number.isSafeInteger(revision) || revision < 1) {
+		throw new Error("Publication policy revision must be an exact positive integer.");
+	}
+	const policy = supportedPublicationPolicies.find((candidate) => candidate.publicationPolicyRevision === revision);
+	if (!policy) throw new Error(`Unsupported publication policy revision: ${revision}`);
+	return policy;
+}
+
+function previewManifestFor(releaseManifest, releaseManifestBytes, invocation, supportedPublicationPolicies) {
 	if (!Buffer.isBuffer(releaseManifestBytes) || releaseManifestBytes.byteLength === 0) {
 		throw new Error("Build manifest bytes are required.");
 	}
 	const tag = releaseManifest.build.id;
 	const sequence = validatePreviewSequence(invocation);
+	publicationPolicyFor(invocation.publicationPolicyRevision, supportedPublicationPolicies);
 	return {
 		schemaVersion: PYLON_PUBLICATION_SCHEMA_VERSION,
 		channel: "preview",
 		repository: PYLON_RELEASE_REPOSITORY,
+		publicationPolicyRevision: invocation.publicationPolicyRevision,
 		...sequence,
 		build: {
 			tag,
@@ -265,21 +286,30 @@ function previewManifestFor(releaseManifest, releaseManifestBytes, invocation) {
 	};
 }
 
-export function createPreviewManifest(releaseManifest, releaseManifestBytes, invocation) {
+export function createPreviewManifest(
+	releaseManifest,
+	releaseManifestBytes,
+	invocation,
+	{ supportedPublicationPolicies = PYLON_SUPPORTED_PUBLICATION_POLICIES } = {},
+) {
 	validateReleaseManifest(releaseManifest);
 	if (releaseManifest.build.id !== releaseBuildId(releaseManifest.source.commit)) throw new Error("Current preview build id is malformed.");
-	return previewManifestFor(releaseManifest, releaseManifestBytes, invocation);
+	return previewManifestFor(releaseManifest, releaseManifestBytes, invocation, supportedPublicationPolicies);
 }
 
 export function validatePreviewManifest(
 	previewManifest,
 	releaseManifest,
 	releaseManifestBytes,
-	{ historical = false, supportedRecipes = PYLON_SUPPORTED_RELEASE_RECIPES } = {},
+	{
+		historical = false,
+		supportedRecipes = PYLON_SUPPORTED_RELEASE_RECIPES,
+		supportedPublicationPolicies = PYLON_SUPPORTED_PUBLICATION_POLICIES,
+	} = {},
 ) {
 	if (historical) validatePublishedReleaseManifest(releaseManifest, supportedRecipes);
 	else validateReleaseManifest(releaseManifest);
-	const expected = previewManifestFor(releaseManifest, releaseManifestBytes, previewManifest);
+	const expected = previewManifestFor(releaseManifest, releaseManifestBytes, previewManifest, supportedPublicationPolicies);
 	if (canonicalJson(previewManifest) !== canonicalJson(expected)) {
 		throw new Error("Preview manifest does not match the exact deterministic build manifest.");
 	}
@@ -307,11 +337,20 @@ function validateRevocation(value) {
 	return value;
 }
 
-export function createStableManifest({ previewManifest, previewManifestBytes, sequence, previous = null, revocations = [], promotion }) {
+export function createStableManifest({
+	previewManifest,
+	previewManifestBytes,
+	sequence,
+	previous = null,
+	revocations = [],
+	promotion,
+	supportedPublicationPolicies = PYLON_SUPPORTED_PUBLICATION_POLICIES,
+}) {
 	if (canonicalJson(previewManifest) !== previewManifestBytes.toString("utf8")) {
 		throw new Error("Preview manifest is not canonical publication JSON.");
 	}
 	const previewTag = parsePreviewTag(previewManifest.build?.tag);
+	publicationPolicyFor(previewManifest.publicationPolicyRevision, supportedPublicationPolicies);
 	if (
 		previewManifest.schemaVersion !== PYLON_PUBLICATION_SCHEMA_VERSION ||
 		previewManifest.channel !== "preview" ||
@@ -347,9 +386,10 @@ export function createStableManifest({ previewManifest, previewManifestBytes, se
 	) {
 		throw new Error("Stable promotion must bind its protected policy commit/tree and operation.");
 	}
+	publicationPolicyFor(promotion.publicationPolicyRevision, supportedPublicationPolicies);
 	const expectedPromotionKeys = promotion.kind === "promote"
-		? ["kind", "policyCommit", "policyTree"]
-		: ["kind", "policyCommit", "policyTree", "revocation"];
+		? ["kind", "policyCommit", "policyTree", "publicationPolicyRevision"]
+		: ["kind", "policyCommit", "policyTree", "publicationPolicyRevision", "revocation"];
 	if (!exactKeys(promotion, expectedPromotionKeys)) throw new Error("Malformed stable promotion metadata.");
 	if (promotion.kind === "withdraw") {
 		const revocation = validateRevocation(promotion.revocation);
@@ -375,6 +415,7 @@ export function createStableManifest({ previewManifest, previewManifestBytes, se
 			previewTag: previewManifest.build.tag,
 			id: previewManifest.build.id,
 			recipeRevision: previewManifest.build.recipeRevision,
+			publicationPolicyRevision: previewManifest.publicationPolicyRevision,
 			source: previewManifest.build.source,
 			releaseManifest: previewManifest.build.releaseManifest,
 			previewManifest: {
@@ -388,7 +429,11 @@ export function createStableManifest({ previewManifest, previewManifestBytes, se
 	};
 }
 
-export function validateStableManifest(stableManifest, supportedRecipes = PYLON_SUPPORTED_RELEASE_RECIPES) {
+export function validateStableManifest(
+	stableManifest,
+	supportedRecipes = PYLON_SUPPORTED_RELEASE_RECIPES,
+	supportedPublicationPolicies = PYLON_SUPPORTED_PUBLICATION_POLICIES,
+) {
 	if (
 		!exactKeys(stableManifest, [
 			"schemaVersion",
@@ -410,9 +455,14 @@ export function validateStableManifest(stableManifest, supportedRecipes = PYLON_
 	}
 	const build = stableManifest.build;
 	const recipe = supportedRecipes.find((candidate) => candidate.recipeRevision === build?.recipeRevision);
+	publicationPolicyFor(build?.publicationPolicyRevision, supportedPublicationPolicies);
+	publicationPolicyFor(stableManifest.promotion?.publicationPolicyRevision, supportedPublicationPolicies);
 	if (
 		!recipe ||
-		!exactKeys(build, ["previewSequence", "previewTag", "id", "recipeRevision", "source", "releaseManifest", "previewManifest", "assets"]) ||
+		!exactKeys(build, [
+			"previewSequence", "previewTag", "id", "recipeRevision", "publicationPolicyRevision", "source",
+			"releaseManifest", "previewManifest", "assets",
+		]) ||
 		canonicalJson(validatePreviewSequence(build.previewSequence ?? {})) !== canonicalJson(build.previewSequence) ||
 		build.previewTag !== build.id || !Number.isSafeInteger(build.recipeRevision) || build.recipeRevision < 1 ||
 		!exactKeys(build.source, ["repository", "commit", "tree"]) ||
@@ -472,7 +522,7 @@ export function validateStableManifest(stableManifest, supportedRecipes = PYLON_
 	}
 	if (stableManifest.promotion?.kind === "withdraw") {
 		if (
-			!exactKeys(stableManifest.promotion, ["kind", "policyCommit", "policyTree", "revocation"]) ||
+			!exactKeys(stableManifest.promotion, ["kind", "policyCommit", "policyTree", "publicationPolicyRevision", "revocation"]) ||
 			!/^[0-9a-f]{40}$/.test(stableManifest.promotion.policyCommit) ||
 			!/^[0-9a-f]{40}$/.test(stableManifest.promotion.policyTree) ||
 			!stableManifest.revocations.some(
@@ -482,7 +532,7 @@ export function validateStableManifest(stableManifest, supportedRecipes = PYLON_
 			throw new Error("Stable withdrawal does not append one exact revocation.");
 		}
 	} else if (
-		!exactKeys(stableManifest.promotion, ["kind", "policyCommit", "policyTree"]) ||
+		!exactKeys(stableManifest.promotion, ["kind", "policyCommit", "policyTree", "publicationPolicyRevision"]) ||
 		stableManifest.promotion.kind !== "promote" ||
 		!/^[0-9a-f]{40}$/.test(stableManifest.promotion.policyCommit) ||
 		!/^[0-9a-f]{40}$/.test(stableManifest.promotion.policyTree)
@@ -496,11 +546,15 @@ function containsHistory(previous, next) {
 	return previous.every((entry) => next.some((candidate) => canonicalJson(entry) === canonicalJson(candidate)));
 }
 
-export function validateStableHistory(manifests) {
+export function validateStableHistory(
+	manifests,
+	supportedRecipes = PYLON_SUPPORTED_RELEASE_RECIPES,
+	supportedPublicationPolicies = PYLON_SUPPORTED_PUBLICATION_POLICIES,
+) {
 	const ordered = manifests.toSorted((left, right) => left.sequence - right.sequence);
 	let previous;
 	for (let index = 0; index < ordered.length; index += 1) {
-		const current = validateStableManifest(ordered[index]);
+		const current = validateStableManifest(ordered[index], supportedRecipes, supportedPublicationPolicies);
 		if (current.sequence !== index + 1) throw new Error("Stable publication history has a skipped or duplicate sequence.");
 		if (previous) {
 			if (

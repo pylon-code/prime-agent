@@ -37,10 +37,11 @@ pylon-prime-agent-release-v1.json
 pylon-preview-channel-v1.json
 ```
 
-The canonical preview manifest binds the full source commit/tree, recipe, build-manifest digest, archive digests, and this monotonic channel identity:
+The canonical preview manifest binds the full source commit/tree, artifact recipe, build-manifest digest, archive digests, exact preview signer policy, and this monotonic channel identity:
 
 ```json
 {
+  "publicationPolicyRevision": 1,
   "sequenceEpoch": 1,
   "sequence": 123,
   "workflowRunId": "33428882721"
@@ -70,13 +71,15 @@ GH_TOKEN="$(gh auth token)" npm run release:pylon:verify-preview-history -- \
   --initialize
 ```
 
-Use `--initialize` only after manually inspecting the first full verified receipt. Omit it thereafter. The state and persistent lock anchor must be local regular non-symlink entries. `proper-lockfile@4.1.2` owns the adjacent lock directory with a 30-second stale bound and 10-second heartbeat. Active contention fails immediately; a crashed owner becomes recoverable after the stale bound without manual deletion. The write is file-fsync, atomic rename, then directory-fsync. Lower sequences and the same sequence with a different tag, run id, or manifest digest fail as rollback/equivocation. Higher gaps are valid.
+Use `--initialize` only after manually inspecting the first full verified receipt. Omit it thereafter. The state and persistent lock anchor must be local regular non-symlink entries. `proper-lockfile@4.1.2` owns the adjacent lock directory with a 30-second stale bound and 10-second heartbeat. Full manifest and attestation validation finishes before lock acquisition. The locked state re-read, monotonic transition, compare-and-set, file fsync, atomic rename, and directory fsync use yielding filesystem operations so the heartbeat remains live. Active contention fails immediately; a crashed owner becomes recoverable after the stale bound without manual deletion. Lower sequences and the same sequence with a different tag, run id, or manifest digest fail as rollback/equivocation. Higher gaps are valid.
 
 ## Stable promotion
 
 Run **Actions → Pylon stable promotion → Run workflow** on `pylon` with `operation=promote`, an immutable `preview_tag`, and no recovery or withdrawal identity.
 
-Current policy can promote an older recipe only when `scripts/pylon-prime-supported-release-recipes-v1.json` lists its exact closed manifest schema, Node/npm/minimum-Node tuple, preview/stable workflow paths, and SHA-256 of both exact workflow byte strings. The verifier selects the manifest's exact recipe, fetches each signer workflow path at the signer commit, checks its byte digest before structural checks, and rejects unknown recipes or registry keys. Every future publication workflow edit requires a new recipe revision and new reviewed digests; never rewrite an existing recipe. The Ubuntu Linux/macOS install uses current protected verifier source; it never checks out or executes the older source. The preview tag recipe must equal the build recipe copied into stable.
+Current policy can promote older artifacts only when `scripts/pylon-prime-supported-release-recipes-v1.json` closes two independent immutable identity sets. A `recipeRevision` entry contains only the build manifest schema and Node/npm/minimum-Node tuple. A `publicationPolicyRevision` entry contains the exact preview/stable workflow paths and SHA-256 of both workflow byte strings. Preview manifests bind the preview policy revision that signed them. Stable manifests preserve that preview policy revision beside the build recipe and record the current stable policy revision under `promotion`.
+
+The verifier selects preview workflow bytes by the preview manifest's policy revision and stable workflow bytes by `promotion.publicationPolicyRevision`. A future stable policy revision can therefore promote historical recipe/policy-r1 preview bytes without rewriting r1. Unknown, duplicate, nonpositive, or extra registry identities fail closed. A publication workflow edit requires a new immutable publication policy revision and reviewed digests; it does not by itself require an artifact recipe revision. Bump the recipe only when the artifact recipe identity changes. Never rewrite either historical entry. The Ubuntu Linux/macOS install uses current protected verifier source; it never checks out or executes the older source. The preview tag recipe must equal the build recipe copied into stable.
 
 Normal stable transaction order is strict:
 
@@ -96,7 +99,7 @@ Stable tags remain:
 pylon-stable-<six-digit-sequence>-g<source-sha-12>-r<recipe-revision>
 ```
 
-The signed stable manifest copies the preview sequence epoch/number/run id, full preview identity/digests, current policy commit/tree, exact previous stable tag/digest, high-water, operation, and cumulative sorted revocations.
+The signed stable manifest copies the preview sequence epoch/number/run id, full preview identity/digests, artifact recipe and preview publication policy revision. Its `promotion` record adds the current stable publication policy revision with the policy commit/tree, exact previous stable tag/digest, high-water, operation, and cumulative sorted revocations.
 
 ## Explicit stable recovery
 
@@ -128,7 +131,7 @@ npm run release:pylon:verify-stable-history -- \
   stable-history/pylon-stable-*/pylon-stable-channel-v1.json
 ```
 
-Use `--initialize` once, then omit it. The CLI requires the complete contiguous canonical chain, a regular persistent lock anchor, regular non-symlink manifests/state, and explicit local state. The pinned lock has the same 30-second stale bound, 10-second heartbeat, immediate active-contention failure, and automatic crashed-owner recovery as preview state. The CLI rejects malformed state, a lower valid prefix, and any rewrite at or below the witnessed sequence. It file-fsyncs, atomically renames, and directory-fsyncs only a monotonic advance.
+Use `--initialize` once, then omit it. The CLI requires the complete contiguous canonical chain, a regular persistent lock anchor, regular non-symlink manifests/state, and explicit local state. It parses and hashes the full chain before acquiring the lock. The pinned lock has the same 30-second stale bound, 10-second heartbeat, immediate active-contention failure, and automatic crashed-owner recovery as preview state. Its locked re-read, transition, compare-and-set, file fsync, atomic rename, and directory fsync yield to that heartbeat. The CLI rejects malformed state, a lower valid prefix, and any rewrite at or below the witnessed sequence. It writes only a monotonic advance.
 
 ## Failure and incident handling
 

@@ -222,7 +222,12 @@ export function verifyPreviewAttestations({ artifactDir, sourceSha, sourceTree, 
 		sourceSha,
 		workflowRunId: verified.previewManifest.workflowRunId,
 	};
-	verifyApprovedWorkflowAtSignerDigest(PYLON_PREVIEW_WORKFLOW, sourceSha, "preview", verified.previewManifest.build.recipeRevision);
+	verifyApprovedWorkflowAtSignerDigest(
+		PYLON_PREVIEW_WORKFLOW,
+		sourceSha,
+		"preview",
+		verified.previewManifest.publicationPolicyRevision,
+	);
 	const attempts = new Map();
 	for (const subject of verified.subjects) {
 		for (const attempt of verifySubject(join(artifactDir, subject.name), subject, verified.subjects, sourceSha, invocation)) {

@@ -1,16 +1,8 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import {
-	closeSync,
-	fsyncSync,
-	lstatSync,
-	openSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
+import { lstat, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,6 +17,7 @@ import { withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 import { verifyPreviewAttestations } from "./verify-pylon-publication-attestations.mjs";
 
 const STATE_SCHEMA_VERSION = 1;
+const STATE_MAX_BYTES = 4 * 1024;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function exactKeys(value, keys) {
@@ -45,46 +38,47 @@ function validateState(state) {
 	return state;
 }
 
-function syncDirectory(path) {
-	let descriptor;
+async function syncDirectory(path) {
+	let handle;
 	try {
-		descriptor = openSync(path, "r");
-		fsyncSync(descriptor);
+		handle = await open(path, "r");
+		await handle.sync();
 	} catch (error) {
 		if (!["EINVAL", "EPERM", "EISDIR"].includes(error?.code)) throw error;
 	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
+		if (handle !== undefined) await handle.close();
 	}
 }
 
-function atomicWrite(statePath, state) {
+async function atomicWrite(statePath, state) {
 	const directory = dirname(statePath);
 	const temporary = resolve(directory, `.${basename(statePath)}.${process.pid}.${randomUUID()}.tmp`);
-	let descriptor;
+	let handle;
 	try {
-		descriptor = openSync(temporary, "wx", 0o600);
-		writeFileSync(descriptor, canonicalJson(state));
-		fsyncSync(descriptor);
-		closeSync(descriptor);
-		descriptor = undefined;
-		renameSync(temporary, statePath);
-		syncDirectory(directory);
+		handle = await open(temporary, "wx", 0o600);
+		await handle.writeFile(canonicalJson(state));
+		await handle.sync();
+		await handle.close();
+		handle = undefined;
+		await rename(temporary, statePath);
+		await syncDirectory(directory);
 	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
-		rmSync(temporary, { force: true });
+		if (handle !== undefined) await handle.close();
+		await rm(temporary, { force: true });
 	}
 }
 
-function readState(path) {
-	const stat = lstatSync(path);
+async function readState(path) {
+	const stat = await lstat(path);
 	if (!stat.isFile()) throw new Error("Consumer preview high-water state is not one regular file.");
-	const bytes = readFileSync(path);
+	if (stat.size < 1 || stat.size > STATE_MAX_BYTES) throw new Error("Consumer preview high-water state is malformed.");
+	const bytes = await readFile(path);
 	const state = validateState(JSON.parse(bytes));
 	if (bytes.toString("utf8") !== canonicalJson(state)) throw new Error("Consumer preview high-water state is not canonical JSON.");
 	return state;
 }
 
-export function recordPreviewHighWater(previewManifest, previewBytes, { statePath, initialize = false }) {
+export async function recordPreviewHighWater(previewManifest, previewBytes, { statePath, initialize = false }) {
 	if (typeof statePath !== "string" || !statePath) throw new Error("A consumer-local --state path is required.");
 	if (!Buffer.isBuffer(previewBytes) || previewBytes.toString("utf8") !== canonicalJson(previewManifest)) {
 		throw new Error("Preview high-water requires exact canonical verified manifest bytes.");
@@ -94,18 +88,23 @@ export function recordPreviewHighWater(previewManifest, previewBytes, { statePat
 		!/^[1-9][0-9]*$/.test(previewManifest.workflowRunId ?? "")
 	) throw new Error("Verified preview has a malformed monotonic sequence identity.");
 	const path = resolve(statePath);
-	return withConsumerStateLock(path, () => {
-		const entry = lstatSync(path, { throwIfNoEntry: false });
+	const highWater = {
+		sequence: previewManifest.sequence,
+		tag: previewManifest.build.tag,
+		sha256: sha256Bytes(previewBytes),
+		workflowRunId: previewManifest.workflowRunId,
+	};
+	return withConsumerStateLock(path, async () => {
+		let entry;
+		try {
+			entry = await lstat(path);
+		} catch (error) {
+			if (error?.code !== "ENOENT") throw error;
+		}
 		if (entry && !entry.isFile()) throw new Error("Consumer preview high-water state is not one regular file.");
 		if (!entry && !initialize) throw new Error("No consumer preview high-water exists. Verify the release, then use --initialize once.");
 		if (entry && initialize) throw new Error("Consumer preview high-water already exists; --initialize cannot reset it.");
-		const prior = entry ? readState(path) : null;
-		const highWater = {
-			sequence: previewManifest.sequence,
-			tag: previewManifest.build.tag,
-			sha256: sha256Bytes(previewBytes),
-			workflowRunId: previewManifest.workflowRunId,
-		};
+		const prior = entry ? await readState(path) : null;
 		if (prior) {
 			if (prior.sequenceEpoch !== previewManifest.sequenceEpoch) throw new Error("Preview sequence epoch changed without a new signed state schema.");
 			if (highWater.sequence < prior.highWater.sequence) throw new Error("Verified preview is older than the consumer high-water sequence.");
@@ -123,7 +122,7 @@ export function recordPreviewHighWater(previewManifest, previewBytes, { statePat
 			sequenceEpoch: previewManifest.sequenceEpoch,
 			highWater,
 		};
-		atomicWrite(path, state);
+		await atomicWrite(path, state);
 		return { state, advanced: true };
 	});
 }
@@ -165,7 +164,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
 			sourceTree: untrusted.build?.source?.tree ?? "",
 			historical: args.historical,
 		});
-		const result = recordPreviewHighWater(verified.previewManifest, previewBytes, args);
+		const result = await recordPreviewHighWater(verified.previewManifest, previewBytes, args);
 		console.log(JSON.stringify({ highWater: result.state.highWater, advanced: result.advanced }));
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : String(error));

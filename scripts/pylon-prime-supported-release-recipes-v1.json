@@ -6,11 +6,16 @@
 			"manifestSchemaVersion": 1,
 			"nodeVersion": "22.23.2",
 			"npmVersion": "11.10.1",
-			"minimumNodeVersion": "22.8.0",
+			"minimumNodeVersion": "22.8.0"
+		}
+	],
+	"publicationPolicies": [
+		{
+			"publicationPolicyRevision": 1,
 			"previewWorkflowPath": ".github/workflows/pylon-preview-release.yml",
-			"previewWorkflowSha256": "de0eec2a8f8f69962de6abe41d7cc58bf4961cf3111b5dc184468564c963c49d",
+			"previewWorkflowSha256": "5b783f2af487b1028487048f01665ea64e2d4a69daa645c34704ce65a5e2fa51",
 			"stableWorkflowPath": ".github/workflows/pylon-stable-release.yml",
-			"stableWorkflowSha256": "d3a262f4bf7a0ddbee5023ec1a42e33a4b98b068eddff3e9b554681a97a019e5"
+			"stableWorkflowSha256": "9ca99c412c7f980052d3a7eb24fccb1048583b90c292f75a5e6c4139b12b2869"
 		}
 	]
 }

@@ -84,6 +84,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
 				tag: verified.previewManifest.build.tag,
 				source: verified.previewManifest.build.source,
 				recipeRevision: verified.previewManifest.build.recipeRevision,
+				publicationPolicyRevision: verified.previewManifest.publicationPolicyRevision,
 				subjects: verified.subjects,
 			}),
 		);

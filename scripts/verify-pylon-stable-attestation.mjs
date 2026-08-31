@@ -36,7 +36,12 @@ export function verifyStableAttestation(path, sourceSha, sourceTree) {
 		throw new Error("Promotion commit/tree does not match the signed stable policy identity.");
 	}
 	const subject = { name: PYLON_STABLE_MANIFEST, sha256: sha256Bytes(bytes) };
-	verifyApprovedWorkflowAtSignerDigest(PYLON_STABLE_WORKFLOW, sourceSha, "stable", manifest.build.recipeRevision);
+	verifyApprovedWorkflowAtSignerDigest(
+		PYLON_STABLE_WORKFLOW,
+		sourceSha,
+		"stable",
+		manifest.promotion.publicationPolicyRevision,
+	);
 	const result = spawnSync(
 		"gh",
 		[

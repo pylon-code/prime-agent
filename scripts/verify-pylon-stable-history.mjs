@@ -1,16 +1,8 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import {
-	closeSync,
-	fsyncSync,
-	lstatSync,
-	openSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
+import { lstat, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,6 +17,7 @@ import {
 } from "./lib/pylon-publication.mjs";
 
 const STATE_SCHEMA_VERSION = 1;
+const STATE_MAX_BYTES = 4 * 1024;
 
 function exactKeys(value, keys) {
 	return (
@@ -51,9 +44,11 @@ function validateConsumerState(state) {
 	return state;
 }
 
-function readCanonicalState(statePath) {
-	if (!lstatSync(statePath).isFile()) throw new Error("Consumer stable high-water state is not one regular file.");
-	const bytes = readFileSync(statePath);
+async function readCanonicalState(statePath) {
+	const stat = await lstat(statePath);
+	if (!stat.isFile()) throw new Error("Consumer stable high-water state is not one regular file.");
+	if (stat.size < 1 || stat.size > STATE_MAX_BYTES) throw new Error("Consumer stable high-water state is malformed.");
+	const bytes = await readFile(statePath);
 	const state = validateConsumerState(JSON.parse(bytes));
 	if (bytes.toString("utf8") !== canonicalJson(state)) {
 		throw new Error("Consumer stable high-water state is not canonical JSON.");
@@ -61,33 +56,33 @@ function readCanonicalState(statePath) {
 	return state;
 }
 
-function syncDirectory(path) {
-	let descriptor;
+async function syncDirectory(path) {
+	let handle;
 	try {
-		descriptor = openSync(path, "r");
-		fsyncSync(descriptor);
+		handle = await open(path, "r");
+		await handle.sync();
 	} catch (error) {
-		if (!(["EINVAL", "EPERM", "EISDIR"].includes(error?.code))) throw error;
+		if (!["EINVAL", "EPERM", "EISDIR"].includes(error?.code)) throw error;
 	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
+		if (handle !== undefined) await handle.close();
 	}
 }
 
-function writeStateAtomically(statePath, state) {
+async function writeStateAtomically(statePath, state) {
 	const directory = dirname(statePath);
 	const temporary = resolve(directory, `.${basename(statePath)}.${process.pid}.${randomUUID()}.tmp`);
-	let descriptor;
+	let handle;
 	try {
-		descriptor = openSync(temporary, "wx", 0o600);
-		writeFileSync(descriptor, canonicalJson(state));
-		fsyncSync(descriptor);
-		closeSync(descriptor);
-		descriptor = undefined;
-		renameSync(temporary, statePath);
-		syncDirectory(directory);
+		handle = await open(temporary, "wx", 0o600);
+		await handle.writeFile(canonicalJson(state));
+		await handle.sync();
+		await handle.close();
+		handle = undefined;
+		await rename(temporary, statePath);
+		await syncDirectory(directory);
 	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
-		rmSync(temporary, { force: true });
+		if (handle !== undefined) await handle.close();
+		await rm(temporary, { force: true });
 	}
 }
 
@@ -103,11 +98,27 @@ function verifiedManifestFiles(paths) {
 	});
 }
 
-export function verifyStableHistoryWithState(paths, { statePath, initialize = false }) {
+export async function verifyStableHistoryWithState(paths, { statePath, initialize = false }) {
 	if (typeof statePath !== "string" || !statePath) throw new Error("A consumer-local --state path is required.");
 	const absoluteStatePath = resolve(statePath);
-	return withConsumerStateLock(absoluteStatePath, () => {
-		const stateEntry = lstatSync(absoluteStatePath, { throwIfNoEntry: false });
+	const history = validateStableHistory(verifiedManifestFiles(paths));
+	const witnessed = new Map(history.map((manifest) => [manifest.sequence, {
+		tag: manifest.tag,
+		sha256: sha256Bytes(Buffer.from(canonicalJson(manifest))),
+	}]));
+	const latest = history.at(-1);
+	const highWater = {
+		sequence: latest.sequence,
+		tag: latest.tag,
+		sha256: witnessed.get(latest.sequence).sha256,
+	};
+	return withConsumerStateLock(absoluteStatePath, async () => {
+		let stateEntry;
+		try {
+			stateEntry = await lstat(absoluteStatePath);
+		} catch (error) {
+			if (error?.code !== "ENOENT") throw error;
+		}
 		const stateExists = stateEntry !== undefined;
 		if (stateExists && !stateEntry.isFile()) {
 			throw new Error("Consumer stable high-water state is not one regular file.");
@@ -116,23 +127,16 @@ export function verifyStableHistoryWithState(paths, { statePath, initialize = fa
 			throw new Error("No consumer high-water state exists. Inspect the full history, then use --initialize once to accept its witnessed high-water.");
 		}
 		if (stateExists && initialize) throw new Error("Consumer high-water state already exists; --initialize cannot reset it.");
-		const priorState = stateExists ? readCanonicalState(absoluteStatePath) : null;
-		const history = validateStableHistory(verifiedManifestFiles(paths));
-		const latest = history.at(-1);
-		const highWater = {
-			sequence: latest.sequence,
-			tag: latest.tag,
-			sha256: sha256Bytes(Buffer.from(canonicalJson(latest))),
-		};
+		const priorState = stateExists ? await readCanonicalState(absoluteStatePath) : null;
 		if (priorState) {
 			if (latest.sequence < priorState.highWater.sequence) {
 				throw new Error("Verified stable history is older than the persisted consumer high-water mark.");
 			}
-			const witnessed = history.find((manifest) => manifest.sequence === priorState.highWater.sequence);
+			const priorWitness = witnessed.get(priorState.highWater.sequence);
 			if (
-				!witnessed ||
-				witnessed.tag !== priorState.highWater.tag ||
-				sha256Bytes(Buffer.from(canonicalJson(witnessed))) !== priorState.highWater.sha256
+				!priorWitness ||
+				priorWitness.tag !== priorState.highWater.tag ||
+				priorWitness.sha256 !== priorState.highWater.sha256
 			) {
 				throw new Error("Verified stable history rewrites the consumer's persisted high-water sequence.");
 			}
@@ -144,7 +148,7 @@ export function verifyStableHistoryWithState(paths, { statePath, initialize = fa
 			highWater,
 		};
 		const advanced = !priorState || highWater.sequence > priorState.highWater.sequence;
-		if (advanced) writeStateAtomically(absoluteStatePath, state);
+		if (advanced) await writeStateAtomically(absoluteStatePath, state);
 		return { history, state: advanced ? state : priorState, advanced };
 	});
 }
@@ -167,7 +171,7 @@ function parseArgs(args) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
 	try {
 		const args = parseArgs(process.argv.slice(2));
-		const verified = verifyStableHistoryWithState(args.paths, args);
+		const verified = await verifyStableHistoryWithState(args.paths, args);
 		console.log(JSON.stringify({
 			sequences: verified.history.length,
 			highWater: verified.state.highWater,

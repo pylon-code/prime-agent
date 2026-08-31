@@ -1,52 +1,68 @@
 import { randomUUID } from "node:crypto";
-import lockfile from "proper-lockfile";
-import { closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { constants } from "node:fs";
+import {
+	link,
+	lstat,
+	mkdir,
+	open,
+	readFile,
+	rm,
+} from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+
+import lockfile from "proper-lockfile";
 
 export const PYLON_CONSUMER_LOCK_STALE_MS = 30_000;
 export const PYLON_CONSUMER_LOCK_UPDATE_MS = 10_000;
 const anchorContents = "pylon-consumer-state-lock-v1\n";
 
-function ensureAnchor(anchorPath) {
+async function ensureAnchor(anchorPath) {
 	const temporary = `${anchorPath}.${process.pid}.${randomUUID()}.tmp`;
-	let descriptor;
+	let handle;
 	try {
-		descriptor = openSync(temporary, "wx", 0o600);
-		writeFileSync(descriptor, anchorContents);
-		fsyncSync(descriptor);
-		closeSync(descriptor);
-		descriptor = undefined;
+		handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+		await handle.writeFile(anchorContents);
+		await handle.sync();
+		await handle.close();
+		handle = undefined;
 		try {
-			linkSync(temporary, anchorPath);
+			await link(temporary, anchorPath);
 		} catch (error) {
 			if (error?.code !== "EEXIST") throw error;
 		}
 	} finally {
-		if (descriptor !== undefined) closeSync(descriptor);
-		rmSync(temporary, { force: true });
+		if (handle !== undefined) await handle.close();
+		await rm(temporary, { force: true });
 	}
-	const entry = lstatSync(anchorPath);
-	if (!entry.isFile() || readFileSync(anchorPath, "utf8") !== anchorContents) {
+	const entry = await lstat(anchorPath);
+	if (!entry.isFile() || await readFile(anchorPath, "utf8") !== anchorContents) {
 		throw new Error("Consumer high-water lock anchor is not one exact regular file.");
 	}
 }
 
-export function withConsumerStateLock(statePath, action) {
+export async function withConsumerStateLock(
+	statePath,
+	action,
+	{
+		stale = PYLON_CONSUMER_LOCK_STALE_MS,
+		update = PYLON_CONSUMER_LOCK_UPDATE_MS,
+	} = {},
+) {
 	const absoluteStatePath = resolve(statePath);
 	const directory = dirname(absoluteStatePath);
-	mkdirSync(directory, { recursive: true, mode: 0o700 });
-	if (!lstatSync(directory).isDirectory()) {
+	await mkdir(directory, { recursive: true, mode: 0o700 });
+	if (!(await lstat(directory)).isDirectory()) {
 		throw new Error("Consumer high-water state directory must be one canonical real directory.");
 	}
 	const anchorPath = `${absoluteStatePath}.lock-anchor`;
-	ensureAnchor(anchorPath);
+	await ensureAnchor(anchorPath);
 	let release;
 	try {
-		release = lockfile.lockSync(anchorPath, {
+		release = await lockfile.lock(anchorPath, {
 			realpath: true,
 			lockfilePath: `${absoluteStatePath}.lock`,
-			stale: PYLON_CONSUMER_LOCK_STALE_MS,
-			update: PYLON_CONSUMER_LOCK_UPDATE_MS,
+			stale,
+			update,
 			retries: 0,
 		});
 	} catch (error) {
@@ -54,8 +70,8 @@ export function withConsumerStateLock(statePath, action) {
 		throw error;
 	}
 	try {
-		return action(absoluteStatePath);
+		return await action(absoluteStatePath);
 	} finally {
-		release();
+		await release();
 	}
 }
