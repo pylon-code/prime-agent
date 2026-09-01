@@ -1186,6 +1186,33 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			else rejectChild(new Error(`consumer child failed with ${code}: ${stderr}`));
 		});
 	});
+	const runRotationChild = (statePath) => new Promise((resolveChild, rejectChild) => {
+		const source = `
+			import { rotateConsumerStateJournal } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/pylon-consumer-lock.mjs")).href)};
+			try {
+				const result = await rotateConsumerStateJournal(process.argv[1]);
+				process.stdout.write(JSON.stringify(result));
+			} catch (error) {
+				console.error(error.stack);
+				process.exitCode = 1;
+			}
+		`;
+		const child = spawn(process.execPath, ["--input-type=module", "--eval", source, statePath], {
+			cwd: resolve("."),
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let stdout = "";
+		let stderr = "";
+		child.stdout.setEncoding("utf8");
+		child.stderr.setEncoding("utf8");
+		child.stdout.on("data", (chunk) => { stdout += chunk; });
+		child.stderr.on("data", (chunk) => { stderr += chunk; });
+		child.on("error", rejectChild);
+		child.on("close", (code) => {
+			if (code === 0) resolveChild(JSON.parse(stdout));
+			else rejectChild(new Error(`rotation child failed with ${code}: ${stderr}`));
+		});
+	});
 	const v1Fixture = (
 		statePath,
 		{ projection = "one", secondTransition = false, terminal = true, applied = false, ownerPid = 999_999 } = {},
@@ -1440,6 +1467,36 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		assert.equal(statSync(`${priorLayoutPath}.lock.v1-retired`).isDirectory(), true);
 		assert.equal(existsSync(join(`${priorLayoutPath}.lock.v1-retired`, ".pylon-consumer-v1-retired.json")), false);
 
+		const retiredOnlyPath = join(fixture, "v1-retired-only.json");
+		mkdirSync(`${retiredOnlyPath}.lock.v1-retired`, { mode: 0o700 });
+		await assert.rejects(
+			() => withConsumerStateLock(retiredOnlyPath, async () => {}, manualRuntime({ value: 1 })),
+			/transaction namespace is missing/,
+		);
+		assert.equal(existsSync(`${retiredOnlyPath}.journal`), false, "a retired-only legacy signal is detected before v2 initialization");
+
+		const deletedTransactionsPath = join(fixture, "v1-deleted-transactions.json");
+		v1Fixture(deletedTransactionsPath, { secondTransition: true, applied: true });
+		await migrateConsumerStateJournal(deletedTransactionsPath, manualRuntime({ value: 1 }));
+		rmSync(`${deletedTransactionsPath}.transactions`, { recursive: true });
+		await assert.rejects(
+			() => withConsumerStateLock(deletedTransactionsPath, async () => {}, manualRuntime({ value: 2 })),
+			/transaction namespace is missing/,
+		);
+		await assert.rejects(
+			() => rotateConsumerStateJournal(deletedTransactionsPath, manualRuntime({ value: 2 })),
+			/transaction namespace is missing/,
+		);
+
+		const malformedMarkerOnlyPath = join(fixture, "v1-malformed-marker-only.json");
+		mkdirSync(`${malformedMarkerOnlyPath}.lock`, { mode: 0o700 });
+		writePrivate(join(`${malformedMarkerOnlyPath}.lock`, ".pylon-consumer-v1-retired.json"), "{}\n");
+		await assert.rejects(
+			() => withConsumerStateLock(malformedMarkerOnlyPath, async () => {}, manualRuntime({ value: 1 })),
+			/retirement marker.*malformed/i,
+		);
+		assert.equal(existsSync(`${malformedMarkerOnlyPath}.journal`), false);
+
 		const corruptMigrationPath = join(fixture, "v1-corrupt-migration.json");
 		const corruptV1 = v1Fixture(corruptMigrationPath);
 		writePrivate(join(corruptV1.transactionDirectory, "extra.json"), "{}\n");
@@ -1605,6 +1662,114 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		await owner;
 		assert.deepEqual(JSON.parse(readFileSync(activePath, "utf8")), { value: "owner" });
 
+		const stagedPath = join(fixture, "staged-callback-exclusivity.json");
+		const stagedReady = deferred();
+		const returnStagedAction = deferred();
+		const stagedOwner = withConsumerStateLock(stagedPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("staged-owner"));
+			stagedReady.resolve();
+			await returnStagedAction.promise;
+		}, manualRuntime({ value: 1 }));
+		await stagedReady.promise;
+		const stagedJournal = consumerJournal(stagedPath);
+		assert.equal(
+			readdirSync(stagedJournal.epoch)
+				.filter((name) => name.startsWith("terminal-"))
+				.map((name) => JSON.parse(readFileSync(join(stagedJournal.epoch, name))))
+				.some((decision) => decision.outcome === "commit"),
+			false,
+			"commitState stages bytes but publishes no resolvable commit while the callback is active",
+		);
+		await assert.rejects(
+			() => withConsumerStateLock(stagedPath, async () => {}, manualRuntime({ value: 1 })),
+			/actively locked/,
+		);
+		await assert.rejects(
+			() => rotateConsumerStateJournal(stagedPath, manualRuntime({ value: 1 })),
+			/actively locked/,
+		);
+		returnStagedAction.resolve();
+		await stagedOwner;
+		assert.deepEqual(JSON.parse(readFileSync(stagedPath, "utf8")), { value: "staged-owner" });
+		await withConsumerStateLock(stagedPath, async (_path, transaction) => {
+			assert.deepEqual(JSON.parse(transaction.readStateBytes()), { value: "staged-owner" });
+		}, manualRuntime({ value: 2 }));
+
+		const stagedThrowPath = join(fixture, "staged-then-throw.json");
+		await assert.rejects(
+			() => withConsumerStateLock(stagedThrowPath, async (_path, transaction) => {
+				await transaction.commitState(bytes("must-not-commit"));
+				throw new Error("action failed after staging");
+			}, manualRuntime({ value: 1 })),
+			/action failed after staging/,
+		);
+		await withConsumerStateLock(stagedThrowPath, async (_path, transaction) => {
+			assert.equal(transaction.readStateBytes(), null);
+		}, manualRuntime({ value: 2 }));
+		assert.equal(transitionNames(stagedThrowPath).length, 0);
+
+		const stagedCrashPath = join(fixture, "staged-then-crashed.json");
+		const crashingSource = `
+			import { withConsumerStateLock } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/pylon-consumer-lock.mjs")).href)};
+			const hold = setInterval(() => {}, 1000);
+			await withConsumerStateLock(process.argv[1], async (_path, transaction) => {
+				await transaction.commitState(Buffer.from(JSON.stringify({ value: "crashed-stage" }) + "\\n"));
+				process.stdout.write("staged\\n");
+				await new Promise(() => {});
+			}, { stale: 20, update: 10, now: () => 1, startHeartbeat: () => async () => {} });
+			clearInterval(hold);
+		`;
+		const crashingChild = spawn(process.execPath, ["--input-type=module", "--eval", crashingSource, stagedCrashPath], {
+			cwd: resolve("."),
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		const crashingChildStaged = deferred();
+		let crashingChildOutput = "";
+		let crashingChildError = "";
+		crashingChild.stdout.setEncoding("utf8");
+		crashingChild.stderr.setEncoding("utf8");
+		crashingChild.stdout.on("data", (chunk) => {
+			crashingChildOutput += chunk;
+			if (crashingChildOutput.includes("staged\n")) crashingChildStaged.resolve();
+		});
+		crashingChild.stderr.on("data", (chunk) => { crashingChildError += chunk; });
+		const crashingChildClosed = new Promise((resolveChild, rejectChild) => {
+			crashingChild.on("error", rejectChild);
+			crashingChild.on("close", (code, signal) => resolveChild({ code, signal }));
+		});
+		await Promise.race([
+			crashingChildStaged.promise,
+			crashingChildClosed.then(({ code, signal }) => {
+				throw new Error(`staged crash child exited before staging (${code ?? signal}): ${crashingChildError}`);
+			}),
+		]);
+		assert.equal(crashingChild.kill("SIGKILL"), true);
+		const crashed = await crashingChildClosed;
+		assert.equal(crashed.signal, "SIGKILL", crashingChildError);
+		await withConsumerStateLock(stagedCrashPath, async (_path, transaction) => {
+			assert.equal(transaction.readStateBytes(), null);
+		}, manualRuntime({ value: 100 }));
+		assert.equal(transitionNames(stagedCrashPath).length, 0);
+
+		const stagedRetirePath = join(fixture, "staged-then-retired.json");
+		const stagedRetireClock = { value: 1 };
+		const stagedBeforeRetire = deferred();
+		const returnRetiredAction = deferred();
+		const retiredAfterStage = withConsumerStateLock(stagedRetirePath, async (_path, transaction) => {
+			await transaction.commitState(bytes("retired-stage"));
+			stagedBeforeRetire.resolve();
+			await returnRetiredAction.promise;
+		}, manualRuntime(stagedRetireClock));
+		await stagedBeforeRetire.promise;
+		stagedRetireClock.value = 100;
+		await withConsumerStateLock(stagedRetirePath, async (_path, transaction) => {
+			await transaction.commitState(bytes("retirement-winner"));
+		}, manualRuntime(stagedRetireClock));
+		returnRetiredAction.resolve();
+		await assert.rejects(retiredAfterStage, /lost ownership|retired/);
+		assert.deepEqual(JSON.parse(readFileSync(stagedRetirePath, "utf8")), { value: "retirement-winner" });
+		assert.equal(transitionNames(stagedRetirePath).length, 1);
+
 		for (const [label, candidates] of [
 			["identical", ["same", "same"]],
 			["distinct", ["left", "right"]],
@@ -1743,6 +1908,73 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		await firstProjection;
 		assert.deepEqual(JSON.parse(readFileSync(projectionPath, "utf8")), { value: "three" });
 		assert.equal(transitionNames(projectionPath).length, 3);
+
+		const ctimeProjectionPath = join(fixture, "projection-ctime-retry.json");
+		await withConsumerStateLock(ctimeProjectionPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("ctime-base"));
+		}, manualRuntime({ value: 1 }));
+		let changedProjectionCtime = false;
+		const authenticatedProjectionOperations = [];
+		await withConsumerStateLock(ctimeProjectionPath, async (_path, transaction) => {
+			assert.deepEqual(JSON.parse(transaction.readStateBytes()), { value: "ctime-base" });
+		}, manualRuntime({ value: 2 }, {
+			beforePathOperation: async ({ operation }) => authenticatedProjectionOperations.push(operation),
+			projectionRead: {
+				beforeFinalStat: async () => {
+					if (changedProjectionCtime) return;
+					changedProjectionCtime = true;
+					writePrivate(ctimeProjectionPath, bytes("ctime-base"));
+				},
+			},
+		}));
+		assert.equal(changedProjectionCtime, true);
+		assert.equal(authenticatedProjectionOperations.includes("projection-retry-authentication"), true);
+		assert.deepEqual(JSON.parse(readFileSync(ctimeProjectionPath, "utf8")), { value: "ctime-base" });
+
+		const projectionStressPath = join(fixture, "projection-helper-stress.json");
+		const firstStressProjectionReady = deferred();
+		const releaseFirstStressProjection = deferred();
+		let heldFirstStressProjection = false;
+		const firstStressWriter = withConsumerStateLock(projectionStressPath, async (_path, transaction) => {
+			await transaction.commitState(Buffer.from(`${JSON.stringify({ count: 1 })}\n`));
+		}, manualRuntime({ value: 1 }, {
+			afterProjectionFileSync: async () => {
+				if (heldFirstStressProjection) return;
+				heldFirstStressProjection = true;
+				firstStressProjectionReady.resolve();
+				await releaseFirstStressProjection.promise;
+			},
+		}));
+		await firstStressProjectionReady.promise;
+		for (let count = 2; count <= 8; count += 1) {
+			await withConsumerStateLock(projectionStressPath, async (_path, transaction) => {
+				assert.equal(JSON.parse(transaction.readStateBytes()).count, count - 1);
+				await transaction.commitState(Buffer.from(`${JSON.stringify({ count })}\n`));
+			}, manualRuntime({ value: count }));
+		}
+		releaseFirstStressProjection.resolve();
+		await firstStressWriter;
+		const projectionStressRotations = await Promise.all(Array.from(
+			{ length: 3 },
+			() => rotateConsumerStateJournal(projectionStressPath, manualRuntime({ value: 20 })),
+		));
+		assert.deepEqual(projectionStressRotations, Array.from({ length: 3 }, () => projectionStressRotations[0]));
+		assert.equal(projectionStressRotations[0].epoch, 2);
+		assert.deepEqual(JSON.parse(readFileSync(projectionStressPath, "utf8")), { count: 8 });
+
+		const symlinkProjectionPath = join(fixture, "projection-symlink-corruption.json");
+		await withConsumerStateLock(symlinkProjectionPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("symlink-base"));
+		}, manualRuntime({ value: 1 }));
+		const symlinkProjectionTarget = join(fixture, "projection-symlink-target.json");
+		writePrivate(symlinkProjectionTarget, bytes("symlink-base"));
+		rmSync(symlinkProjectionPath);
+		symlinkSync(symlinkProjectionTarget, symlinkProjectionPath);
+		await assert.rejects(
+			() => withConsumerStateLock(symlinkProjectionPath, async () => {}, manualRuntime({ value: 2 })),
+			/not one regular non-symlink file/,
+		);
+
 		writeFileSync(join(consumerJournal(projectionPath).epoch, `transition-${"f".repeat(64)}.json`), "{}\n");
 		await assert.rejects(
 			() => withConsumerStateLock(projectionPath, async () => {}, manualRuntime(projectionClock)),
@@ -2085,6 +2317,16 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			assert.deepEqual(JSON.parse(transaction.readStateBytes()), { value: "concurrent-anchor" });
 			await transaction.commitState(bytes("concurrent-after-rotation"));
 		}, { ...manualRuntime({ value: 3 }), maxLockGenerations: 2 });
+
+		const rotationWavePath = join(fixture, "concurrent-rotation-process-wave.json");
+		await withConsumerStateLock(rotationWavePath, async (_path, transaction) => {
+			await transaction.commitState(bytes("wave-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const rotationWave = await Promise.all(Array.from({ length: 12 }, () => runRotationChild(rotationWavePath)));
+		assert.equal(rotationWave.every((result) => result.epoch === 2), true);
+		assert.deepEqual(rotationWave, Array.from({ length: 12 }, () => rotationWave[0]));
+		assert.equal(readdirSync(`${rotationWavePath}.journal`).filter((name) => name.startsWith("checkpoint-")).length, 1);
+		assert.equal(readdirSync(`${rotationWavePath}.journal`).filter((name) => name.startsWith("epoch-")).length, 1);
 
 		for (const competitorHook of ["afterRotationEpochSync", "afterMetadataLink"]) {
 			const competingRotationPath = join(fixture, `competing-rotation-${competitorHook}.json`);

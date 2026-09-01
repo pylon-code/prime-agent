@@ -26,6 +26,7 @@ const MAX_LOCK_GENERATIONS = 65_536;
 const MAX_OPERATION_GENERATIONS = MAX_LOCK_GENERATIONS + 1;
 const MAX_JOURNAL_ROOT_ENTRIES = 16;
 const MAX_TEMPORARY_ENTRIES = 65_536;
+const PROJECTION_RETRY_LIMIT = 32;
 const TEMPORARY_DIRECTORY_NAME = ".owned-temporaries-v2";
 const LEGACY_RETIREMENT_MARKER_NAME = ".pylon-consumer-v1-retired.json";
 const uuidSource = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
@@ -630,7 +631,7 @@ function genesisCheckpoint(statePath) {
 	};
 }
 
-async function scanJournalRoot(statePath, journalDirectory, options) {
+async function scanJournalRoot(statePath, journalDirectory, options, replacementRetries = PROJECTION_RETRY_LIMIT) {
 	await secureDirectory(journalDirectory, "Consumer high-water journal directory", options);
 	await options.syncDirectory(journalDirectory);
 	const names = await options.readDirectory(journalDirectory);
@@ -670,6 +671,17 @@ async function scanJournalRoot(statePath, journalDirectory, options) {
 				"Consumer high-water journal checkpoint",
 				options,
 			);
+			if (checkpoint === null) {
+				const epoch = Number(checkpointMatch[1]);
+				const hasLaterCheckpoint = names.some((candidate) => {
+					const match = checkpointPattern.exec(candidate);
+					return match && Number(match[1]) > epoch;
+				});
+				if (hasLaterCheckpoint && replacementRetries > 0) {
+					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1);
+				}
+				throw new Error("Consumer high-water journal lost its current checkpoint during an authenticated scan.");
+			}
 			if (checkpointName(checkpoint) !== name || checkpoint.epoch !== Number(checkpointMatch[1])) {
 				throw new Error("Consumer high-water journal checkpoint name is malformed.");
 			}
@@ -678,9 +690,34 @@ async function scanJournalRoot(statePath, journalDirectory, options) {
 		}
 		const epochMatch = epochPattern.exec(name);
 		if (epochMatch) {
-			const entry = await options.lstatEntry(path);
+			let entry;
+			try {
+				entry = await options.lstatEntry(path);
+			} catch (error) {
+				const epoch = Number(epochMatch[1]);
+				const hasLaterEpoch = names.some((candidate) => {
+					const match = epochPattern.exec(candidate);
+					return match && Number(match[1]) > epoch;
+				});
+				if (error?.code === "ENOENT" && hasLaterEpoch && replacementRetries > 0) {
+					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1);
+				}
+				throw error;
+			}
 			if (!entry.isDirectory() || entry.isSymbolicLink?.()) throw new Error("Consumer high-water epoch entry must be one real directory.");
-			await secureDirectory(path, "Consumer high-water epoch directory", options);
+			try {
+				await secureDirectory(path, "Consumer high-water epoch directory", options);
+			} catch (error) {
+				const epoch = Number(epochMatch[1]);
+				const hasLaterEpoch = names.some((candidate) => {
+					const match = epochPattern.exec(candidate);
+					return match && Number(match[1]) > epoch;
+				});
+				if (error?.code === "ENOENT" && hasLaterEpoch && replacementRetries > 0) {
+					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1);
+				}
+				throw error;
+			}
 			epochEntries.push({ name, path, epoch: Number(epochMatch[1]), epochId: epochMatch[2] });
 			continue;
 		}
@@ -858,35 +895,53 @@ async function walkTransactions(context, options) {
 	return { tipDigest, tipBytes, length: visited.size };
 }
 
+function isProjectionReplacementTransient(error) {
+	return error?.code === "ENOENT" || error?.message === "Consumer high-water state changed while it was read.";
+}
+
+function isCommitHelperReplacementTransient(error) {
+	return isProjectionReplacementTransient(error) || [
+		"Consumer high-water journal epoch changed and fenced a paused writer.",
+		"Consumer high-water journal checkpoint changed and fenced a paused writer.",
+	].includes(error?.message);
+}
+
 async function repairProjection(context, initialTip, options, writer = options.activeWriter) {
 	let tip = initialTip;
-	for (let attempt = 0; attempt < 8; attempt += 1) {
+	for (let attempt = 0; attempt < PROJECTION_RETRY_LIMIT; attempt += 1) {
 		if (tip.tipBytes === null) return tip;
-		const projection = await readProjection(context, "projection-read", options);
-		if (projection.sha256 !== tip.tipDigest) {
-			await options.hooks?.beforeProjectionWrite?.({ tipDigest: tip.tipDigest });
-			await revalidateAuthority(context, "projection-write", options);
-			const temporary = join(context.temporaryDirectory, temporaryName(context.statePath, "projection", writer, context));
-			let handle;
-			try {
-				handle = await options.openFile(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
-				await handle.chmod?.(0o600);
-				await handle.writeFile(tip.tipBytes);
-				await handle.sync();
-				await handle.close();
-				handle = undefined;
-				await options.hooks?.afterProjectionFileSync?.({ tipDigest: tip.tipDigest, temporary });
-				await revalidateAuthority(context, "projection-rename", options);
-				await options.renameFile(temporary, context.statePath);
-				await options.hooks?.afterProjectionRename?.({ tipDigest: tip.tipDigest });
-				await options.syncDirectory(context.temporaryDirectory);
-				await options.syncDirectory(dirname(context.statePath));
-				await options.hooks?.afterProjectionDirectorySync?.({ tipDigest: tip.tipDigest });
-			} finally {
-				if (handle !== undefined) await handle.close();
-				await options.removeFile(temporary, { force: true });
-				await options.syncDirectory(context.temporaryDirectory);
+		try {
+			const projection = await readProjection(context, "projection-read", options);
+			if (projection.sha256 !== tip.tipDigest) {
+				await options.hooks?.beforeProjectionWrite?.({ tipDigest: tip.tipDigest });
+				await revalidateAuthority(context, "projection-write", options);
+				const temporary = join(context.temporaryDirectory, temporaryName(context.statePath, "projection", writer, context));
+				let handle;
+				try {
+					handle = await options.openFile(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+					await handle.chmod?.(0o600);
+					await handle.writeFile(tip.tipBytes);
+					await handle.sync();
+					await handle.close();
+					handle = undefined;
+					await options.hooks?.afterProjectionFileSync?.({ tipDigest: tip.tipDigest, temporary });
+					await revalidateAuthority(context, "projection-rename", options);
+					await options.renameFile(temporary, context.statePath);
+					await options.hooks?.afterProjectionRename?.({ tipDigest: tip.tipDigest });
+					await options.syncDirectory(context.temporaryDirectory);
+					await options.syncDirectory(dirname(context.statePath));
+					await options.hooks?.afterProjectionDirectorySync?.({ tipDigest: tip.tipDigest });
+				} finally {
+					if (handle !== undefined) await handle.close();
+					await options.removeFile(temporary, { force: true });
+					await options.syncDirectory(context.temporaryDirectory);
+				}
 			}
+		} catch (error) {
+			if (!isProjectionReplacementTransient(error)) throw error;
+			await revalidateAuthority(context, "projection-retry-authentication", options);
+			tip = await walkTransactions(context, options);
+			continue;
 		}
 		const latest = await walkTransactions(context, options);
 		if (latest.tipDigest === tip.tipDigest) return latest;
@@ -1119,11 +1174,57 @@ async function publishApplied(context, claim, terminal, options) {
 	await options.hooks?.afterApplied?.({ claim, terminal });
 }
 
+async function readApplied(context, claim, terminal, options) {
+	await revalidateAuthority(context, "read-applied", options);
+	return readExactMetadata(
+		appliedPath(context, claim),
+		options.metadataMaxBytes,
+		(value) => validateApplied(value, claim, terminal),
+		"Consumer high-water lock applied marker",
+		options,
+	);
+}
+
+async function finishCommitAtAuthenticatedDescendant(context, options) {
+	const scan = await scanJournalRoot(context.statePath, context.journalDirectory, options);
+	const head = scan.head;
+	if (
+		!head || scan.missingHeadEpoch || head.checkpoint.epoch !== context.checkpoint.epoch + 1 ||
+		head.checkpoint.previousCheckpointSha256 !== context.checkpointDigest ||
+		head.checkpoint.retiredEpochDirectory !== basename(context.epochDirectory)
+	) return false;
+	const descendant = contextFromHead(context.statePath, context.guardPath, context.journalDirectory, head);
+	const tip = await walkTransactions(descendant, options);
+	await repairProjection(descendant, tip, options, {
+		generation: 0,
+		token: descendant.checkpoint.epochId,
+		type: "rotation",
+	});
+	return true;
+}
+
 async function finishCommit(context, claim, terminal, options) {
-	for (const transaction of terminal.transactions) await publishTransition(context, transaction, claim, options);
-	const tip = await walkTransactions(context, options);
-	await repairProjection(context, tip, options, claim);
-	await publishApplied(context, claim, terminal, options);
+	for (let attempt = 0; attempt < PROJECTION_RETRY_LIMIT; attempt += 1) {
+		try {
+			await readApplied(context, claim, terminal, options);
+			for (const transaction of terminal.transactions) await publishTransition(context, transaction, claim, options);
+			const tip = await walkTransactions(context, options);
+			await repairProjection(context, tip, options, claim);
+			await publishApplied(context, claim, terminal, options);
+			return;
+		} catch (error) {
+			if (!isCommitHelperReplacementTransient(error)) throw error;
+			try {
+				await revalidateAuthority(context, "finish-commit-retry-authentication", options);
+				await walkTransactions(context, options);
+			} catch (authenticationError) {
+				if (!isCommitHelperReplacementTransient(authenticationError)) throw authenticationError;
+				if (await finishCommitAtAuthenticatedDescendant(context, options)) return;
+				throw authenticationError;
+			}
+		}
+	}
+	throw new Error("Consumer high-water commit helper could not converge after bounded projection replacement retries.");
 }
 
 function rotationCheckpoint(context, tip) {
@@ -1443,14 +1544,26 @@ async function cleanupAuthority(
 		if (epoch.name !== context.checkpoint.retiredEpochDirectory) {
 			throw new Error("Consumer high-water journal contains an orphan epoch directory.");
 		}
-		const retiredNames = await options.readDirectory(epoch.path);
+		let retiredNames;
+		try {
+			retiredNames = await options.readDirectory(epoch.path);
+		} catch (error) {
+			if (error?.code === "ENOENT") continue;
+			throw error;
+		}
 		if (retiredNames.length > options.maxJournalEntries + MAX_TEMPORARY_ENTRIES) {
 			throw new Error("Consumer high-water retired epoch exceeds its safe allocation bound.");
 		}
 		const retiredTemporaries = [];
 		for (const name of retiredNames) {
 			const path = join(epoch.path, name);
-			const entry = await options.lstatEntry(path);
+			let entry;
+			try {
+				entry = await options.lstatEntry(path);
+			} catch (error) {
+				if (error?.code === "ENOENT") continue;
+				throw error;
+			}
 			if (entry.isSymbolicLink?.() || (!entry.isFile() && !entry.isDirectory())) {
 				throw new Error("Consumer high-water retired epoch contains an unsafe entry.");
 			}
@@ -2438,39 +2551,97 @@ async function prepareContext(statePath, options) {
 	await ensureDurableConsumerStateDirectory(directory, options.directoryOperations);
 	await secureDirectory(directory, "Consumer high-water state directory", options);
 	const guardPath = `${absoluteStatePath}.lock`;
+	const retiredLockDirectory = `${absoluteStatePath}.lock.v1-retired`;
 	const journalDirectory = `${absoluteStatePath}.journal`;
 	const legacyTransactionDirectory = `${absoluteStatePath}.transactions`;
+
+	// Detect every old-authority signal before creating a guard or a genesis journal.
 	const legacyEntry = await lstatOrNull(legacyTransactionDirectory, options);
-	if (legacyEntry) {
-		if (!legacyEntry.isDirectory() || legacyEntry.isSymbolicLink?.()) {
-			throw new Error("Prior v1 consumer transaction authority must be one real directory.");
-		}
-		const journalEntry = await lstatOrNull(journalDirectory, options);
-		if (!journalEntry) {
-			throw new Error(
-				"Prior v1 consumer transaction authority exists. Stop every old client and run the explicit quiescent consumer journal migration command.",
+	const guardEntry = await lstatOrNull(guardPath, options);
+	const retiredEntry = await lstatOrNull(retiredLockDirectory, options);
+	const journalEntry = await lstatOrNull(journalDirectory, options);
+	if (legacyEntry && (!legacyEntry.isDirectory() || legacyEntry.isSymbolicLink?.())) {
+		throw new Error("Prior v1 consumer transaction authority must be one real directory.");
+	}
+	if (retiredEntry && (!retiredEntry.isDirectory() || retiredEntry.isSymbolicLink?.())) {
+		throw new Error("Prior retired v1 consumer lock authority must be one real directory and is never replaced.");
+	}
+	if (guardEntry && (
+		guardEntry.isSymbolicLink?.() || (!guardEntry.isFile() && !guardEntry.isDirectory())
+	)) throw new Error("Legacy consumer lock guard is not one exact regular non-symlink file.");
+
+	let inPlaceMarkerEntry = null;
+	if (guardEntry?.isDirectory() && !guardEntry.isSymbolicLink?.()) {
+		const markerPath = join(guardPath, LEGACY_RETIREMENT_MARKER_NAME);
+		inPlaceMarkerEntry = await lstatOrNull(markerPath, options);
+		if (inPlaceMarkerEntry) {
+			if (!inPlaceMarkerEntry.isFile() || inPlaceMarkerEntry.isSymbolicLink?.()) {
+				throw new Error("Legacy consumer high-water retirement marker must be one real file.");
+			}
+			await readExactMetadata(
+				markerPath,
+				options.metadataMaxBytes,
+				(value) => validateLegacyRetirementMarker(value, absoluteStatePath),
+				"Legacy consumer high-water retirement marker",
+				options,
 			);
 		}
+	}
+
+	let scan = null;
+	if (journalEntry) {
 		if (!journalEntry.isDirectory() || journalEntry.isSymbolicLink?.()) {
 			throw new Error("Consumer high-water journal directory must be one real directory.");
 		}
 		await secureDirectory(journalDirectory, "Consumer high-water journal directory", options);
-		const temporaryDirectory = join(journalDirectory, TEMPORARY_DIRECTORY_NAME);
-		const temporaryEntry = await lstatOrNull(temporaryDirectory, options);
-		if (!temporaryEntry) {
-			throw new Error("Migrated consumer high-water journal lacks its exact temporary namespace.");
+		try {
+			scan = await scanJournalRoot(absoluteStatePath, journalDirectory, options);
+		} catch (error) {
+			if (error?.message !== "Consumer high-water journal lacks its exact temporary namespace.") throw error;
+			const names = await options.readDirectory(journalDirectory);
+			if (names.length === 1 && names[0] === TEMPORARY_DIRECTORY_NAME) {
+				scan = await scanJournalRoot(absoluteStatePath, journalDirectory, options);
+			} else if (names.length !== 0) {
+				throw error;
+			}
 		}
-		const scan = await scanJournalRoot(absoluteStatePath, journalDirectory, options);
-		if (!scan.head || scan.missingHeadEpoch) {
+	}
+	const hasInPlaceLegacyDirectory = guardEntry?.isDirectory() && !guardEntry.isSymbolicLink?.();
+	const hasMigratedV2Head = scan?.head?.checkpoint.sourceAuthoritySha256 !== undefined &&
+		scan.head.checkpoint.sourceAuthoritySha256 !== GENESIS_DIGEST;
+	const hasLegacySignal = legacyEntry !== null || retiredEntry !== null || hasInPlaceLegacyDirectory || hasMigratedV2Head;
+	if (hasLegacySignal) {
+		if (!legacyEntry) {
+			if (hasInPlaceLegacyDirectory && !inPlaceMarkerEntry && !retiredEntry && !hasMigratedV2Head) {
+				throw new Error(
+					`Legacy consumer lock directory exists at ${guardPath}. Stop every legacy proper-lockfile client, ` +
+					"confirm that no owner remains, remove that directory manually, and retry.",
+				);
+			}
+			throw new Error("Prior v1 consumer authority is incomplete because its transaction namespace is missing.");
+		}
+		// This independently validates the selected live/in-place or prior-retired lock namespace.
+		await legacyMigrationSource(absoluteStatePath, options);
+		if (!journalEntry) {
+			throw new Error(
+				"Prior v1 consumer authority exists. Stop every old client and run the explicit quiescent consumer journal migration command.",
+			);
+		}
+		if (!scan?.head || scan.missingHeadEpoch) {
 			throw new Error("Prior v1 authority has no complete authenticated v2 migration checkpoint.");
 		}
 		const context = contextFromHead(absoluteStatePath, guardPath, journalDirectory, scan.head);
 		await validateMigratedAuthority(context, options);
 		return { context, scan };
 	}
+
+	if (scan?.head) {
+		if (scan.missingHeadEpoch) scan = await initializeJournal(absoluteStatePath, journalDirectory, options);
+		return { context: contextFromHead(absoluteStatePath, guardPath, journalDirectory, scan.head), scan };
+	}
 	await ensureDirectory(journalDirectory, "Consumer high-water journal directory", options);
 	await ensureDirectory(join(journalDirectory, TEMPORARY_DIRECTORY_NAME), "Consumer high-water temporary directory", options);
-	const scan = await initializeJournal(absoluteStatePath, journalDirectory, options);
+	scan = await initializeJournal(absoluteStatePath, journalDirectory, options);
 	return { context: contextFromHead(absoluteStatePath, guardPath, journalDirectory, scan.head), scan };
 }
 
@@ -2522,6 +2693,8 @@ async function runNormalLocked(statePath, action, rawOptions) {
 			}
 			const baseBytes = chain.tipBytes ?? legacyBytes;
 			const baseDigest = baseBytes === null ? GENESIS_DIGEST : digest(baseBytes);
+			let stagedCandidate = null;
+			let candidateWasStaged = false;
 			const commitTransactions = async (candidateBytes) => {
 				const transactions = [];
 				if (chain.tipBytes === null && legacyBytes !== null) {
@@ -2553,10 +2726,13 @@ async function runNormalLocked(statePath, action, rawOptions) {
 			const transaction = Object.freeze({
 				readStateBytes: () => baseBytes === null ? null : Buffer.from(baseBytes),
 				commitState: async (value) => {
-					if (terminal !== null) throw new Error("Consumer high-water transaction already has a terminal decision.");
+					if (terminal !== null || candidateWasStaged) {
+						throw new Error("Consumer high-water transaction already staged a candidate or has a terminal decision.");
+					}
 					const bytes = Buffer.isBuffer(value) ? Buffer.from(value) : Buffer.from(value);
 					if (bytes.length < 1 || bytes.length > options.stateMaxBytes) throw new Error("Consumer high-water state is malformed.");
-					await commitTransactions(bytes);
+					stagedCandidate = bytes;
+					candidateWasStaged = true;
 				},
 			});
 			let result;
@@ -2566,8 +2742,10 @@ async function runNormalLocked(statePath, action, rawOptions) {
 			} catch (error) {
 				actionError = error;
 			}
+			if (actionError === undefined && (candidateWasStaged || legacyBytes !== null)) {
+				await commitTransactions(candidateWasStaged ? stagedCandidate : null);
+			}
 			await stopHeartbeatOnce();
-			if (terminal === null && actionError === undefined && legacyBytes !== null) await commitTransactions(null);
 			await release(actionError);
 			if (actionError !== undefined) throw actionError;
 			return result;
