@@ -240,22 +240,10 @@ jobs:
               const sourceCommit = await github.rest.git.getCommit({ owner, repo, commit_sha: sourceSha });
               sourceTree = sourceCommit.data.tree.sha;
             }
-            const protection = await github.graphql(
-              `query($owner:String!,$repo:String!,$ref:String!){repository(owner:$owner,name:$repo){ref(qualifiedName:$ref){branchProtectionRule{requiresStatusChecks requiredStatusChecks{context app{databaseId}}}}}}`,
-              { owner, repo, ref: "refs/heads/pylon" },
-            );
-            const rule = protection.repository?.ref?.branchProtectionRule;
-            const required = rule?.requiredStatusChecks;
             const expectedPolicy = [
               { context: "Check changelog fragment", appId: 15368, workflowPath: ".github/workflows/changelog-merged-proof.yml" },
               { context: "build-check-test", appId: 15368, workflowPath: ".github/workflows/ci.yml" },
             ];
-            const actualPolicy = Array.isArray(required) ? required.map((requirement) => ({
-              context: requirement.context, appId: requirement.app?.databaseId ?? null,
-            })).sort((left, right) => left.context < right.context ? -1 : left.context > right.context ? 1 : 0) : null;
-            if (!rule?.requiresStatusChecks || JSON.stringify(actualPolicy) !== JSON.stringify(expectedPolicy.map(({ context, appId }) => ({ context, appId })))) {
-              throw new Error("Protected pylon must require exactly the two app-bound publication checks.");
-            }
             const proveChecks = async (sha, label) => {
               const checks = await github.paginate(github.rest.checks.listForRef, { owner, repo, ref: sha, filter: "latest", per_page: 100 });
               for (const requirement of expectedPolicy) {
@@ -485,7 +473,7 @@ jobs:
               --operation "$OPERATION"
               --policy-sha "${{ github.sha }}"
               --policy-tree "$policy_tree"
-              --publication-policy-revision 1
+              --publication-policy-revision 2
             )
             if [ "$OPERATION" = withdraw ]; then
               args+=(--revoke-tag "$REVOKE_STABLE_TAG" --reason "$REASON")
@@ -569,7 +557,7 @@ jobs:
           if (
             manifest.schemaVersion !== 1 || manifest.channel !== "stable" ||
             manifest.repository !== "https://github.com/pylon-code/prime-agent" ||
-            manifest.promotion?.publicationPolicyRevision !== 1 ||
+            manifest.promotion?.publicationPolicyRevision !== 2 ||
             !/^pylon-stable-[0-9]{6}-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(manifest.tag)
           ) throw new Error("Stable manifest identity is malformed.");
           NODE
@@ -675,8 +663,8 @@ jobs:
             if (
               !parsed || !preview || Number(parsed[1]) !== manifest.sequence || parsed[2] !== manifest.build.source?.commit?.slice(0, 12) ||
               Number(parsed[3]) !== manifest.build.recipeRevision || preview[1] !== parsed[2] || Number(preview[2]) !== manifest.build.recipeRevision ||
-              manifest.build.previewTag !== manifest.build.id || ![1].includes(manifest.build.publicationPolicyRevision) ||
-              manifest.promotion?.policyCommit !== context.sha || manifest.promotion?.publicationPolicyRevision !== 1
+              manifest.build.previewTag !== manifest.build.id || ![1, 2].includes(manifest.build.publicationPolicyRevision) ||
+              manifest.promotion?.policyCommit !== context.sha || manifest.promotion?.publicationPolicyRevision !== 2
             ) throw new Error("Stable draft identity is malformed or not signed by this policy commit.");
             const name = `Pylon Prime stable ${tag}`;
             const encoded = bytes.toString("base64");
@@ -852,8 +840,10 @@ jobs:
               Number(previewMatch[2]) !== manifest.build?.recipeRevision || manifest.build.previewTag !== manifest.build.id ||
               manifest.build.previewSequence?.sequenceEpoch !== 1 || !Number.isSafeInteger(manifest.build.previewSequence?.sequence) ||
               manifest.build.previewSequence.sequence < 1 || !/^[1-9][0-9]*$/.test(manifest.build.previewSequence?.workflowRunId ?? "") ||
-              manifest.build.previewTag !== process.env.PREVIEW_TAG || ![1].includes(manifest.build.publicationPolicyRevision) ||
-              manifest.promotion?.kind !== operation || manifest.promotion?.publicationPolicyRevision !== 1 ||
+              manifest.build.previewTag !== process.env.PREVIEW_TAG || ![1, 2].includes(manifest.build.publicationPolicyRevision) ||
+              manifest.promotion?.kind !== operation ||
+              (mode === "normal" ? manifest.promotion?.publicationPolicyRevision !== 2 :
+                ![1, 2].includes(manifest.promotion?.publicationPolicyRevision)) ||
               manifest.promotion?.policyCommit !== process.env.POLICY_SHA || manifest.promotion?.policyTree !== process.env.POLICY_TREE
             ) throw new Error("Stable manifest, preview recipe, operator request, or policy identity differs.");
             if (operation === "withdraw") {
@@ -917,22 +907,10 @@ jobs:
             const previewRef = await github.rest.git.getRef({ owner, repo, ref: `tags/${manifest.build.previewTag}` });
             if (previewRef.data.object.type !== "commit" || previewRef.data.object.sha !== manifest.build.source.commit) throw new Error("Immutable preview tag changed before stable CAS.");
 
-            const protection = await github.graphql(
-              `query($owner:String!,$repo:String!,$ref:String!){repository(owner:$owner,name:$repo){ref(qualifiedName:$ref){branchProtectionRule{requiresStatusChecks requiredStatusChecks{context app{databaseId}}}}}}`,
-              { owner, repo, ref: "refs/heads/pylon" },
-            );
-            const rule = protection.repository?.ref?.branchProtectionRule;
-            const required = rule?.requiredStatusChecks;
             const expectedPolicy = [
               { context: "Check changelog fragment", appId: 15368, workflowPath: ".github/workflows/changelog-merged-proof.yml" },
               { context: "build-check-test", appId: 15368, workflowPath: ".github/workflows/ci.yml" },
             ];
-            const actualPolicy = Array.isArray(required) ? required.map((requirement) => ({
-              context: requirement.context, appId: requirement.app?.databaseId ?? null,
-            })).sort((left, right) => left.context < right.context ? -1 : left.context > right.context ? 1 : 0) : null;
-            if (!rule?.requiresStatusChecks || JSON.stringify(actualPolicy) !== JSON.stringify(expectedPolicy.map(({ context, appId }) => ({ context, appId })))) {
-              throw new Error("Protected pylon must require exactly the two app-bound publication checks.");
-            }
             const proveChecks = async (sha, label) => {
               const checks = await github.paginate(github.rest.checks.listForRef, { owner, repo, ref: sha, filter: "latest", per_page: 100 });
               for (const requirement of expectedPolicy) {

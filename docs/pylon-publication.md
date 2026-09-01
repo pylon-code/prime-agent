@@ -86,7 +86,7 @@ The canonical preview manifest binds the full source commit/tree, artifact recip
 
 ```json
 {
-  "publicationPolicyRevision": 1,
+  "publicationPolicyRevision": 2,
   "sequenceEpoch": 1,
   "sequence": 123,
   "workflowRunId": "33428882721"

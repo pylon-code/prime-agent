@@ -366,7 +366,7 @@ test("preview manifest binds the full source tree, build, recipe, and build-mani
 	]) assert.throws(() => createPreviewManifest(release, releaseBytes, invalid), /sequence identity/);
 	for (const invalid of [
 		{ ...invocation, publicationPolicyRevision: 0 },
-		{ ...invocation, publicationPolicyRevision: 2 },
+		{ ...invocation, publicationPolicyRevision: 3 },
 		{ sequenceEpoch: 1, sequence: 17, workflowRunId: "33428882721" },
 	]) assert.throws(() => createPreviewManifest(release, releaseBytes, invalid), /policy revision/);
 	for (const mutate of [
@@ -769,7 +769,7 @@ test("stable manifest nested schema rejects extras, malformed identities, unsafe
 		(value) => (value.build.source.tree = "abc"),
 		(value) => (value.build.recipeRevision = 2),
 		(value) => delete value.build.publicationPolicyRevision,
-		(value) => (value.build.publicationPolicyRevision = 2),
+		(value) => (value.build.publicationPolicyRevision = 3),
 		(value) => (value.build.releaseManifest.file = "other.json"),
 		(value) => (value.build.previewManifest.file = "other.json"),
 		(value) => (value.build.assets[0].file = "../escape.tgz"),
@@ -779,7 +779,7 @@ test("stable manifest nested schema rejects extras, malformed identities, unsafe
 		(value) => value.build.assets.reverse(),
 		(value) => (value.promotion.policyTree = "abc"),
 		(value) => delete value.promotion.publicationPolicyRevision,
-		(value) => (value.promotion.publicationPolicyRevision = 2),
+		(value) => (value.promotion.publicationPolicyRevision = 3),
 	]) {
 		const changed = structuredClone(stable);
 		mutate(changed);
@@ -859,7 +859,7 @@ test("merged changelog proof never relabels a PR-head check as merge-SHA evidenc
 			path: ".github/workflows/changelog-fragment.yml",
 			repository: PYLON_PUBLICATION_REPOSITORY,
 			headRepository: PYLON_PUBLICATION_REPOSITORY,
-			pullRequests: [29],
+			pullRequests: [],
 		}],
 	};
 	assert.equal(validateMergedChangelogProof(proof).number, 29);
@@ -877,6 +877,136 @@ test("merged changelog proof never relabels a PR-head check as merge-SHA evidenc
 		mutate(changed);
 		assert.throws(() => validateMergedChangelogProof(changed));
 	}
+});
+
+test("merged changelog workflow accepts the actual deleted PR-head run response with an empty pull_requests array", async () => {
+	const mergeSha = "c34a2dd3b393700d512b0cbb30eb0bf66bd6dcc8";
+	const headSha = "f4d9ef03b529faf2e07031c8b7cd703363316ae5";
+	const pullNumber = 42;
+	const headRef = "feat/pylon-protected-publication";
+	const checkSuiteId = 90_698_064_557;
+	const checkRunId = 99_743_581_069;
+	const workflowRunId = 33_472_036_328;
+	const workflowId = 344_179_420;
+	const listAssociated = async () => {};
+	const listChecks = async () => {};
+	const script = githubScriptForStep(
+		".github/workflows/changelog-merged-proof.yml",
+		"Prove the merged pull request head check",
+	);
+	for (const binding of [
+		"pull.merge_commit_sha === mergeSha",
+		'pull.base.ref === "pylon"',
+		"pull.head.repo?.full_name !== repository",
+		"check.head_sha === pull.head.sha",
+		"check.app?.id === 15368",
+		"run.check_suite_id === suite.id",
+		'run.event === "pull_request"',
+		"run.head_sha === pull.head.sha",
+		"run.head_branch === pull.head.ref",
+		'workflow.path === ".github/workflows/changelog-fragment.yml"',
+	]) assert.ok(script.includes(binding), `merged changelog workflow lost direct binding: ${binding}`);
+	assert.doesNotMatch(script, /run\.pull_requests/, "Actions run pull_requests is not stable after head deletion");
+
+	let deletedHeadLookups = 0;
+	const github = {
+		paginate: async (method, parameters) => {
+			if (method === listAssociated) {
+				assert.deepEqual(parameters, {
+					owner: "pylon-code", repo: "prime-agent", commit_sha: mergeSha, per_page: 100,
+				});
+				return [{ number: pullNumber }];
+			}
+			if (method === listChecks) {
+				assert.deepEqual(parameters, {
+					owner: "pylon-code", repo: "prime-agent", ref: headSha, filter: "latest", per_page: 100,
+				});
+				return [{
+					id: checkRunId,
+					name: "Check changelog fragment",
+					head_sha: headSha,
+					app: { id: GITHUB_ACTIONS_APP_ID },
+					status: "completed",
+					conclusion: "success",
+					check_suite: { id: checkSuiteId },
+					details_url: `https://github.com/pylon-code/prime-agent/actions/runs/${workflowRunId}/job/${checkRunId}`,
+				}];
+			}
+			throw new Error("Unexpected pagination endpoint.");
+		},
+		rest: {
+			repos: {
+				listPullRequestsAssociatedWithCommit: listAssociated,
+			},
+			pulls: {
+				get: async (parameters) => {
+					assert.deepEqual(parameters, { owner: "pylon-code", repo: "prime-agent", pull_number: pullNumber });
+					return { data: {
+						number: pullNumber,
+						merged_at: "2026-09-01T17:39:57Z",
+						merge_commit_sha: mergeSha,
+						base: { ref: "pylon", repo: { full_name: PYLON_PUBLICATION_REPOSITORY } },
+						head: { ref: headRef, sha: headSha, repo: { full_name: PYLON_PUBLICATION_REPOSITORY } },
+					} };
+				},
+			},
+			checks: {
+				listForRef: listChecks,
+				getSuite: async (parameters) => {
+					assert.deepEqual(parameters, {
+						owner: "pylon-code", repo: "prime-agent", check_suite_id: checkSuiteId,
+					});
+					return { data: {
+						id: checkSuiteId,
+						app: { id: GITHUB_ACTIONS_APP_ID },
+						head_sha: headSha,
+						status: "completed",
+						conclusion: "success",
+					} };
+				},
+			},
+			actions: {
+				getWorkflowRun: async (parameters) => {
+					assert.deepEqual(parameters, {
+						owner: "pylon-code", repo: "prime-agent", run_id: workflowRunId,
+					});
+					return { data: {
+						id: workflowRunId,
+						workflow_id: workflowId,
+						check_suite_id: checkSuiteId,
+						event: "pull_request",
+						status: "completed",
+						conclusion: "success",
+						head_sha: headSha,
+						head_branch: headRef,
+						head_repository: { id: 1_349_002_285, full_name: PYLON_PUBLICATION_REPOSITORY },
+						repository: { id: 1_349_002_285, full_name: PYLON_PUBLICATION_REPOSITORY },
+						pull_requests: [],
+					} };
+				},
+				getWorkflow: async (parameters) => {
+					assert.deepEqual(parameters, {
+						owner: "pylon-code", repo: "prime-agent", workflow_id: workflowId,
+					});
+					return { data: { path: ".github/workflows/changelog-fragment.yml" } };
+				},
+			},
+			git: {
+				getRef: async () => {
+					deletedHeadLookups += 1;
+					throw Object.assign(new Error("Reference does not exist"), { status: 404 });
+				},
+			},
+		},
+	};
+	const execute = new AsyncFunction("github", "context", "core", script);
+	await execute(github, {
+		repo: { owner: "pylon-code", repo: "prime-agent" },
+		eventName: "push",
+		ref: PYLON_PUBLICATION_REF,
+		sha: mergeSha,
+	}, {});
+	assert.equal(deletedHeadLookups, 0, "proof must stay SHA-bound when the merged head branch no longer resolves");
 });
 
 test("canonical invocation rejects main, tags, PR events, forks, and malformed source", () => {
@@ -1096,7 +1226,12 @@ test("standalone preview verification rejects tamper, extras, symlinks, and nonc
 test("recipe and publication policy registries close independent immutable identities", () => {
 	const registryText = readFileSync(join(root, "scripts/pylon-prime-supported-release-recipes-v1.json"), "utf8");
 	const registry = parseSupportedReleaseRecipeRegistry(registryText);
-	const policy = registry.publicationPolicies[0];
+	const policies = registry.publicationPolicies;
+	const historicalPolicy = policies[0];
+	const policy = policies.at(-1);
+	assert.deepEqual(policies.map((candidate) => candidate.publicationPolicyRevision), [1, 2]);
+	assert.equal(historicalPolicy.previewWorkflowSha256, "e790a5da7063bd40fbd886e84945c3200291194fdbd5b002079349e45356a41d");
+	assert.equal(historicalPolicy.stableWorkflowSha256, "dfcecdf6b58f143f9b7a543eadd124c190350ae29ac9eadccb907f1398b0958a");
 	const preview = readFileSync(join(root, policy.previewWorkflowPath), "utf8");
 	const stable = readFileSync(join(root, policy.stableWorkflowPath), "utf8");
 	assert.deepEqual(validateApprovedWorkflowBytes(
@@ -1111,6 +1246,50 @@ test("recipe and publication policy registries close independent immutable ident
 		"stable",
 		policy.publicationPolicyRevision,
 	), { workflow: policy.stableWorkflowPath, environment: "pylon-stable" });
+	const retiredAdministrationRead = "branchProtectionRule requiredStatusChecks";
+	const legacyPreviewShape = preview.replace(
+		"// Exact-SHA workflow proof is checked by the final publisher after the push checks can complete.",
+		`// ${retiredAdministrationRead}`,
+	);
+	const legacyStableShape = stable.replace(
+		'            const requestedPreview = process.env.PREVIEW_TAG;\n',
+		`            // ${retiredAdministrationRead}\n            const requestedPreview = process.env.PREVIEW_TAG;\n`,
+	);
+	const legacyShapePolicy = {
+		...historicalPolicy,
+		previewWorkflowSha256: createHash("sha256").update(legacyPreviewShape).digest("hex"),
+		stableWorkflowSha256: createHash("sha256").update(legacyStableShape).digest("hex"),
+	};
+	for (const [workflowPath, workflow, channel, environment] of [
+		[legacyShapePolicy.previewWorkflowPath, legacyPreviewShape, "preview", "pylon-preview"],
+		[legacyShapePolicy.stableWorkflowPath, legacyStableShape, "stable", "pylon-stable"],
+	]) {
+		assert.match(workflow, /branchProtectionRule requiredStatusChecks/);
+		assert.deepEqual(
+			validateApprovedWorkflowBytes(workflowPath, workflow, channel, 1, [legacyShapePolicy]),
+			{ workflow: workflowPath, environment },
+		);
+		assert.throws(
+			() => validateApprovedWorkflowBytes(workflowPath, workflow, channel, 1, policies),
+			/bytes differ/,
+			"p1 revision dispatch must remain behind the exact registered workflow hash",
+		);
+		const revision2ShapePolicy = { ...legacyShapePolicy, publicationPolicyRevision: 2 };
+		assert.throws(
+			() => validateApprovedWorkflowBytes(workflowPath, workflow, channel, 2, [revision2ShapePolicy]),
+			/Administration-gated branch-protection read/,
+		);
+	}
+	assert.throws(
+		() => validateApprovedWorkflowBytes(
+			legacyShapePolicy.previewWorkflowPath,
+			`${legacyPreviewShape}# arbitrary p1 bytes\n`,
+			"preview",
+			1,
+			[legacyShapePolicy],
+		),
+		/bytes differ/,
+	);
 	for (const changed of [
 		`${preview}\n  rogue:\n    permissions: write-all\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo arbitrary\n`,
 		`${stable}\n  rogue-oidc:\n    permissions:\n      id-token: write\n      attestations: write\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo sign\n`,
@@ -1123,28 +1302,27 @@ test("recipe and publication policy registries close independent immutable ident
 		policy.publicationPolicyRevision,
 	), /bytes differ/);
 	assert.throws(() => validateApprovedWorkflowBytes(policy.previewWorkflowPath, preview, "preview", 999), /Unsupported/);
+	assert.throws(
+		() => validateApprovedAttestationWorkflow(preview.replace(
+			"// Exact-SHA workflow proof is checked by the final publisher after the push checks can complete.",
+			"// branchProtectionRule requiredStatusChecks",
+		), "preview"),
+		/Administration-gated branch-protection read/,
+	);
 
-	const stableR2 = stable
-		.replace("--publication-policy-revision 1", "--publication-policy-revision 2")
-		.replaceAll("promotion?.publicationPolicyRevision !== 1", "promotion?.publicationPolicyRevision !== 2");
-	assert.notEqual(stableR2, stable);
-	assert.match(stableR2, /--publication-policy-revision 2/);
-	assert.match(stableR2, /promotion\?\.publicationPolicyRevision !== 2/);
-	assert.match(stableR2, /!\[1\]\.includes\(manifest\.build\.publicationPolicyRevision\)/);
-	const policyR2 = {
-		...policy,
-		publicationPolicyRevision: 2,
-		stableWorkflowSha256: sha256Bytes(Buffer.from(stableR2)),
-	};
-	const policies = [policy, policyR2];
-	assert.deepEqual(validateApprovedWorkflowBytes(
-		policyR2.stableWorkflowPath,
-		stableR2,
-		"stable",
-		2,
-		policies,
-	), { workflow: policyR2.stableWorkflowPath, environment: "pylon-stable" });
-	assert.throws(() => validateApprovedWorkflowBytes(policy.stableWorkflowPath, stableR2, "stable", 1, policies), /bytes differ/);
+	assert.match(preview, /--publication-policy-revision 2/);
+	assert.match(preview, /preview(?:Manifest)?\.publicationPolicyRevision !== 2/);
+	assert.match(stable, /--publication-policy-revision 2/);
+	assert.match(stable, /promotion\?\.publicationPolicyRevision !== 2/);
+	assert.match(stable, /!\[1, 2\]\.includes\(manifest\.build\.publicationPolicyRevision\)/);
+	assert.throws(
+		() => validateApprovedWorkflowBytes(historicalPolicy.previewWorkflowPath, preview, "preview", 1, policies),
+		/bytes differ/,
+	);
+	assert.throws(
+		() => validateApprovedWorkflowBytes(historicalPolicy.stableWorkflowPath, stable, "stable", 1, policies),
+		/bytes differ/,
+	);
 	const promotedByR2 = firstStable();
 	promotedByR2.promotion.publicationPolicyRevision = 2;
 	assert.equal(validateStableManifest(promotedByR2, registry.recipes, policies), promotedByR2);
@@ -2541,9 +2719,23 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 	}
 });
 
-test("admission is non-authoritative and every protected mutation has a fresh combined App audit", async () => {
+test("default-token source admission avoids Administration reads and every protected mutation has a fresh App audit", async () => {
 	for (const [workflow, step] of [
 		[".github/workflows/pylon-preview-release.yml", "Require the canonical protected push"],
+		[".github/workflows/pylon-stable-release.yml", "Require protected pylon and an exact verified preview source"],
+	]) {
+		const script = githubScriptForStep(workflow, step);
+		for (const value of ["pylon-code", "prime-agent", "refs/heads/pylon", "context.sha", "heads/pylon"]) {
+			assert.ok(script.includes(value), `${workflow}:${step} lacks canonical source binding ${value}`);
+		}
+		assert.doesNotMatch(
+			script,
+			/branchProtectionRule|requiredStatusChecks|getBranchProtection|\/branches\/[^\s"'`]+\/protection|github\.graphql|rulesets\/\{ruleset_id\}/,
+			"default GITHUB_TOKEN source admission must not request Administration or branch-protection data",
+		);
+	}
+
+	for (const [workflow, step] of [
 		[".github/workflows/pylon-preview-release.yml", "Verify exact checks and freeze the approved preview draft"],
 		[".github/workflows/pylon-stable-release.yml", "Require protected pylon and an exact verified preview source"],
 		[".github/workflows/pylon-stable-release.yml", "Re-download and validate the exact stable transaction"],
@@ -2552,10 +2744,12 @@ test("admission is non-authoritative and every protected mutation has a fresh co
 		for (const value of [
 			"Check changelog fragment", "build-check-test", "15368",
 			".github/workflows/changelog-merged-proof.yml", ".github/workflows/ci.yml",
-		]) assert.ok(script.includes(value), `${workflow}:${step} lacks ${value}`);
-		assert.match(script, /JSON\.stringify\(actualPolicy\) !== JSON\.stringify/);
-		assert.doesNotMatch(script, /rulesets\/\{ruleset_id\}|bypass_actors|current_user_can_bypass/,
-			"normal GITHUB_TOKEN admission must not claim authoritative ruleset visibility");
+			"run.check_suite_id === suite.id", 'run.event === "push"',
+		]) assert.ok(script.includes(value), `${workflow}:${step} lacks direct exact-check binding ${value}`);
+		assert.match(script, /check\.head_sha === (?:sha|sourceSha)/);
+		assert.match(script, /run\.head_sha === (?:sha|sourceSha)/);
+		assert.doesNotMatch(script, /branchProtectionRule|requiredStatusChecks|getBranchProtection|github\.graphql/,
+			"default-token exact-check proof must not depend on Administration data");
 	}
 
 	const authoritativeSteps = [
@@ -2759,7 +2953,7 @@ test("stable recovery body durably carries bounded exact canonical manifest byte
 	}), /49152/);
 });
 
-test("stable zero-asset recovery reuses the body-carried attested bytes and excludes only its draft", async () => {
+test("stable p1 zero-asset recovery carries the historical policy revision to attestation", async () => {
 	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-recovery-"));
 	try {
 		const manifest = firstStable();
@@ -2788,6 +2982,7 @@ test("stable zero-asset recovery reuses the body-carried attested bytes and excl
 			},
 			verifyAttestation: (path, policyCommit, policyTree) => {
 				assert.equal(readFileSync(path).equals(bytes), true);
+				assert.equal(JSON.parse(readFileSync(path, "utf8")).promotion.publicationPolicyRevision, 1);
 				assert.equal(policyCommit, source.commit);
 				assert.equal(policyTree, source.tree);
 				verified = true;
@@ -2850,6 +3045,7 @@ test("stable stage survives a crash after createRelease by recovering its exact 
 	const oldManifest = process.env.STABLE_MANIFEST;
 	try {
 		const manifest = firstStable();
+		manifest.promotion.publicationPolicyRevision = 2;
 		const bytes = Buffer.from(canonicalJson(manifest));
 		const manifestPath = join(fixture, PYLON_STABLE_MANIFEST);
 		writeFileSync(manifestPath, bytes);
