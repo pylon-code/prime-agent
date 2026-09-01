@@ -1,6 +1,19 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+	chmodSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	readdirSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	truncateSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createRequire } from "node:module";
@@ -55,7 +68,16 @@ import { validatePreviewWorkflowRunEvidence, verifyGhAttestationResult } from ".
 import { recordPreviewHighWater } from "./verify-pylon-preview-history.mjs";
 import { verifyStableHistoryWithState } from "./verify-pylon-stable-history.mjs";
 import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
-import { ensureDurableConsumerStateDirectory, withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
+import {
+	ensureDurableConsumerStateDirectory,
+	rotateConsumerStateJournal,
+	withConsumerStateLock,
+} from "./lib/pylon-consumer-lock.mjs";
+import {
+	PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+	PYLON_STABLE_HISTORY_MAX_MANIFESTS,
+	readBoundedRegularFile,
+} from "./lib/pylon-bounded-file.mjs";
 import { isExactWithdrawalReplay, selectStableHistoryReleases } from "./prepare-pylon-stable-manifest.mjs";
 import { recoverStableDraft } from "./recover-pylon-stable-manifest.mjs";
 
@@ -74,6 +96,18 @@ const invocation = {
 	workflowRunId: "33428882721",
 	publicationPolicyRevision: 1,
 };
+
+function consumerJournal(statePath) {
+	const journal = `${statePath}.journal`;
+	const checkpoint = readdirSync(journal).find((name) => name.startsWith("checkpoint-"));
+	const epoch = readdirSync(journal).find((name) => name.startsWith("epoch-"));
+	if (!checkpoint || !epoch) throw new Error("consumer journal fixture is incomplete");
+	return { journal, checkpoint: join(journal, checkpoint), epoch: join(journal, epoch) };
+}
+
+function transitionNames(statePath) {
+	return readdirSync(consumerJournal(statePath).epoch).filter((name) => name.startsWith("transition-"));
+}
 
 function fakeReleaseManifest() {
 	return createReleaseManifest({
@@ -401,7 +435,7 @@ test("consumer stable high-water requires explicit initialization, is idempotent
 		writeFileSync(legacyPath, canonicalJson(initialized.state));
 		const migrated = await verifyStableHistoryWithState([firstPath], { statePath: legacyPath });
 		assert.equal(migrated.advanced, false);
-		assert.equal(readdirSync(`${legacyPath}.transactions`).filter((name) => !name.startsWith(".")).length, 1);
+		assert.equal(transitionNames(legacyPath).length, 1);
 		await assert.rejects(() => verifyStableHistoryWithState([firstPath, secondPath], { statePath, initialize: true }), /cannot reset/);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
@@ -469,27 +503,86 @@ test("consumer stable high-water rejects malformed, noncanonical, symlinked, and
 		symlinkSync(realDirectory, `${badLockState}.lock`);
 		await assert.rejects(
 			() => verifyStableHistoryWithState([manifestPath], { statePath: badLockState, initialize: true }),
-			/metadata path.*real directory/,
+			/legacy consumer lock guard.*regular non-symlink file/i,
 		);
-		const badTransactionState = join(fixture, "bad-transactions.json");
-		symlinkSync(realDirectory, `${badTransactionState}.transactions`);
+		const badJournalState = join(fixture, "bad-journal.json");
+		symlinkSync(realDirectory, `${badJournalState}.journal`);
 		await assert.rejects(
-			() => verifyStableHistoryWithState([manifestPath], { statePath: badTransactionState, initialize: true }),
-			/metadata path.*real directory/,
+			() => verifyStableHistoryWithState([manifestPath], { statePath: badJournalState, initialize: true }),
+			/journal directory.*real directory/,
 		);
-		const badLockEntryState = join(fixture, "bad-lock-entry.json");
-		mkdirSync(`${badLockEntryState}.lock`);
-		writeFileSync(join(`${badLockEntryState}.lock`, "unexpected"), "bad\n");
+		const badJournalEntryState = join(fixture, "bad-journal-entry.json");
+		mkdirSync(`${badJournalEntryState}.journal`);
+		writeFileSync(join(`${badJournalEntryState}.journal`, ".unexpected"), "bad\n");
 		await assert.rejects(
-			() => verifyStableHistoryWithState([manifestPath], { statePath: badLockEntryState, initialize: true }),
-			/lock directory contains a malformed entry/,
+			() => verifyStableHistoryWithState([manifestPath], { statePath: badJournalEntryState, initialize: true }),
+			/unexpected hidden entry/,
+		);
+
+		const exactMetadataState = join(fixture, "exact-metadata.json");
+		await verifyStableHistoryWithState([manifestPath], { statePath: exactMetadataState, initialize: true });
+		const exactMetadata = consumerJournal(exactMetadataState);
+		assert.equal(statSync(`${exactMetadataState}.lock`).mode & 0o777, 0o600);
+		assert.equal(statSync(exactMetadataState).mode & 0o777, 0o600);
+		assert.equal(statSync(exactMetadata.journal).mode & 0o777, 0o700);
+		assert.equal(statSync(exactMetadata.epoch).mode & 0o777, 0o700);
+		chmodSync(exactMetadataState, 0o666);
+		chmodSync(`${exactMetadataState}.lock`, 0o666);
+		chmodSync(exactMetadata.journal, 0o777);
+		chmodSync(exactMetadata.checkpoint, 0o666);
+		chmodSync(exactMetadata.epoch, 0o777);
+		for (const name of readdirSync(exactMetadata.epoch)) chmodSync(join(exactMetadata.epoch, name), 0o666);
+		await verifyStableHistoryWithState([manifestPath], { statePath: exactMetadataState });
+		for (const path of [exactMetadataState, `${exactMetadataState}.lock`, exactMetadata.checkpoint]) {
+			assert.equal(statSync(path).mode & 0o022, 0, `${path} kept group/world write bits`);
+		}
+		for (const path of [exactMetadata.journal, exactMetadata.epoch]) {
+			assert.equal(statSync(path).mode & 0o022, 0, `${path} kept group/world write bits`);
+		}
+		if (typeof process.getuid === "function") {
+			await assert.rejects(
+				() => withConsumerStateLock(exactMetadataState, async () => {}, { currentUid: process.getuid() + 1 }),
+				/owned by the current uid/,
+			);
+		}
+
+		const orphanState = join(fixture, "orphan-metadata.json");
+		await verifyStableHistoryWithState([manifestPath], { statePath: orphanState, initialize: true });
+		const orphanEpoch = consumerJournal(orphanState).epoch;
+		const orphanToken = randomUUID();
+		for (const [kind, value, message] of [
+			["heartbeat", { schemaVersion: 2, generation: 1, token: orphanToken, refreshedAtMs: 1 }, /orphan heartbeat/],
+			["terminal", { schemaVersion: 2, generation: 1, token: orphanToken, outcome: "released" }, /orphan terminal/],
+			["applied", { schemaVersion: 2, generation: 1, token: orphanToken, terminalSha256: "0".repeat(64) }, /orphan applied/],
+		]) {
+			const path = join(orphanEpoch, `${kind}-0000000000000001-${orphanToken}.json`);
+			writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+			await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath: orphanState }), message);
+			rmSync(path);
+		}
+		writeFileSync(join(orphanEpoch, "unexpected-extra"), "bad\n", { mode: 0o600 });
+		await assert.rejects(
+			() => verifyStableHistoryWithState([manifestPath], { statePath: orphanState }),
+			/malformed or unexpected entry/,
+		);
+		rmSync(join(orphanEpoch, "unexpected-extra"));
+		const checkpoint = JSON.parse(readFileSync(consumerJournal(orphanState).checkpoint));
+		const symlinkTemporary = join(
+			orphanEpoch,
+			`.pylon-consumer-tmp-v1-p1-e${checkpoint.epochId}-g0000000000000001-w${randomUUID()}` +
+				`-n${"a".repeat(12)}-kclaim-t${"0".repeat(64)}.tmp`,
+		);
+		symlinkSync(manifestPath, symlinkTemporary);
+		await assert.rejects(
+			() => verifyStableHistoryWithState([manifestPath], { statePath: orphanState }),
+			/owned temporary.*regular non-symlink file/,
 		);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
 });
 
-test("consumer stable high-water requires canonical regular manifest files", async () => {
+test("consumer stable high-water pins and bounds every manifest before parsing", async () => {
 	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-state-"));
 	try {
 		const target = join(fixture, "target.json");
@@ -497,10 +590,73 @@ test("consumer stable high-water requires canonical regular manifest files", asy
 		const statePath = join(fixture, "stable.json");
 		writeFileSync(target, canonicalJson(firstStable()));
 		symlinkSync(target, manifestPath);
-		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /regular file/);
+		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /regular non-symlink file/);
 		rmSync(manifestPath);
 		writeFileSync(manifestPath, JSON.stringify(firstStable()));
 		await assert.rejects(() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }), /not canonical/);
+
+		writeFileSync(manifestPath, Buffer.alloc(PYLON_PUBLICATION_MANIFEST_MAX_BYTES + 1));
+		await assert.rejects(
+			() => verifyStableHistoryWithState([manifestPath], { statePath, initialize: true }),
+			/format byte limit/,
+		);
+		writeFileSync(manifestPath, canonicalJson(firstStable()));
+		await assert.rejects(
+			() => verifyStableHistoryWithState([manifestPath], {
+				statePath,
+				initialize: true,
+				fileOptions: { hooks: { afterInitialStat: ({ path }) => writeFileSync(path, "x", { flag: "a" }) } },
+			}),
+			/changed while it was read/,
+		);
+		writeFileSync(manifestPath, canonicalJson(firstStable()));
+		await assert.rejects(
+			() => verifyStableHistoryWithState([manifestPath], {
+				statePath,
+				initialize: true,
+				fileOptions: { hooks: { afterInitialStat: ({ path }) => truncateSync(path, 1) } },
+			}),
+			/changed while it was read/,
+		);
+
+		writeFileSync(manifestPath, canonicalJson(firstStable()));
+		const moved = join(fixture, "pinned-original.json");
+		let swapped = false;
+		await assert.rejects(
+			() => verifyStableHistoryWithState([manifestPath], {
+				statePath: join(fixture, "pinned-state.json"),
+				initialize: true,
+				fileOptions: {
+					hooks: {
+						afterInitialStat: ({ path }) => {
+							if (swapped) return;
+							swapped = true;
+							renameSync(path, moved);
+							writeFileSync(path, "replacement must not be read");
+						},
+					},
+				},
+			}),
+			/changed while it was read/,
+		);
+		assert.equal(swapped, true, "the descriptor re-stat detects a pathname swap without reading the replacement");
+
+		const maximum = join(fixture, "maximum.bin");
+		writeFileSync(maximum, Buffer.alloc(PYLON_PUBLICATION_MANIFEST_MAX_BYTES, 0x61));
+		assert.equal(
+			(await readBoundedRegularFile(maximum, {
+				maxBytes: PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+				description: "Maximum valid bounded input",
+			})).length,
+			PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+		);
+		await assert.rejects(
+			() => verifyStableHistoryWithState(
+				Array(PYLON_STABLE_HISTORY_MAX_MANIFESTS + 1).fill(maximum),
+				{ statePath, initialize: true },
+			),
+			/manifest work bound/,
+		);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
@@ -831,6 +987,11 @@ test("standalone preview verification rejects tamper, extras, symlinks, and nonc
 		writeFileSync(target, release.assets[0].sha256[0]);
 		writeFileSync(join(fixture, PYLON_PREVIEW_MANIFEST), JSON.stringify(preview));
 		assert.throws(() => verifyPreviewPublication(fixture), /not canonical/);
+		writeFileSync(join(fixture, PYLON_PREVIEW_MANIFEST), Buffer.alloc(PYLON_PUBLICATION_MANIFEST_MAX_BYTES + 1));
+		assert.throws(() => verifyPreviewPublication(fixture), /format byte limit/);
+		rmSync(join(fixture, PYLON_PREVIEW_MANIFEST));
+		symlinkSync(join(fixture, PYLON_RELEASE_MANIFEST), join(fixture, PYLON_PREVIEW_MANIFEST));
+		assert.throws(() => verifyPreviewPublication(fixture), /regular non-symlink file/);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
@@ -1013,6 +1174,71 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 
 	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-consumer-lock-")));
 	try {
+		const properLockfile = nodeRequire("proper-lockfile");
+		const legacyLivePath = join(fixture, "legacy-live.json");
+		const releaseLegacy = await properLockfile.lock(legacyLivePath, { realpath: false, retries: 0 });
+		await assert.rejects(
+			() => withConsumerStateLock(legacyLivePath, async () => {}, manualRuntime({ value: 1 })),
+			/Legacy consumer lock directory exists.*confirm that no owner remains.*manually/i,
+		);
+		assert.equal(statSync(`${legacyLivePath}.lock`).isDirectory(), true);
+		await releaseLegacy();
+		await withConsumerStateLock(legacyLivePath, async () => {}, manualRuntime({ value: 1 }));
+		assert.equal(statSync(`${legacyLivePath}.lock`).isFile(), true, "the handoff guard is a permanent regular file");
+		await assert.rejects(
+			() => properLockfile.lock(legacyLivePath, { realpath: false, retries: 0 }),
+			/lock|directory|ENOTDIR|EEXIST/i,
+		);
+
+		const legacyRacePath = join(fixture, "legacy-race.json");
+		const guardReady = deferred();
+		const letGuardLink = deferred();
+		const currentRacer = withConsumerStateLock(legacyRacePath, async () => {}, manualRuntime({ value: 1 }, {
+			afterFileSync: async ({ kind }) => {
+				if (kind !== "legacy-guard") return;
+				guardReady.resolve();
+				await letGuardLink.promise;
+			},
+		}));
+		await guardReady.promise;
+		const releaseRaceLegacy = await properLockfile.lock(legacyRacePath, { realpath: false, retries: 0 });
+		letGuardLink.resolve();
+		await assert.rejects(currentRacer, /Legacy consumer lock directory exists/);
+		await releaseRaceLegacy();
+		await withConsumerStateLock(legacyRacePath, async () => {}, manualRuntime({ value: 100 }));
+		await assert.rejects(
+			() => properLockfile.lock(legacyRacePath, { realpath: false, retries: 0 }),
+			/lock|directory|ENOTDIR|EEXIST/i,
+		);
+
+		const ambiguousLegacyPath = join(fixture, "legacy-ambiguous.json");
+		mkdirSync(`${ambiguousLegacyPath}.lock`, { mode: 0o700 });
+		await assert.rejects(
+			() => withConsumerStateLock(ambiguousLegacyPath, async () => {}, manualRuntime({ value: 100 })),
+			/remove that directory manually/,
+		);
+		assert.equal(statSync(`${ambiguousLegacyPath}.lock`).isDirectory(), true, "ambiguous legacy leases are never stolen");
+
+		for (const hookName of ["afterFileSync", "afterMetadataLink", "afterMetadataDirectorySync"]) {
+			const bootstrapCrashPath = join(fixture, `bootstrap-crash-${hookName}.json`);
+			const reached = deferred();
+			const crash = deferred();
+			const interrupted = withConsumerStateLock(bootstrapCrashPath, async () => {}, manualRuntime({ value: 1 }, {
+				[hookName]: async ({ kind }) => {
+					if (kind !== "checkpoint") return;
+					reached.resolve();
+					await crash.promise;
+				},
+			}));
+			await reached.promise;
+			await withConsumerStateLock(bootstrapCrashPath, async (_path, transaction) => {
+				await transaction.commitState(bytes("recovered-bootstrap"));
+			}, manualRuntime({ value: 100 }));
+			crash.reject(new Error(`simulated bootstrap crash at ${hookName}`));
+			await assert.rejects(interrupted, /simulated bootstrap crash/);
+			assert.deepEqual(JSON.parse(readFileSync(bootstrapCrashPath, "utf8")), { value: "recovered-bootstrap" });
+		}
+
 		const activePath = join(fixture, "active.json");
 		const activeClock = { value: 1 };
 		const activeOptions = manualRuntime(activeClock);
@@ -1095,7 +1321,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		assert.match(recoveries.find((result) => result.status === "rejected").reason.message, /actively locked/);
 		oldRelease.resolve();
 		await oldOwnerRejected;
-		const raceClaims = readdirSync(`${racePath}.lock`).filter((name) => name.startsWith("claim-"));
+		const raceClaims = readdirSync(consumerJournal(racePath).epoch).filter((name) => name.startsWith("claim-"));
 		assert.equal(raceClaims.length, 2);
 
 		const fencedPath = join(fixture, "fenced.json");
@@ -1119,7 +1345,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		await assert.rejects(retiredWriter, /lost ownership/);
 		assert.deepEqual(JSON.parse(readFileSync(fencedPath, "utf8")), { value: "winner" });
 		assert.equal(
-			readdirSync(`${fencedPath}.transactions`).filter((name) => !name.startsWith(".")).length,
+			transitionNames(fencedPath).length,
 			1,
 			"a retired writer cannot publish a sibling transition from GENESIS",
 		);
@@ -1150,14 +1376,17 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		letStaleProjectionRename.resolve();
 		await firstProjection;
 		assert.deepEqual(JSON.parse(readFileSync(projectionPath, "utf8")), { value: "three" });
-		assert.equal(readdirSync(`${projectionPath}.transactions`).filter((name) => !name.startsWith(".")).length, 3);
-		writeFileSync(join(`${projectionPath}.transactions`, `${"f".repeat(64)}.json`), "{}\n");
+		assert.equal(transitionNames(projectionPath).length, 3);
+		writeFileSync(join(consumerJournal(projectionPath).epoch, `transition-${"f".repeat(64)}.json`), "{}\n");
 		await assert.rejects(
 			() => withConsumerStateLock(projectionPath, async () => {}, manualRuntime(projectionClock)),
 			/unreachable transition/,
 		);
 
 		for (const crashPoint of [
+			["afterFileSync", "legacy-guard"],
+			["afterMetadataLink", "legacy-guard"],
+			["afterMetadataDirectorySync", "legacy-guard"],
 			["afterFileSync", "claim"],
 			["afterMetadataLink", "claim"],
 			["afterMetadataDirectorySync", "claim"],
@@ -1199,6 +1428,126 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			await assert.rejects(interrupted, /simulated crash|retired/);
 			await withConsumerStateLock(crashPath, async () => {}, manualRuntime(crashClock));
 			assert.deepEqual(JSON.parse(readFileSync(crashPath, "utf8")), { value: "recovered" });
+			assert.equal(
+				readdirSync(consumerJournal(crashPath).epoch).some((name) => name.startsWith(".")),
+				false,
+				"owned crash temporaries converge after fencing",
+			);
+		}
+
+		const legacyRotationPath = join(fixture, "legacy-rotation.json");
+		writeFileSync(legacyRotationPath, bytes("legacy-anchor"), { mode: 0o600 });
+		assert.equal((await rotateConsumerStateJournal(legacyRotationPath, manualRuntime({ value: 1 }))).epoch, 2);
+		await withConsumerStateLock(legacyRotationPath, async (_path, transaction) => {
+			assert.deepEqual(JSON.parse(transaction.readStateBytes()), { value: "legacy-anchor" });
+		}, manualRuntime({ value: 2 }));
+
+		const rotationAuthorityPath = join(fixture, "rotation-authority.json");
+		const rotationClock = { value: 1 };
+		const pausedRotationOwner = deferred();
+		const rotationOwnerEntered = deferred();
+		const oldRotationOwner = withConsumerStateLock(rotationAuthorityPath, async (_path, transaction) => {
+			rotationOwnerEntered.resolve();
+			await pausedRotationOwner.promise;
+			await transaction.commitState(bytes("stale-after-rotation"));
+		}, manualRuntime(rotationClock));
+		await rotationOwnerEntered.promise;
+		await assert.rejects(
+			() => rotateConsumerStateJournal(rotationAuthorityPath, manualRuntime(rotationClock)),
+			/actively locked/,
+		);
+		rotationClock.value = 100;
+		const rotatedAuthority = await rotateConsumerStateJournal(rotationAuthorityPath, manualRuntime(rotationClock));
+		assert.equal(rotatedAuthority.epoch, 2);
+		pausedRotationOwner.resolve();
+		await assert.rejects(oldRotationOwner, /retired|fenced|lost ownership/);
+		await withConsumerStateLock(rotationAuthorityPath, async (_path, transaction) => {
+			assert.equal(transaction.readStateBytes(), null);
+			await transaction.commitState(bytes("after-rotation"));
+		}, manualRuntime(rotationClock));
+		assert.deepEqual(JSON.parse(readFileSync(rotationAuthorityPath, "utf8")), { value: "after-rotation" });
+		assert.deepEqual(
+			readdirSync(`${rotationAuthorityPath}.journal`).filter((name) => !name.startsWith(".")),
+			readdirSync(`${rotationAuthorityPath}.journal`).filter((name) => !name.startsWith(".")).filter(
+				(name) => name.startsWith("checkpoint-") || name.startsWith("epoch-"),
+			),
+		);
+		assert.equal(readdirSync(`${rotationAuthorityPath}.journal`).filter((name) => name.startsWith("checkpoint-")).length, 1);
+		assert.equal(readdirSync(`${rotationAuthorityPath}.journal`).filter((name) => name.startsWith("epoch-")).length, 1);
+
+		const depthRotationPath = join(fixture, "depth-rotation.json");
+		const depthOptions = { ...manualRuntime({ value: 1 }), maxTransactionDepth: 1 };
+		await withConsumerStateLock(depthRotationPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("one"));
+		}, depthOptions);
+		await assert.rejects(
+			() => withConsumerStateLock(depthRotationPath, async (_path, transaction) => {
+				await transaction.commitState(bytes("blocked"));
+			}, { ...manualRuntime({ value: 2 }), maxTransactionDepth: 1 }),
+			/run the consumer journal rotation command/,
+		);
+		await rotateConsumerStateJournal(depthRotationPath, { ...manualRuntime({ value: 3 }), maxTransactionDepth: 1 });
+		await withConsumerStateLock(depthRotationPath, async (_path, transaction) => {
+			assert.deepEqual(JSON.parse(transaction.readStateBytes()), { value: "one" });
+			await transaction.commitState(bytes("two"));
+		}, { ...manualRuntime({ value: 4 }), maxTransactionDepth: 1 });
+		assert.deepEqual(JSON.parse(readFileSync(depthRotationPath, "utf8")), { value: "two" });
+
+		const claimRotationPath = join(fixture, "claim-rotation.json");
+		for (let generation = 1; generation <= 2; generation += 1) {
+			await withConsumerStateLock(
+				claimRotationPath,
+				async () => {},
+				{ ...manualRuntime({ value: generation }), maxLockGenerations: 3 },
+			);
+		}
+		await assert.rejects(
+			() => withConsumerStateLock(
+				claimRotationPath,
+				async () => {},
+				{ ...manualRuntime({ value: 3 }), maxLockGenerations: 3 },
+			),
+			/claim reserve.*rotation command/,
+		);
+		assert.equal((await rotateConsumerStateJournal(
+			claimRotationPath,
+			{ ...manualRuntime({ value: 4 }), maxLockGenerations: 3 },
+		)).epoch, 2);
+
+		for (const [hookName, wantedKind] of [
+			["afterRotationEpochSync", null],
+			["afterFileSync", "checkpoint"],
+			["afterMetadataLink", "checkpoint"],
+			["afterMetadataDirectorySync", "checkpoint"],
+			["afterRotationCheckpoint", null],
+		]) {
+			const rotationCrashPath = join(fixture, `rotation-crash-${hookName}.json`);
+			const rotationCrashClock = { value: 1 };
+			await withConsumerStateLock(rotationCrashPath, async (_path, transaction) => {
+				await transaction.commitState(bytes("anchored"));
+			}, manualRuntime(rotationCrashClock));
+			const reached = deferred();
+			const resume = deferred();
+			let armed = true;
+			const interrupted = rotateConsumerStateJournal(rotationCrashPath, manualRuntime(rotationCrashClock, {
+				[hookName]: async (event = {}) => {
+					if (!armed || (wantedKind !== null && event.kind !== wantedKind)) return;
+					armed = false;
+					reached.resolve();
+					await resume.promise;
+				},
+			}));
+			await reached.promise;
+			rotationCrashClock.value = 100;
+			await withConsumerStateLock(rotationCrashPath, async (_path, transaction) => {
+				assert.deepEqual(JSON.parse(transaction.readStateBytes()), { value: "anchored" });
+			}, manualRuntime(rotationCrashClock));
+			resume.resolve();
+			await Promise.allSettled([interrupted]);
+			const rootEntries = readdirSync(`${rotationCrashPath}.journal`);
+			assert.equal(rootEntries.filter((name) => name.startsWith("checkpoint-")).length, 1);
+			assert.equal(rootEntries.filter((name) => name.startsWith("epoch-")).length, 1);
+			assert.equal(rootEntries.some((name) => name.startsWith(".")), false);
 		}
 
 		const swapRoot = join(fixture, "swap-root");

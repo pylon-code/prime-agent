@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 
-import { lstatSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+	PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+	PYLON_STABLE_HISTORY_MAX_BYTES,
+	PYLON_STABLE_HISTORY_MAX_MANIFESTS,
+	readBoundedRegularFile,
+} from "./lib/pylon-bounded-file.mjs";
 import { PYLON_RELEASE_REPOSITORY } from "./lib/pylon-release.mjs";
 import { withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 import {
@@ -53,22 +58,36 @@ function readCanonicalState(bytes) {
 	return state;
 }
 
-function verifiedManifestFiles(paths) {
+async function verifiedManifestFiles(paths, fileOptions = {}) {
 	if (!Array.isArray(paths) || paths.length === 0) throw new Error("Provide every stable manifest from sequence 1 through current high-water.");
-	return paths.map((input) => {
+	if (paths.length > PYLON_STABLE_HISTORY_MAX_MANIFESTS) {
+		throw new Error(`Stable history exceeds its ${PYLON_STABLE_HISTORY_MAX_MANIFESTS}-manifest work bound.`);
+	}
+	let totalBytes = 0;
+	const manifests = [];
+	for (const input of paths) {
 		const path = resolve(input);
-		if (!lstatSync(path).isFile()) throw new Error(`Stable manifest is not a regular file: ${path}`);
-		const bytes = readFileSync(path);
+		const bytes = await readBoundedRegularFile(path, {
+			maxBytes: PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+			description: `Stable manifest ${path}`,
+			...fileOptions,
+		});
+		if (bytes === null) throw new Error(`Stable manifest does not exist: ${path}`);
+		totalBytes += bytes.length;
+		if (totalBytes > PYLON_STABLE_HISTORY_MAX_BYTES) {
+			throw new Error("Stable history exceeds its total manifest byte bound.");
+		}
 		const manifest = validateStableManifest(JSON.parse(bytes));
 		if (bytes.toString("utf8") !== canonicalJson(manifest)) throw new Error(`Stable manifest is not canonical: ${path}`);
-		return manifest;
-	});
+		manifests.push(manifest);
+	}
+	return manifests;
 }
 
-export async function verifyStableHistoryWithState(paths, { statePath, initialize = false }) {
+export async function verifyStableHistoryWithState(paths, { statePath, initialize = false, fileOptions = {} }) {
 	if (typeof statePath !== "string" || !statePath) throw new Error("A consumer-local --state path is required.");
 	const absoluteStatePath = resolve(statePath);
-	const history = validateStableHistory(verifiedManifestFiles(paths));
+	const history = validateStableHistory(await verifiedManifestFiles(paths, fileOptions));
 	const witnessed = new Map(history.map((manifest) => [manifest.sequence, {
 		tag: manifest.tag,
 		sha256: sha256Bytes(Buffer.from(canonicalJson(manifest))),

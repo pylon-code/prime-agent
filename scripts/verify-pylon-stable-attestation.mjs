@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+	PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+	readBoundedRegularFileSync,
+} from "./lib/pylon-bounded-file.mjs";
 import {
 	canonicalJson,
 	PYLON_PUBLICATION_REF,
@@ -29,7 +32,11 @@ function parseArgs(args) {
 }
 
 export function verifyStableAttestation(path, sourceSha, sourceTree) {
-	const bytes = readFileSync(path);
+	const bytes = readBoundedRegularFileSync(path, {
+		maxBytes: PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+		description: "Stable attestation manifest",
+	});
+	if (bytes === null) throw new Error("Stable attestation manifest does not exist.");
 	const manifest = validateStableManifest(JSON.parse(bytes));
 	if (canonicalJson(manifest) !== bytes.toString("utf8")) throw new Error("Stable manifest is not canonical publication JSON.");
 	if (manifest.promotion.policyCommit !== sourceSha || manifest.promotion.policyTree !== sourceTree) {

@@ -5,6 +5,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+	PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+	readBoundedRegularFileSync,
+} from "./lib/pylon-bounded-file.mjs";
+import {
 	hashBytes,
 	PYLON_RELEASE_MANIFEST,
 	validateReleaseManifest,
@@ -32,11 +36,19 @@ function parseArgs(args) {
 }
 
 export function verifyPreviewPublication(artifactsDir, { historical = false } = {}) {
-	const releaseBytes = readFileSync(join(artifactsDir, PYLON_RELEASE_MANIFEST));
+	const releaseBytes = readBoundedRegularFileSync(join(artifactsDir, PYLON_RELEASE_MANIFEST), {
+		maxBytes: PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+		description: "Release manifest",
+	});
+	if (releaseBytes === null) throw new Error("Release manifest does not exist.");
 	const releaseManifest = JSON.parse(releaseBytes);
 	if (historical) validatePublishedReleaseManifest(releaseManifest);
 	else validateReleaseManifest(releaseManifest);
-	const previewBytes = readFileSync(join(artifactsDir, PYLON_PREVIEW_MANIFEST));
+	const previewBytes = readBoundedRegularFileSync(join(artifactsDir, PYLON_PREVIEW_MANIFEST), {
+		maxBytes: PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+		description: "Preview manifest",
+	});
+	if (previewBytes === null) throw new Error("Preview manifest does not exist.");
 	const previewManifest = JSON.parse(previewBytes);
 	if (canonicalJson(previewManifest) !== previewBytes.toString("utf8")) {
 		throw new Error("Preview manifest is not canonical publication JSON.");

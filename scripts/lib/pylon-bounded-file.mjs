@@ -1,0 +1,136 @@
+import {
+	closeSync,
+	constants,
+	fstatSync,
+	lstatSync,
+	openSync,
+	readSync,
+} from "node:fs";
+import { lstat, open } from "node:fs/promises";
+export const PYLON_PUBLICATION_MANIFEST_MAX_BYTES = 64 * 1024;
+export const PYLON_STABLE_HISTORY_MAX_MANIFESTS = 4096;
+export const PYLON_STABLE_HISTORY_MAX_BYTES = 32 * 1024 * 1024;
+
+
+function sameStat(left, right) {
+	return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
+		left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+
+export async function readBoundedRegularFile(
+	path,
+	{
+		maxBytes,
+		minBytes = 1,
+		description = "Input",
+		openFile = open,
+		lstatEntry = lstat,
+		validateHandle,
+		hooks,
+	} = {},
+) {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Number.isSafeInteger(minBytes) || minBytes < 0 || minBytes > maxBytes) {
+		throw new Error("Bounded file limits are invalid.");
+	}
+	let pathEntry;
+	try {
+		pathEntry = await lstatEntry(path);
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		throw error;
+	}
+	if (pathEntry.isSymbolicLink?.() || !pathEntry.isFile()) {
+		throw new Error(`${description} is not one regular non-symlink file.`);
+	}
+	let handle;
+	try {
+		handle = await openFile(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		if (["ELOOP", "EISDIR"].includes(error?.code)) {
+			throw new Error(`${description} is not one regular non-symlink file.`);
+		}
+		throw error;
+	}
+	try {
+		let before = await handle.stat();
+		if (!before.isFile()) throw new Error(`${description} is not one regular non-symlink file.`);
+		if (validateHandle) before = await validateHandle(handle, before, description);
+		if (before.size < minBytes || before.size > maxBytes) throw new Error(`${description} exceeds its format byte limit or is malformed.`);
+		await hooks?.afterInitialStat?.({ path, handle, stat: before });
+		const bytes = Buffer.alloc(before.size);
+		let offset = 0;
+		while (offset < bytes.length) {
+			const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+			if (bytesRead === 0) throw new Error(`${description} changed while it was read.`);
+			offset += bytesRead;
+		}
+		const extra = Buffer.alloc(1);
+		const { bytesRead: extraBytes } = await handle.read(extra, 0, 1, bytes.length);
+		await hooks?.beforeFinalStat?.({ path, handle, bytes });
+		const after = await handle.stat();
+		if (extraBytes !== 0 || !sameStat(before, after)) throw new Error(`${description} changed while it was read.`);
+		return bytes;
+	} finally {
+		await handle.close();
+	}
+}
+
+
+export function readBoundedRegularFileSync(
+	path,
+	{
+		maxBytes,
+		minBytes = 1,
+		description = "Input",
+		openFile = openSync,
+		lstatEntry = lstatSync,
+		statFile = fstatSync,
+		readFile = readSync,
+		closeFile = closeSync,
+		hooks,
+	} = {},
+) {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Number.isSafeInteger(minBytes) || minBytes < 0 || minBytes > maxBytes) {
+		throw new Error("Bounded file limits are invalid.");
+	}
+	let pathEntry;
+	try {
+		pathEntry = lstatEntry(path);
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		throw error;
+	}
+	if (pathEntry.isSymbolicLink?.() || !pathEntry.isFile()) {
+		throw new Error(`${description} is not one regular non-symlink file.`);
+	}
+	let descriptor;
+	try {
+		descriptor = openFile(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+	} catch (error) {
+		if (error?.code === "ENOENT") return null;
+		if (["ELOOP", "EISDIR"].includes(error?.code)) throw new Error(`${description} is not one regular non-symlink file.`);
+		throw error;
+	}
+	try {
+		const before = statFile(descriptor);
+		if (!before.isFile()) throw new Error(`${description} is not one regular non-symlink file.`);
+		if (before.size < minBytes || before.size > maxBytes) throw new Error(`${description} exceeds its format byte limit or is malformed.`);
+		hooks?.afterInitialStat?.({ path, descriptor, stat: before });
+		const bytes = Buffer.alloc(before.size);
+		let offset = 0;
+		while (offset < bytes.length) {
+			const bytesRead = readFile(descriptor, bytes, offset, bytes.length - offset, offset);
+			if (bytesRead === 0) throw new Error(`${description} changed while it was read.`);
+			offset += bytesRead;
+		}
+		const extra = Buffer.alloc(1);
+		const extraBytes = readFile(descriptor, extra, 0, 1, bytes.length);
+		hooks?.beforeFinalStat?.({ path, descriptor, bytes });
+		const after = statFile(descriptor);
+		if (extraBytes !== 0 || !sameStat(before, after)) throw new Error(`${description} changed while it was read.`);
+		return bytes;
+	} finally {
+		closeFile(descriptor);
+	}
+}

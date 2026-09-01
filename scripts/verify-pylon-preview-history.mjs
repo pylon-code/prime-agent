@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
-import { lstatSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+	PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+	readBoundedRegularFile,
+} from "./lib/pylon-bounded-file.mjs";
 import {
 	canonicalJson,
 	parsePreviewTag,
@@ -116,8 +119,11 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
 	try {
 		const args = parseArgs(process.argv.slice(2));
 		const previewPath = join(args.artifactDir, PYLON_PREVIEW_MANIFEST);
-		if (!lstatSync(previewPath).isFile()) throw new Error("Preview manifest is not one regular file.");
-		const previewBytes = readFileSync(previewPath);
+		const previewBytes = await readBoundedRegularFile(previewPath, {
+			maxBytes: PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
+			description: "Preview manifest",
+		});
+		if (previewBytes === null) throw new Error("Preview manifest does not exist.");
 		const untrusted = JSON.parse(previewBytes);
 		const verified = verifyPreviewAttestations({
 			artifactDir: args.artifactDir,

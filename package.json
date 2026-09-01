@@ -38,6 +38,7 @@
 		"release:pylon:verify-attestations": "node scripts/verify-pylon-publication-attestations.mjs",
 		"release:pylon:verify-stable-attestation": "node scripts/verify-pylon-stable-attestation.mjs",
 		"release:pylon:verify-stable-history": "node scripts/verify-pylon-stable-history.mjs",
+		"release:pylon:rotate-consumer-journal": "node scripts/rotate-pylon-consumer-journal.mjs",
 		"release:pylon:smoke": "node scripts/smoke-pylon-prime-agent-release.mjs",
 		"test:pylon-release": "node --test scripts/pylon-prime-agent-release.test.mjs",
 		"test:pylon-publication": "node --test scripts/pylon-publication.test.mjs",
