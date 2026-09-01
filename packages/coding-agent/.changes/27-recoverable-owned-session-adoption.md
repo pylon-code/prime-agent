@@ -1,0 +1,1 @@
+- Added recoverable adoption for caller-owned daemon sessions. ([#27](https://github.com/pylon-code/prime-agent/issues/27))

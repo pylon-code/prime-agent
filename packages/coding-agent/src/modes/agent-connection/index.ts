@@ -9,14 +9,34 @@ export type {
 	PromptLifecycleStateSnapshot,
 } from "../../core/prompt-lifecycle.js";
 export type {
+	DaemonEventCursor,
+	DaemonRecoverableOwnedSessionAdoptionProof,
+	DaemonRecoverableOwnedSessionConfirmResult,
+	DaemonRecoverableOwnedSessionCreateResult,
+	DaemonRecoverableOwnedSessionPrepareResult,
+} from "../daemon/daemon-protocol.js";
+export type {
 	DaemonAgentConnectionOptions,
 	DaemonOwnedSessionContractProof,
 	DaemonOwnedSessionDaemonIdentity,
 	DaemonOwnedSessionDisposeOptions,
 	DaemonOwnedSessionDisposeResult,
+	DaemonRecoverableOwnedSessionAdoptionOptions,
+	DaemonRecoverableOwnedSessionAdoptionResult,
 } from "./daemon-agent-connection.js";
 export { DaemonAgentConnection } from "./daemon-agent-connection.js";
 export { InProcessAgentConnection } from "./in-process-agent-connection.js";
+export {
+	adoptRecoverableOwnedSession,
+	confirmRecoverableOwnedSessionAdoption,
+	createRecoverableOwnedSession,
+	type RecoverableOwnedSessionAdoption,
+	type RecoverableOwnedSessionAdoptionConfirmation,
+	type RecoverableOwnedSessionAdoptionOptions,
+	type RecoverableOwnedSessionCreateOptions,
+	type RecoverableOwnedSessionCreation,
+} from "./recoverable-owned-session.js";
+
 export { createAgentConnectionCommands, createAgentConnectionState } from "./snapshot.js";
 export type {
 	AgentConnection,

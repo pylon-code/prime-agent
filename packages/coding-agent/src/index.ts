@@ -298,6 +298,8 @@ export {
 	type DaemonOwnedSessionDaemonIdentity,
 	type DaemonOwnedSessionDisposeOptions,
 	type DaemonOwnedSessionDisposeResult,
+	type DaemonRecoverableOwnedSessionAdoptionOptions,
+	type DaemonRecoverableOwnedSessionAdoptionResult,
 	type ExpiredPromptLifecycle,
 	InProcessAgentConnection,
 	type PromptEventAttribution,
@@ -307,6 +309,16 @@ export {
 	type PromptLifecycleSnapshot,
 	type PromptLifecycleStateSnapshot,
 } from "./modes/agent-connection/index.js";
+export {
+	adoptRecoverableOwnedSession,
+	confirmRecoverableOwnedSessionAdoption,
+	createRecoverableOwnedSession,
+	type RecoverableOwnedSessionAdoption,
+	type RecoverableOwnedSessionAdoptionConfirmation,
+	type RecoverableOwnedSessionAdoptionOptions,
+	type RecoverableOwnedSessionCreateOptions,
+	type RecoverableOwnedSessionCreation,
+} from "./modes/agent-connection/recoverable-owned-session.js";
 // Run modes for programmatic SDK usage
 export {
 	ClientPromptStashStore,
@@ -327,6 +339,7 @@ export {
 	type DaemonCommand,
 	type DaemonCommandEnvelope,
 	type DaemonCommandId,
+	type DaemonEventCursor,
 	type DaemonEventEnvelope,
 	type DaemonEventId,
 	type DaemonEventMeta,
@@ -341,6 +354,10 @@ export {
 	type DaemonProtocolInfo,
 	type DaemonProtocolName,
 	type DaemonProtocolVersion,
+	type DaemonRecoverableOwnedSessionAdoptionProof,
+	type DaemonRecoverableOwnedSessionConfirmResult,
+	type DaemonRecoverableOwnedSessionCreateResult,
+	type DaemonRecoverableOwnedSessionPrepareResult,
 	type DaemonReplayInfo,
 	type DaemonReplayStatus,
 	type DaemonResponse,
@@ -425,6 +442,7 @@ export {
 	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
 	PRIME_AGENT_SDK_FEATURES,
 	type PrimeAgentSdkFeature,
+	RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE,
 } from "./sdk-features.js";
 // Clipboard utilities
 export { copyToClipboard } from "./utils/clipboard.js";

@@ -7,8 +7,9 @@ import {
 	maybeRunOwnedSessionWorkerFrontend,
 } from "./cli/owned-session-worker.js";
 import { APP_NAME } from "./config.js";
+import type { DaemonWorkerBootstrapEnvironment } from "./modes/daemon/daemon-worker-protocol.js";
 
-export async function runCli(): Promise<void> {
+export async function runCli(daemonWorkerBootstrap?: DaemonWorkerBootstrapEnvironment): Promise<void> {
 	try {
 		enableCompileCache?.();
 	} catch {
@@ -38,7 +39,7 @@ export async function runCli(): Promise<void> {
 		setGlobalDispatcher(new EnvHttpProxyAgent({ bodyTimeout: 0, headersTimeout: 0 }));
 
 		try {
-			await main(process.argv.slice(2));
+			await main(process.argv.slice(2), { daemonWorkerBootstrap });
 		} finally {
 			closeOwnedSessionWorkerOwnerWatch();
 		}

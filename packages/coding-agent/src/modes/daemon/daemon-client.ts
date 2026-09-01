@@ -67,6 +67,8 @@ interface PendingDaemonRequest {
 	recoverAcrossReconnect: boolean;
 	/** Re-checked against the new hello before a reconnect replay. */
 	compatibilities: readonly DaemonCommandCompatibility[];
+	/** Fences generation-bound recovery commands before a reconnect replay. */
+	expectedSupervisorGeneration?: string;
 }
 
 function daemonEndpointDetails(socketPath: string): string {
@@ -164,6 +166,10 @@ export class DaemonClient {
 
 	get hello(): DaemonHello | undefined {
 		return this.helloMessage;
+	}
+
+	get clientId(): string {
+		return this.protocolClientId;
 	}
 
 	get isConnected(): boolean {
@@ -380,6 +386,13 @@ export class DaemonClient {
 			);
 		}
 		const hello = this.helloMessage ?? (await this.waitForHello());
+		const expectedSupervisorGeneration =
+			"expectedSupervisorGeneration" in command && typeof command.expectedSupervisorGeneration === "string"
+				? command.expectedSupervisorGeneration
+				: undefined;
+		if (expectedSupervisorGeneration !== undefined && hello.supervisorGeneration !== expectedSupervisorGeneration) {
+			throw new Error("Recoverable owned session adoption is unavailable");
+		}
 		const compatibilities = getDaemonCommandCompatibilities(command);
 		const missingCompatibility = compatibilities.find(
 			(compatibility) => !this.meetsCommandCompatibility(hello, compatibility),
@@ -461,6 +474,9 @@ export class DaemonClient {
 				acknowledgeResult,
 				recoverAcrossReconnect: options.recoverAcrossReconnect !== false,
 				compatibilities,
+				...("expectedSupervisorGeneration" in command && typeof command.expectedSupervisorGeneration === "string"
+					? { expectedSupervisorGeneration: command.expectedSupervisorGeneration }
+					: {}),
 			};
 			this.pendingRequests.set(id, pending);
 			this.armPendingRequestTimeout(id, pending);
@@ -546,6 +562,14 @@ export class DaemonClient {
 						continue;
 					}
 					pending.awaitingReconnect = false;
+					if (
+						pending.expectedSupervisorGeneration !== undefined &&
+						message.supervisorGeneration !== pending.expectedSupervisorGeneration
+					) {
+						this.pendingRequests.delete(id);
+						pending.reject(new Error("Recoverable owned session adoption is unavailable"));
+						continue;
+					}
 					const missingCompatibility = pending.compatibilities.find(
 						(compatibility) => !this.meetsCommandCompatibility(message, compatibility),
 					);

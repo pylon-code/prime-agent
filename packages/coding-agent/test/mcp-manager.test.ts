@@ -281,12 +281,79 @@ describe("McpManager", () => {
 			credentialSource: "acp",
 		});
 
-		expect(manager.replaceAcpServers([], "owner-a")).toBe(true);
+		expect(manager.transferAcpServersOwner("owner-a", "owner-b")).toBe(true);
+		expect(await handlers["mcp.config"]({ server: "task" })).toEqual({
+			type: "http",
+			url: "https://task.example/mcp",
+			headers: { Authorization: "Bearer task-token" },
+			credentialSource: "acp",
+		});
+		expect(() => manager.transferAcpServersOwner("owner-a", "owner-c")).toThrow("owned by another client");
+		expect(manager.replaceAcpServers([], "owner-b")).toBe(true);
 		expect(await handlers["mcp.config"]({ server: "task" })).toEqual({
 			type: "http",
 			url: "https://user.example/mcp",
 			oauth: true,
 		});
 		expect(authStorage.get("mcp:task")).toMatchObject({ access: "stored-oauth-token" });
+	});
+
+	it("proves idempotent ACP owner transfer and rollback after response loss", () => {
+		const manager = new McpManager({ authStorage });
+		manager.replaceAcpServers(
+			[{ name: "task", type: "http", url: "https://task.example/mcp", headers: {} }],
+			"owner-a",
+		);
+		const transferred = manager.transferAcpServersOwnerTransaction("transaction-a", "owner-a", "owner-b");
+		expect(transferred).toEqual({
+			transactionId: "transaction-a",
+			previousOwnerId: "owner-a",
+			nextOwnerId: "owner-b",
+			changed: true,
+			state: "transferred",
+		});
+		expect(manager.transferAcpServersOwnerTransaction("transaction-a", "owner-a", "owner-b")).toEqual(transferred);
+		expect(manager.queryAcpServersOwnerTransaction("transaction-a", "owner-a", "owner-b")).toEqual(transferred);
+		expect(() => manager.queryAcpServersOwnerTransaction("transaction-a", "owner-a", "owner-c")).toThrow(
+			"transaction tuple changed",
+		);
+
+		const rolledBack = manager.rollbackAcpServersOwnerTransaction("transaction-a", "owner-a", "owner-b");
+		expect(rolledBack).toEqual({ ...transferred, state: "rolled_back" });
+		expect(manager.rollbackAcpServersOwnerTransaction("transaction-a", "owner-a", "owner-b")).toEqual(rolledBack);
+		expect(manager.queryAcpServersOwnerTransaction("transaction-a", "owner-a", "owner-b")).toEqual(rolledBack);
+		const transferredAgain = manager.transferAcpServersOwnerTransaction("transaction-a", "owner-a", "owner-b");
+		expect(transferredAgain).toEqual(transferred);
+		expect(manager.queryAcpServersOwnerTransaction("transaction-a", "owner-a", "owner-b")).toEqual(transferred);
+		expect(() => manager.transferAcpServersOwner("owner-a", "owner-c")).toThrow("owned by another client");
+		expect(manager.replaceAcpServers([], "owner-b")).toBe(true);
+
+		const empty = new McpManager({ authStorage });
+		expect(empty.transferAcpServersOwnerTransaction("transaction-empty", "owner-a", "owner-b")).toMatchObject({
+			changed: false,
+			state: "transferred",
+		});
+		expect(empty.rollbackAcpServersOwnerTransaction("transaction-empty", "owner-a", "owner-b")).toMatchObject({
+			changed: false,
+			state: "rolled_back",
+		});
+		empty.retireAcpServersOwnerTransaction("transaction-empty", "owner-a", "owner-b");
+		expect(() => empty.queryAcpServersOwnerTransaction("transaction-empty", "owner-a", "owner-b")).toThrow(
+			"transaction is unknown",
+		);
+	});
+
+	it("bounds unconfirmed ACP owner transfer receipts under churn", () => {
+		const manager = new McpManager({ authStorage });
+		for (let index = 0; index < 400; index++) {
+			manager.transferAcpServersOwnerTransaction(`transaction-${index}`, "owner-a", "owner-b");
+		}
+		const receipts = (manager as unknown as { acpOwnerTransfers: Map<string, unknown> }).acpOwnerTransfers;
+		expect(receipts.size).toBeLessThanOrEqual(256);
+		expect(() => manager.queryAcpServersOwnerTransaction("transaction-0", "owner-a", "owner-b")).toThrow(
+			"transaction is unknown",
+		);
+		manager.retireAcpServersOwnerTransaction("transaction-399", "owner-a", "owner-b");
+		expect(receipts.has("transaction-399")).toBe(false);
 	});
 });

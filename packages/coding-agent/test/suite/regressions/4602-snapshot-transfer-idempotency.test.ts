@@ -28,7 +28,12 @@ const snapshotId = "snapshot-4602";
 interface WorkerHarness {
 	descriptor: { workerId: string; rootActiveSessionId: string; lifecycle: "ready" | "recovering"; pid: number };
 	authorizedActiveSessionIds: Set<string>;
-	client?: { close: ReturnType<typeof vi.fn>; request: ReturnType<typeof vi.fn> };
+	client?: {
+		close: ReturnType<typeof vi.fn>;
+		request: ReturnType<typeof vi.fn>;
+		matchesAuthenticatedIncarnation: (incarnation: string) => boolean;
+	};
+	workerIncarnation?: string;
 	summaries: Map<string, SessionSummary>;
 	snapshotCache: Map<string, DaemonAttachResult>;
 	transcriptCaches: Map<string, SnapshotTranscriptCache>;
@@ -126,7 +131,8 @@ function workerHarness() {
 			pid: 987_654_321,
 		},
 		authorizedActiveSessionIds: new Set([activeSessionId]),
-		client: { close, request },
+		client: { close, request, matchesAuthenticatedIncarnation: (incarnation) => incarnation === "incarnation-4602" },
+		workerIncarnation: "incarnation-4602",
 		summaries: new Map([[activeSessionId, summary()]]),
 		snapshotCache: new Map(),
 		transcriptCaches: new Map<string, SnapshotTranscriptCache>(),

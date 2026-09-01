@@ -12,6 +12,14 @@ import type { AuthStorage } from "../auth-storage.js";
 import type { McpServerConfig } from "../settings-manager.js";
 import type { AcpMcpServerConfig } from "./acp-mcp-types.js";
 
+export interface AcpMcpOwnerTransferProof {
+	transactionId: string;
+	previousOwnerId: string;
+	nextOwnerId: string;
+	changed: boolean;
+	state: "transferred" | "rolled_back";
+}
+
 export interface McpManagerOptions {
 	authStorage: AuthStorage;
 	/** Reads the current Settings.mcpServers (name → config). Re-read on refresh(). */
@@ -22,6 +30,13 @@ export interface McpManagerOptions {
 
 /** A resolved integration: a catalog/user entry plus its provider id. */
 const GENERIC_SERVER_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const ACP_MCP_OWNER_TRANSFER_RETENTION_MS = 5 * 60_000;
+const ACP_MCP_OWNER_TRANSFER_RECEIPT_LIMIT = 256;
+
+interface AcpMcpOwnerTransferReceipt {
+	proof: AcpMcpOwnerTransferProof;
+	expiresAt: number;
+}
 
 interface ResolvedIntegration {
 	server: string;
@@ -39,6 +54,7 @@ export class McpManager {
 	private integrations = new Map<string, ResolvedIntegration>();
 	private acpServers = new Map<string, AcpMcpServerConfig>();
 	private acpOwnerId?: string;
+	private readonly acpOwnerTransfers = new Map<string, AcpMcpOwnerTransferReceipt>();
 	/** Provider ids we registered for user servers, so refresh can drop removed ones. */
 	private registeredUserProviderIds = new Set<string>();
 
@@ -58,6 +74,125 @@ export class McpManager {
 
 	canReleaseAcpServers(ownerId: string): boolean {
 		return this.acpOwnerId === undefined || this.acpOwnerId === ownerId;
+	}
+
+	transferAcpServersOwner(previousOwnerId: string, nextOwnerId: string): boolean {
+		if (!previousOwnerId || !nextOwnerId) throw new Error("ACP MCP owner ids are required");
+		if (this.acpOwnerId === undefined) return false;
+		if (this.acpOwnerId !== previousOwnerId) throw new Error("ACP MCP configuration is owned by another client");
+		if (previousOwnerId === nextOwnerId) return false;
+		this.acpOwnerId = nextOwnerId;
+		return true;
+	}
+
+	transferAcpServersOwnerTransaction(
+		transactionId: string,
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): AcpMcpOwnerTransferProof {
+		this.assertAcpOwnerTransferTuple(transactionId, previousOwnerId, nextOwnerId);
+		const existing = this.getAcpOwnerTransfer(transactionId);
+		if (existing) {
+			const matched = this.assertAcpOwnerTransferMatch(existing, previousOwnerId, nextOwnerId);
+			if (matched.state === "transferred") return { ...matched };
+			if (matched.changed) {
+				if (this.acpOwnerId !== previousOwnerId) {
+					throw new Error("ACP MCP configuration is owned by another client");
+				}
+				this.acpOwnerId = nextOwnerId;
+			}
+			const transferred = { ...matched, state: "transferred" as const };
+			this.rememberAcpOwnerTransfer(transferred);
+			return { ...transferred };
+		}
+		if (this.acpOwnerId !== undefined && this.acpOwnerId !== previousOwnerId) {
+			throw new Error("ACP MCP configuration is owned by another client");
+		}
+		const changed = this.acpOwnerId !== undefined && previousOwnerId !== nextOwnerId;
+		if (changed) this.acpOwnerId = nextOwnerId;
+		const proof: AcpMcpOwnerTransferProof = {
+			transactionId,
+			previousOwnerId,
+			nextOwnerId,
+			changed,
+			state: "transferred",
+		};
+		this.rememberAcpOwnerTransfer(proof);
+		return { ...proof };
+	}
+
+	queryAcpServersOwnerTransaction(
+		transactionId: string,
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): AcpMcpOwnerTransferProof {
+		this.assertAcpOwnerTransferTuple(transactionId, previousOwnerId, nextOwnerId);
+		const proof = this.getAcpOwnerTransfer(transactionId);
+		if (!proof) throw new Error("ACP MCP owner transfer transaction is unknown");
+		return { ...this.assertAcpOwnerTransferMatch(proof, previousOwnerId, nextOwnerId) };
+	}
+
+	rollbackAcpServersOwnerTransaction(
+		transactionId: string,
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): AcpMcpOwnerTransferProof {
+		const proof = this.queryAcpServersOwnerTransaction(transactionId, previousOwnerId, nextOwnerId);
+		if (proof.state === "rolled_back") return proof;
+		if (proof.changed) {
+			if (this.acpOwnerId !== nextOwnerId) throw new Error("ACP MCP owner transfer cannot be rolled back");
+			this.acpOwnerId = previousOwnerId;
+		}
+		const rolledBack = { ...proof, state: "rolled_back" as const };
+		this.rememberAcpOwnerTransfer(rolledBack);
+		return { ...rolledBack };
+	}
+
+	retireAcpServersOwnerTransaction(transactionId: string, previousOwnerId: string, nextOwnerId: string): void {
+		this.assertAcpOwnerTransferTuple(transactionId, previousOwnerId, nextOwnerId);
+		const proof = this.getAcpOwnerTransfer(transactionId);
+		if (proof) this.assertAcpOwnerTransferMatch(proof, previousOwnerId, nextOwnerId);
+		this.acpOwnerTransfers.delete(transactionId);
+	}
+
+	private getAcpOwnerTransfer(transactionId: string): AcpMcpOwnerTransferProof | undefined {
+		const receipt = this.acpOwnerTransfers.get(transactionId);
+		if (!receipt) return undefined;
+		if (receipt.expiresAt <= Date.now()) {
+			this.acpOwnerTransfers.delete(transactionId);
+			return undefined;
+		}
+		return receipt.proof;
+	}
+
+	private rememberAcpOwnerTransfer(proof: AcpMcpOwnerTransferProof): void {
+		this.acpOwnerTransfers.delete(proof.transactionId);
+		this.acpOwnerTransfers.set(proof.transactionId, {
+			proof,
+			expiresAt: Date.now() + ACP_MCP_OWNER_TRANSFER_RETENTION_MS,
+		});
+		while (this.acpOwnerTransfers.size > ACP_MCP_OWNER_TRANSFER_RECEIPT_LIMIT) {
+			const oldest = this.acpOwnerTransfers.keys().next().value;
+			if (oldest === undefined) break;
+			this.acpOwnerTransfers.delete(oldest);
+		}
+	}
+
+	private assertAcpOwnerTransferTuple(transactionId: string, previousOwnerId: string, nextOwnerId: string): void {
+		if (!transactionId || !previousOwnerId || !nextOwnerId) {
+			throw new Error("ACP MCP owner transfer transaction and owner ids are required");
+		}
+	}
+
+	private assertAcpOwnerTransferMatch(
+		proof: AcpMcpOwnerTransferProof,
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): AcpMcpOwnerTransferProof {
+		if (proof.previousOwnerId !== previousOwnerId || proof.nextOwnerId !== nextOwnerId) {
+			throw new Error("ACP MCP owner transfer transaction tuple changed");
+		}
+		return proof;
 	}
 
 	replaceAcpServers(servers: readonly AcpMcpServerConfig[], ownerId: string): boolean {

@@ -23,16 +23,72 @@ import {
 	type DaemonCommand,
 	type DaemonOutbound,
 	daemonOutboundForCorrelatedPromptCapability,
+	daemonSupervisorServerCapabilities,
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
+	DAEMON_WORKER_BOOTSTRAP_ENV_KEYS,
 	type DaemonWorkerDescriptor,
 	durableDaemonWorkerDescriptor,
+	sanitizeDaemonWorkerBootstrapEnvironment,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
-import { CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE } from "../src/sdk-features.js";
+import {
+	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+	PRIME_AGENT_SDK_FEATURES,
+	RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE,
+} from "../src/sdk-features.js";
+
+function sliceWireSource(source: string, start: string, end: string): string {
+	const startIndex = source.indexOf(start);
+	const endIndex = source.indexOf(end, startIndex);
+	if (startIndex < 0 || endIndex < 0) throw new Error(`Missing wire schema boundary: ${start} -> ${end}`);
+	return source.slice(startIndex, endIndex);
+}
+
+function daemonSchemaDigest(daemonSource: string, workerSource: string): string {
+	const sections = [
+		sliceWireSource(daemonSource, "export type DaemonClientCapability", "export type DaemonReplayStatus"),
+		sliceWireSource(
+			daemonSource,
+			"export interface DaemonRecoverableOwnedSessionCreateResult",
+			"export type DaemonCommand =",
+		),
+		sliceWireSource(daemonSource, "export type DaemonCommand =", "type DaemonCommandName"),
+		sliceWireSource(
+			daemonSource,
+			"const RECOVERABLE_OWNED_SESSION_ADOPTION_COMMAND",
+			"const AUTHORITATIVE_OWNED_SESSION_CLEANUP_COMMAND",
+		),
+		sliceWireSource(
+			daemonSource,
+			"export interface DaemonSavedSessionInfo",
+			"export type DaemonDeleteSavedSessionResult",
+		),
+		sliceWireSource(daemonSource, "export type DaemonOutbound =", "export const DAEMON_OUTBOUND_COMPATIBILITY"),
+		sliceWireSource(
+			daemonSource,
+			"export type DaemonOwnedSessionCleanupStatus",
+			"export type DaemonServerCapability",
+		),
+		sliceWireSource(daemonSource, "export type DaemonLaunchEnvMode", "/**\n * The allowlist of env vars"),
+		sliceWireSource(daemonSource, "export type DaemonErrorInfo =", "export type DaemonSessionClosedReason"),
+		sliceWireSource(workerSource, "export const DAEMON_WORKER_ROLE_ENV", "export type DaemonWorkerLifecycle"),
+		sliceWireSource(
+			workerSource,
+			"export interface DaemonWorkerAuthenticationResult",
+			"export interface DaemonWorkerDescriptor",
+		),
+	];
+	return createHash("sha256").update(sections.join("\n")).digest("hex").slice(0, 12);
+}
+
+function replaceWireSentinel(source: string, before: string, after: string): string {
+	if (!source.includes(before)) throw new Error(`Missing wire mutation sentinel: ${before}`);
+	return source.replace(before, after);
+}
 
 describe("daemon protocol helpers", () => {
 	it("serializes worker descriptors as identity-only version 2 state", () => {
@@ -158,6 +214,20 @@ describe("daemon protocol helpers", () => {
 		).toEqual({ KEEP_EXACT: "yes" });
 	});
 
+	it("centrally strips every private worker bootstrap variable across process roles", () => {
+		const environment: NodeJS.ProcessEnv = { KEEP_PUBLIC: "yes" };
+		for (const key of DAEMON_WORKER_BOOTSTRAP_ENV_KEYS) environment[key] = `private-${key}`;
+		sanitizeDaemonWorkerBootstrapEnvironment(environment);
+		expect(environment).toEqual({ KEEP_PUBLIC: "yes" });
+
+		const windowsEnvironment: NodeJS.ProcessEnv = {
+			keep_public: "yes",
+			[DAEMON_WORKER_BOOTSTRAP_ENV_KEYS[0]!.toLowerCase()]: "private-role",
+		};
+		sanitizeDaemonWorkerBootstrapEnvironment(windowsEnvironment, "win32");
+		expect(windowsEnvironment).toEqual({ keep_public: "yes" });
+	});
+
 	it("capability-gates exact launch replacement without changing legacy commands", () => {
 		const exact = getDaemonCommandCompatibilities({
 			type: "create",
@@ -181,39 +251,78 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_SUPERVISOR_SERVER_CAPABILITIES).toContain(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE);
 	});
 
-	it("keeps the advertised schema identity synchronized with wire type shapes", () => {
-		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
-		const commandSource = source.slice(
-			source.indexOf("export type DaemonCommand ="),
-			source.indexOf("type DaemonCommandName"),
-		);
-		const savedSessionSource = source.slice(
-			source.indexOf("export interface DaemonSavedSessionInfo"),
-			source.indexOf("export type DaemonDeleteSavedSessionResult"),
-		);
-		const outboundSource = source.slice(
-			source.indexOf("export type DaemonOutbound ="),
-			source.indexOf("export const DAEMON_OUTBOUND_COMPATIBILITY"),
-		);
-		const ownedSessionSource = source.slice(
-			source.indexOf("export type DaemonOwnedSessionCleanupStatus"),
-			source.indexOf("export type DaemonServerCapability"),
-		);
-		const launchEnvironmentSource = source.slice(
-			source.indexOf("export type DaemonLaunchEnvMode"),
-			source.indexOf("/**\n * The allowlist of env vars"),
-		);
-		const errorInfoSource = source.slice(
-			source.indexOf("export type DaemonErrorInfo ="),
-			source.indexOf("export type DaemonSessionClosedReason"),
-		);
-		const digest = createHash("sha256")
-			.update(
-				`${commandSource}\n${savedSessionSource}\n${outboundSource}\n${ownedSessionSource}\n${launchEnvironmentSource}\n${errorInfoSource}`,
-			)
-			.digest("hex")
-			.slice(0, 12);
+	it("independently freezes and schema/capability-gates recoverable owned adoption", () => {
+		expect(Object.isFrozen(PRIME_AGENT_SDK_FEATURES)).toBe(true);
+		expect(PRIME_AGENT_SDK_FEATURES).toContain(RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE);
+		for (const type of [
+			"create_recoverable_owned_session",
+			"prepare_recoverable_owned_session_adoption",
+			"commit_recoverable_owned_session_adoption",
+			"confirm_recoverable_owned_session_adoption",
+		] as const) {
+			expect(DAEMON_COMMAND_COMPATIBILITY[type]).toEqual({
+				minProtocol: 7,
+				minSchemaRevision: 30,
+				capability: "daemon_recoverable_owned_session_adoption_v1",
+			});
+		}
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain("daemon_recoverable_owned_session_adoption_v1");
+		expect(DAEMON_SUPERVISOR_SERVER_CAPABILITIES).toContain("daemon_recoverable_owned_session_adoption_v1");
+		expect(daemonSupervisorServerCapabilities("linux")).toContain("daemon_recoverable_owned_session_adoption_v1");
+		expect(daemonSupervisorServerCapabilities("win32")).not.toContain("daemon_recoverable_owned_session_adoption_v1");
+		expect(DAEMON_SUPPORTED_CLIENT_CAPABILITIES).not.toContain("daemon_recoverable_owned_session_adoption_v1");
+	});
+
+	it("keeps the advertised schema identity synchronized with daemon and worker wire shapes", () => {
+		const daemonSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
+		const workerSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-worker-protocol.ts"), "utf8");
+		const digest = daemonSchemaDigest(daemonSource, workerSource);
 		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
+	});
+
+	it("changes the schema digest for every recoverable adoption wire family", () => {
+		const daemonSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
+		const workerSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-worker-protocol.ts"), "utf8");
+		const baseline = daemonSchemaDigest(daemonSource, workerSource);
+		const daemonMutations = [
+			['| "daemon_recoverable_owned_session_adoption_v1";', '| "daemon_recoverable_owned_session_adoption_v2";'],
+			['type: "create_recoverable_owned_session";', 'type: "create_recoverable_owned_session_v2";'],
+			[
+				'type: "commit_recoverable_owned_session_adoption";',
+				'type: "commit_recoverable_owned_session_adoption_v2";',
+			],
+			[
+				'type: "confirm_recoverable_owned_session_adoption";',
+				'type: "confirm_recoverable_owned_session_adoption_v2";',
+			],
+			["expectedSupervisorGeneration: string;", "expectedSupervisorGeneration: string & { readonly v2: true };"],
+			["recoveryHandle: string;", "recoveryHandle: string & { readonly v2: true };"],
+			['status: "adopted";', 'status: "adopted_v2";'],
+			[
+				"export interface DaemonRecoverableOwnedSessionPrepareResult extends DaemonAttachResult",
+				"export interface DaemonRecoverableOwnedSessionPrepareResultV2 extends DaemonAttachResult",
+			],
+			['status: "confirmed";', 'status: "confirmed_v2";'],
+			["minSchemaRevision: 30,", "minSchemaRevision: 31,"],
+		] as const;
+		for (const [before, after] of daemonMutations) {
+			expect(daemonSchemaDigest(replaceWireSentinel(daemonSource, before, after), workerSource)).not.toBe(baseline);
+		}
+		const workerMutations = [
+			[
+				'export const DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_AGENT_DIR";',
+				'export const DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_AGENT_DIR_V2";',
+			],
+			["workerIncarnation: string;", `workerIncarnation: \`\${string}-v2\`;`],
+			[
+				'action: "transfer" | "query" | "rollback" | "retire";',
+				'action: "transfer" | "query" | "rollback" | "retire" | "inspect";',
+			],
+			['state: "transferred" | "rolled_back";', 'state: "transferred" | "rolled_back" | "unknown";'],
+		] as const;
+		for (const [before, after] of workerMutations) {
+			expect(daemonSchemaDigest(daemonSource, replaceWireSentinel(workerSource, before, after))).not.toBe(baseline);
+		}
 	});
 
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {
@@ -289,7 +398,7 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("capability- and schema-gates fresh snapshot generation nonces", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(29);
+		expect(DAEMON_SCHEMA_REVISION).toBe(30);
 		expect(DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION).toBe(28);
 		expect(
 			getDaemonCommandCompatibilities({

@@ -54,6 +54,14 @@ Headless and ephemeral clients use the same worker runtime as interactive client
 
 The full launch environment remains in supervisor memory and is not written to the worker descriptor. Direct SDK calls to print and RPC modes remain in-process so embedders can pass non-serializable extension factories.
 
+### Recoverable ownership adoption
+
+A full-access client-owned worker can opt into `daemon_recoverable_owned_session_adoption_v1`. Recovery remains limited to the same detached supervisor process and generation. The supervisor keeps worker authority and the HMAC secret in memory, while a separate `OwnedSessionRecoveryStore` persists only opaque keyed verifiers with atomic `0600` writes in a `0700` directory. Recovery handles never enter worker descriptors or the generic command journal.
+
+Availability requires schema revision 30; the frozen SDK adoption and caller-environment tokens; hello offers for adoption, caller-environment cleanup, and authoritative cleanup; negotiated `event_sequence`, `correlated_prompt_lifecycle_v1`, `client_owned_sessions`, and `caller_owned_session_environment_cleanup_v1`; and exact attached adoption and cleanup proofs. The attached worker replay status must be `complete`. Partial or unavailable replay fails before ownership changes.
+
+Prepare freezes ownership mutation, permanently retires the original create-request replay authority, obtains an authoritative worker snapshot, and buffers bounded sequenced frames. Commit validates the snapshot proof and caller cursor, transfers both the worker owner and ACP MCP owner in place, attaches the claimant, then publishes only contiguous post-snapshot frames. Exact repeated cursor/frame bytes after reconnect are deduplicated; a conflicting duplicate fails closed, and traffic for other sessions on a shared client is discarded from the staging lane. A disconnect before commit rolls ownership back, but never revives create replay. Confirmation removes the prior-handle retry window only after the caller persists the rotated handle and exact proof. Retention is bounded for no-lifecycle, active, terminal, prepared, and unconfirmed-final states.
+
 ## Session Ownership and Leases
 
 Every persisted session is protected by a process-safe lease keyed by canonical JSONL path.

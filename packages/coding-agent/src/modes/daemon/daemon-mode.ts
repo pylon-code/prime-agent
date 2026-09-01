@@ -7,7 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
@@ -18,6 +18,7 @@ import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	appendRotatingLog,
+	ENV_AGENT_DIR,
 	getCronJobsPath,
 	getDaemonLogPath,
 	getDaemonUpdateRestartManifestPath,
@@ -183,16 +184,17 @@ import {
 } from "./daemon-socket.js";
 import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
 import {
-	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
-	DAEMON_WORKER_ROLE_ENV,
+	DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
-	DAEMON_WORKER_TOKEN_ENV,
+	type DaemonWorkerAcpMcpOwnerTransferProof,
+	type DaemonWorkerAuthenticationResult,
 	type DaemonWorkerCommand,
 	type DaemonWorkerFrameHeader,
 	isDaemonWorkerFrameHeader,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
+	sanitizeDaemonWorkerBootstrapEnvironment,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
@@ -226,6 +228,9 @@ export interface DaemonModeOptions {
 	worker?: {
 		authenticationToken: string;
 		restoreActiveSessionId?: string;
+		supervisorSocketPath?: string;
+		supervisorAgentDir?: string;
+		recoveryJournalPath?: string;
 	};
 }
 
@@ -484,6 +489,8 @@ export class AgentDaemon {
 		{ client: DaemonSocketClient; ownerId: string; serverNames: string[]; release?: Promise<void> }
 	>();
 	private readonly mutationDrain = new MutationDrainLatch();
+	/** Authenticated process incarnation. It is returned only on the private worker channel. */
+	private readonly workerIncarnation = randomBytes(32).toString("base64url");
 	private updateRestart?: {
 		id: symbol;
 		owner?: DaemonSocketClient;
@@ -609,8 +616,9 @@ export class AgentDaemon {
 			? AgentCronJobStore.forSessionArtifacts()
 			: new AgentCronJobStore(getCronJobsPath(this.agentDir));
 		this.restoreActiveSessionId = options.worker?.restoreActiveSessionId;
-		const recoveryJournalPath = process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
-		if (options.worker && recoveryJournalPath) {
+		const recoveryJournalPath =
+			options.worker?.recoveryJournalPath ?? process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+		if (recoveryJournalPath) {
 			this.recoveryJournal = new WorkerRecoveryJournal(recoveryJournalPath);
 		}
 		this.cronScheduler = new AgentCronScheduler(this.cronStore, {
@@ -702,7 +710,7 @@ export class AgentDaemon {
 	}
 
 	private supervisorSocketPathFromEnv(): string | undefined {
-		const raw = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		const raw = this.options.worker?.supervisorSocketPath ?? process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 		return raw ? normalizeSocketPath(raw) : undefined;
 	}
 
@@ -887,12 +895,10 @@ export class AgentDaemon {
 				return;
 			}
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", supervisorSocketPath]);
-			const environment = createCliSubprocessEnv();
-			delete environment[DAEMON_WORKER_ROLE_ENV];
-			delete environment[DAEMON_WORKER_TOKEN_ENV];
-			delete environment[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];
-			delete environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
-			delete environment[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			const environment = sanitizeDaemonWorkerBootstrapEnvironment(createCliSubprocessEnv());
+			const supervisorAgentDir =
+				this.options.worker?.supervisorAgentDir ?? process.env[DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV];
+			if (supervisorAgentDir) environment[ENV_AGENT_DIR] = supervisorAgentDir;
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
@@ -3466,6 +3472,7 @@ export class AgentDaemon {
 					type: "response",
 					command: "worker_auth",
 					success: true,
+					data: { workerIncarnation: this.workerIncarnation } satisfies DaemonWorkerAuthenticationResult,
 				});
 				return;
 			}
@@ -3624,6 +3631,61 @@ export class AgentDaemon {
 					const state = this.getSessionState(command.activeSessionId);
 					this.detachClientFromSession(client, state);
 					this.write(client, success(command.id, "detach"));
+					return;
+				}
+				case "worker_transfer_acp_mcp_owner": {
+					const state = this.getBoundSessionState(command.activeSessionId);
+					const current = this.acpMcpOwners.get(state.activeSessionId);
+					if (current?.release) throw new Error("ACP MCP configuration is being released");
+					if (current && current.client !== client) {
+						throw new Error("ACP MCP configuration is owned by another daemon client");
+					}
+					if (command.action === "retire") {
+						state.runtime.session.retireAcpMcpServersOwnerTransaction(
+							command.transactionId,
+							command.previousOwnerId,
+							command.ownerId,
+						);
+						this.writeWorkerSuccess(client, command, {
+							transactionId: command.transactionId,
+							previousOwnerId: command.previousOwnerId,
+							nextOwnerId: command.ownerId,
+							status: "retired" as const,
+						});
+						return;
+					}
+					const proof: DaemonWorkerAcpMcpOwnerTransferProof =
+						command.action === "transfer"
+							? state.runtime.session.transferAcpMcpServersOwnerTransaction(
+									command.transactionId,
+									command.previousOwnerId,
+									command.ownerId,
+								)
+							: command.action === "query"
+								? state.runtime.session.queryAcpMcpServersOwnerTransaction(
+										command.transactionId,
+										command.previousOwnerId,
+										command.ownerId,
+									)
+								: state.runtime.session.rollbackAcpMcpServersOwnerTransaction(
+										command.transactionId,
+										command.previousOwnerId,
+										command.ownerId,
+									);
+					if (current && proof.changed) {
+						current.ownerId = proof.state === "transferred" ? command.ownerId : command.previousOwnerId;
+					}
+					if (
+						proof.transactionId !== command.transactionId ||
+						proof.previousOwnerId !== command.previousOwnerId ||
+						proof.nextOwnerId !== command.ownerId ||
+						(proof.state !== "transferred" && proof.state !== "rolled_back") ||
+						(current &&
+							current.ownerId !== (proof.state === "transferred" ? command.ownerId : command.previousOwnerId))
+					) {
+						throw new Error("ACP MCP owner transfer proof is invalid");
+					}
+					this.writeWorkerSuccess(client, command, proof);
 					return;
 				}
 				case "worker_archive_and_shutdown": {
@@ -7470,6 +7532,7 @@ type SequencedDaemonOutbound = Extract<
 	{
 		type:
 			| "session_event"
+			| "prompt_lifecycle"
 			| "session_status"
 			| "session_replaced"
 			| "session_resynced"

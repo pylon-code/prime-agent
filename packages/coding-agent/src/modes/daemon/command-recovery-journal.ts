@@ -1,6 +1,6 @@
 import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
-import type { DaemonClientId, DaemonCommandId, DaemonResponse } from "./daemon-protocol.js";
+import type { DaemonClientId, DaemonCommand, DaemonCommandId, DaemonResponse } from "./daemon-protocol.js";
 
 interface ReceivedRecord {
 	version: 1;
@@ -43,6 +43,17 @@ export type CommandJournalBeginResult =
 
 const COMPACT_AFTER_RECORDS = 4096;
 
+const BEARER_RETURNING_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
+	"create_recoverable_owned_session",
+	"prepare_recoverable_owned_session_adoption",
+	"commit_recoverable_owned_session_adoption",
+	"confirm_recoverable_owned_session_adoption",
+]);
+
+export function commandRecoveryJournalAllows(commandType: string): boolean {
+	return !BEARER_RETURNING_COMMANDS.has(commandType as DaemonCommand["type"]);
+}
+
 export function createCommandIdempotencyKey(clientId: DaemonClientId, commandId: DaemonCommandId): string {
 	return JSON.stringify([clientId, commandId]);
 }
@@ -84,6 +95,9 @@ export class CommandRecoveryJournal {
 		commandType: string,
 		requestIdentity?: string,
 	): CommandJournalBeginResult {
+		if (!commandRecoveryJournalAllows(commandType)) {
+			throw new Error(`Command recovery journal rejects bearer-returning command: ${commandType}`);
+		}
 		const key = createCommandIdempotencyKey(clientId, commandId);
 		const existing = this.lookup(clientId, commandId, requestIdentity);
 		if (existing) return existing;

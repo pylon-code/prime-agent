@@ -385,7 +385,9 @@ describe("ENG-4606 update restart coordinator", () => {
 			),
 		);
 		const originalActiveSessionId = created.activeSessionId ?? created.id;
-		const updateCommand = [process.execPath, tsxPath, launcherFixturePath].map(shellQuote).join(" ");
+		const updateCommand = [process.execPath, tsxPath, launcherFixturePath, originalActiveSessionId]
+			.map(shellQuote)
+			.join(" ");
 		const executeResponse = await client.request(
 			{ type: "execute_bash", activeSessionId: originalActiveSessionId, command: updateCommand },
 			5000,

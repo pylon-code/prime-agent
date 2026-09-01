@@ -63,7 +63,11 @@ import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
 import { createActiveSessionId, type DaemonSocketClient } from "./active-session-state.js";
-import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
+import {
+	CommandRecoveryJournal,
+	commandRecoveryJournalAllows,
+	createCommandIdempotencyKey,
+} from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
@@ -78,7 +82,6 @@ import {
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
 	DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION,
-	DAEMON_SUPERVISOR_SERVER_CAPABILITIES,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
@@ -86,12 +89,18 @@ import {
 	type DaemonCommand,
 	type DaemonOutbound,
 	type DaemonOwnedSessionCleanupResult,
+	type DaemonRecoverableOwnedSessionAdoptionProof,
+	type DaemonRecoverableOwnedSessionConfirmResult,
+	type DaemonRecoverableOwnedSessionCreateResult,
+	type DaemonRecoverableOwnedSessionPrepareResult,
 	type DaemonResponse,
 	type DaemonUpdateRestartManifest,
 	daemonOutboundForCorrelatedPromptCapability,
+	daemonSupervisorServerCapabilities,
 	failure,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
+	isDaemonRecoveryRequestId,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -129,9 +138,12 @@ import {
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
 	DAEMON_WORKER_STARTUP_GATE_FD_ENV,
+	DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 	type DaemonCreateCommand,
+	type DaemonWorkerAcpMcpOwnerTransferProof,
+	type DaemonWorkerAcpMcpOwnerTransferRetirement,
 	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
 	type DaemonWorkerLifecycle,
@@ -139,8 +151,23 @@ import {
 	durableDaemonWorkerDescriptor,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
+	sanitizeDaemonWorkerBootstrapEnvironment,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
+import { appendRecoverableOwnedFrame, reconcileRecoverableOwnedFrames } from "./owned-session-adoption-buffer.js";
+import {
+	RECOVERABLE_OWNED_CONFIRMATION_RETENTION_MS,
+	RECOVERABLE_OWNED_DISCONNECTED_RETENTION_MS,
+	RECOVERABLE_OWNED_PREPARE_TIMEOUT_MS,
+	RECOVERABLE_OWNED_TERMINAL_RETENTION_MS,
+	recoverableOwnedRetention,
+} from "./owned-session-recovery-retention.js";
+import {
+	OWNED_SESSION_ADOPTION_UNAVAILABLE,
+	OwnedSessionAdoptionUnavailableError,
+	type OwnedSessionRecoveryReceipt,
+	OwnedSessionRecoveryStore,
+} from "./owned-session-recovery-store.js";
 import { createRlmLedgerRegistrySeedSource, RlmSpawnLedger } from "./rlm-ledger.js";
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import {
@@ -209,6 +236,8 @@ const STALE_RECLAIM_WAIT_MS = 10_000;
 // supervisor event loop with synchronous subprocess spawns.
 const LIVENESS_IDENTITY_RECHECK_MS = 500;
 const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;
+const OWNED_SESSION_RECOVERY_DIRECTORY = "owned-session-recovery";
+const RECOVERABLE_OWNED_CONNECTED_EXPIRY = Number.MAX_SAFE_INTEGER;
 const IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS = 5 * 60_000;
 const IDLE_EVICTION_MIN_SWEEP_INTERVAL_MS = 60_000;
 const IDLE_EVICTION_DRAIN_TIMEOUT_MS = 5_000;
@@ -221,6 +250,10 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"list",
 	"list_agent_peers",
 	"list_saved_sessions",
+	"create_recoverable_owned_session",
+	"prepare_recoverable_owned_session_adoption",
+	"commit_recoverable_owned_session_adoption",
+	"confirm_recoverable_owned_session_adoption",
 	"create",
 	"attach",
 	"reattach",
@@ -326,10 +359,102 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
+const RECOVERABLE_OWNED_COMMAND_TYPES: ReadonlySet<string> = new Set([
+	"create_recoverable_owned_session",
+	"prepare_recoverable_owned_session_adoption",
+	"commit_recoverable_owned_session_adoption",
+	"confirm_recoverable_owned_session_adoption",
+]);
+
+function isRecoverableOwnedCommandType(command: string): boolean {
+	return RECOVERABLE_OWNED_COMMAND_TYPES.has(command);
+}
+
+function recoverableOwnedCommandFailure(id: string | undefined, command: string, error: unknown): DaemonResponse {
+	return isRecoverableOwnedCommandType(command)
+		? failure(id, command, OWNED_SESSION_ADOPTION_UNAVAILABLE, {
+				code: "owned_session_adoption_unavailable",
+			})
+		: failure(id, command, error, serializeDaemonError(error));
+}
+
+function salvageRecoverableOwnedCommand(line: string): { id?: string; command: string } | undefined {
+	try {
+		const parsed = JSON.parse(line) as { id?: unknown; type?: unknown; command?: { type?: unknown } };
+		const command = typeof parsed.command?.type === "string" ? parsed.command.type : parsed.type;
+		if (typeof command !== "string" || !isRecoverableOwnedCommandType(command)) return undefined;
+		return { ...(typeof parsed.id === "string" ? { id: parsed.id } : {}), command };
+	} catch {
+		return undefined;
+	}
+}
+
+interface RecoverableOwnedSessionAuthority {
+	workerId: string;
+	workerIncarnation: string;
+	activeSessionId: string;
+	sessionId: string;
+	correlationId: string;
+	mcpOwnerId: string;
+	recoveryConfig: AgentSessionRuntimeConfig;
+	launchEnv: Record<string, string>;
+	activeDeadline?: number;
+	proof?: DaemonRecoverableOwnedSessionAdoptionProof;
+}
+
+interface RecoverableOwnedBufferedFrame {
+	payload: Buffer;
+	message: DaemonOutbound;
+	cursor?: { generation: string; sequence: number };
+}
+
+interface RecoverableOwnedAdoption {
+	recordId: string;
+	requestIdDigest: string;
+	requestDigest: string;
+	client: DaemonSocketClient;
+	workerClient: DaemonWorkerClient;
+	workerIncarnation: string;
+	workerStopRevision: number;
+	previousOwnerClientId: string;
+	activeSessionId: string;
+	proof: DaemonRecoverableOwnedSessionAdoptionProof;
+	result?: DaemonRecoverableOwnedSessionPrepareResult;
+	preparePromise?: Promise<DaemonRecoverableOwnedSessionPrepareResult>;
+	frames: RecoverableOwnedBufferedFrame[];
+	bufferedBytes: number;
+	error?: Error;
+	finalRetry?: true;
+	committing?: true;
+	timeout: ReturnType<typeof setTimeout>;
+}
+
+interface RecoverableOwnedFinalReceipt {
+	recordId: string;
+	requestIdDigest: string;
+	requestDigest: string;
+	ownerClientId: string;
+	result: DaemonRecoverableOwnedSessionPrepareResult;
+	frames: Buffer[];
+	mcpTransfer?: {
+		transactionId: string;
+		previousOwnerId: string;
+		nextOwnerId: string;
+	};
+}
+
+interface RecoverableOwnedCreateRun {
+	requestDigest: string;
+	ownerClientId: string;
+	promise: Promise<DaemonRecoverableOwnedSessionCreateResult>;
+}
+
 interface ResidentWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
 	client?: DaemonWorkerClient;
+	/** Private random process incarnation learned only through authenticated worker handshake. */
+	workerIncarnation?: string;
 	heartbeatSnapshot?: AgentConnectionHeartbeat[];
 	heartbeatSnapshotStale?: boolean;
 	summaries: Map<string, SessionSummary>;
@@ -358,6 +483,10 @@ interface ResidentWorker {
 		promise: Promise<void>;
 	};
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
+	recoveryRecordId?: string;
+	recoverableAdoption?: RecoverableOwnedAdoption;
+	recoverableFinal?: RecoverableOwnedFinalReceipt;
+	recoveryConfirmationTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
 	updateRestartPrepareClient?: DaemonWorkerClient;
 }
@@ -388,6 +517,12 @@ interface DaemonSupervisorOptions {
 	socketPath?: string;
 	defaultSessionConfig: AgentSessionRuntimeConfig;
 	descriptorDir?: string;
+	/** Test seam for platform-specific startup without mutating process.platform. */
+	platform?: NodeJS.Platform;
+	ownedSessionRecoveryStoreFactory?: (
+		directory: string,
+		supervisorGeneration: string,
+	) => OwnedSessionRecoveryStore<RecoverableOwnedSessionAuthority>;
 }
 
 interface PersistedSupervisorConfig {
@@ -779,6 +914,13 @@ export class DaemonSupervisor {
 	private readonly snapshotCacheParent: string;
 	private snapshotCacheRoot: string;
 	private commandJournal!: CommandRecoveryJournal;
+	private ownedSessionRecoveryStore!: OwnedSessionRecoveryStore<RecoverableOwnedSessionAuthority>;
+	private readonly platform: NodeJS.Platform;
+	private readonly ownedSessionRecoveryStoreFactory: (
+		directory: string,
+		supervisorGeneration: string,
+	) => OwnedSessionRecoveryStore<RecoverableOwnedSessionAuthority>;
+	private readonly recoverableOwnedCreateRuns = new Map<string, RecoverableOwnedCreateRun>();
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
 	private transcriptPreparations?: WeakMap<ResidentWorker, Map<string, SupervisorTranscriptPreparation>>;
@@ -800,6 +942,10 @@ export class DaemonSupervisor {
 			this.rejectReady = rejectReady;
 		});
 		void this.ready.catch(() => undefined);
+		this.platform = options.platform ?? process.platform;
+		this.ownedSessionRecoveryStoreFactory =
+			options.ownedSessionRecoveryStoreFactory ??
+			((directory, supervisorGeneration) => new OwnedSessionRecoveryStore(directory, supervisorGeneration));
 		const agentDir = options.defaultSessionConfig.agentDir;
 		if (!agentDir) {
 			throw new Error("Daemon supervisor config is missing agentDir");
@@ -840,6 +986,12 @@ export class DaemonSupervisor {
 			rmSync(this.snapshotCacheParent, { recursive: true, force: true });
 			this.snapshotCacheRoot = createSnapshotCacheProcessRoot(this.snapshotCacheParent, this.generation);
 			this.commandJournal = new CommandRecoveryJournal(join(this.descriptorDir, "command-journal.jsonl"));
+			if (this.platform !== "win32") {
+				this.ownedSessionRecoveryStore = this.ownedSessionRecoveryStoreFactory(
+					join(this.descriptorDir, OWNED_SESSION_RECOVERY_DIRECTORY),
+					this.generation,
+				);
+			}
 			this.loadWorkerDescriptors();
 			const workersToAdopt = [...this.workers.values()];
 
@@ -1211,6 +1363,42 @@ export class DaemonSupervisor {
 			if (worker.descriptor.orphanProcessJournalPath) {
 				this.removeWorkerCleanupFile(worker.descriptor.orphanProcessJournalPath);
 			}
+			if (worker.recoverableAdoption) clearTimeout(worker.recoverableAdoption.timeout);
+			if (worker.recoveryConfirmationTimer) clearTimeout(worker.recoveryConfirmationTimer);
+			if (worker.recoveryRecordId) {
+				const recordId = worker.recoveryRecordId;
+				let retained = false;
+				if (!this.shuttingDown) {
+					try {
+						const receipt = this.ownedSessionRecoveryStore.get(recordId);
+						if (receipt?.phase === "final" && receipt.authority.proof) {
+							const retentionMs = Math.max(
+								1,
+								Math.min(
+									RECOVERABLE_OWNED_TERMINAL_RETENTION_MS,
+									receipt.authority.activeDeadline
+										? receipt.authority.activeDeadline - Date.now()
+										: RECOVERABLE_OWNED_TERMINAL_RETENTION_MS,
+								),
+							);
+							this.ownedSessionRecoveryStore.markFinal(recordId, Date.now() + retentionMs);
+							const expiry = setTimeout(() => {
+								this.retireRecoverableOwnedFinalTransferReceipt(worker);
+								this.ownedSessionRecoveryStore.remove(recordId);
+							}, retentionMs);
+							expiry.unref();
+							retained = true;
+						}
+					} catch {
+						// An unreadable stale receipt cannot retain authority.
+					}
+				}
+				if (!retained) {
+					this.retireRecoverableOwnedFinalTransferReceipt(worker);
+					this.ownedSessionRecoveryStore.remove(recordId);
+				}
+				worker.recoveryRecordId = undefined;
+			}
 			this.removeWorkerCleanupFile(worker.descriptorPath);
 		} catch (error) {
 			this.log(`Failed to remove worker descriptor ${worker.descriptorPath}: ${String(error)}`);
@@ -1292,7 +1480,7 @@ export class DaemonSupervisor {
 						supervisorProcessStartId: this.ownership?.record.processStartId,
 						supervisorSocketPath: this.ownership?.record.socketPath,
 						clientId: client.id,
-						serverCapabilities: DAEMON_SUPERVISOR_SERVER_CAPABILITIES,
+						serverCapabilities: daemonSupervisorServerCapabilities(this.platform),
 					});
 				}
 			},
@@ -1320,6 +1508,11 @@ export class DaemonSupervisor {
 				client.catchupActiveSessionIds?.delete(activeSessionId);
 				client.catchupPurposes?.delete(activeSessionId);
 				void this.syncWorkerExtensionUi(activeSessionId);
+			}
+			for (const worker of this.workers.values()) {
+				if (worker.recoverableAdoption?.client === client) {
+					this.rollbackRecoverableOwnedAdoption(worker, worker.recoverableAdoption);
+				}
 			}
 			this.scheduleOwnedWorkerCleanupForClient(this.protocolClientId(client));
 		};
@@ -1415,6 +1608,34 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private restoreRecoverableOwnedConnection(client: DaemonSocketClient): void {
+		const clientId = this.protocolClientId(client);
+		for (const worker of this.workers.values()) {
+			if (worker.descriptor.ownerClientId !== clientId || !worker.recoveryRecordId) continue;
+			const receipt = this.ownedSessionRecoveryStore.get(worker.recoveryRecordId);
+			if (!receipt || receipt.phase === "final") continue;
+			const summary = worker.summaries.get(receipt.authority.activeSessionId);
+			if (
+				receipt.authority.workerId !== worker.descriptor.workerId ||
+				worker.workerIncarnation !== receipt.authority.workerIncarnation ||
+				!worker.client?.matchesAuthenticatedIncarnation(receipt.authority.workerIncarnation) ||
+				!summary ||
+				summary.sessionId !== receipt.authority.sessionId ||
+				worker.recoverableAdoption !== undefined
+			) {
+				throw new OwnedSessionAdoptionUnavailableError();
+			}
+			if (receipt.phase !== "connected") {
+				receipt.authority.activeDeadline = undefined;
+				this.ownedSessionRecoveryStore.markConnected(
+					receipt.recordId,
+					this.recoverableAuthorityDigest(receipt.authority),
+					RECOVERABLE_OWNED_CONNECTED_EXPIRY,
+				);
+			}
+		}
+	}
+
 	private scheduleOwnedWorkerCleanupForClient(clientId: string): void {
 		if ([...this.clients].some((client) => this.protocolClientId(client) === clientId)) {
 			return;
@@ -1427,6 +1648,10 @@ export class DaemonSupervisor {
 	}
 
 	private scheduleOwnedWorkerCleanup(worker: ResidentWorker): void {
+		if (worker.recoveryRecordId) {
+			this.scheduleRecoverableOwnedWorkerCleanup(worker);
+			return;
+		}
 		const ownerClientId = worker.descriptor.ownerClientId;
 		if (
 			!ownerClientId ||
@@ -1448,6 +1673,77 @@ export class DaemonSupervisor {
 				this.log(`Could not clean up client-owned worker ${worker.descriptor.workerId}: ${String(error)}`),
 			);
 		}, OWNED_WORKER_DISCONNECT_GRACE_MS);
+		worker.ownerCleanupTimer.unref();
+	}
+
+	private scheduleRecoverableOwnedWorkerCleanup(worker: ResidentWorker, force = false): void {
+		const ownerClientId = worker.descriptor.ownerClientId;
+		const recordId = worker.recoveryRecordId;
+		if (
+			!ownerClientId ||
+			!recordId ||
+			worker.recoverableAdoption ||
+			[...this.clients].some((client) => this.protocolClientId(client) === ownerClientId)
+		) {
+			return;
+		}
+		if (worker.ownerCleanupTimer) {
+			if (!force) return;
+			clearTimeout(worker.ownerCleanupTimer);
+			worker.ownerCleanupTimer = undefined;
+		}
+		let receipt: OwnedSessionRecoveryReceipt<RecoverableOwnedSessionAuthority> | undefined;
+		try {
+			receipt = this.ownedSessionRecoveryStore.get(recordId);
+		} catch {
+			receipt = undefined;
+		}
+		if (!receipt) {
+			void this.stopWorker(worker, true).catch(() => undefined);
+			return;
+		}
+		const summary = worker.summaries.get(receipt.authority.activeSessionId);
+		const cached = worker.snapshotCache.get(receipt.authority.activeSessionId)?.snapshot.promptLifecycles;
+		const lifecycle = cached?.records.find((entry) => entry.correlationId === receipt.authority.correlationId);
+		const expired = cached?.expired.some((entry) => entry.correlationId === receipt.authority.correlationId) === true;
+		const busy = summary ? isSessionSummaryBusy(summary) : false;
+		const terminal = expired || (lifecycle ? ["completed", "cancelled", "failed"].includes(lifecycle.phase) : false);
+		const now = Date.now();
+		const retention = recoverableOwnedRetention({
+			now,
+			busy,
+			hasLifecycle: lifecycle !== undefined || expired,
+			terminal,
+			...(receipt.authority.activeDeadline !== undefined
+				? { activeDeadline: receipt.authority.activeDeadline }
+				: {}),
+		});
+		receipt.authority.activeDeadline = retention.activeDeadline;
+		const retentionMs = retention.retentionMs;
+		try {
+			this.ownedSessionRecoveryStore.markDisconnected(recordId, now + Math.max(1, retentionMs));
+		} catch {
+			void this.stopWorker(worker, true).catch(() => undefined);
+			return;
+		}
+		worker.ownerCleanupTimer = setTimeout(() => {
+			worker.ownerCleanupTimer = undefined;
+			if (
+				worker.recoveryRecordId !== recordId ||
+				worker.descriptor.ownerClientId !== ownerClientId ||
+				[...this.clients].some((client) => this.protocolClientId(client) === ownerClientId) ||
+				this.workers.get(worker.descriptor.workerId) !== worker
+			) {
+				return;
+			}
+			this.ownedSessionRecoveryStore.remove(recordId);
+			worker.recoveryRecordId = undefined;
+			void this.stopWorker(worker, true).catch((error) =>
+				this.log(
+					`Could not clean up recoverable client-owned worker ${worker.descriptor.workerId}: ${String(error)}`,
+				),
+			);
+		}, retentionMs);
 		worker.ownerCleanupTimer.unref();
 	}
 
@@ -1610,14 +1906,27 @@ export class DaemonSupervisor {
 		try {
 			preParsed = this.parseCommandAndRegisterPromptAdmission(client, line);
 		} catch (error) {
-			this.write(client, failure(salvageDaemonCommandId(line), "parse", error));
+			const recoverable = salvageRecoverableOwnedCommand(line);
+			this.write(
+				client,
+				recoverable
+					? recoverableOwnedCommandFailure(
+							recoverable.id ?? salvageDaemonCommandId(line),
+							recoverable.command,
+							error,
+						)
+					: failure(salvageDaemonCommandId(line), "parse", error),
+			);
 			return;
 		}
 		const command = preParsed.command;
 		const parsedAdmission = preParsed.admission;
 		const correlatedOrder = preParsed.correlatedOrder;
 		if (command.type === "cancel_prompt_admission" && this.updateRestartPhase !== undefined) {
-			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			this.write(
+				client,
+				recoverableOwnedCommandFailure(command.id, command.type, "Daemon is preparing an update restart"),
+			);
 			return;
 		}
 		const cancellationAdmission =
@@ -1633,7 +1942,7 @@ export class DaemonSupervisor {
 		} catch (error) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			correlatedOrder?.release();
-			this.write(client, failure(command.id, command.type, error));
+			this.write(client, recoverableOwnedCommandFailure(command.id, command.type, error));
 			return;
 		}
 		const envelopeClientId = preParsed.envelopeClientId;
@@ -1641,12 +1950,51 @@ export class DaemonSupervisor {
 			this.protocolClientIds.set(client, envelopeClientId);
 			client.id = envelopeClientId;
 		}
-		if (this.clients?.has(client)) {
-			this.cancelOwnedWorkerCleanup(client.id);
+		const duplicatePhysicalClient = [...this.clients].some(
+			(other) =>
+				other !== client &&
+				this.protocolClientId(other) === this.protocolClientId(client) &&
+				!other.socket.destroyed,
+		);
+		if (duplicatePhysicalClient) {
+			correlatedOrder?.release();
+			this.write(
+				client,
+				recoverableOwnedCommandFailure(command.id, command.type, "Client identity is already connected"),
+			);
+			return;
 		}
+		const conflictingAdoptions = [...this.workers.values()].filter(
+			(worker) =>
+				worker.recoverableAdoption &&
+				worker.recoverableAdoption.client !== client &&
+				worker.recoverableAdoption.previousOwnerClientId === this.protocolClientId(client),
+		);
+		if (conflictingAdoptions.some((worker) => worker.recoverableAdoption?.committing)) {
+			correlatedOrder?.release();
+			this.write(
+				client,
+				recoverableOwnedCommandFailure(command.id, command.type, OWNED_SESSION_ADOPTION_UNAVAILABLE),
+			);
+			return;
+		}
+		for (const worker of conflictingAdoptions) {
+			if (worker.recoverableAdoption) this.rollbackRecoverableOwnedAdoption(worker, worker.recoverableAdoption);
+		}
+		try {
+			this.restoreRecoverableOwnedConnection(client);
+		} catch (error) {
+			correlatedOrder?.release();
+			this.write(client, recoverableOwnedCommandFailure(command.id, command.type, error));
+			return;
+		}
+		if (this.clients.has(client)) this.cancelOwnedWorkerCleanup(client.id);
 		if (!DAEMON_COMMAND_TYPES.has(command.type)) {
 			correlatedOrder?.release();
-			this.write(client, failure(command.id, command.type, `Unknown daemon command: ${command.type}`));
+			this.write(
+				client,
+				recoverableOwnedCommandFailure(command.id, command.type, `Unknown daemon command: ${command.type}`),
+			);
 			return;
 		}
 		if (
@@ -1670,13 +2018,15 @@ export class DaemonSupervisor {
 		} catch (error) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			correlatedOrder?.release();
-			this.write(client, failure(command.id, command.type, error));
+			this.write(client, recoverableOwnedCommandFailure(command.id, command.type, error));
 			return;
 		}
 
 		const mutation = isDaemonMutatingCommand(command);
 		const journalIdentity =
-			envelopeClientId && command.id && mutation ? { clientId: envelopeClientId, commandId: command.id } : undefined;
+			envelopeClientId && command.id && mutation && commandRecoveryJournalAllows(command.type)
+				? { clientId: envelopeClientId, commandId: command.id }
+				: undefined;
 		const correlatedRequestIdentity =
 			command.type === "submit_correlated_prompt" || command.type === "cancel_correlated_prompt"
 				? correlatedCommandRequestIdentity(command)
@@ -1689,7 +2039,11 @@ export class DaemonSupervisor {
 			correlatedOrder?.release();
 			this.write(
 				client,
-				failure(command.id, command.type, "Correlated command id was reused with a different request"),
+				recoverableOwnedCommandFailure(
+					command.id,
+					command.type,
+					"Correlated command id was reused with a different request",
+				),
 			);
 			return;
 		}
@@ -1720,7 +2074,10 @@ export class DaemonSupervisor {
 		if (restartRejected && mutation) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			correlatedOrder?.release();
-			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			this.write(
+				client,
+				recoverableOwnedCommandFailure(command.id, command.type, "Daemon is preparing an update restart"),
+			);
 			return;
 		}
 		if (journalIdentity) {
@@ -1735,7 +2092,11 @@ export class DaemonSupervisor {
 				correlatedOrder?.release();
 				this.write(
 					client,
-					failure(command.id, command.type, "Correlated command id was reused with a different request"),
+					recoverableOwnedCommandFailure(
+						command.id,
+						command.type,
+						"Correlated command id was reused with a different request",
+					),
 				);
 				return;
 			}
@@ -1773,7 +2134,11 @@ export class DaemonSupervisor {
 				if (inFlight.requestIdentity !== requestIdentity) {
 					this.write(
 						client,
-						failure(command.id, command.type, "Correlated command id was reused with a different request"),
+						recoverableOwnedCommandFailure(
+							command.id,
+							command.type,
+							"Correlated command id was reused with a different request",
+						),
 					);
 					return;
 				}
@@ -1795,7 +2160,8 @@ export class DaemonSupervisor {
 		// Attach is intentionally read-only and is not fence-gated. If eviction wins
 		// the race, attach fails cleanly with "Session worker is not connected" and
 		// the client retries through the saved-session path instead of mutating state.
-		if (mutation) this.mutationDrain.begin();
+		const tracksMutation = mutation && command.type !== "prepare_recoverable_owned_session_adoption";
+		if (tracksMutation) this.mutationDrain.begin();
 		try {
 			await correlatedOrder?.previous;
 			const response = await this.handleCommand(client, command, cancellationAdmission, correlatedOrder);
@@ -1812,13 +2178,13 @@ export class DaemonSupervisor {
 			}
 		} catch (error) {
 			this.log(`Supervisor command ${command.type} failed: ${error instanceof Error ? error.stack : String(error)}`);
-			let response = failure(command.id, command.type, error, serializeDaemonError(error));
+			let response = recoverableOwnedCommandFailure(command.id, command.type, error);
 			if (journalIdentity && !isSupervisorGenerationStale(error)) {
 				try {
 					await this.assertCurrentOwnership();
 					this.commandJournal.recordResult(journalIdentity.clientId, journalIdentity.commandId, response);
 				} catch (ownershipError) {
-					response = failure(command.id, command.type, ownershipError, serializeDaemonError(ownershipError));
+					response = recoverableOwnedCommandFailure(command.id, command.type, ownershipError);
 				}
 			}
 			if (correlatedJournalRun) {
@@ -1831,14 +2197,14 @@ export class DaemonSupervisor {
 			if (correlatedJournalRun) {
 				if (!correlatedJournalRun.settled) {
 					correlatedJournalRun.resolve(
-						failure(command.id, command.type, "Correlated command ended without a result"),
+						recoverableOwnedCommandFailure(command.id, command.type, "Correlated command ended without a result"),
 					);
 				}
 				if (this.correlatedJournalRuns.get(correlatedJournalRun.key) === correlatedJournalRun) {
 					this.correlatedJournalRuns.delete(correlatedJournalRun.key);
 				}
 			}
-			if (mutation) this.mutationDrain.end();
+			if (tracksMutation) this.mutationDrain.end();
 		}
 	}
 
@@ -1905,6 +2271,46 @@ export class DaemonSupervisor {
 			}
 			case "list_saved_sessions":
 				return this.handleSavedSessionList(client, command);
+			case "create_recoverable_owned_session": {
+				try {
+					return success(command.id, command.type, await this.createRecoverableOwnedSession(client, command));
+				} catch {
+					throw new OwnedSessionAdoptionUnavailableError();
+				}
+			}
+			case "prepare_recoverable_owned_session_adoption": {
+				try {
+					return success(
+						command.id,
+						command.type,
+						await this.prepareRecoverableOwnedSessionAdoption(client, command),
+					);
+				} catch {
+					throw new OwnedSessionAdoptionUnavailableError();
+				}
+			}
+			case "commit_recoverable_owned_session_adoption": {
+				try {
+					return success(
+						command.id,
+						command.type,
+						await this.commitRecoverableOwnedSessionAdoption(client, command),
+					);
+				} catch {
+					throw new OwnedSessionAdoptionUnavailableError();
+				}
+			}
+			case "confirm_recoverable_owned_session_adoption": {
+				try {
+					return success(
+						command.id,
+						command.type,
+						await this.confirmRecoverableOwnedSessionAdoption(client, command),
+					);
+				} catch {
+					throw new OwnedSessionAdoptionUnavailableError();
+				}
+			}
 			case "create": {
 				const createCommand = prepareCallerOwnedCreateEnvironment(command);
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), createCommand);
@@ -1934,6 +2340,12 @@ export class DaemonSupervisor {
 				return success(command.id, "create", this.publicSummary(worker, summary));
 			}
 			case "attach": {
+				if (
+					command.expectedSupervisorGeneration !== undefined &&
+					command.expectedSupervisorGeneration !== this.generation
+				) {
+					throw new OwnedSessionAdoptionUnavailableError();
+				}
 				const attachmentEpoch = this.advanceAttachmentEpoch(client, command.activeSessionId);
 				const requestedCapabilities = normalizeCapabilities(command.capabilities, command.supportsExtensionUi);
 				let releaseSnapshotReservation = requestedCapabilities.has("chunked_snapshot")
@@ -2154,7 +2566,10 @@ export class DaemonSupervisor {
 				return success(command.id, command.type, this.getOwnedSessionCleanup(command.activeSessionId));
 			case "complete_owned_session": {
 				const match = await this.findWorker(command.activeSessionId);
-				if (match.worker.descriptor.ownerClientId !== this.protocolClientId(client)) {
+				if (
+					match.worker.recoverableAdoption ||
+					match.worker.descriptor.ownerClientId !== this.protocolClientId(client)
+				) {
 					return failure(command.id, command.type, "Session is not owned by this client", {
 						code: "owned_session_owner_mismatch",
 					});
@@ -2200,7 +2615,7 @@ export class DaemonSupervisor {
 				setImmediate(() => void this.shutdown(0, false, true, false, "update"));
 				return success(command.id, command.type);
 			case "shutdown":
-				setImmediate(() => void this.shutdown(0, true, false, command.force === true, "shutdown"));
+				void this.shutdown(0, true, false, command.force === true, "shutdown");
 				return success(command.id, "shutdown");
 			case "prepare_update_restart": {
 				const manifest = await this.prepareUpdateRestart();
@@ -2244,7 +2659,7 @@ export class DaemonSupervisor {
 						)
 						.map((worker) =>
 							this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
-								failure(command.id, command.type, error, serializeDaemonError(error)),
+								recoverableOwnedCommandFailure(command.id, command.type, error),
 							),
 						),
 				);
@@ -2273,7 +2688,7 @@ export class DaemonSupervisor {
 						workers.map(async (worker) => {
 							if (worker.client && worker.descriptor.lifecycle === "ready") {
 								const response = await this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
-									failure(command.id, command.type, error, serializeDaemonError(error)),
+									recoverableOwnedCommandFailure(command.id, command.type, error),
 								);
 								if (response.success) {
 									const snapshot = heartbeatsFromResponse(response);
@@ -2292,7 +2707,7 @@ export class DaemonSupervisor {
 							const state =
 								worker.descriptor.lifecycle === "ready" ? "disconnected" : worker.descriptor.lifecycle;
 							const error = new Error(`Cannot list heartbeats while session worker is ${state}`);
-							return { response: failure(command.id, command.type, error, serializeDaemonError(error)) };
+							return { response: recoverableOwnedCommandFailure(command.id, command.type, error) };
 						}),
 					);
 				const failed = snapshots.find((snapshot) => snapshot.response)?.response;
@@ -2651,7 +3066,1199 @@ export class DaemonSupervisor {
 		return success(command.id, "list_saved_sessions", { sessions: saved.map(serializeSavedSessionInfo) });
 	}
 
-	private async createOrReuseWorker(clientId: string, command: DaemonCreateCommand): Promise<ResidentWorker> {
+	private recoverableAuthorityDigest(
+		authority: Pick<
+			RecoverableOwnedSessionAuthority,
+			| "workerIncarnation"
+			| "activeSessionId"
+			| "sessionId"
+			| "correlationId"
+			| "mcpOwnerId"
+			| "recoveryConfig"
+			| "launchEnv"
+		>,
+	): string {
+		return this.ownedSessionRecoveryStore.digestAuthority({
+			workerIncarnation: authority.workerIncarnation,
+			activeSessionId: authority.activeSessionId,
+			sessionId: authority.sessionId,
+			correlationId: authority.correlationId,
+			mcpOwnerId: authority.mcpOwnerId,
+			recoveryConfig: authority.recoveryConfig,
+			...(authority.launchEnv ? { launchEnv: authority.launchEnv } : {}),
+		});
+	}
+
+	private assertRecoverableOwnedSessionPlatform(): void {
+		if (this.platform === "win32") throw new OwnedSessionAdoptionUnavailableError();
+	}
+
+	private async createRecoverableOwnedSession(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "create_recoverable_owned_session" }>,
+	): Promise<DaemonRecoverableOwnedSessionCreateResult> {
+		this.assertRecoverableOwnedSessionPlatform();
+		if (
+			command.expectedSupervisorGeneration !== this.generation ||
+			!isDaemonRecoveryRequestId(command.requestId) ||
+			!command.correlationId ||
+			command.correlationId.length > 128 ||
+			!command.mcpOwnerId ||
+			command.mcpOwnerId.length > 256 ||
+			command.launchEnvMode !== "replace" ||
+			command.launchEnv === undefined ||
+			command.config === undefined ||
+			!isDeepStrictEqual(command.config, command.recoveryConfig)
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		const exactLaunchEnv = cloneCallerOwnedSessionLaunchEnv(command.launchEnv) as Record<string, string>;
+		const createRequest = {
+			type: command.type,
+			requestId: command.requestId,
+			expectedSupervisorGeneration: command.expectedSupervisorGeneration,
+			correlationId: command.correlationId,
+			mcpOwnerId: command.mcpOwnerId,
+			recoveryConfig: command.recoveryConfig,
+			...(command.sessionPath !== undefined ? { sessionPath: command.sessionPath } : {}),
+			...(command.continueRecent !== undefined ? { continueRecent: command.continueRecent } : {}),
+			...(command.noSession !== undefined ? { noSession: command.noSession } : {}),
+			...(command.name !== undefined ? { name: command.name } : {}),
+			...(command.runtimeMetadata !== undefined ? { runtimeMetadata: command.runtimeMetadata } : {}),
+			...(command.env !== undefined ? { env: command.env } : {}),
+			launchEnv: exactLaunchEnv,
+			launchEnvMode: command.launchEnvMode,
+		};
+		const requestIdDigest = this.ownedSessionRecoveryStore.digestRequest({
+			type: command.type,
+			requestId: command.requestId,
+		});
+		const requestDigest = this.ownedSessionRecoveryStore.digestRequest(createRequest);
+		const existing = this.ownedSessionRecoveryStore.getByCreateRequest(requestIdDigest, requestDigest);
+		if (existing) {
+			const worker = this.workers.get(existing.authority.workerId);
+			const summary = worker?.summaries.get(existing.authority.activeSessionId);
+			if (
+				!worker ||
+				!summary ||
+				worker.recoveryRecordId !== existing.recordId ||
+				worker.workerIncarnation !== existing.authority.workerIncarnation ||
+				!worker.client?.matchesAuthenticatedIncarnation(existing.authority.workerIncarnation)
+			) {
+				throw new OwnedSessionAdoptionUnavailableError();
+			}
+			const retryOwnerClientId = this.protocolClientId(client);
+			if (worker.descriptor.ownerClientId !== retryOwnerClientId) {
+				if (
+					worker.descriptor.ownerClientId === undefined ||
+					[...this.clients].some(
+						(other) =>
+							other !== client &&
+							this.protocolClientId(other) === worker.descriptor.ownerClientId &&
+							!other.socket.destroyed,
+					)
+				) {
+					throw new OwnedSessionAdoptionUnavailableError();
+				}
+				worker.descriptor.ownerClientId = retryOwnerClientId;
+				this.persistWorker(worker);
+			}
+			return {
+				state: this.publicSummary(worker, summary),
+				recoveryHandle: existing.recoveryHandle,
+				supervisorGeneration: this.generation,
+				ownershipGeneration: existing.ownershipGeneration,
+			};
+		}
+		const running = this.recoverableOwnedCreateRuns.get(requestIdDigest);
+		if (running) {
+			if (running.requestDigest !== requestDigest || running.ownerClientId !== this.protocolClientId(client))
+				throw new OwnedSessionAdoptionUnavailableError();
+			return running.promise;
+		}
+		const promise = (async (): Promise<DaemonRecoverableOwnedSessionCreateResult> => {
+			const createCommand = prepareCallerOwnedCreateEnvironment({
+				type: "create",
+				id: command.id,
+				...(command.sessionPath !== undefined ? { sessionPath: command.sessionPath } : {}),
+				...(command.continueRecent !== undefined ? { continueRecent: command.continueRecent } : {}),
+				...(command.noSession !== undefined ? { noSession: command.noSession } : {}),
+				...(command.name !== undefined ? { name: command.name } : {}),
+				config: command.recoveryConfig,
+				...(command.runtimeMetadata !== undefined ? { runtimeMetadata: command.runtimeMetadata } : {}),
+				...(command.env !== undefined ? { env: command.env } : {}),
+				launchEnv: exactLaunchEnv,
+				launchEnvMode: "replace",
+				lifecycle: "client_owned",
+			});
+			let worker: ResidentWorker | undefined;
+			let launchedWorker: ResidentWorker | undefined;
+			try {
+				worker = await this.createOrReuseWorker(
+					this.protocolClientId(client),
+					createCommand,
+					(launched) => (launchedWorker = launched),
+				);
+				if (worker.recoveryRecordId !== undefined) throw new OwnedSessionAdoptionUnavailableError();
+				const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
+				if (!summary) throw new OwnedSessionAdoptionUnavailableError();
+				const activeSessionId = summary.activeSessionId ?? summary.id;
+				if (
+					!worker.workerIncarnation ||
+					!worker.client?.matchesAuthenticatedIncarnation(worker.workerIncarnation)
+				) {
+					throw new OwnedSessionAdoptionUnavailableError();
+				}
+				const authorityBase = {
+					workerIncarnation: worker.workerIncarnation,
+					activeSessionId,
+					sessionId: summary.sessionId,
+					correlationId: command.correlationId,
+					mcpOwnerId: command.mcpOwnerId,
+					recoveryConfig: command.recoveryConfig,
+					launchEnv: exactLaunchEnv,
+				};
+				const authority: RecoverableOwnedSessionAuthority = {
+					workerId: worker.descriptor.workerId,
+					...authorityBase,
+				};
+				const receipt = this.ownedSessionRecoveryStore.create({
+					requestIdDigest,
+					requestDigest,
+					authorityDigest: this.recoverableAuthorityDigest(authorityBase),
+					authority,
+					expiresAt: RECOVERABLE_OWNED_CONNECTED_EXPIRY,
+				});
+				worker.recoveryRecordId = receipt.recordId;
+				if (worker.ownerCleanupTimer) {
+					clearTimeout(worker.ownerCleanupTimer);
+					worker.ownerCleanupTimer = undefined;
+				}
+				this.scheduleOwnedWorkerCleanup(worker);
+				return {
+					state: this.publicSummary(worker, summary),
+					recoveryHandle: receipt.recoveryHandle,
+					supervisorGeneration: this.generation,
+					ownershipGeneration: receipt.ownershipGeneration,
+				};
+			} catch (error) {
+				if (worker?.recoveryRecordId) {
+					try {
+						this.ownedSessionRecoveryStore.remove(worker.recoveryRecordId);
+					} catch {
+						// Exact worker containment below remains authoritative when receipt cleanup fails.
+					}
+					worker.recoveryRecordId = undefined;
+				}
+				if (
+					launchedWorker &&
+					worker === launchedWorker &&
+					this.workers.get(worker.descriptor.workerId) === worker
+				) {
+					await this.stopWorker(worker, true, true).catch((cleanupError) =>
+						this.reportCleanupFailure(`recoverable worker create ${worker!.descriptor.workerId}`, cleanupError),
+					);
+				} else if (worker) {
+					this.scheduleOwnedWorkerCleanup(worker);
+				}
+				throw error;
+			}
+		})();
+		this.recoverableOwnedCreateRuns.set(requestIdDigest, {
+			requestDigest,
+			ownerClientId: this.protocolClientId(client),
+			promise,
+		});
+		try {
+			return await promise;
+		} finally {
+			if (this.recoverableOwnedCreateRuns.get(requestIdDigest)?.promise === promise) {
+				this.recoverableOwnedCreateRuns.delete(requestIdDigest);
+			}
+		}
+	}
+
+	private async prepareRecoverableOwnedSessionAdoption(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "prepare_recoverable_owned_session_adoption" }>,
+	): Promise<DaemonRecoverableOwnedSessionPrepareResult> {
+		this.assertRecoverableOwnedSessionPlatform();
+		if (
+			!isDaemonRecoveryRequestId(command.requestId) ||
+			!command.capabilities.includes("event_sequence") ||
+			!command.capabilities.includes("attach_snapshot") ||
+			!command.capabilities.includes("correlated_prompt_lifecycle_v1") ||
+			!command.capabilities.includes(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE) ||
+			!command.activeSessionId ||
+			!command.sessionId ||
+			!command.correlationId ||
+			!command.previousMcpOwnerId ||
+			!command.mcpOwnerId ||
+			command.expectedSupervisorGeneration !== this.generation ||
+			command.cursor.generation === "" ||
+			!Number.isSafeInteger(command.cursor.sequence) ||
+			command.cursor.sequence < 0
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		const launchEnv = cloneCallerOwnedSessionLaunchEnv(command.launchEnv) as Record<string, string>;
+		const candidateReceipt = this.ownedSessionRecoveryStore.getByHandle(command.recoveryHandle);
+		const candidateWorker = this.workers.get(candidateReceipt.authority.workerId);
+		if (
+			!candidateWorker ||
+			candidateWorker.recoveryRecordId !== candidateReceipt.recordId ||
+			candidateWorker.workerIncarnation !== candidateReceipt.authority.workerIncarnation ||
+			!candidateWorker.client?.matchesAuthenticatedIncarnation(candidateReceipt.authority.workerIncarnation)
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		const authorityBase = {
+			workerIncarnation: candidateReceipt.authority.workerIncarnation,
+			activeSessionId: command.activeSessionId,
+			sessionId: command.sessionId,
+			correlationId: command.correlationId,
+			mcpOwnerId: command.previousMcpOwnerId,
+			recoveryConfig: command.recoveryConfig,
+			launchEnv,
+		};
+		const requestIdDigest = this.ownedSessionRecoveryStore.digestRequest({
+			type: command.type,
+			requestId: command.requestId,
+		});
+		const requestDigest = this.ownedSessionRecoveryStore.digestRequest({
+			type: command.type,
+			requestId: command.requestId,
+			expectedSupervisorGeneration: command.expectedSupervisorGeneration,
+			activeSessionId: command.activeSessionId,
+			sessionId: command.sessionId,
+			correlationId: command.correlationId,
+			cursor: command.cursor,
+			previousMcpOwnerId: command.previousMcpOwnerId,
+			mcpOwnerId: command.mcpOwnerId,
+			recoveryConfig: command.recoveryConfig,
+			launchEnv,
+		});
+		const reserved = candidateWorker.recoverableAdoption;
+		if (reserved) {
+			if (
+				reserved.recordId !== candidateReceipt.recordId ||
+				reserved.requestIdDigest !== requestIdDigest ||
+				reserved.requestDigest !== requestDigest ||
+				reserved.client !== client ||
+				reserved.activeSessionId !== command.activeSessionId ||
+				!reserved.preparePromise
+			) {
+				throw new OwnedSessionAdoptionUnavailableError();
+			}
+			return reserved.preparePromise;
+		}
+		const prepareDeadline = Date.now() + RECOVERABLE_OWNED_PREPARE_TIMEOUT_MS;
+		const receipt = this.ownedSessionRecoveryStore.beginAdoption({
+			recoveryHandle: command.recoveryHandle,
+			requestIdDigest,
+			requestDigest,
+			authorityDigest: this.recoverableAuthorityDigest(authorityBase),
+			expectedSupervisorGeneration: command.expectedSupervisorGeneration,
+			expiresAt: prepareDeadline,
+		});
+		const worker = this.workers.get(receipt.authority.workerId);
+		if (
+			!worker ||
+			worker !== candidateWorker ||
+			worker.recoveryRecordId !== receipt.recordId ||
+			worker.workerIncarnation !== receipt.authority.workerIncarnation ||
+			!worker.client?.matchesAuthenticatedIncarnation(receipt.authority.workerIncarnation) ||
+			this.isWorkerStopping(worker)
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		if (receipt.phase === "final") {
+			return this.prepareRecoverableOwnedFinalRetry(
+				worker,
+				client,
+				command,
+				receipt,
+				requestIdDigest,
+				requestDigest,
+				prepareDeadline,
+				worker.recoverableFinal,
+			);
+		}
+		if (
+			worker.descriptor.ownerClientId === undefined ||
+			[...this.clients].some(
+				(other) =>
+					other !== client &&
+					this.protocolClientId(other) === worker.descriptor.ownerClientId &&
+					!other.socket.destroyed,
+			)
+		) {
+			this.ownedSessionRecoveryStore.markDisconnected(
+				receipt.recordId,
+				Date.now() + RECOVERABLE_OWNED_DISCONNECTED_RETENTION_MS,
+			);
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		if (worker.ownerCleanupTimer) {
+			clearTimeout(worker.ownerCleanupTimer);
+			worker.ownerCleanupTimer = undefined;
+		}
+		const workerClient = worker.client;
+		if (!workerClient) throw new OwnedSessionAdoptionUnavailableError();
+		const workerStopRevision = worker.stopRevision;
+		const timeout = setTimeout(
+			() => this.expireRecoverableOwnedAdoption(worker, receipt.recordId),
+			Math.max(1, prepareDeadline - Date.now()),
+		);
+		timeout.unref();
+		const adoption: RecoverableOwnedAdoption = {
+			recordId: receipt.recordId,
+			requestIdDigest,
+			requestDigest,
+			client,
+			workerClient,
+			workerIncarnation: receipt.authority.workerIncarnation,
+			workerStopRevision,
+			previousOwnerClientId: worker.descriptor.ownerClientId,
+			activeSessionId: command.activeSessionId,
+			proof: undefined as unknown as DaemonRecoverableOwnedSessionAdoptionProof,
+			frames: [],
+			bufferedBytes: 0,
+			timeout,
+		};
+		worker.recoverableAdoption = adoption;
+		const preparePromise = (async () => {
+			this.mutationDrain.begin();
+			try {
+				await this.mutationDrain.waitForDrain(
+					1,
+					AbortSignal.timeout(Math.max(1, prepareDeadline - Date.now())),
+					"Timed out draining mutations for recoverable owned-session adoption",
+				);
+				if (
+					Date.now() >= prepareDeadline ||
+					worker.recoverableAdoption !== adoption ||
+					worker.client !== workerClient ||
+					worker.workerIncarnation !== receipt.authority.workerIncarnation ||
+					!workerClient.matchesAuthenticatedIncarnation(receipt.authority.workerIncarnation) ||
+					worker.stopRevision !== workerStopRevision ||
+					worker.descriptor.ownerClientId === undefined ||
+					[...this.clients].some(
+						(other) =>
+							other !== client &&
+							this.protocolClientId(other) === worker.descriptor.ownerClientId &&
+							!other.socket.destroyed,
+					)
+				) {
+					throw new OwnedSessionAdoptionUnavailableError();
+				}
+				return await this.prepareRecoverableOwnedSnapshot(worker, adoption, receipt, command, prepareDeadline);
+			} catch (error) {
+				this.rollbackRecoverableOwnedAdoption(worker, adoption);
+				throw error;
+			} finally {
+				this.mutationDrain.end();
+			}
+		})();
+		adoption.preparePromise = preparePromise;
+		return preparePromise;
+	}
+
+	private async prepareRecoverableOwnedFinalRetry(
+		worker: ResidentWorker,
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "prepare_recoverable_owned_session_adoption" }>,
+		receipt: OwnedSessionRecoveryReceipt<RecoverableOwnedSessionAuthority>,
+		requestIdDigest: string,
+		requestDigest: string,
+		prepareDeadline: number,
+		finalReceipt: RecoverableOwnedFinalReceipt | undefined,
+	): Promise<DaemonRecoverableOwnedSessionPrepareResult> {
+		if (
+			!finalReceipt ||
+			finalReceipt.recordId !== receipt.recordId ||
+			finalReceipt.requestIdDigest !== requestIdDigest ||
+			finalReceipt.requestDigest !== requestDigest ||
+			finalReceipt.result.recoveryHandle !== receipt.recoveryHandle ||
+			worker.descriptor.ownerClientId !== finalReceipt.ownerClientId ||
+			receipt.authority.mcpOwnerId !== command.mcpOwnerId ||
+			receipt.authority.proof === undefined ||
+			worker.recoverableAdoption !== undefined ||
+			[...this.clients].some(
+				(other) =>
+					other !== client &&
+					this.protocolClientId(other) === finalReceipt.ownerClientId &&
+					!other.socket.destroyed,
+			)
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		if (worker.ownerCleanupTimer) {
+			clearTimeout(worker.ownerCleanupTimer);
+			worker.ownerCleanupTimer = undefined;
+		}
+		const workerClient = worker.client;
+		const workerIncarnation = worker.workerIncarnation;
+		if (!workerClient || !workerIncarnation) throw new OwnedSessionAdoptionUnavailableError();
+		const workerStopRevision = worker.stopRevision;
+		const timeout = setTimeout(
+			() => this.expireRecoverableOwnedAdoption(worker, receipt.recordId),
+			Math.max(1, prepareDeadline - Date.now()),
+		);
+		timeout.unref();
+		const adoption: RecoverableOwnedAdoption = {
+			recordId: receipt.recordId,
+			requestIdDigest,
+			requestDigest,
+			client,
+			workerClient,
+			workerIncarnation,
+			workerStopRevision,
+			previousOwnerClientId: finalReceipt.ownerClientId,
+			activeSessionId: command.activeSessionId,
+			proof: receipt.authority.proof,
+			frames: [],
+			bufferedBytes: 0,
+			finalRetry: true,
+			timeout,
+		};
+		worker.recoverableAdoption = adoption;
+		const preparePromise = (async () => {
+			this.mutationDrain.begin();
+			const previousAuthority = receipt.authority;
+			const previousAuthorityDigest = this.recoverableAuthorityDigest(previousAuthority);
+			const previousOwnerClientId = finalReceipt.ownerClientId;
+			let authorityReplaced = false;
+			try {
+				await this.mutationDrain.waitForDrain(
+					1,
+					AbortSignal.timeout(Math.max(1, prepareDeadline - Date.now())),
+					"Timed out draining mutations for recoverable owned-session adoption",
+				);
+				if (
+					Date.now() >= prepareDeadline ||
+					worker.recoverableAdoption !== adoption ||
+					worker.client !== workerClient ||
+					worker.workerIncarnation !== workerIncarnation ||
+					!workerClient.matchesAuthenticatedIncarnation(workerIncarnation) ||
+					worker.stopRevision !== workerStopRevision
+				) {
+					throw new OwnedSessionAdoptionUnavailableError();
+				}
+				const result = await this.prepareRecoverableOwnedSnapshot(
+					worker,
+					adoption,
+					receipt,
+					command,
+					prepareDeadline,
+				);
+				await this.assertCurrentOwnership();
+				this.assertRecoverableOwnedAdoptionCurrent(worker, adoption, client);
+				this.validateRecoverableOwnedBuffer(adoption, result.proof.cursor);
+				const nextAuthority: RecoverableOwnedSessionAuthority = {
+					...receipt.authority,
+					proof: result.proof,
+				};
+				worker.descriptor.ownerClientId = this.protocolClientId(client);
+				this.persistWorker(worker);
+				this.ownedSessionRecoveryStore.replaceAuthority(
+					receipt.recordId,
+					this.recoverableAuthorityDigest(nextAuthority),
+					nextAuthority,
+				);
+				authorityReplaced = true;
+				this.ownedSessionRecoveryStore.markFinal(
+					receipt.recordId,
+					Date.now() + RECOVERABLE_OWNED_CONFIRMATION_RETENTION_MS,
+				);
+				// Final-retry prepare has durably rebound ownership to this claimant.
+				// Keep the reservation validator aligned with that new exact owner.
+				adoption.previousOwnerClientId = this.protocolClientId(client);
+				worker.recoverableFinal = {
+					recordId: receipt.recordId,
+					requestIdDigest,
+					requestDigest,
+					ownerClientId: this.protocolClientId(client),
+					result,
+					frames: adoption.frames.map((frame) => Buffer.from(frame.payload)),
+					...(finalReceipt.mcpTransfer ? { mcpTransfer: finalReceipt.mcpTransfer } : {}),
+				};
+				// Keep the capture fence reserved until repeated commit queues every retained frame.
+				// Prepare must not attach live delivery or K+1 can overtake retained S+1..K.
+				this.scheduleRecoverableOwnedConfirmationExpiry(worker, receipt.recordId);
+				return result;
+			} catch (error) {
+				if (authorityReplaced) {
+					try {
+						this.ownedSessionRecoveryStore.replaceAuthority(
+							receipt.recordId,
+							previousAuthorityDigest,
+							previousAuthority,
+						);
+					} catch {
+						await this.stopWorker(worker, true).catch(() => undefined);
+					}
+				}
+				worker.descriptor.ownerClientId = previousOwnerClientId;
+				try {
+					this.persistWorker(worker);
+				} catch {
+					await this.stopWorker(worker, true).catch(() => undefined);
+				}
+				this.rollbackRecoverableOwnedAdoption(worker, adoption);
+				throw error;
+			} finally {
+				this.mutationDrain.end();
+			}
+		})();
+		adoption.preparePromise = preparePromise;
+		return preparePromise;
+	}
+
+	private async prepareRecoverableOwnedSnapshot(
+		worker: ResidentWorker,
+		adoption: RecoverableOwnedAdoption,
+		receipt: OwnedSessionRecoveryReceipt<RecoverableOwnedSessionAuthority>,
+		command: Extract<DaemonCommand, { type: "prepare_recoverable_owned_session_adoption" }>,
+		prepareDeadline: number,
+	): Promise<DaemonRecoverableOwnedSessionPrepareResult> {
+		const response = await this.requireAvailableWorkerClient(worker).request(
+			{
+				type: "attach",
+				activeSessionId: command.activeSessionId,
+				capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "correlated_prompt_lifecycle_v1"],
+				supportsExtensionUi: false,
+				env: collectDaemonClientEnv(),
+			},
+			Math.max(1, prepareDeadline - Date.now()),
+		);
+		const attached = attachResultFromResponse(response);
+		const snapshot = attached.snapshot;
+		const cursor = snapshot.lastEventCursor;
+		if (
+			attached.replay.status !== "complete" ||
+			snapshot.activeSessionId !== command.activeSessionId ||
+			snapshot.summary.sessionId !== command.sessionId ||
+			snapshot.state.sessionId !== command.sessionId ||
+			!cursor ||
+			cursor.generation !== command.cursor.generation ||
+			cursor.sequence < command.cursor.sequence ||
+			cursor.sequence !== snapshot.lastEventSequence
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		const lifecycle = snapshot.promptLifecycles?.records.find(
+			(entry) => entry.correlationId === command.correlationId,
+		);
+		const expired = snapshot.promptLifecycles?.expired.find((entry) => entry.correlationId === command.correlationId);
+		if (!lifecycle && !expired) throw new OwnedSessionAdoptionUnavailableError();
+		this.validateRecoverableOwnedBuffer(adoption, cursor);
+		const proof: DaemonRecoverableOwnedSessionAdoptionProof = {
+			feature: "recoverable_owned_session_adoption_v1",
+			status: "adopted",
+			supervisorGeneration: this.generation,
+			ownershipGeneration: receipt.ownershipGeneration,
+			activeSessionId: command.activeSessionId,
+			sessionId: command.sessionId,
+			correlationId: command.correlationId,
+			lifecycle: lifecycle ?? { ...expired!, expired: true as const },
+			cursor,
+			mcpOwnerId: command.mcpOwnerId,
+		};
+		adoption.proof = proof;
+		adoption.client.capabilities = normalizeCapabilities(command.capabilities, command.supportsExtensionUi);
+		adoption.client.supportsExtensionUi = adoption.client.capabilities.has("extension_ui");
+		const publicSummary = this.publicSummary(worker, snapshot.summary);
+		const result: DaemonRecoverableOwnedSessionPrepareResult = {
+			...attached,
+			state: attached.state ? publicSummary : undefined,
+			snapshot: { ...snapshot, summary: publicSummary },
+			client: { id: command.clientId, capabilities: [...adoption.client.capabilities] },
+			recoveryHandle: receipt.recoveryHandle,
+			proof,
+		};
+		adoption.result = result;
+		return result;
+	}
+
+	private assertRecoverableOwnedAdoptionCurrent(
+		worker: ResidentWorker,
+		adoption: RecoverableOwnedAdoption,
+		client: DaemonSocketClient,
+	): void {
+		if (
+			this.workers.get(worker.descriptor.workerId) !== worker ||
+			worker.recoverableAdoption !== adoption ||
+			adoption.client !== client ||
+			worker.descriptor.ownerClientId !== adoption.previousOwnerClientId ||
+			worker.client !== adoption.workerClient ||
+			worker.workerIncarnation !== adoption.workerIncarnation ||
+			!adoption.workerClient.matchesAuthenticatedIncarnation(adoption.workerIncarnation) ||
+			worker.stopRevision !== adoption.workerStopRevision ||
+			this.isWorkerStopping(worker) ||
+			[...this.clients].some(
+				(other) =>
+					other !== client &&
+					this.protocolClientId(other) === adoption.previousOwnerClientId &&
+					!other.socket.destroyed,
+			)
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+	}
+
+	private recoverableOwnedMcpTransferProof(
+		response: DaemonResponse,
+		transactionId: string,
+		previousOwnerId: string,
+		nextOwnerId: string,
+		expectedState?: "transferred" | "rolled_back",
+	): DaemonWorkerAcpMcpOwnerTransferProof {
+		if (!response.success || !response.data || typeof response.data !== "object") {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		const proof = response.data as Partial<DaemonWorkerAcpMcpOwnerTransferProof>;
+		if (
+			proof.transactionId !== transactionId ||
+			proof.previousOwnerId !== previousOwnerId ||
+			proof.nextOwnerId !== nextOwnerId ||
+			typeof proof.changed !== "boolean" ||
+			(proof.state !== "transferred" && proof.state !== "rolled_back") ||
+			(expectedState !== undefined && proof.state !== expectedState)
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		return proof as DaemonWorkerAcpMcpOwnerTransferProof;
+	}
+
+	private async requestRecoverableOwnedMcpTransfer(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		transactionId: string,
+		action: "transfer" | "query" | "rollback",
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): Promise<DaemonWorkerAcpMcpOwnerTransferProof> {
+		const response = await this.requireAvailableWorkerClient(worker).requestWorker(
+			{
+				type: "worker_transfer_acp_mcp_owner",
+				activeSessionId,
+				transactionId,
+				action,
+				previousOwnerId,
+				ownerId: nextOwnerId,
+			},
+			RECOVERABLE_OWNED_PREPARE_TIMEOUT_MS,
+		);
+		return this.recoverableOwnedMcpTransferProof(
+			response,
+			transactionId,
+			previousOwnerId,
+			nextOwnerId,
+			action === "transfer" ? "transferred" : action === "rollback" ? "rolled_back" : undefined,
+		);
+	}
+
+	private async retireRecoverableOwnedMcpTransferReceipt(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		transactionId: string,
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): Promise<void> {
+		const response = await this.requireAvailableWorkerClient(worker).requestWorker(
+			{
+				type: "worker_transfer_acp_mcp_owner",
+				activeSessionId,
+				transactionId,
+				action: "retire",
+				previousOwnerId,
+				ownerId: nextOwnerId,
+			},
+			RECOVERABLE_OWNED_PREPARE_TIMEOUT_MS,
+		);
+		if (!response.success || !response.data || typeof response.data !== "object") {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		const retired = response.data as Partial<DaemonWorkerAcpMcpOwnerTransferRetirement>;
+		if (
+			retired.transactionId !== transactionId ||
+			retired.previousOwnerId !== previousOwnerId ||
+			retired.nextOwnerId !== nextOwnerId ||
+			retired.status !== "retired"
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+	}
+
+	private async transferRecoverableOwnedMcpOwner(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		transactionId: string,
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): Promise<DaemonWorkerAcpMcpOwnerTransferProof> {
+		try {
+			return await this.requestRecoverableOwnedMcpTransfer(
+				worker,
+				activeSessionId,
+				transactionId,
+				"transfer",
+				previousOwnerId,
+				nextOwnerId,
+			);
+		} catch {
+			const observed = await this.requestRecoverableOwnedMcpTransfer(
+				worker,
+				activeSessionId,
+				transactionId,
+				"query",
+				previousOwnerId,
+				nextOwnerId,
+			);
+			if (observed.state === "transferred") return observed;
+			return this.requestRecoverableOwnedMcpTransfer(
+				worker,
+				activeSessionId,
+				transactionId,
+				"transfer",
+				previousOwnerId,
+				nextOwnerId,
+			);
+		}
+	}
+
+	private async rollbackRecoverableOwnedMcpOwner(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		transactionId: string,
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): Promise<boolean> {
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				await this.requestRecoverableOwnedMcpTransfer(
+					worker,
+					activeSessionId,
+					transactionId,
+					"rollback",
+					previousOwnerId,
+					nextOwnerId,
+				);
+				return true;
+			} catch {
+				try {
+					const proof = await this.requestRecoverableOwnedMcpTransfer(
+						worker,
+						activeSessionId,
+						transactionId,
+						"query",
+						previousOwnerId,
+						nextOwnerId,
+					);
+					if (proof.state === "rolled_back") return true;
+				} catch {
+					// A failed query leaves rollback unproven and must not authorize a retry.
+				}
+			}
+		}
+		return false;
+	}
+
+	private async commitRecoverableOwnedSessionAdoption(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "commit_recoverable_owned_session_adoption" }>,
+	): Promise<DaemonRecoverableOwnedSessionAdoptionProof> {
+		this.assertRecoverableOwnedSessionPlatform();
+		if (
+			command.expectedSupervisorGeneration !== this.generation ||
+			!isDaemonRecoveryRequestId(command.requestId) ||
+			command.proof.supervisorGeneration !== command.expectedSupervisorGeneration
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		const requestIdDigest = this.ownedSessionRecoveryStore.digestRequest({
+			type: "prepare_recoverable_owned_session_adoption",
+			requestId: command.requestId,
+		});
+		const adoptionMatches = [...this.workers.values()].filter((candidate) => {
+			const reserved = candidate.recoverableAdoption;
+			return (
+				reserved?.client === client &&
+				reserved.requestIdDigest === requestIdDigest &&
+				reserved.result?.recoveryHandle === command.recoveryHandle &&
+				isDeepStrictEqual(reserved.proof, command.proof)
+			);
+		});
+		const committedMatches = [...this.workers.values()].filter((candidate) => {
+			const final = candidate.recoverableFinal;
+			return (
+				final?.ownerClientId === this.protocolClientId(client) &&
+				final.requestIdDigest === requestIdDigest &&
+				final.result.recoveryHandle === command.recoveryHandle &&
+				isDeepStrictEqual(final.result.proof, command.proof)
+			);
+		});
+		if (adoptionMatches.length > 1 || committedMatches.length > 1) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		const selected = adoptionMatches[0];
+		const adoption = selected?.recoverableAdoption;
+		const committedWorker = committedMatches[0];
+		const committed = committedWorker?.recoverableFinal;
+		if (adoption?.finalRetry) {
+			if (!selected || !adoption.result || committedWorker !== selected || !committed) {
+				throw new OwnedSessionAdoptionUnavailableError();
+			}
+			const receipt = this.ownedSessionRecoveryStore.getForConfirmation(command.recoveryHandle, requestIdDigest);
+			if (
+				adoption.recordId !== receipt.recordId ||
+				committed.recordId !== receipt.recordId ||
+				selected.recoveryRecordId !== receipt.recordId ||
+				selected.workerIncarnation !== receipt.authority.workerIncarnation ||
+				!selected.client?.matchesAuthenticatedIncarnation(receipt.authority.workerIncarnation) ||
+				selected.descriptor.ownerClientId !== this.protocolClientId(client) ||
+				client.socket.destroyed
+			) {
+				throw new OwnedSessionAdoptionUnavailableError();
+			}
+			this.assertRecoverableOwnedAdoptionCurrent(selected, adoption, client);
+			this.validateRecoverableOwnedBuffer(adoption, adoption.proof.cursor);
+			const frames = adoption.frames.map((frame) => Buffer.from(frame.payload));
+			committed.frames = frames;
+			for (const frame of frames) this.writeSerialized(client, frame);
+			clearTimeout(adoption.timeout);
+			selected.recoverableAdoption = undefined;
+			client.attachedActiveSessionIds.add(adoption.proof.activeSessionId);
+			void this.syncWorkerExtensionUi(adoption.proof.activeSessionId);
+			return adoption.proof;
+		}
+		if (committed && committedWorker && !adoption) {
+			const receipt = this.ownedSessionRecoveryStore.getForConfirmation(command.recoveryHandle, requestIdDigest);
+			if (
+				committedWorker.recoveryRecordId !== receipt.recordId ||
+				committedWorker.workerIncarnation !== receipt.authority.workerIncarnation ||
+				!committedWorker.client?.matchesAuthenticatedIncarnation(receipt.authority.workerIncarnation) ||
+				committedWorker.descriptor.ownerClientId !== this.protocolClientId(client) ||
+				client.socket.destroyed ||
+				[...this.clients].some(
+					(other) =>
+						other !== client &&
+						this.protocolClientId(other) === this.protocolClientId(client) &&
+						!other.socket.destroyed,
+				)
+			) {
+				throw new OwnedSessionAdoptionUnavailableError();
+			}
+			for (const frame of committed.frames) this.writeSerialized(client, frame);
+			client.attachedActiveSessionIds.add(committed.result.proof.activeSessionId);
+			return committed.result.proof;
+		}
+		if (!selected || !adoption || !adoption.result || adoption.finalRetry || committed) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		const commitReceipt = this.ownedSessionRecoveryStore.getForCommit(
+			adoption.recordId,
+			command.recoveryHandle,
+			requestIdDigest,
+		);
+		this.assertRecoverableOwnedAdoptionCurrent(selected, adoption, client);
+		this.validateRecoverableOwnedBuffer(adoption, adoption.proof.cursor);
+		await this.assertCurrentOwnership();
+		this.assertRecoverableOwnedAdoptionCurrent(selected, adoption, client);
+		this.validateRecoverableOwnedBuffer(adoption, adoption.proof.cursor);
+		this.ownedSessionRecoveryStore.markCommitting(adoption.recordId);
+		adoption.committing = true;
+		const previousOwner = selected.descriptor.ownerClientId;
+		const previousAuthority = commitReceipt.authority;
+		const previousAuthorityDigest = this.recoverableAuthorityDigest(previousAuthority);
+		const transactionId = this.ownedSessionRecoveryStore.digestRequest({
+			type: "recoverable_owned_mcp_transfer",
+			recordId: adoption.recordId,
+			requestDigest: adoption.requestDigest,
+		});
+		let transferAttempted = false;
+		let authorityReplaced = false;
+		try {
+			transferAttempted = true;
+			await this.transferRecoverableOwnedMcpOwner(
+				selected,
+				adoption.proof.activeSessionId,
+				transactionId,
+				commitReceipt.authority.mcpOwnerId,
+				adoption.proof.mcpOwnerId,
+			);
+			await this.assertCurrentOwnership();
+			// This is the ownership cut. No await may occur between the final live-channel/frame
+			// validation and the synchronous descriptor, authority, and receipt commit below.
+			this.assertRecoverableOwnedAdoptionCurrent(selected, adoption, client);
+			this.validateRecoverableOwnedBuffer(adoption, adoption.proof.cursor);
+			const nextAuthority: RecoverableOwnedSessionAuthority = {
+				...commitReceipt.authority,
+				mcpOwnerId: adoption.proof.mcpOwnerId,
+				proof: adoption.proof,
+			};
+			selected.descriptor.ownerClientId = this.protocolClientId(client);
+			this.persistWorker(selected);
+			this.ownedSessionRecoveryStore.replaceAuthority(
+				adoption.recordId,
+				this.recoverableAuthorityDigest(nextAuthority),
+				nextAuthority,
+			);
+			authorityReplaced = true;
+			this.ownedSessionRecoveryStore.markFinal(
+				adoption.recordId,
+				Date.now() + RECOVERABLE_OWNED_CONFIRMATION_RETENTION_MS,
+			);
+			selected.recoverableFinal = {
+				recordId: adoption.recordId,
+				requestIdDigest: adoption.requestIdDigest,
+				requestDigest: adoption.requestDigest,
+				ownerClientId: this.protocolClientId(client),
+				result: adoption.result,
+				frames: adoption.frames.map((frame) => Buffer.from(frame.payload)),
+				mcpTransfer: {
+					transactionId,
+					previousOwnerId: commitReceipt.authority.mcpOwnerId,
+					nextOwnerId: adoption.proof.mcpOwnerId,
+				},
+			};
+			this.scheduleRecoverableOwnedConfirmationExpiry(selected, adoption.recordId);
+		} catch (error) {
+			let rollbackProved = !transferAttempted;
+			if (transferAttempted) {
+				rollbackProved = await this.rollbackRecoverableOwnedMcpOwner(
+					selected,
+					adoption.proof.activeSessionId,
+					transactionId,
+					commitReceipt.authority.mcpOwnerId,
+					adoption.proof.mcpOwnerId,
+				);
+			}
+			if (rollbackProved && transferAttempted) {
+				await this.retireRecoverableOwnedMcpTransferReceipt(
+					selected,
+					adoption.proof.activeSessionId,
+					transactionId,
+					commitReceipt.authority.mcpOwnerId,
+					adoption.proof.mcpOwnerId,
+				).catch(() => undefined);
+			}
+			let authorityRollbackProved = true;
+			if (authorityReplaced) {
+				try {
+					this.ownedSessionRecoveryStore.replaceAuthority(
+						adoption.recordId,
+						previousAuthorityDigest,
+						previousAuthority,
+					);
+				} catch {
+					authorityRollbackProved = false;
+				}
+			}
+			selected.descriptor.ownerClientId = previousOwner;
+			try {
+				this.persistWorker(selected);
+			} catch {
+				authorityRollbackProved = false;
+			}
+			this.rollbackRecoverableOwnedAdoption(selected, adoption);
+			if (!rollbackProved || !authorityRollbackProved) {
+				await this.stopWorker(selected, true).catch(() => undefined);
+			}
+			throw error;
+		}
+		const frames = selected.recoverableFinal?.frames ?? adoption.frames.map((frame) => frame.payload);
+		for (const frame of frames) this.writeSerialized(client, frame);
+		clearTimeout(adoption.timeout);
+		selected.recoverableAdoption = undefined;
+		client.attachedActiveSessionIds.add(adoption.proof.activeSessionId);
+		void this.syncWorkerExtensionUi(adoption.proof.activeSessionId);
+		return adoption.proof;
+	}
+
+	private async confirmRecoverableOwnedSessionAdoption(
+		_client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "confirm_recoverable_owned_session_adoption" }>,
+	): Promise<DaemonRecoverableOwnedSessionConfirmResult> {
+		this.assertRecoverableOwnedSessionPlatform();
+		if (
+			!isDaemonRecoveryRequestId(command.requestId) ||
+			command.expectedSupervisorGeneration !== this.generation ||
+			command.proof.supervisorGeneration !== command.expectedSupervisorGeneration
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		const requestIdDigest = this.ownedSessionRecoveryStore.digestRequest({
+			type: "prepare_recoverable_owned_session_adoption",
+			requestId: command.requestId,
+		});
+		const receipt = this.ownedSessionRecoveryStore.getForConfirmation(command.recoveryHandle, requestIdDigest);
+		if (
+			receipt.ownershipGeneration !== command.proof.ownershipGeneration ||
+			command.proof.supervisorGeneration !== this.generation ||
+			command.proof.sessionId !== receipt.authority.sessionId ||
+			command.proof.correlationId !== receipt.authority.correlationId ||
+			!receipt.authority.proof ||
+			!isDeepStrictEqual(command.proof, receipt.authority.proof)
+		) {
+			throw new OwnedSessionAdoptionUnavailableError();
+		}
+		this.ownedSessionRecoveryStore.confirm({
+			recoveryHandle: command.recoveryHandle,
+			requestIdDigest,
+			authorityDigest: this.recoverableAuthorityDigest(receipt.authority),
+			expiresAt: RECOVERABLE_OWNED_CONNECTED_EXPIRY,
+		});
+		const worker = this.workers.get(receipt.authority.workerId);
+		const finalReceipt =
+			worker?.recoverableFinal?.recordId === receipt.recordId ? worker.recoverableFinal : undefined;
+		if (worker && finalReceipt?.mcpTransfer) {
+			await this.retireRecoverableOwnedMcpTransferReceipt(
+				worker,
+				receipt.authority.activeSessionId,
+				finalReceipt.mcpTransfer.transactionId,
+				finalReceipt.mcpTransfer.previousOwnerId,
+				finalReceipt.mcpTransfer.nextOwnerId,
+			).catch(() => undefined);
+		}
+		if (worker?.recoverableFinal?.recordId === receipt.recordId) worker.recoverableFinal = undefined;
+		if (worker?.recoveryConfirmationTimer) {
+			clearTimeout(worker.recoveryConfirmationTimer);
+			worker.recoveryConfirmationTimer = undefined;
+		}
+		return { status: "confirmed" };
+	}
+
+	private retireRecoverableOwnedFinalTransferReceipt(worker: ResidentWorker): void {
+		const finalReceipt = worker.recoverableFinal;
+		if (!finalReceipt?.mcpTransfer) return;
+		void this.retireRecoverableOwnedMcpTransferReceipt(
+			worker,
+			finalReceipt.result.proof.activeSessionId,
+			finalReceipt.mcpTransfer.transactionId,
+			finalReceipt.mcpTransfer.previousOwnerId,
+			finalReceipt.mcpTransfer.nextOwnerId,
+		).catch(() => undefined);
+	}
+
+	private scheduleRecoverableOwnedConfirmationExpiry(worker: ResidentWorker, recordId: string): void {
+		if (worker.recoveryConfirmationTimer) clearTimeout(worker.recoveryConfirmationTimer);
+		worker.recoveryConfirmationTimer = setTimeout(() => {
+			worker.recoveryConfirmationTimer = undefined;
+			let expired = false;
+			try {
+				const receipt = this.ownedSessionRecoveryStore.get(recordId);
+				if (!receipt || receipt.phase === "final") {
+					this.ownedSessionRecoveryStore.remove(recordId);
+					expired = true;
+				}
+			} catch {
+				expired = true;
+			}
+			if (!expired || worker.recoveryRecordId !== recordId) return;
+			if (worker.ownerCleanupTimer) {
+				clearTimeout(worker.ownerCleanupTimer);
+				worker.ownerCleanupTimer = undefined;
+			}
+			this.retireRecoverableOwnedFinalTransferReceipt(worker);
+			worker.recoveryRecordId = undefined;
+			worker.recoverableFinal = undefined;
+			if (this.workers.get(worker.descriptor.workerId) !== worker) return;
+			const ownerClientId = worker.descriptor.ownerClientId;
+			const ownerConnected =
+				ownerClientId !== undefined &&
+				[...this.clients].some(
+					(client) => this.protocolClientId(client) === ownerClientId && !client.socket.destroyed,
+				);
+			if (ownerConnected) {
+				this.scheduleOwnedWorkerCleanup(worker);
+				return;
+			}
+			void this.stopWorker(worker, true, true).catch((error) =>
+				this.log(
+					`Could not contain unconfirmed recoverable worker ${worker.descriptor.workerId}: ${String(error)}`,
+				),
+			);
+		}, RECOVERABLE_OWNED_CONFIRMATION_RETENTION_MS + 1);
+		worker.recoveryConfirmationTimer.unref();
+	}
+
+	private validateRecoverableOwnedBuffer(
+		adoption: RecoverableOwnedAdoption,
+		cursor: { generation: string; sequence: number },
+	): void {
+		if (adoption.error) throw adoption.error;
+		const reconciled = reconcileRecoverableOwnedFrames(adoption.frames, cursor);
+		adoption.frames = reconciled.frames;
+		adoption.bufferedBytes = reconciled.bufferedBytes;
+	}
+
+	private captureRecoverableOwnedFrame(
+		worker: ResidentWorker,
+		activeSessionId: string,
+		message: DaemonOutbound,
+		payload: Buffer,
+	): void {
+		const adoption = worker.recoverableAdoption;
+		if (!adoption || adoption.activeSessionId !== activeSessionId) return;
+		if (adoption.error) return;
+		const meta = (message as { meta?: { cursor?: { generation?: unknown; sequence?: unknown } } }).meta;
+		const cursor = meta?.cursor;
+		if (
+			!cursor ||
+			typeof cursor.generation !== "string" ||
+			!Number.isSafeInteger(cursor.sequence) ||
+			(cursor.sequence as number) < 0
+		) {
+			adoption.error = new OwnedSessionAdoptionUnavailableError();
+			return;
+		}
+		try {
+			adoption.bufferedBytes = appendRecoverableOwnedFrame(adoption.frames, adoption.bufferedBytes, {
+				payload: Buffer.from(payload),
+				message,
+				cursor: { generation: cursor.generation, sequence: cursor.sequence as number },
+			});
+		} catch (error) {
+			adoption.error = error instanceof Error ? error : new OwnedSessionAdoptionUnavailableError();
+		}
+	}
+
+	private expireRecoverableOwnedAdoption(worker: ResidentWorker, recordId: string): void {
+		const adoption = worker.recoverableAdoption;
+		if (!adoption || adoption.recordId !== recordId) return;
+		this.rollbackRecoverableOwnedAdoption(worker, adoption);
+	}
+
+	private rollbackRecoverableOwnedAdoption(worker: ResidentWorker, adoption: RecoverableOwnedAdoption): void {
+		clearTimeout(adoption.timeout);
+		if (worker.recoverableAdoption === adoption) worker.recoverableAdoption = undefined;
+		try {
+			const receipt = this.ownedSessionRecoveryStore.get(adoption.recordId);
+			if (receipt?.phase === "final") {
+				this.ownedSessionRecoveryStore.markFinal(
+					adoption.recordId,
+					Date.now() + RECOVERABLE_OWNED_CONFIRMATION_RETENTION_MS,
+				);
+			} else if (receipt) {
+				this.ownedSessionRecoveryStore.rollbackAdoption(
+					adoption.recordId,
+					this.recoverableAuthorityDigest(receipt.authority),
+					Date.now() + RECOVERABLE_OWNED_DISCONNECTED_RETENTION_MS,
+				);
+			}
+		} catch {
+			// Without a durable disconnected receipt, normal owner cleanup remains authoritative.
+		}
+		this.scheduleOwnedWorkerCleanup(worker);
+	}
+
+	private async createOrReuseWorker(
+		clientId: string,
+		command: DaemonCreateCommand,
+		onLaunched?: (worker: ResidentWorker) => void,
+	): Promise<ResidentWorker> {
 		let createCommand = command;
 		if (command.name !== undefined) {
 			const normalizedName = command.name.trim();
@@ -2702,8 +4309,13 @@ export class DaemonSupervisor {
 				return this.reuseWorkerForCreate(existing, ownerClientId, createCommand.sessionPath);
 			}
 		}
+		const launchNewWorker = async (): Promise<ResidentWorker> => {
+			const worker = await this.launchWorker(createCommand, undefined, ownerClientId);
+			onLaunched?.(worker);
+			return worker;
+		};
 		const opening = (async () => {
-			if (!createCommand.name) return this.launchWorker(createCommand, undefined, ownerClientId);
+			if (!createCommand.name) return launchNewWorker();
 			const savedSiblings = createCommand.sessionPath ? await this.rlmLedgerSiblings(createCommand.sessionPath) : [];
 			const target = savedSiblings.find(
 				(session) => canonicalSessionPath(session.path) === canonicalSessionPath(createCommand.sessionPath!),
@@ -2716,7 +4328,7 @@ export class DaemonSupervisor {
 				} else {
 					await this.assertSupervisorSessionNameAvailable(targetSummary, createCommand.name!);
 				}
-				return this.launchWorker(createCommand, undefined, ownerClientId);
+				return launchNewWorker();
 			});
 		})();
 		this.openingWorkers.set(key, opening);
@@ -2913,13 +4525,17 @@ export class DaemonSupervisor {
 		const orphanProcessJournalPath =
 			existing?.descriptor.orphanProcessJournalPath ?? join(this.descriptorDir, `${workerId}.orphans.jsonl`);
 		const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
-		const workerEnvironmentSource = {
+		const workerEnvironmentBase = sanitizeDaemonWorkerBootstrapEnvironment({
 			...(launchEnvMode === "replace" ? launchEnv : { ...process.env, ...launchEnv }),
+		});
+		const workerEnvironmentSource = {
+			...workerEnvironmentBase,
 			// Prime-owned worker authentication, recovery, startup, lease, and orphan-cleanup bootstrap.
 			[DAEMON_WORKER_ROLE_ENV]: "1",
 			[DAEMON_WORKER_TOKEN_ENV]: token,
 			[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: rootActiveSessionId,
 			[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: this.socketPath,
+			[DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV]: createCommand.config?.agentDir ?? this.defaultSessionConfig.agentDir,
 			[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: recoveryJournalPath,
 			[DAEMON_WORKER_STARTUP_GATE_FD_ENV]: String(WORKER_STARTUP_GATE_FD),
 			[ORPHAN_PROCESS_JOURNAL_ENV]: orphanProcessJournalPath,
@@ -3156,6 +4772,45 @@ export class DaemonSupervisor {
 		}
 	}
 
+	private retireRecoverableOwnedAuthorityForWorkerIncarnation(
+		worker: ResidentWorker,
+		nextWorkerIncarnation: string,
+	): void {
+		const recordId = worker.recoveryRecordId;
+		let recordedWorkerIncarnation = worker.workerIncarnation;
+		if (recordId) {
+			try {
+				recordedWorkerIncarnation ??= this.ownedSessionRecoveryStore.get(recordId)?.authority.workerIncarnation;
+			} catch {
+				recordedWorkerIncarnation = undefined;
+			}
+		}
+		if (
+			recordedWorkerIncarnation === nextWorkerIncarnation &&
+			(!worker.recoverableAdoption || worker.recoverableAdoption.workerIncarnation === nextWorkerIncarnation)
+		) {
+			return;
+		}
+		if (!recordId && !worker.recoverableAdoption && !worker.recoverableFinal) return;
+		this.retireRecoverableOwnedFinalTransferReceipt(worker);
+		if (recordId) this.ownedSessionRecoveryStore.remove(recordId);
+		if (worker.recoverableAdoption) {
+			clearTimeout(worker.recoverableAdoption.timeout);
+			worker.recoverableAdoption.error = new OwnedSessionAdoptionUnavailableError();
+		}
+		if (worker.recoveryConfirmationTimer) {
+			clearTimeout(worker.recoveryConfirmationTimer);
+			worker.recoveryConfirmationTimer = undefined;
+		}
+		if (worker.ownerCleanupTimer) {
+			clearTimeout(worker.ownerCleanupTimer);
+			worker.ownerCleanupTimer = undefined;
+		}
+		worker.recoveryRecordId = undefined;
+		worker.recoverableAdoption = undefined;
+		worker.recoverableFinal = undefined;
+	}
+
 	private async connectWorker(
 		worker: ResidentWorker,
 		timeoutMs: number,
@@ -3171,19 +4826,23 @@ export class DaemonSupervisor {
 			try {
 				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
 				await client.waitForHello(1000);
-				await client.authenticateWorker(
+				const workerIncarnation = await client.authenticateWorker(
 					worker.descriptor.authenticationToken,
 					this.supervisorAuthenticationClaim(),
 					1000,
 				);
 				await this.assertRecoveryAllowed();
 				assertCurrent?.();
+				this.retireRecoverableOwnedAuthorityForWorkerIncarnation(worker, workerIncarnation);
 				client.onFrame((frame) => this.handleWorkerFrame(worker, frame, client));
 				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
-				worker.client?.close();
+				const previousClient = worker.client;
 				worker.client = client;
+				worker.workerIncarnation = workerIncarnation;
 				worker.authorityRevision = (worker.authorityRevision ?? 0) + 1;
 				worker.authorizedActiveSessionIds = new Set([worker.descriptor.rootActiveSessionId]);
+				previousClient?.close();
+				this.scheduleOwnedWorkerCleanup(worker);
 				return client;
 			} catch (error) {
 				lastError = error;
@@ -3322,8 +4981,12 @@ export class DaemonSupervisor {
 		if (worker.client !== client) {
 			return;
 		}
+		const interruptedAdoption =
+			worker.recoverableAdoption?.workerClient === client ? worker.recoverableAdoption : undefined;
 		this.abortTranscriptPreparations(worker, error);
 		worker.client = undefined;
+		worker.workerIncarnation = undefined;
+		if (interruptedAdoption) this.rollbackRecoverableOwnedAdoption(worker, interruptedAdoption);
 		worker.authorityRevision = (worker.authorityRevision ?? 0) + 1;
 		worker.authorizedActiveSessionIds = new Set([worker.descriptor.rootActiveSessionId]);
 		this.invalidateWorkerSessionInputPauses(worker, "Session worker disconnected while input was paused");
@@ -3862,12 +5525,11 @@ export class DaemonSupervisor {
 						this.persistWorker(worker);
 						return;
 					}
-					const safeToKillWorkerProcess =
-						processAlive && processIdentityMatches && worker.descriptor.processStartId !== undefined;
-					const promptLifecycleRecovery = await this.recoverUncertainWorkerOperations(
-						worker,
-						safeToKillWorkerProcess,
-					);
+					const processToKill =
+						processAlive && processIdentityMatches && worker.descriptor.processStartId !== undefined
+							? { pid: worker.descriptor.pid, processStartId: worker.descriptor.processStartId }
+							: undefined;
+					const promptLifecycleRecovery = await this.recoverUncertainWorkerOperations(worker, processToKill);
 					assertCurrent();
 					await this.launchWorker(
 						recoveryCommand,
@@ -3949,12 +5611,10 @@ export class DaemonSupervisor {
 
 	private async recoverUncertainWorkerOperations(
 		worker: ResidentWorker,
-		killWorkerProcess = true,
+		processToKill: { pid: number; processStartId: string } | false = false,
 	): Promise<Map<string, WorkerSessionRecovery>> {
 		await this.assertRecoveryAllowed();
-		if (killWorkerProcess) {
-			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
-		}
+		if (processToKill) this.signalCapturedProcess(processToKill, "SIGKILL");
 		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
 		if (orphanProcessJournalPath) {
 			try {
@@ -4409,8 +6069,9 @@ export class DaemonSupervisor {
 
 	private isWorkerAccessibleToClient(client: DaemonSocketClient, worker: ResidentWorker): boolean {
 		return (
-			worker.descriptor.ownerClientId === undefined ||
-			worker.descriptor.ownerClientId === this.protocolClientId(client)
+			!worker.recoverableAdoption &&
+			(worker.descriptor.ownerClientId === undefined ||
+				worker.descriptor.ownerClientId === this.protocolClientId(client))
 		);
 	}
 
@@ -5872,6 +7533,14 @@ export class DaemonSupervisor {
 			return;
 		}
 		this.streamReconstructor.observe(decodedOutbound);
+		this.captureRecoverableOwnedFrame(worker, activeSessionId, decodedOutbound, publicPayload);
+		if (
+			worker.recoveryRecordId &&
+			decodedOutbound.type === "prompt_lifecycle" &&
+			["completed", "cancelled", "failed"].includes(decodedOutbound.lifecycle.phase)
+		) {
+			queueMicrotask(() => this.scheduleRecoverableOwnedWorkerCleanup(worker, true));
+		}
 		if (
 			decodedOutbound.type === "session_event" &&
 			decodedOutbound.event.type === "rlm_child_update" &&
@@ -6353,6 +8022,12 @@ export class DaemonSupervisor {
 		renameSync(tempPath, path);
 	}
 
+	private signalCapturedProcess(process: { pid: number; processStartId: string }, signal: NodeJS.Signals): boolean {
+		if (getProcessStartId(process.pid) !== process.processStartId) return false;
+		signalProcessGroupOrProcess(process.pid, signal);
+		return true;
+	}
+
 	/**
 	 * Verdict on whether a pid is still the process we launched. Callers must
 	 * be conservative in both directions: signal a pid only on "current"
@@ -6473,19 +8148,36 @@ export class DaemonSupervisor {
 		if (!recoveryCleanup) {
 			worker.stopRevision++;
 		}
-		// A retry can rescind this stop and relaunch the worker while we await
-		// below. Bind every liveness check and signal to the process this stop
-		// entered with, and abort cleanup once the stop no longer applies: the
-		// pid changed (relaunched) or a removeDescriptor stop lost its tombstone
-		// (rescinded, even before the successor pid lands).
+		// Fence recovery synchronously before the first await. Capture the exact
+		// authenticated channel and process generation at the same boundary so a
+		// recovery task cannot swap in a successor and inherit this stop.
+		worker.intentionalStop = true;
+		if (removeDescriptor) {
+			worker.descriptor.stopRequestedAt ??= new Date().toISOString();
+			worker.descriptor.archiveOnStop ||= archiveSession;
+		} else {
+			worker.descriptor.lifecycle = "recovering";
+		}
+		const entryStopRevision = worker.stopRevision;
 		const entryPid = worker.descriptor.pid;
 		const entryStartId = worker.descriptor.processStartId;
+		const entryWorkerIncarnation = worker.workerIncarnation;
+		const entryWorkerClient = worker.client;
+		const stoppingWorkerClient =
+			entryWorkerClient &&
+			entryWorkerIncarnation &&
+			entryWorkerClient.matchesAuthenticatedIncarnation(entryWorkerIncarnation)
+				? entryWorkerClient
+				: undefined;
+		const recoveryTasks =
+			!recoveryCleanup && !directChild
+				? [worker.recovery, worker.deferredRecovery].flatMap((task) => (task ? [task] : []))
+				: [];
 		const assertStopStillApplies = () => {
-			if (directChild) {
-				return;
-			}
+			if (directChild) return;
 			if (
 				this.workers.get(worker.descriptor.workerId) !== worker ||
+				worker.stopRevision !== entryStopRevision ||
 				worker.descriptor.pid !== entryPid ||
 				worker.descriptor.processStartId !== entryStartId ||
 				(removeDescriptor && worker.descriptor.stopRequestedAt === undefined)
@@ -6497,22 +8189,36 @@ export class DaemonSupervisor {
 			if (removeDescriptor) {
 				this.persistWorkerStopTombstone(worker, archiveSession);
 			} else {
-				worker.intentionalStop = true;
-				worker.descriptor.lifecycle = "recovering";
 				this.persistWorker(worker);
 			}
 		} catch (error) {
-			if (!directChild) {
-				throw error;
-			}
+			if (!directChild) throw error;
 			this.reportCleanupFailure(`worker rollback state ${worker.descriptor.workerId}`, error);
 		}
-		if (!recoveryCleanup && !directChild) {
-			// The tombstone/revision above closes recovery admission. Join every
-			// recovery task that could already have passed an earlier async gate
-			// before proving the process and durable registration absent.
-			await Promise.all([worker.recovery, worker.deferredRecovery].flatMap((task) => (task ? [task] : [])));
-			assertStopStillApplies();
+		let authenticatedShutdownAccepted = false;
+		if (stoppingWorkerClient) {
+			try {
+				const response = archiveSession
+					? await stoppingWorkerClient.requestWorker({ type: "worker_archive_and_shutdown" }, force ? 1000 : 5000)
+					: await stoppingWorkerClient.request({ type: "shutdown" }, force ? 1000 : 5000);
+				authenticatedShutdownAccepted = response.success;
+			} catch {
+				// The exact channel is gone. The pid fallback below performs a fresh
+				// start-id check immediately before signalling.
+			} finally {
+				stoppingWorkerClient.close();
+				if (worker.client === stoppingWorkerClient && worker.workerIncarnation === entryWorkerIncarnation) {
+					worker.client = undefined;
+					worker.workerIncarnation = undefined;
+				}
+			}
+		}
+		if (!authenticatedShutdownAccepted) {
+			if (directChild) {
+				directChild.child.kill("SIGTERM");
+			} else if (this.processIdentity(entryPid, entryStartId) === "current") {
+				signalProcessGroupOrProcess(entryPid, "SIGTERM");
+			}
 		}
 		const transferError = new Error("Session worker stopped during snapshot transfer");
 		const generationTranscripts = new Set<SnapshotTranscriptCache>();
@@ -6536,21 +8242,6 @@ export class DaemonSupervisor {
 		worker.transcriptCaches.clear();
 		worker.snapshotCache.clear();
 		worker.snapshotGenerations?.clear();
-		if (worker.client) {
-			if (archiveSession) {
-				await worker.client
-					.requestWorker({ type: "worker_archive_and_shutdown" }, force ? 1000 : 5000)
-					.catch(() => undefined);
-			} else {
-				await worker.client.request({ type: "shutdown" }, force ? 1000 : 5000).catch(() => undefined);
-			}
-			worker.client.close();
-			worker.client = undefined;
-		} else if (directChild) {
-			directChild.child.kill("SIGTERM");
-		} else if (this.processIdentity(entryPid, entryStartId) === "current") {
-			signalProcessGroupOrProcess(entryPid, "SIGTERM");
-		}
 		// Identity-aware in both directions: a replaced pid counts as gone (never
 		// signal a recycled pid) while an unknown identity counts as alive (never
 		// clean up a possibly-live worker on a transient lookup failure). kill(0)
@@ -6602,6 +8293,10 @@ export class DaemonSupervisor {
 		if (directChild) {
 			await directChild.closed;
 		}
+		// Only join recovery work after the captured process has exited. The
+		// synchronous stop fence prevents those tasks from recreating durable
+		// state while descriptor and journal removal is pending.
+		if (recoveryTasks.length > 0) await Promise.all(recoveryTasks);
 		assertStopStillApplies();
 		if (removeDescriptor && worker.descriptor.archiveOnStop) {
 			if (force) {
@@ -6732,9 +8427,7 @@ export class DaemonSupervisor {
 				// to be recycled by an unrelated process. A transiently
 				// unobservable identity skips this attempt but keeps escalation
 				// armed so a wedged worker is still killed on a later pass.
-				const observedNow = processStartId === undefined ? undefined : getProcessStartId(pid);
-				if (processStartId !== undefined && observedNow === processStartId) {
-					signalProcessGroupOrProcess(pid, "SIGKILL");
+				if (processStartId !== undefined && this.signalCapturedProcess({ pid, processStartId }, "SIGKILL")) {
 					killed = true;
 				}
 			}
@@ -6970,7 +8663,7 @@ export class DaemonSupervisor {
 	): Promise<never> {
 		this.shuttingDown = true;
 		this.clearIdleEvictionTimer();
-		await this.idleEvictionSweep?.catch(() => undefined);
+		const idleEvictionSweep = this.idleEvictionSweep;
 		if (closingReason) {
 			for (const client of this.clients) {
 				this.write(client, { type: "daemon_closing", reason: closingReason });
@@ -7022,6 +8715,7 @@ export class DaemonSupervisor {
 				worker.client = undefined;
 			}
 		}
+		if (idleEvictionSweep) await idleEvictionSweep.catch(() => undefined);
 		await this.catalog.stop();
 		for (const client of this.clients) {
 			client.detachInput();
@@ -7040,13 +8734,8 @@ export class DaemonSupervisor {
 		await this.runCleanupStep("daemon ownership", async () => ownership?.release());
 		if (relaunch) {
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", this.socketPath]);
-			const environment = createCliSubprocessEnv();
+			const environment = sanitizeDaemonWorkerBootstrapEnvironment(createCliSubprocessEnv());
 			delete environment[DAEMON_CATALOG_ROLE_ENV];
-			delete environment[DAEMON_WORKER_ROLE_ENV];
-			delete environment[DAEMON_WORKER_TOKEN_ENV];
-			delete environment[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];
-			delete environment[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
-			delete environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];

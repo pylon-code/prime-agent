@@ -6,6 +6,7 @@ export {
 	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
 	PRIME_AGENT_SDK_FEATURES,
 	type PrimeAgentSdkFeature,
+	RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE,
 } from "../sdk-features.js";
 export {
 	type AcpModeOptions,
@@ -38,8 +39,21 @@ export type {
 	DaemonOwnedSessionDaemonIdentity,
 	DaemonOwnedSessionDisposeOptions,
 	DaemonOwnedSessionDisposeResult,
+	DaemonRecoverableOwnedSessionAdoptionOptions,
+	DaemonRecoverableOwnedSessionAdoptionResult,
 } from "./agent-connection/index.js";
-export { DaemonAgentConnection, InProcessAgentConnection } from "./agent-connection/index.js";
+export {
+	adoptRecoverableOwnedSession,
+	confirmRecoverableOwnedSessionAdoption,
+	createRecoverableOwnedSession,
+	DaemonAgentConnection,
+	InProcessAgentConnection,
+	type RecoverableOwnedSessionAdoption,
+	type RecoverableOwnedSessionAdoptionConfirmation,
+	type RecoverableOwnedSessionAdoptionOptions,
+	type RecoverableOwnedSessionCreateOptions,
+	type RecoverableOwnedSessionCreation,
+} from "./agent-connection/index.js";
 export { type AgentsViewModeOptions, runAgentsViewMode } from "./agents-view/agents-view-mode.js";
 export {
 	type AgentsViewRow,
@@ -90,6 +104,7 @@ export type {
 	DaemonCommand,
 	DaemonCommandEnvelope,
 	DaemonCommandId,
+	DaemonEventCursor,
 	DaemonEventEnvelope,
 	DaemonEventId,
 	DaemonEventMeta,
@@ -102,6 +117,10 @@ export type {
 	DaemonProtocolInfo,
 	DaemonProtocolName,
 	DaemonProtocolVersion,
+	DaemonRecoverableOwnedSessionAdoptionProof,
+	DaemonRecoverableOwnedSessionConfirmResult,
+	DaemonRecoverableOwnedSessionCreateResult,
+	DaemonRecoverableOwnedSessionPrepareResult,
 	DaemonReplayInfo,
 	DaemonReplayStatus,
 	DaemonResponse,

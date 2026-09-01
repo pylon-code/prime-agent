@@ -34,6 +34,7 @@ import { createDeferred } from "./suite/scheduling.js";
 const workerLaunchTestState = vi.hoisted(() => ({
 	capture: false,
 	forceMissingProcessStartId: false,
+	processStartIdOverride: undefined as ((pid: number) => string | undefined) | undefined,
 	fixtureMode: "worker" as "worker" | "close-gate" | "rollback-gate" | "successful-gate",
 	gateMarkerPath: "",
 	tsxCliPath: "",
@@ -109,6 +110,7 @@ vi.mock("../src/core/session-lease.js", async (importOriginal) => {
 	return {
 		...actual,
 		getProcessStartId(pid: number): string | undefined {
+			if (workerLaunchTestState.processStartIdOverride) return workerLaunchTestState.processStartIdOverride(pid);
 			return workerLaunchTestState.forceMissingProcessStartId ? undefined : actual.getProcessStartId(pid);
 		},
 	};
@@ -291,6 +293,7 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 		workerLaunchTestState.capture = false;
 		workerLaunchTestState.forceMissingProcessStartId = false;
+		workerLaunchTestState.processStartIdOverride = undefined;
 		workerLaunchTestState.fixtureMode = "worker";
 		workerLaunchTestState.gateMarkerPath = "";
 		workerLaunchTestState.tsxCliPath = "";
@@ -574,6 +577,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(Object.keys(exactEnvironment ?? {}).sort()).toEqual(
 			[
 				"CALLER_ENV_A",
+				"PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_AGENT_DIR",
 				"PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET",
 				"PRIME_AGENT_INTERNAL_DAEMON_WORKER",
 				"PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID",
@@ -2394,6 +2398,30 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
+	it("rechecks captured process identity immediately before SIGKILL", () => {
+		const processStartId = getProcessStartId(process.pid);
+		expect(processStartId).toBeDefined();
+		const supervisor = Object.create(DaemonSupervisor.prototype) as {
+			signalCapturedProcess(process: { pid: number; processStartId: string }, signal: NodeJS.Signals): boolean;
+		};
+		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		try {
+			workerLaunchTestState.processStartIdOverride = () => "recycled-process-start";
+			expect(
+				supervisor.signalCapturedProcess({ pid: process.pid, processStartId: processStartId! }, "SIGKILL"),
+			).toBe(false);
+			expect(killSpy).not.toHaveBeenCalled();
+
+			workerLaunchTestState.processStartIdOverride = () => processStartId;
+			expect(
+				supervisor.signalCapturedProcess({ pid: process.pid, processStartId: processStartId! }, "SIGKILL"),
+			).toBe(true);
+			expect(killSpy).toHaveBeenCalledWith(process.pid, "SIGKILL");
+		} finally {
+			workerLaunchTestState.processStartIdOverride = undefined;
+			killSpy.mockRestore();
+		}
+	});
 	it("never follows a relaunched worker pid after a retry rescinds the stop", async () => {
 		vi.useFakeTimers();
 		const worker = {
@@ -5297,6 +5325,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			ready: Promise.resolve(),
 			workers: new Map(),
+			clients: new Set([client]),
 			protocolClientIds: new WeakMap(),
 			commandJournal,
 			mutationDrain,
@@ -5343,6 +5372,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			ready: Promise.resolve(),
 			workers: new Map(),
+			clients: new Set([client]),
 			protocolClientIds: new WeakMap(),
 			commandJournal,
 			mutationDrain,

@@ -9,6 +9,11 @@ import {
 	DaemonAgentConnection,
 	type DaemonOwnedSessionContractProof,
 } from "../src/modes/agent-connection/daemon-agent-connection.js";
+import {
+	adoptRecoverableOwnedSession,
+	confirmRecoverableOwnedSessionAdoption,
+	type RecoverableOwnedSessionAdoptionOptions,
+} from "../src/modes/agent-connection/recoverable-owned-session.js";
 import type {
 	AgentConnectionEvent,
 	AgentConnectionRlmChildAgentSnapshot,
@@ -32,8 +37,13 @@ import {
 	type DaemonAttachResult,
 	type DaemonCommand,
 	type DaemonOutbound,
+	type DaemonRecoverableOwnedSessionPrepareResult,
 	type DaemonResponse,
 } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	RECOVERABLE_OWNED_MAX_BUFFERED_BYTES,
+	RECOVERABLE_OWNED_MAX_BUFFERED_FRAMES,
+} from "../src/modes/daemon/owned-session-adoption-buffer.js";
 
 class FakeDaemonClient {
 	readonly requests: DaemonCommand[] = [];
@@ -54,6 +64,14 @@ class FakeDaemonClient {
 	reconnectCount = 0;
 	resetTransportCount = 0;
 	reconnectError: Error | undefined;
+	recoverablePrepareResultFactory:
+		| ((
+				command: Extract<DaemonCommand, { type: "prepare_recoverable_owned_session_adoption" }>,
+		  ) => DaemonRecoverableOwnedSessionPrepareResult)
+		| undefined;
+	recoverableCommitEvents: DaemonOutbound[] = [];
+	recoverableTransportError?: Error;
+	recoverableResponseError?: string;
 	attachFailures = 0;
 	attachError: Error | undefined;
 	connectionStateGate: Promise<void> | undefined;
@@ -104,6 +122,12 @@ class FakeDaemonClient {
 		this.requests.push(command);
 		this.requestTimeouts.push(timeoutMs);
 		this.requestOptions.push(options);
+		if (command.type.includes("recoverable_owned_session")) {
+			if (this.recoverableTransportError) throw this.recoverableTransportError;
+			if (this.recoverableResponseError) {
+				return { type: "response", command: command.type, success: false, error: this.recoverableResponseError };
+			}
+		}
 		switch (command.type) {
 			case "prompt":
 				if (this.promptGate) await this.promptGate;
@@ -626,6 +650,19 @@ class FakeDaemonClient {
 					success: true,
 					data: this.ownedSessionCompletionStatus === "invalid" ? { status: "invalid" } : { status: "completed" },
 				};
+			case "prepare_recoverable_owned_session_adoption":
+				if (!this.recoverablePrepareResultFactory) throw new Error("Missing recoverable prepare fixture");
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: this.recoverablePrepareResultFactory(command),
+				};
+			case "commit_recoverable_owned_session_adoption":
+				for (const message of this.recoverableCommitEvents) this.emitMessage(message);
+				return { type: "response", command: command.type, success: true, data: command.proof };
+			case "confirm_recoverable_owned_session_adoption":
+				return { type: "response", command: command.type, success: true, data: { status: "confirmed" } };
 			default:
 				throw new Error(`Unexpected command: ${command.type}`);
 		}
@@ -666,6 +703,10 @@ class FakeDaemonClient {
 	}
 
 	enableRequestRecovery(): void {}
+
+	get clientId(): string {
+		return "fake-protocol-client";
+	}
 
 	getTransportGeneration(): number {
 		return this.transportGeneration;
@@ -1026,6 +1067,500 @@ function emitSequencedQueueUpdate(client: FakeDaemonClient, activeSessionId: str
 }
 
 describe("DaemonAgentConnection", () => {
+	it("stages recoverable adoption across exact frame replay and unrelated shared-client traffic", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.hello = {
+			...fakeClient.hello!,
+			schemaRevision: 30,
+			supervisorGeneration: SUPERVISOR_GENERATION_A,
+		};
+		for (const capability of [
+			"daemon_recoverable_owned_session_adoption_v1",
+			"caller_owned_session_environment_cleanup_v1",
+			"authoritative_owned_session_cleanup_v1",
+			"attach_snapshot",
+			"event_sequence",
+			"slim_attach",
+			"correlated_prompt_lifecycle_v1",
+			"client_owned_sessions",
+		])
+			fakeClient.serverCapabilities.add(capability);
+		const activeSessionId = "recover-active";
+		const sessionId = "recover-session";
+		const correlationId = "recover-correlation";
+		const lifecycle: PromptLifecycleSnapshot = {
+			correlationId,
+			phase: "queued",
+			kind: "model_prompt",
+			revision: 1,
+			deliveryCrossed: false,
+		};
+		fakeClient.recoverablePrepareResultFactory = (command) => {
+			const attached = createAttachResult(activeSessionId, command.clientId, command.capabilities, 5, {
+				state: createConnectionState(activeSessionId, sessionId),
+			});
+			attached.snapshot.promptLifecycles = { records: [lifecycle], expired: [] };
+			return {
+				...attached,
+				recoveryHandle: "A".repeat(43),
+				proof: {
+					feature: "recoverable_owned_session_adoption_v1",
+					status: "adopted",
+					supervisorGeneration: SUPERVISOR_GENERATION_A,
+					ownershipGeneration: 1,
+					activeSessionId,
+					sessionId,
+					correlationId,
+					lifecycle,
+					cursor: { generation: `generation-${activeSessionId}`, sequence: 5 },
+					mcpOwnerId: "next-mcp-owner",
+				},
+			};
+		};
+		const lifecycleEvent = (
+			sequence: number,
+			phase: "delivered" | "completed",
+			revision: number,
+		): DaemonOutbound => ({
+			type: "prompt_lifecycle",
+			activeSessionId,
+			lifecycle: { ...lifecycle, phase, revision, deliveryCrossed: true },
+			meta: {
+				id: `event-${sequence}`,
+				protocol: DAEMON_PROTOCOL_INFO,
+				activeSessionId,
+				sequence,
+				emittedAt: "2026-01-01T00:00:00.000Z",
+				cursor: { generation: `generation-${activeSessionId}`, sequence },
+			},
+		});
+		const delivered = lifecycleEvent(6, "delivered", 2);
+		const completed = lifecycleEvent(7, "completed", 3);
+		fakeClient.recoverableCommitEvents = [
+			delivered,
+			{
+				type: "session_event",
+				activeSessionId: "concurrent-other-session",
+				event: { type: "session_action_update", actions: { queuedCount: 0, steering: [], followUps: [] } },
+				meta: {
+					id: "concurrent-other-session:1",
+					protocol: DAEMON_PROTOCOL_INFO,
+					activeSessionId: "concurrent-other-session",
+					sequence: 1,
+					cursor: { generation: "generation-concurrent-other-session", sequence: 1 },
+					emittedAt: "2026-01-01T00:00:00.000Z",
+				},
+			},
+			completed,
+			delivered,
+			completed,
+		];
+		const adopted = await adoptRecoverableOwnedSession(fakeClient as unknown as DaemonClient, {
+			requestId: "00112233445566778899aabbccddeeff",
+			recoveryHandle: "B".repeat(43),
+			expectedSupervisorGeneration: SUPERVISOR_GENERATION_A,
+			activeSessionId,
+			sessionId,
+			correlationId,
+			cursor: { generation: `generation-${activeSessionId}`, sequence: 4 },
+			previousMcpOwnerId: "previous-mcp-owner",
+			mcpOwnerId: "next-mcp-owner",
+			config: { cwd: "/tmp/project" },
+			launchEnv: { PATH: "/caller/bin" },
+			connectionOptions: { supportsExtensionUi: false },
+		});
+		await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+		const snapshot = await adopted.connection.getInitialSnapshot();
+		expect(snapshot.lastEventCursor).toEqual({ generation: `generation-${activeSessionId}`, sequence: 7 });
+		expect(snapshot.promptLifecycles?.records).toEqual([
+			expect.objectContaining({ correlationId, phase: "completed", revision: 3 }),
+		]);
+		const attachedContractProof = adopted.connection.getOwnedSessionContractProof();
+		expect(attachedContractProof).toMatchObject({
+			feature: "caller_owned_session_environment_cleanup_v1",
+			status: "attached",
+			daemon: { supervisorGeneration: SUPERVISOR_GENERATION_A },
+		});
+		expect(Object.isFrozen(attachedContractProof)).toBe(true);
+		const prepareCommand = fakeClient.requests[0];
+		expect(prepareCommand?.type).toBe("prepare_recoverable_owned_session_adoption");
+		if (prepareCommand?.type === "prepare_recoverable_owned_session_adoption") {
+			expect(prepareCommand.capabilities).toEqual(
+				expect.arrayContaining([
+					"event_sequence",
+					"correlated_prompt_lifecycle_v1",
+					"client_owned_sessions",
+					"caller_owned_session_environment_cleanup_v1",
+				]),
+			);
+		}
+		expect(fakeClient.requests.map((request) => request.type)).toEqual([
+			"prepare_recoverable_owned_session_adoption",
+			"commit_recoverable_owned_session_adoption",
+		]);
+		await confirmRecoverableOwnedSessionAdoption(fakeClient as unknown as DaemonClient, {
+			requestId: "00112233445566778899aabbccddeeff",
+			recoveryHandle: adopted.recoveryHandle,
+			proof: adopted.proof,
+		});
+		expect(fakeClient.requests.at(-1)?.type).toBe("confirm_recoverable_owned_session_adoption");
+		const cleanup = await adopted.connection.disposeOwnedSession();
+		expect(cleanup).toMatchObject({
+			feature: "caller_owned_session_environment_cleanup_v1",
+			status: "completed",
+			started: attachedContractProof,
+			daemonReplaced: false,
+		});
+		expect(Object.isFrozen(cleanup)).toBe(true);
+	});
+
+	it("requires exact-generation complete creation attachment proofs and cleans up fenced failures", async () => {
+		const makeClient = () => {
+			const client = new FakeDaemonClient();
+			client.hello = {
+				...client.hello!,
+				schemaRevision: DAEMON_SCHEMA_REVISION,
+				supervisorGeneration: SUPERVISOR_GENERATION_A,
+			};
+			for (const capability of [
+				"caller_owned_session_environment_cleanup_v1",
+				"authoritative_owned_session_cleanup_v1",
+				"attach_snapshot",
+				"event_sequence",
+				"slim_attach",
+				"correlated_prompt_lifecycle_v1",
+				"client_owned_sessions",
+			])
+				client.serverCapabilities.add(capability);
+			return client;
+		};
+		const options = {
+			ownedSession: true,
+			ownedSessionRecoveryConfig: { cwd: "/tmp/project" },
+			ownedSessionLaunchEnv: { PATH: "/caller/bin" },
+		};
+
+		const partialReplay = makeClient();
+		partialReplay.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 2, {
+				state: createConnectionState(command.activeSessionId, "session-created"),
+			});
+			return { ...result, replay: { ...result.replay, status: "partial" } };
+		};
+		await expect(
+			DaemonAgentConnection.attachRecoverableOwnedSessionCreation(
+				asDaemonClient(partialReplay),
+				"active-created",
+				"session-created",
+				SUPERVISOR_GENERATION_A,
+				options,
+			),
+		).rejects.toThrow("Recoverable owned session adoption is unavailable");
+		expect(partialReplay.requests.map((request) => request.type)).toContain("complete_owned_session");
+
+		const missingCapability = makeClient();
+		missingCapability.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 2, {
+				state: createConnectionState(command.activeSessionId, "session-created"),
+			});
+			return {
+				...result,
+				client: {
+					...result.client,
+					capabilities: result.client.capabilities.filter(
+						(capability) => capability !== "caller_owned_session_environment_cleanup_v1",
+					),
+				},
+			};
+		};
+		await expect(
+			DaemonAgentConnection.attachRecoverableOwnedSessionCreation(
+				asDaemonClient(missingCapability),
+				"active-created",
+				"session-created",
+				SUPERVISOR_GENERATION_A,
+				options,
+			),
+		).rejects.toThrow("Recoverable owned session adoption is unavailable");
+		expect(missingCapability.requests.map((request) => request.type)).toContain("complete_owned_session");
+
+		const replacedDaemon = makeClient();
+		replacedDaemon.attachResultFactory = (command) => {
+			replacedDaemon.hello = { ...replacedDaemon.hello!, supervisorGeneration: SUPERVISOR_GENERATION_B };
+			return createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 2, {
+				state: createConnectionState(command.activeSessionId, "session-created"),
+			});
+		};
+		await expect(
+			DaemonAgentConnection.attachRecoverableOwnedSessionCreation(
+				asDaemonClient(replacedDaemon),
+				"active-created",
+				"session-created",
+				SUPERVISOR_GENERATION_A,
+				options,
+			),
+		).rejects.toThrow("Recoverable owned session adoption is unavailable");
+		expect(replacedDaemon.requests.map((request) => request.type)).toEqual(["attach"]);
+	});
+
+	it("refuses recoverable adoption without the hello gate or an exact attached proof", async () => {
+		const options = {
+			requestId: "00112233445566778899aabbccddeeff",
+			recoveryHandle: "B".repeat(43),
+			expectedSupervisorGeneration: SUPERVISOR_GENERATION_A,
+			activeSessionId: "recover-active",
+			sessionId: "recover-session",
+			correlationId: "recover-correlation",
+			cursor: { generation: "generation-recover-active", sequence: 4 },
+			previousMcpOwnerId: "previous-mcp-owner",
+			mcpOwnerId: "next-mcp-owner",
+			config: { cwd: "/tmp/project" },
+			launchEnv: { PATH: "/caller/bin" },
+			connectionOptions: { supportsExtensionUi: false },
+		} as const;
+		const missingHelloGate = new FakeDaemonClient();
+		missingHelloGate.hello = { ...missingHelloGate.hello!, schemaRevision: 30 };
+		await expect(adoptRecoverableOwnedSession(missingHelloGate as unknown as DaemonClient, options)).rejects.toThrow(
+			"Recoverable owned session adoption is unavailable",
+		);
+		expect(missingHelloGate.requests).toEqual([]);
+
+		const invalidProof = new FakeDaemonClient();
+		invalidProof.hello = {
+			...invalidProof.hello!,
+			schemaRevision: 30,
+			supervisorGeneration: SUPERVISOR_GENERATION_A,
+		};
+		for (const capability of [
+			"daemon_recoverable_owned_session_adoption_v1",
+			"caller_owned_session_environment_cleanup_v1",
+			"authoritative_owned_session_cleanup_v1",
+			"attach_snapshot",
+			"event_sequence",
+			"slim_attach",
+			"correlated_prompt_lifecycle_v1",
+			"client_owned_sessions",
+		])
+			invalidProof.serverCapabilities.add(capability);
+		invalidProof.recoverablePrepareResultFactory = (command) => {
+			const attached = createAttachResult(options.activeSessionId, command.clientId, command.capabilities, 5, {
+				state: createConnectionState(options.activeSessionId, options.sessionId),
+			});
+			const lifecycle: PromptLifecycleSnapshot = {
+				correlationId: options.correlationId,
+				phase: "queued",
+				kind: "model_prompt",
+				revision: 1,
+				deliveryCrossed: false,
+			};
+			attached.snapshot.promptLifecycles = { records: [lifecycle], expired: [] };
+			return {
+				...attached,
+				recoveryHandle: "A".repeat(43),
+				proof: {
+					feature: "recoverable_owned_session_adoption_v1",
+					status: "adopted",
+					supervisorGeneration: SUPERVISOR_GENERATION_A,
+					ownershipGeneration: 1,
+					activeSessionId: options.activeSessionId,
+					sessionId: "wrong-session",
+					correlationId: options.correlationId,
+					lifecycle,
+					cursor: { generation: "generation-recover-active", sequence: 5 },
+					mcpOwnerId: options.mcpOwnerId,
+				},
+			};
+		};
+		await expect(adoptRecoverableOwnedSession(invalidProof as unknown as DaemonClient, options)).rejects.toThrow(
+			"Recoverable owned session adoption is unavailable",
+		);
+		expect(invalidProof.requests.map((request) => request.type)).toEqual([
+			"prepare_recoverable_owned_session_adoption",
+		]);
+	});
+
+	it("refuses malformed, oversized, and over-count adoption frames before commit", async () => {
+		const activeSessionId = "recover-active";
+		const sessionId = "recover-session";
+		const correlationId = "recover-correlation";
+		const unavailable = "Recoverable owned session adoption is unavailable";
+		const options = {
+			requestId: "00112233445566778899aabbccddeeff",
+			recoveryHandle: "B".repeat(43),
+			expectedSupervisorGeneration: SUPERVISOR_GENERATION_A,
+			activeSessionId,
+			sessionId,
+			correlationId,
+			cursor: { generation: `generation-${activeSessionId}`, sequence: 4 },
+			previousMcpOwnerId: "previous-mcp-owner",
+			mcpOwnerId: "next-mcp-owner",
+			config: { cwd: "/tmp/project" },
+			launchEnv: { PATH: "/caller/bin" },
+			connectionOptions: { supportsExtensionUi: false },
+		} as const;
+		const configuredClient = () => {
+			const client = new FakeDaemonClient();
+			client.hello = {
+				...client.hello!,
+				schemaRevision: 30,
+				supervisorGeneration: SUPERVISOR_GENERATION_A,
+			};
+			for (const capability of [
+				"daemon_recoverable_owned_session_adoption_v1",
+				"caller_owned_session_environment_cleanup_v1",
+				"authoritative_owned_session_cleanup_v1",
+				"attach_snapshot",
+				"event_sequence",
+				"slim_attach",
+				"correlated_prompt_lifecycle_v1",
+				"client_owned_sessions",
+			])
+				client.serverCapabilities.add(capability);
+			return client;
+		};
+		const prepareResult = (
+			command: Extract<DaemonCommand, { type: "prepare_recoverable_owned_session_adoption" }>,
+		) => {
+			const attached = createAttachResult(activeSessionId, command.clientId, command.capabilities, 5, {
+				state: createConnectionState(activeSessionId, sessionId),
+			});
+			const lifecycle: PromptLifecycleSnapshot = {
+				correlationId,
+				phase: "queued",
+				kind: "model_prompt",
+				revision: 1,
+				deliveryCrossed: false,
+			};
+			attached.snapshot.promptLifecycles = { records: [lifecycle], expired: [] };
+			return {
+				...attached,
+				recoveryHandle: "A".repeat(43),
+				proof: {
+					feature: "recoverable_owned_session_adoption_v1" as const,
+					status: "adopted" as const,
+					supervisorGeneration: SUPERVISOR_GENERATION_A,
+					ownershipGeneration: 1,
+					activeSessionId,
+					sessionId,
+					correlationId,
+					lifecycle,
+					cursor: { generation: `generation-${activeSessionId}`, sequence: 5 },
+					mcpOwnerId: options.mcpOwnerId,
+				},
+			};
+		};
+		const event = (sequence: number, steering = "frame"): DaemonOutbound => ({
+			type: "session_event",
+			activeSessionId,
+			event: {
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [steering], followUps: [] },
+			},
+			meta: {
+				id: `${activeSessionId}:${sequence}`,
+				protocol: DAEMON_PROTOCOL_INFO,
+				activeSessionId,
+				sequence,
+				cursor: { generation: `generation-${activeSessionId}`, sequence },
+				emittedAt: "2026-01-01T00:00:00.000Z",
+			},
+		});
+
+		const malformed = configuredClient();
+		malformed.recoverablePrepareResultFactory = (command) => {
+			malformed.emitMessage({
+				type: "session_event",
+				activeSessionId,
+				event: { type: "session_action_update", actions: { queuedCount: 0, steering: [], followUps: [] } },
+			});
+			return prepareResult(command);
+		};
+		await expect(adoptRecoverableOwnedSession(malformed as unknown as DaemonClient, options)).rejects.toThrow(
+			unavailable,
+		);
+		expect(malformed.requests.map((request) => request.type)).toEqual(["prepare_recoverable_owned_session_adoption"]);
+
+		const oversized = configuredClient();
+		oversized.recoverablePrepareResultFactory = (command) => {
+			oversized.emitMessage(event(6, "x".repeat(RECOVERABLE_OWNED_MAX_BUFFERED_BYTES)));
+			return prepareResult(command);
+		};
+		await expect(adoptRecoverableOwnedSession(oversized as unknown as DaemonClient, options)).rejects.toThrow(
+			unavailable,
+		);
+		expect(oversized.requests.map((request) => request.type)).toEqual(["prepare_recoverable_owned_session_adoption"]);
+
+		const overCount = configuredClient();
+		overCount.recoverablePrepareResultFactory = (command) => {
+			for (let index = 0; index <= RECOVERABLE_OWNED_MAX_BUFFERED_FRAMES; index++) {
+				overCount.emitMessage(event(6 + index));
+			}
+			return prepareResult(command);
+		};
+		await expect(adoptRecoverableOwnedSession(overCount as unknown as DaemonClient, options)).rejects.toThrow(
+			unavailable,
+		);
+		expect(overCount.requests.map((request) => request.type)).toEqual(["prepare_recoverable_owned_session_adoption"]);
+	});
+
+	it("normalizes public adoption failures and requires an exact launch environment", async () => {
+		const client = new FakeDaemonClient();
+		client.hello = {
+			...client.hello!,
+			schemaRevision: 30,
+			supervisorGeneration: SUPERVISOR_GENERATION_A,
+		};
+		client.serverCapabilities.add("daemon_recoverable_owned_session_adoption_v1");
+		client.serverCapabilities.add("caller_owned_session_environment_cleanup_v1");
+		client.serverCapabilities.add("authoritative_owned_session_cleanup_v1");
+		const options: RecoverableOwnedSessionAdoptionOptions = {
+			requestId: "00112233445566778899aabbccddeeff",
+			recoveryHandle: "B".repeat(43),
+			expectedSupervisorGeneration: SUPERVISOR_GENERATION_A,
+			activeSessionId: "recover-active",
+			sessionId: "recover-session",
+			correlationId: "recover-correlation",
+			cursor: { generation: "generation-recover-active", sequence: 4 },
+			previousMcpOwnerId: "previous-mcp-owner",
+			mcpOwnerId: "next-mcp-owner",
+			config: { cwd: "/tmp/project" },
+			launchEnv: { PRIVATE_CANARY: "launch-environment-canary" },
+		};
+		const unavailable = "Recoverable owned session adoption is unavailable";
+		client.recoverableTransportError = new Error("private-socket-path-canary");
+		const transportFailure = adoptRecoverableOwnedSession(client as unknown as DaemonClient, options);
+		await expect(transportFailure).rejects.toThrow(unavailable);
+		await expect(transportFailure).rejects.not.toThrow("private-socket-path-canary");
+
+		client.recoverableTransportError = undefined;
+		client.recoverableResponseError = "private-registry-stage-canary";
+		const responseFailure = adoptRecoverableOwnedSession(client as unknown as DaemonClient, options);
+		await expect(responseFailure).rejects.toThrow(unavailable);
+		await expect(responseFailure).rejects.not.toThrow("private-registry-stage-canary");
+
+		const missingLaunchEnv = {
+			...options,
+			launchEnv: undefined,
+		} as unknown as RecoverableOwnedSessionAdoptionOptions;
+		await expect(adoptRecoverableOwnedSession(client as unknown as DaemonClient, missingLaunchEnv)).rejects.toThrow(
+			unavailable,
+		);
+		// @ts-expect-error launchEnv is a required public authority input.
+		const compileTimeMissingLaunchEnv: RecoverableOwnedSessionAdoptionOptions = {
+			requestId: options.requestId,
+			recoveryHandle: options.recoveryHandle,
+			expectedSupervisorGeneration: options.expectedSupervisorGeneration,
+			activeSessionId: options.activeSessionId,
+			sessionId: options.sessionId,
+			correlationId: options.correlationId,
+			cursor: options.cursor,
+			previousMcpOwnerId: options.previousMcpOwnerId,
+			mcpOwnerId: options.mcpOwnerId,
+			config: options.config,
+		};
+		void compileTimeMissingLaunchEnv;
+	});
+
 	it("carries an opt-out-only telemetry policy on attach", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {

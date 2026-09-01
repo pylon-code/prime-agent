@@ -19,6 +19,20 @@ describe("CommandRecoveryJournal", () => {
 		return join(root, "commands.jsonl");
 	}
 
+	it("rejects bearer-returning recovery commands instead of persisting their responses", () => {
+		const journal = new CommandRecoveryJournal(createPath());
+		for (const command of [
+			"create_recoverable_owned_session",
+			"prepare_recoverable_owned_session_adoption",
+			"commit_recoverable_owned_session_adoption",
+			"confirm_recoverable_owned_session_adoption",
+		]) {
+			expect(() => journal.begin("client-a", `command-${command}`, command)).toThrow(
+				"rejects bearer-returning command",
+			);
+		}
+	});
+
 	it("marks received commands uncertain instead of replaying them", () => {
 		const journal = new CommandRecoveryJournal(createPath());
 		expect(journal.begin("client-a", "command-a", "prompt")).toEqual({ status: "new" });
