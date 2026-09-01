@@ -368,6 +368,21 @@ decisions:
       - Prime upstream exposes an equivalent public-root token, exact caller environment reuse, generation-scoped post-attach proof, and structured bounded cleanup outcomes.
       - Pylon can remove the fork token without weakening native multi-instance isolation or its pre-create ACP fallback.
 
+  recoverable-owned-session-adoption:
+    area: runtime-reliability
+    state: shipped
+    owner: shared
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/27
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/tree/c718bf3c30fd8da206ed551837cbb54f7ad15948
+    fork_change: recoverable-owned-session-adoption-v1
+    upstream_support: Prime upstream does not expose capability-gated same-supervisor adoption of an existing caller-owned worker with private rotating authority, prepare/commit proof, authoritative snapshot fencing, ordered event reconciliation, and in-place MCP ownership transfer.
+    revisit_when:
+      - Prime upstream exposes an equivalent frozen public SDK token, detached-daemon capability, non-enumerating failure contract, same-generation rotating authority, staged proof, and explicit durability confirmation.
+      - Pylon can remove the fork token without weakening caller-owned worker continuity, event ordering, credential privacy, or owner isolation.
+
   deterministic-pylon-release-artifacts:
     area: distribution
     state: candidate

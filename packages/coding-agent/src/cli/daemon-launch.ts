@@ -16,13 +16,7 @@ import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../modes/daemon/daemo
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
-import {
-	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
-	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
-	DAEMON_WORKER_ROLE_ENV,
-	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
-	DAEMON_WORKER_TOKEN_ENV,
-} from "../modes/daemon/daemon-worker-protocol.js";
+import { sanitizeDaemonWorkerBootstrapEnvironment } from "../modes/daemon/daemon-worker-protocol.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
@@ -357,12 +351,7 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	// a CLI running inside a daemon worker (e.g. a test spawned by the Prime
 	// Agent daemon) would launch the supervisor in worker mode, which listens
 	// on the socket but never sends the daemon_hello handshake.
-	const env = createCliSubprocessEnv();
-	delete env[DAEMON_WORKER_ROLE_ENV];
-	delete env[DAEMON_WORKER_TOKEN_ENV];
-	delete env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];
-	delete env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
-	delete env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+	const env = sanitizeDaemonWorkerBootstrapEnvironment(createCliSubprocessEnv());
 	delete env[ORPHAN_PROCESS_JOURNAL_ENV];
 	delete env[SESSION_LEASES_ENABLED_ENV];
 	delete env[SESSION_LEASE_OWNER_ID_ENV];

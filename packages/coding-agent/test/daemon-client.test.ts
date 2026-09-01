@@ -108,6 +108,7 @@ function emitHello(
 	version = DAEMON_PROTOCOL_VERSION,
 	serverCapabilities: string[] = ["session_input_admission"],
 	schemaRevision?: number,
+	supervisorGeneration = "supervisor-generation",
 ): void {
 	socket.emit(
 		"data",
@@ -116,6 +117,7 @@ function emitHello(
 			socketPath: "/tmp/prime-agent.sock",
 			protocol: { name: "prime-agent.daemon", version },
 			schemaRevision,
+			supervisorGeneration,
 			appVersion: "9.9.9",
 			clientId: "client-1",
 			serverCapabilities,
@@ -213,6 +215,7 @@ describe("DaemonClient", () => {
 			"bounded_daemon_ingress_v1",
 			"negotiated_daemon_session_capabilities_v1",
 			"caller_owned_session_environment_cleanup_v1",
+			"recoverable_owned_session_adoption_v1",
 		];
 		const rootConnectionOptions: RootDaemonAgentConnectionOptions = {
 			ownedSession: true,
@@ -230,6 +233,10 @@ describe("DaemonClient", () => {
 		expect(publicSdk.CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE).toBe(
 			"caller_owned_session_environment_cleanup_v1",
 		);
+		expect(publicSdk.RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE).toBe("recoverable_owned_session_adoption_v1");
+		expect(publicSdk.createRecoverableOwnedSession).toEqual(expect.any(Function));
+		expect(publicSdk.adoptRecoverableOwnedSession).toEqual(expect.any(Function));
+		expect(publicSdk.confirmRecoverableOwnedSessionAdoption).toEqual(expect.any(Function));
 		expect(rootConnectionOptions.ownedSession).toBe(true);
 		expect(rootConnectionOptions.ownedSessionRecoveryConfig).toEqual({});
 		expect(rootRequestOptions.recoverAcrossReconnect).toBe(false);
@@ -649,6 +656,34 @@ describe("DaemonClient", () => {
 		).rejects.toThrow("does not support session_input_admission");
 		expect(socket.writes).toEqual([]);
 		client.close();
+	});
+
+	it("requires both schema 30 and the recoverable adoption hello capability before writing", async () => {
+		const command = {
+			type: "create_recoverable_owned_session" as const,
+			requestId: "00112233445566778899aabbccddeeff",
+			expectedSupervisorGeneration: "supervisor-generation",
+			correlationId: "correlation",
+			mcpOwnerId: "mcp-owner",
+			recoveryConfig: { cwd: "/tmp" },
+			config: { cwd: "/tmp" },
+			launchEnv: {},
+			launchEnvMode: "replace" as const,
+		};
+		for (const [capabilities, revision] of [
+			[["daemon_recoverable_owned_session_adoption_v1"], 29],
+			[[], 30],
+		] as const) {
+			const client = new DaemonClient(`/tmp/prime-agent-recover-${revision}-${capabilities.length}.sock`);
+			const connect = client.connect();
+			const socket = netMock.sockets.at(-1)!;
+			socket.emit("connect");
+			await connect;
+			emitHello(socket, DAEMON_PROTOCOL_VERSION, [...capabilities], revision);
+			await expect(client.request(command)).rejects.toThrow("daemon_recoverable_owned_session_adoption_v1");
+			expect(socket.writes).toEqual([]);
+			client.close();
+		}
 	});
 
 	it("gates exact caller-owned launch replacement while preserving legacy launch commands", async () => {
@@ -1310,6 +1345,102 @@ describe("DaemonClient", () => {
 
 		await expect(response).rejects.toThrow("does not support prompt_admission_cancellation");
 		expect(secondSocket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("fences a generation-bound recoverable create before reconnect replay", async () => {
+		const client = new DaemonClient("/tmp/prime-agent-recover-generation.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(
+			firstSocket,
+			DAEMON_PROTOCOL_VERSION,
+			["daemon_recoverable_owned_session_adoption_v1"],
+			DAEMON_SCHEMA_REVISION,
+			"supervisor-a",
+		);
+
+		const response = client.request({
+			type: "create_recoverable_owned_session",
+			requestId: "00112233445566778899aabbccddeeff",
+			expectedSupervisorGeneration: "supervisor-a",
+			correlationId: "correlation",
+			mcpOwnerId: "mcp-owner",
+			recoveryConfig: { cwd: "/tmp" },
+			config: { cwd: "/tmp" },
+			launchEnv: {},
+			launchEnvMode: "replace",
+		});
+		expect(firstSocket.writes).toHaveLength(1);
+		firstSocket.emit("close");
+
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(
+			secondSocket,
+			DAEMON_PROTOCOL_VERSION,
+			["daemon_recoverable_owned_session_adoption_v1"],
+			DAEMON_SCHEMA_REVISION,
+			"supervisor-b",
+		);
+
+		await expect(response).rejects.toThrow("Recoverable owned session adoption is unavailable");
+		expect(secondSocket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("fences recoverable commit and confirm before their first write", async () => {
+		const client = new DaemonClient("/tmp/prime-agent-recover-generation.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(
+			socket,
+			DAEMON_PROTOCOL_VERSION,
+			["daemon_recoverable_owned_session_adoption_v1"],
+			DAEMON_SCHEMA_REVISION,
+			"supervisor-b",
+		);
+		const proof = {
+			feature: "recoverable_owned_session_adoption_v1" as const,
+			status: "adopted" as const,
+			supervisorGeneration: "supervisor-a",
+			ownershipGeneration: 1,
+			activeSessionId: "active",
+			sessionId: "session",
+			correlationId: "correlation",
+			lifecycle: { correlationId: "correlation", expired: true as const, deliveryCrossed: true },
+			cursor: { generation: "cursor", sequence: 1 },
+			mcpOwnerId: "mcp-owner",
+		};
+		const requestId = "00112233445566778899aabbccddeeff";
+		const recoveryHandle = "A".repeat(43);
+
+		await expect(
+			client.request({
+				type: "commit_recoverable_owned_session_adoption",
+				requestId,
+				expectedSupervisorGeneration: "supervisor-a",
+				recoveryHandle,
+				proof,
+			}),
+		).rejects.toThrow("Recoverable owned session adoption is unavailable");
+		await expect(
+			client.request({
+				type: "confirm_recoverable_owned_session_adoption",
+				requestId,
+				expectedSupervisorGeneration: "supervisor-a",
+				recoveryHandle,
+				proof,
+			}),
+		).rejects.toThrow("Recoverable owned session adoption is unavailable");
+		expect(socket.writes).toEqual([]);
 		client.close();
 	});
 

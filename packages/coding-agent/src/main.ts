@@ -81,9 +81,10 @@ import {
 	collectDaemonLaunchEnv,
 } from "./modes/daemon/daemon-protocol.js";
 import {
-	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	type DaemonWorkerBootstrapEnvironment,
 	isDaemonWorkerProcess,
-	requireDaemonWorkerAuthenticationToken,
+	readDaemonWorkerBootstrapEnvironment,
+	sanitizeDaemonWorkerBootstrapEnvironment,
 	waitForDaemonWorkerStartupGate,
 } from "./modes/daemon/daemon-worker-protocol.js";
 import {
@@ -1053,13 +1054,22 @@ async function findAttachedDaemonSessionSummary(
 
 export interface MainOptions {
 	extensionFactories?: ExtensionFactory[];
+	/** @internal Captured by the CLI before loading preloads or diagnostics. */
+	daemonWorkerBootstrap?: DaemonWorkerBootstrapEnvironment;
 }
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
-	if (isDaemonWorkerProcess()) {
-		waitForDaemonWorkerStartupGate();
-	}
+	const daemonWorkerBootstrap =
+		options?.daemonWorkerBootstrap ??
+		(isDaemonWorkerProcess()
+			? (() => {
+					waitForDaemonWorkerStartupGate();
+					const bootstrap = readDaemonWorkerBootstrapEnvironment();
+					sanitizeDaemonWorkerBootstrapEnvironment(process.env);
+					return bootstrap;
+				})()
+			: undefined);
 	installFileLogSink();
 	if (isDaemonCatalogProcess()) {
 		await runDaemonCatalogProcess();
@@ -1341,14 +1351,17 @@ export async function main(args: string[], options?: MainOptions) {
 	// --list-models still takes the full path to print and exit.
 	if (appMode === "daemon" && parsed.listModels === undefined) {
 		printTimings();
-		if (isDaemonWorkerProcess()) {
+		if (daemonWorkerBootstrap) {
 			await runDaemonMode({
 				socketPath: parsed.daemonSocket,
 				defaultSessionConfig: daemonDefaultSessionConfig,
 				createRuntime,
 				worker: {
-					authenticationToken: requireDaemonWorkerAuthenticationToken(),
-					restoreActiveSessionId: process.env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV],
+					authenticationToken: daemonWorkerBootstrap.authenticationToken,
+					restoreActiveSessionId: daemonWorkerBootstrap.activeSessionId,
+					supervisorSocketPath: daemonWorkerBootstrap.supervisorSocketPath,
+					supervisorAgentDir: daemonWorkerBootstrap.supervisorAgentDir,
+					recoveryJournalPath: daemonWorkerBootstrap.recoveryJournalPath,
 				},
 			});
 		} else {

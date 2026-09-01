@@ -9,10 +9,7 @@ import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_E
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
-	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
-	DAEMON_WORKER_ROLE_ENV,
-	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
-	DAEMON_WORKER_TOKEN_ENV,
+	sanitizeDaemonWorkerBootstrapEnvironment,
 } from "../modes/daemon/daemon-worker-protocol.js";
 import { createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
@@ -513,14 +510,9 @@ function createStatusPath(agentDir: string, socketPath: string, requestId: strin
 }
 
 function coordinatorEnvironment(agentDir: string): NodeJS.ProcessEnv {
-	const environment = { ...process.env };
+	const environment = sanitizeDaemonWorkerBootstrapEnvironment({ ...process.env });
 	environment[ENV_AGENT_DIR] = agentDir;
 	delete environment[SELF_UPDATE_INTERACTIVE_CHILD_ENV];
-	delete environment[DAEMON_WORKER_ROLE_ENV];
-	delete environment[DAEMON_WORKER_TOKEN_ENV];
-	delete environment[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];
-	delete environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
-	delete environment[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 	delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 	delete environment[SESSION_LEASES_ENABLED_ENV];
 	delete environment[SESSION_LEASE_OWNER_ID_ENV];

@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { join, resolve } from "node:path";
+import { Writable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { APP_NAME, ENV_AGENT_DIR } from "../../../src/config.js";
 import { getProcessStartId } from "../../../src/core/session-lease.js";
@@ -26,6 +27,8 @@ import {
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_ROLE_ENV,
+	DAEMON_WORKER_STARTUP_GATE_COMMIT,
+	DAEMON_WORKER_STARTUP_GATE_FD_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 	type DaemonWorkerDescriptor,
@@ -94,6 +97,7 @@ const fixturePath = resolve(__dirname, "../../fixtures/eng-4600-supervisor-fixtu
 const fauxExtensionPath = resolve(__dirname, "../../fixtures/eng-4600-faux-extension.ts");
 const cliPath = resolve(__dirname, "../../../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/cli.mjs");
+const tsxLoaderPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/loader.mjs");
 const tsconfigPath = resolve(__dirname, "../../../../../tsconfig.json");
 const supervisorRegistryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const handles = new Set<ProcessHandle>();
@@ -174,10 +178,11 @@ function spawnStandaloneWorker(
 	token: string,
 	extraEnv: NodeJS.ProcessEnv = {},
 ): ProcessHandle {
-	return trackProcess(
+	// The tsx CLI wrapper drops fd 3 when it relaunches Node, so load tsx in-process.
+	const worker = trackProcess(
 		spawn(
 			paths.executablePath,
-			[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", workerSocketPath, "--offline"],
+			["--import", tsxLoaderPath, cliPath, "--mode", "daemon", "--daemon-socket", workerSocketPath, "--offline"],
 			{
 				cwd: paths.agentDir,
 				env: {
@@ -188,15 +193,22 @@ function spawnStandaloneWorker(
 					[DAEMON_WORKER_ROLE_ENV]: "1",
 					[DAEMON_WORKER_TOKEN_ENV]: token,
 					[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: "eng-4603-worker",
+					[DAEMON_WORKER_STARTUP_GATE_FD_ENV]: "3",
 					[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: paths.socketPath,
 					PI_OFFLINE: "1",
 					TSX_TSCONFIG_PATH: tsconfigPath,
 				},
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["ignore", "pipe", "pipe", "pipe"],
 			},
 		),
 		"worker",
 	);
+	const startupGate = worker.child.stdio[3];
+	if (!(startupGate instanceof Writable)) {
+		throw new Error("Standalone worker startup gate is not writable");
+	}
+	startupGate.end(DAEMON_WORKER_STARTUP_GATE_COMMIT);
+	return worker;
 }
 
 function trackProcess(child: ChildProcess, role: FixtureProcessIdentity["role"]): ProcessHandle {
@@ -342,6 +354,9 @@ function isFixtureDescendant(pid: number, rootPid: number, processes: Map<number
 }
 
 function signalFixtureProcess(identity: FixtureProcessIdentity, signal: NodeJS.Signals): boolean {
+	if (identity.pid === process.pid) {
+		throw new Error(`Refusing to signal current Vitest process ${process.pid} during fixture cleanup`);
+	}
 	const state = fixtureProcessState(identity);
 	if (state === "exited") return false;
 	if (state === "unverified") {
@@ -990,7 +1005,12 @@ describe("ENG-4603 worker recovery convergence", () => {
 				processStartId?: string;
 			};
 			expect(record.pid).toBe(process.pid);
-			expect(record.processStartId).toBe(getProcessStartId(process.pid));
+			const processStartId = record.processStartId;
+			expect(processStartId).toBe(getProcessStartId(process.pid));
+			if (!processStartId) throw new Error("Shutdown admission did not capture the Vitest process identity");
+			expect(() => signalFixtureProcess({ pid: record.pid, processStartId, role: "supervisor" }, "SIGSTOP")).toThrow(
+				`Refusing to signal current Vitest process ${process.pid} during fixture cleanup`,
+			);
 			const renewal = Reflect.get(first, "renewal") as object | undefined;
 			const refreshTimer = renewal
 				? (Reflect.get(renewal, "refreshTimer") as ReturnType<typeof setInterval> | undefined)

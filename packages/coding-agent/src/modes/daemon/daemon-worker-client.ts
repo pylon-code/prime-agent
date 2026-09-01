@@ -3,6 +3,7 @@ import { serializeJsonLine } from "../rpc/jsonl.js";
 import { type PrivateFrame, PrivateFramedChannel } from "../session-worker/private-framing.js";
 import type { DaemonCommand, DaemonOutbound, DaemonResponse, DaemonServerCapability } from "./daemon-protocol.js";
 import {
+	type DaemonWorkerAuthenticationResult,
 	type DaemonWorkerCommand,
 	type DaemonWorkerCommandBody,
 	type DaemonWorkerFrameHeader,
@@ -34,6 +35,7 @@ export class DaemonWorkerClient {
 	>();
 	private requestId = 0;
 	private hello?: DaemonHello;
+	private workerIncarnation?: string;
 	private readonly helloWaiters = new Set<{
 		resolve: (hello: DaemonHello) => void;
 		reject: (error: Error) => void;
@@ -123,17 +125,27 @@ export class DaemonWorkerClient {
 		return this.requestWire(command, timeoutMs);
 	}
 
-	async authenticateWorker(token: string, owner: DaemonWorkerAuthentication, timeoutMs = 3000): Promise<void> {
+	async authenticateWorker(token: string, owner: DaemonWorkerAuthentication, timeoutMs = 3000): Promise<string> {
 		const response = await this.requestWorker({ type: "worker_auth", token, ...owner }, timeoutMs);
-		if (!response.success) {
-			throw new Error(response.error);
+		if (!response.success) throw new Error(response.error);
+		const workerIncarnation = (response.data as Partial<DaemonWorkerAuthenticationResult> | undefined)
+			?.workerIncarnation;
+		if (typeof workerIncarnation !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(workerIncarnation)) {
+			throw new Error("Daemon worker returned an invalid authenticated incarnation");
 		}
+		this.workerIncarnation = workerIncarnation;
+		return workerIncarnation;
+	}
+
+	matchesAuthenticatedIncarnation(workerIncarnation: string): boolean {
+		return this.workerIncarnation === workerIncarnation;
 	}
 
 	close(): void {
 		this.rejectAll(new Error("Daemon worker client closed"));
 		this.channel?.close();
 		this.channel = undefined;
+		this.workerIncarnation = undefined;
 		this.socket?.destroy();
 		this.socket = undefined;
 	}
@@ -230,6 +242,7 @@ export class DaemonWorkerClient {
 		}
 		this.socket = undefined;
 		this.channel = undefined;
+		this.workerIncarnation = undefined;
 		this.rejectAll(error);
 		for (const listener of [...this.closeListeners]) {
 			listener(error);

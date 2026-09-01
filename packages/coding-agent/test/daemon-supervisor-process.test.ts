@@ -16,14 +16,24 @@ import {
 } from "../src/core/session-lease.js";
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
+import {
+	adoptRecoverableOwnedSession,
+	confirmRecoverableOwnedSessionAdoption,
+	createRecoverableOwnedSession,
+} from "../src/modes/agent-connection/recoverable-owned-session.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
-import { collectDaemonLaunchEnv, createDaemonCommandEnvelope } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	collectDaemonClientEnv,
+	collectDaemonLaunchEnv,
+	createDaemonCommandEnvelope,
+} from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
 const blockingProcessPath = resolve(__dirname, "fixtures/blocking-process.mjs");
+const fauxExtensionPath = resolve(__dirname, "fixtures/eng-4600-faux-extension.ts");
 const tempDirs: string[] = [];
 const children = new Set<ChildProcess>();
 const workerPids = new Set<number>();
@@ -259,6 +269,14 @@ async function connectEventually(socketPath: string, child?: ChildProcess): Prom
 	);
 }
 
+async function disconnectDaemonClientWithServerCloseBarrier(client: DaemonClient): Promise<void> {
+	const socket = (client as unknown as { socket?: Socket }).socket;
+	if (!socket || socket.destroyed) return;
+	const closed = new Promise<void>((resolveClose) => socket.once("close", () => resolveClose()));
+	socket.end();
+	await closed;
+}
+
 async function createSnapshotRetryProxy(
 	proxyPath: string,
 	targetPath: string,
@@ -364,6 +382,84 @@ async function createSnapshotRetryProxy(
 		server,
 		attachRequests: () => attachCount,
 		transferIds: () => [...observedTransferIds],
+	};
+}
+
+async function createCommandResponseLossProxy(
+	proxyPath: string,
+	targetPath: string,
+	commandType: string,
+): Promise<{ server: Server; responseObserved: Promise<void>; release(): void }> {
+	let resolveResponseObserved!: () => void;
+	const responseObserved = new Promise<void>((resolveObserved) => {
+		resolveResponseObserved = resolveObserved;
+	});
+	let targetCommandId: string | undefined;
+	let downstreamSocket: Socket | undefined;
+	let upstreamSocket: Socket | undefined;
+	const server = createServer((downstream) => {
+		downstreamSocket = downstream;
+		const upstream = createConnection(targetPath);
+		upstreamSocket = upstream;
+		let requestBuffer = Buffer.alloc(0);
+		let responseBuffer = Buffer.alloc(0);
+		downstream.on("data", (chunk: Buffer) => {
+			requestBuffer = Buffer.concat([requestBuffer, chunk]);
+			while (true) {
+				const newline = requestBuffer.indexOf(0x0a);
+				if (newline < 0) break;
+				const original = Buffer.from(requestBuffer.subarray(0, newline + 1));
+				requestBuffer = requestBuffer.subarray(newline + 1);
+				try {
+					const parsed = JSON.parse(original.toString("utf8")) as {
+						id?: unknown;
+						command?: { type?: unknown };
+					};
+					if (parsed.command?.type === commandType && typeof parsed.id === "string") targetCommandId = parsed.id;
+				} catch {}
+				upstream.write(original);
+			}
+		});
+		upstream.on("data", (chunk: Buffer) => {
+			responseBuffer = Buffer.concat([responseBuffer, chunk]);
+			while (true) {
+				const newline = responseBuffer.indexOf(0x0a);
+				if (newline < 0) break;
+				const original = Buffer.from(responseBuffer.subarray(0, newline + 1));
+				responseBuffer = responseBuffer.subarray(newline + 1);
+				let dropsResponse = false;
+				try {
+					const parsed = JSON.parse(original.toString("utf8")) as {
+						id?: unknown;
+						type?: unknown;
+						command?: unknown;
+					};
+					dropsResponse =
+						parsed.type === "response" && parsed.command === commandType && parsed.id === targetCommandId;
+				} catch {}
+				if (dropsResponse) {
+					resolveResponseObserved();
+					continue;
+				}
+				downstream.write(original);
+			}
+		});
+		upstream.on("error", (error) => downstream.destroy(error));
+		downstream.on("error", () => upstream.destroy());
+		upstream.on("close", () => downstream.destroy());
+		downstream.on("close", () => upstream.destroy());
+	});
+	await new Promise<void>((resolveListen, reject) => {
+		server.once("error", reject);
+		server.listen(proxyPath, () => resolveListen());
+	});
+	return {
+		server,
+		responseObserved,
+		release() {
+			downstreamSocket?.destroy();
+			upstreamSocket?.destroy();
+		},
 	};
 }
 
@@ -1075,6 +1171,497 @@ describe("daemon supervisor resident workers", () => {
 		client.close();
 		await waitForSocketGone(socketPath);
 	}, 60_000);
+
+	it.skipIf(process.platform === "win32")(
+		"adopts a recoverable owned worker with an authoritative snapshot and rotated receipt",
+		async () => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const sessionDir = join(agentDir, "sessions");
+			const socketPath = join(tmpdir(), `prime-recover-owned-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+			mkdirSync(projectDir, { recursive: true });
+			const sessionManager = SessionManager.create(projectDir, sessionDir);
+			sessionManager.appendMessage({ role: "user", content: "recoverable fixture", timestamp: 1 });
+			const sessionPath = sessionManager.getSessionFile();
+			if (!sessionPath) throw new Error("Recoverable fixture did not persist");
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const owner = await connectEventually(socketPath, supervisor);
+			const correlationId = `recover-correlation-${randomUUID()}`;
+			const previousMcpOwnerId = `recover-mcp-${randomUUID()}`;
+			const config = {
+				cwd: projectDir,
+				agentDir,
+				sessionDir,
+				apiKey: "faux-key",
+				extensions: [fauxExtensionPath],
+				provider: "faux",
+				model: "faux",
+				noTools: true,
+				noExtensions: false,
+			};
+			const launchEnv = {
+				...collectDaemonLaunchEnv(),
+				PRIME_AGENT_RECOVERY_TEST: `canary-${randomUUID()}`,
+			};
+			const createRequestId = randomUUID();
+			const created = await createRecoverableOwnedSession(owner, {
+				requestId: createRequestId,
+				correlationId,
+				mcpOwnerId: previousMcpOwnerId,
+				config,
+				sessionPath,
+				launchEnv,
+				connectionOptions: { supportsExtensionUi: false },
+			});
+			if (!created.state.workerPid || !created.state.activeSessionId)
+				throw new Error("Recoverable worker was incomplete");
+			workerPids.add(created.state.workerPid);
+			const recoverableMcpServers = [
+				{
+					name: "recoverable-task",
+					type: "http" as const,
+					url: "https://recoverable.invalid/mcp",
+					headers: { Authorization: "Bearer recoverable-mcp-canary" },
+				},
+			];
+			await created.connection.replaceAcpMcpServers(recoverableMcpServers, previousMcpOwnerId);
+			await created.connection.submitCorrelatedPrompt("record an adoption lifecycle", {
+				correlationId,
+				queueIfBusy: true,
+			});
+			const before = await created.connection.getInitialSnapshot();
+			if (!before.lastEventCursor) throw new Error("Recoverable fixture did not expose an event cursor");
+			const earlyAdopter = await connectEventually(socketPath, supervisor);
+			const requestId = randomUUID();
+			const nextMcpOwnerId = `recover-mcp-${randomUUID()}`;
+			const adoptionOptions = {
+				requestId,
+				recoveryHandle: created.recoveryHandle,
+				expectedSupervisorGeneration: created.supervisorGeneration,
+				activeSessionId: created.state.activeSessionId,
+				sessionId: created.state.sessionId,
+				correlationId,
+				cursor: before.lastEventCursor,
+				previousMcpOwnerId,
+				mcpOwnerId: nextMcpOwnerId,
+				config,
+				launchEnv,
+				connectionOptions: { supportsExtensionUi: false },
+			} as const;
+			await expect(adoptRecoverableOwnedSession(earlyAdopter, adoptionOptions)).rejects.toThrow(
+				"Recoverable owned session adoption is unavailable",
+			);
+			earlyAdopter.close();
+			await disconnectDaemonClientWithServerCloseBarrier(owner);
+			const wrongHandleClient = await connectEventually(socketPath, supervisor);
+			await expect(
+				adoptRecoverableOwnedSession(wrongHandleClient, {
+					...adoptionOptions,
+					requestId: randomUUID(),
+					recoveryHandle: "W".repeat(43),
+				}),
+			).rejects.toThrow("Recoverable owned session adoption is unavailable");
+			wrongHandleClient.close();
+
+			const proxyPath = join(tmpdir(), `prime-recover-loss-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+			const responseLoss = await createCommandResponseLossProxy(
+				proxyPath,
+				socketPath,
+				"commit_recoverable_owned_session_adoption",
+			);
+			const lostResponseAdopter = await connectEventually(proxyPath, supervisor);
+			let lostAdoption: Promise<Awaited<ReturnType<typeof adoptRecoverableOwnedSession>>> | undefined;
+			for (let attempt = 0; attempt < 20; attempt++) {
+				const candidate = adoptRecoverableOwnedSession(lostResponseAdopter, adoptionOptions);
+				const outcome = await Promise.race([
+					responseLoss.responseObserved.then(() => "response_lost" as const),
+					candidate.then(
+						() => "unexpected_success" as const,
+						() => "retry" as const,
+					),
+				]);
+				if (outcome === "response_lost") {
+					lostAdoption = candidate;
+					break;
+				}
+				if (outcome === "unexpected_success") throw new Error("Response-loss proxy forwarded the commit receipt");
+			}
+			if (!lostAdoption) throw new Error("Recoverable commit response was not observed by the loss proxy");
+
+			const retryAdopter = await connectEventually(socketPath, supervisor);
+			const observedAdoptionMessages: string[] = [];
+			const stopObservingAdoptionMessages = retryAdopter.onMessage((message) => {
+				observedAdoptionMessages.push(JSON.stringify(message));
+			});
+			await expect(adoptRecoverableOwnedSession(retryAdopter, adoptionOptions)).rejects.toThrow(
+				"Recoverable owned session adoption is unavailable",
+			);
+			responseLoss.release();
+			await expect(lostAdoption).rejects.toThrow("Recoverable owned session adoption is unavailable");
+			lostResponseAdopter.close();
+			await new Promise<void>((resolveClose) => responseLoss.server.close(() => resolveClose()));
+
+			let commitRetry: Awaited<ReturnType<typeof adoptRecoverableOwnedSession>> | undefined;
+			for (let attempt = 0; attempt < 20; attempt++) {
+				try {
+					commitRetry = await adoptRecoverableOwnedSession(retryAdopter, adoptionOptions);
+					break;
+				} catch (error) {
+					if (!(error instanceof Error) || error.message !== "Recoverable owned session adoption is unavailable") {
+						throw error;
+					}
+				}
+			}
+			if (!commitRetry) throw new Error("Final recoverable adoption receipt did not rebind");
+			expect(commitRetry.recoveryHandle).not.toBe(created.recoveryHandle);
+			expect(commitRetry.proof).toMatchObject({
+				feature: "recoverable_owned_session_adoption_v1",
+				status: "adopted",
+				activeSessionId: created.state.activeSessionId,
+				sessionId: created.state.sessionId,
+				correlationId,
+				mcpOwnerId: nextMcpOwnerId,
+				ownershipGeneration: 1,
+			});
+			const after = await commitRetry.connection.getInitialSnapshot();
+			expect(after.messages).toEqual(before.messages);
+			expect(after.lastEventCursor?.sequence).toBeGreaterThanOrEqual(before.lastEventCursor.sequence);
+			const futureCorrelationId = randomUUID();
+			let resolveFutureLifecycle!: () => void;
+			const futureLifecycle = new Promise<void>((resolve) => {
+				resolveFutureLifecycle = resolve;
+			});
+			const stopObservingFutureLifecycle = commitRetry.connection.subscribe((event) => {
+				if (
+					event.type === "prompt_lifecycle" &&
+					event.lifecycle.correlationId === futureCorrelationId &&
+					["completed", "cancelled", "failed"].includes(event.lifecycle.phase)
+				) {
+					resolveFutureLifecycle();
+				}
+			});
+			await commitRetry.connection.submitCorrelatedPrompt("future event after adoption retry", {
+				correlationId: futureCorrelationId,
+				queueIfBusy: true,
+			});
+			await futureLifecycle;
+			stopObservingFutureLifecycle();
+			await expect(
+				commitRetry.connection.replaceAcpMcpServers(recoverableMcpServers, previousMcpOwnerId),
+			).rejects.toThrow("owned by another daemon client");
+			await commitRetry.connection.releaseAcpMcpServers(nextMcpOwnerId, ["recoverable-task"]);
+			const confirmation = {
+				requestId,
+				recoveryHandle: commitRetry.recoveryHandle,
+				proof: commitRetry.proof,
+			};
+			await confirmRecoverableOwnedSessionAdoption(retryAdopter, confirmation);
+			await confirmRecoverableOwnedSessionAdoption(retryAdopter, confirmation);
+			await owner.connect();
+			await owner.waitForHello();
+			const retiredCreateReplay = await owner.request({
+				type: "create_recoverable_owned_session",
+				requestId: createRequestId,
+				expectedSupervisorGeneration: created.supervisorGeneration,
+				correlationId,
+				mcpOwnerId: previousMcpOwnerId,
+				recoveryConfig: config,
+				sessionPath,
+				config,
+				env: collectDaemonClientEnv(),
+				launchEnv,
+				launchEnvMode: "replace",
+			});
+			expect(retiredCreateReplay).toMatchObject({
+				success: false,
+				error: "Recoverable owned session adoption is unavailable",
+			});
+			expect(JSON.stringify(retiredCreateReplay)).not.toContain(commitRetry.recoveryHandle);
+			expect(readWorkerDescriptor(agentDir).ownerClientId).toBe(retryAdopter.clientId);
+			const fencedOldOwnerMutation = await owner.request({
+				type: "replace_acp_mcp_servers",
+				activeSessionId: created.state.activeSessionId,
+				ownerId: previousMcpOwnerId,
+				servers: recoverableMcpServers,
+			});
+			expect(fencedOldOwnerMutation).toMatchObject({
+				success: false,
+				error: `Unknown active session: ${created.state.activeSessionId}`,
+			});
+			owner.close();
+			const descriptor = readWorkerDescriptor(agentDir);
+			expect(descriptor.pid).toBe(created.state.workerPid);
+			expect(descriptor.ownerClientId).toBe(retryAdopter.clientId);
+			const listed = await retryAdopter.request({ type: "list", includeClientOwned: true });
+			const privateSurfaces = [
+				JSON.stringify(descriptor),
+				JSON.stringify(listed),
+				observedAdoptionMessages.join("\n"),
+				readDaemonLogs(agentDir),
+			];
+			for (const canary of [
+				created.recoveryHandle,
+				commitRetry.recoveryHandle,
+				requestId,
+				previousMcpOwnerId,
+				nextMcpOwnerId,
+				launchEnv.PRIME_AGENT_RECOVERY_TEST,
+			]) {
+				for (const surface of privateSurfaces) expect(surface).not.toContain(canary);
+			}
+			if (!descriptor.processStartId) throw new Error("Recoverable worker did not expose a process identity");
+			identityTrackedProcesses.set(descriptor.pid, descriptor.processStartId);
+			signalIdentityVerifiedProcess(descriptor, "SIGKILL");
+			await waitForProcessGone(descriptor.pid);
+			identityTrackedProcesses.delete(descriptor.pid);
+			workerPids.delete(descriptor.pid);
+			await waitForCondition(
+				() => {
+					const recovered = readWorkerDescriptor(agentDir);
+					return recovered.pid !== descriptor.pid && recovered.lifecycle === "ready";
+				},
+				"Adopted owner did not recover through a replacement worker incarnation",
+				20_000,
+			);
+			const recoveredDescriptor = readWorkerDescriptor(agentDir);
+			if (!recoveredDescriptor.processStartId) {
+				throw new Error("Recovered adopted worker did not expose a process identity");
+			}
+			workerPids.add(recoveredDescriptor.pid);
+			identityTrackedProcesses.set(recoveredDescriptor.pid, recoveredDescriptor.processStartId);
+			expect(recoveredDescriptor.ownerClientId).toBe(retryAdopter.clientId);
+			await expect(confirmRecoverableOwnedSessionAdoption(retryAdopter, confirmation)).rejects.toThrow(
+				"Recoverable owned session adoption is unavailable",
+			);
+			const recoveredCorrelationId = randomUUID();
+			const recoveredLifecycle = new Promise<void>((resolveLifecycle) => {
+				const unsubscribe = commitRetry.connection.subscribe((event) => {
+					if (event.type === "prompt_lifecycle" && event.lifecycle.correlationId === recoveredCorrelationId) {
+						unsubscribe();
+						resolveLifecycle();
+					}
+				});
+			});
+			await commitRetry.connection.submitCorrelatedPrompt("prompt after worker incarnation replacement", {
+				correlationId: recoveredCorrelationId,
+				queueIfBusy: true,
+			});
+			await recoveredLifecycle;
+			stopObservingAdoptionMessages();
+			const cleanupProof = await commitRetry.connection.disposeOwnedSession();
+			expect(cleanupProof).toMatchObject({
+				feature: "caller_owned_session_environment_cleanup_v1",
+				status: "completed",
+				started: { status: "attached" },
+				observed: { supervisorGeneration: created.supervisorGeneration },
+				daemonReplaced: false,
+			});
+			await waitForProcessGone(recoveredDescriptor.pid);
+			workerPids.delete(recoveredDescriptor.pid);
+			identityTrackedProcesses.delete(recoveredDescriptor.pid);
+			await retryAdopter.request({ type: "shutdown" });
+			retryAdopter.close();
+			await waitForSocketGone(socketPath);
+		},
+		60_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"grants exactly one authority to simultaneous recoverable claimants",
+		async () => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const sessionDir = join(agentDir, "sessions");
+			const socketPath = join(tmpdir(), `prime-recover-race-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+			mkdirSync(projectDir, { recursive: true });
+			const sessionManager = SessionManager.create(projectDir, sessionDir);
+			sessionManager.appendMessage({ role: "user", content: "recoverable race fixture", timestamp: 1 });
+			const sessionPath = sessionManager.getSessionFile();
+			if (!sessionPath) throw new Error("Recoverable race fixture did not persist");
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const owner = await connectEventually(socketPath, supervisor);
+			const correlationId = `recover-race-${randomUUID()}`;
+			const previousMcpOwnerId = `recover-race-mcp-${randomUUID()}`;
+			const config = {
+				cwd: projectDir,
+				agentDir,
+				sessionDir,
+				apiKey: "faux-key",
+				extensions: [fauxExtensionPath],
+				provider: "faux",
+				model: "faux",
+				noTools: true,
+				noExtensions: false,
+			};
+			const launchEnv = {
+				...collectDaemonLaunchEnv(),
+				PRIME_AGENT_RECOVERY_RACE: `canary-${randomUUID()}`,
+			};
+			const created = await createRecoverableOwnedSession(owner, {
+				requestId: randomUUID(),
+				correlationId,
+				mcpOwnerId: previousMcpOwnerId,
+				config,
+				sessionPath,
+				launchEnv,
+				connectionOptions: { supportsExtensionUi: false },
+			});
+			if (!created.state.workerPid || !created.state.activeSessionId) {
+				throw new Error("Recoverable race worker was incomplete");
+			}
+			workerPids.add(created.state.workerPid);
+			await created.connection.submitCorrelatedPrompt("record a recoverable race lifecycle", {
+				correlationId,
+				queueIfBusy: true,
+			});
+			const snapshot = await created.connection.getInitialSnapshot();
+			if (!snapshot.lastEventCursor) throw new Error("Recoverable race fixture did not expose a cursor");
+			await disconnectDaemonClientWithServerCloseBarrier(owner);
+			const claimantA = await connectEventually(socketPath, supervisor);
+			const claimantB = await connectEventually(socketPath, supervisor);
+			const requestId = randomUUID();
+			const adoptionOptions = {
+				requestId,
+				recoveryHandle: created.recoveryHandle,
+				expectedSupervisorGeneration: created.supervisorGeneration,
+				activeSessionId: created.state.activeSessionId,
+				sessionId: created.state.sessionId,
+				correlationId,
+				cursor: snapshot.lastEventCursor,
+				previousMcpOwnerId,
+				mcpOwnerId: `recover-race-next-${randomUUID()}`,
+				config,
+				launchEnv,
+				connectionOptions: { supportsExtensionUi: false },
+			} as const;
+			const outcomes = await Promise.allSettled([
+				adoptRecoverableOwnedSession(claimantA, adoptionOptions),
+				adoptRecoverableOwnedSession(claimantB, adoptionOptions),
+			]);
+			const fulfilled = outcomes.flatMap((outcome, index) =>
+				outcome.status === "fulfilled" ? [{ adoption: outcome.value, index }] : [],
+			);
+			const rejected = outcomes.filter((outcome) => outcome.status === "rejected");
+			expect(fulfilled).toHaveLength(1);
+			expect(rejected).toHaveLength(1);
+			expect(rejected[0]).toMatchObject({
+				status: "rejected",
+				reason: { message: "Recoverable owned session adoption is unavailable" },
+			});
+			const winner = fulfilled[0]!;
+			const winnerClient = winner.index === 0 ? claimantA : claimantB;
+			const loserClient = winner.index === 0 ? claimantB : claimantA;
+			expect(readWorkerDescriptor(agentDir).ownerClientId).toBe(winnerClient.clientId);
+			await confirmRecoverableOwnedSessionAdoption(winnerClient, {
+				requestId,
+				recoveryHandle: winner.adoption.recoveryHandle,
+				proof: winner.adoption.proof,
+			});
+			loserClient.close();
+			owner.close();
+			await winner.adoption.connection.dispose();
+			await waitForProcessGone(created.state.workerPid);
+			workerPids.delete(created.state.workerPid);
+			await winnerClient.request({ type: "shutdown" });
+			winnerClient.close();
+			await waitForSocketGone(socketPath);
+		},
+		60_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"fails closed when recoverable authority crosses a supervisor generation",
+		async () => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const sessionDir = join(agentDir, "sessions");
+			const socketPath = join(tmpdir(), `prime-recover-generation-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+			mkdirSync(projectDir, { recursive: true });
+			const sessionManager = SessionManager.create(projectDir, sessionDir);
+			sessionManager.appendMessage({ role: "user", content: "generation fixture", timestamp: 1 });
+			const sessionPath = sessionManager.getSessionFile();
+			if (!sessionPath) throw new Error("Generation fixture did not persist");
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const owner = await connectEventually(socketPath, supervisor);
+			const correlationId = `recover-generation-${randomUUID()}`;
+			const mcpOwnerId = `recover-generation-mcp-${randomUUID()}`;
+			const config = {
+				cwd: projectDir,
+				agentDir,
+				sessionDir,
+				apiKey: "faux-key",
+				extensions: [fauxExtensionPath],
+				provider: "faux",
+				model: "faux",
+				noTools: true,
+				noExtensions: false,
+			};
+			const launchEnv = collectDaemonLaunchEnv();
+			const created = await createRecoverableOwnedSession(owner, {
+				requestId: randomUUID(),
+				correlationId,
+				mcpOwnerId,
+				config,
+				launchEnv,
+				sessionPath,
+				connectionOptions: {
+					supportsExtensionUi: false,
+					recoverDaemon: () => new Promise<void>(() => undefined),
+				},
+			});
+			if (!created.state.workerPid || !created.state.activeSessionId) {
+				throw new Error("Generation fixture worker was incomplete");
+			}
+			workerPids.add(created.state.workerPid);
+			await created.connection.submitCorrelatedPrompt("record a generation lifecycle", {
+				correlationId,
+				queueIfBusy: true,
+			});
+			const snapshot = await created.connection.getInitialSnapshot();
+			if (!snapshot.lastEventCursor) throw new Error("Generation fixture did not expose an event cursor");
+			const workerIdentity = readWorkerDescriptor(agentDir);
+			const supervisorIdentity = {
+				pid: owner.hello?.supervisorPid,
+				processStartId: owner.hello?.supervisorProcessStartId,
+			};
+			signalIdentityVerifiedProcess(supervisorIdentity, "SIGKILL");
+			await waitForProcessGone(supervisorIdentity.pid!);
+			owner.close();
+			const claimant = await connectEventually(socketPath);
+			expect(await claimant.request({ type: "list" })).toMatchObject({ success: true, command: "list" });
+			expect(readWorkerDescriptor(agentDir)).toMatchObject({
+				workerId: workerIdentity.workerId,
+				pid: workerIdentity.pid,
+				processStartId: workerIdentity.processStartId,
+			});
+			await expect(
+				adoptRecoverableOwnedSession(claimant, {
+					requestId: randomUUID(),
+					recoveryHandle: created.recoveryHandle,
+					expectedSupervisorGeneration: created.supervisorGeneration,
+					activeSessionId: created.state.activeSessionId,
+					sessionId: created.state.sessionId,
+					correlationId,
+					cursor: snapshot.lastEventCursor,
+					previousMcpOwnerId: mcpOwnerId,
+					mcpOwnerId: `replacement-mcp-${randomUUID()}`,
+					config,
+					launchEnv,
+					connectionOptions: { supportsExtensionUi: false },
+				}),
+			).rejects.toThrow("Recoverable owned session adoption is unavailable");
+			const shutdownResult = await claimant.request({ type: "shutdown", force: true });
+			expect(shutdownResult).toMatchObject({ success: true, command: "shutdown" });
+			claimant.close();
+			await waitForProcessGone(created.state.workerPid);
+			workerPids.delete(created.state.workerPid);
+			await waitForSocketGone(socketPath);
+		},
+		60_000,
+	);
 
 	it.skipIf(process.platform === "win32")(
 		"isolates two caller-owned environments through worker and supervisor recovery",

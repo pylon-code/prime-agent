@@ -10,9 +10,33 @@ export const DAEMON_WORKER_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER";
 export const DAEMON_WORKER_TOKEN_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN";
 export const DAEMON_WORKER_ACTIVE_SESSION_ID_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID";
 export const DAEMON_WORKER_SUPERVISOR_SOCKET_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET";
+export const DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_AGENT_DIR";
 export const DAEMON_WORKER_RECOVERY_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL";
 export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_STARTUP_GATE_FD";
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
+
+export const DAEMON_WORKER_BOOTSTRAP_ENV_KEYS = [
+	DAEMON_WORKER_ROLE_ENV,
+	DAEMON_WORKER_TOKEN_ENV,
+	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+	DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV,
+	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_STARTUP_GATE_FD_ENV,
+] as const;
+
+/** Remove private worker bootstrap authority before an environment crosses a role or process boundary. */
+export function sanitizeDaemonWorkerBootstrapEnvironment<T extends NodeJS.ProcessEnv>(
+	environment: T,
+	platform: NodeJS.Platform = process.platform,
+): T {
+	const reserved = new Set<string>(DAEMON_WORKER_BOOTSTRAP_ENV_KEYS);
+	for (const key of Object.keys(environment)) {
+		if (reserved.has(key) || (platform === "win32" && reserved.has(key.toUpperCase()))) delete environment[key];
+	}
+	return environment;
+}
+
 export type DaemonWorkerLifecycle = "starting" | "ready" | "recovering" | "stopping" | "failed";
 
 export type DaemonWorkerFrameHeader =
@@ -36,6 +60,25 @@ export type DaemonWorkerFrameHeader =
 	  };
 
 export type DaemonCreateCommand = Extract<DaemonCommand, { type: "create" }>;
+
+export interface DaemonWorkerAuthenticationResult {
+	workerIncarnation: string;
+}
+
+export interface DaemonWorkerAcpMcpOwnerTransferProof {
+	transactionId: string;
+	previousOwnerId: string;
+	nextOwnerId: string;
+	changed: boolean;
+	state: "transferred" | "rolled_back";
+}
+
+export interface DaemonWorkerAcpMcpOwnerTransferRetirement {
+	transactionId: string;
+	previousOwnerId: string;
+	nextOwnerId: string;
+	status: "retired";
+}
 
 export interface DurableDaemonCreateCommand {
 	type: "create";
@@ -69,6 +112,15 @@ export type DaemonWorkerCommand =
 			supportsExtensionUi?: boolean;
 	  }
 	| { id?: string; type: "worker_unsubscribe"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "worker_transfer_acp_mcp_owner";
+			activeSessionId: string;
+			transactionId: string;
+			action: "transfer" | "query" | "rollback" | "retire";
+			previousOwnerId: string;
+			ownerId: string;
+	  }
 	| { id?: string; type: "worker_archive_and_shutdown" }
 	| {
 			id?: string;
@@ -201,6 +253,35 @@ export function requireDaemonWorkerAuthenticationToken(environment: NodeJS.Proce
 		throw new Error("Daemon session worker is missing its authentication token");
 	}
 	return token;
+}
+
+export interface DaemonWorkerBootstrapEnvironment {
+	authenticationToken: string;
+	activeSessionId?: string;
+	supervisorSocketPath?: string;
+	supervisorAgentDir?: string;
+	recoveryJournalPath?: string;
+}
+
+/** Capture worker bootstrap authority once, before the private variables are scrubbed from process.env. */
+export function readDaemonWorkerBootstrapEnvironment(
+	environment: NodeJS.ProcessEnv = process.env,
+): DaemonWorkerBootstrapEnvironment {
+	return {
+		authenticationToken: requireDaemonWorkerAuthenticationToken(environment),
+		...(environment[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]
+			? { activeSessionId: environment[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV] }
+			: {}),
+		...(environment[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]
+			? { supervisorSocketPath: environment[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] }
+			: {}),
+		...(environment[DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV]
+			? { supervisorAgentDir: environment[DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV] }
+			: {}),
+		...(environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]
+			? { recoveryJournalPath: environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] }
+			: {}),
+	};
 }
 
 export function isDaemonWorkerFrameHeader(value: unknown): value is DaemonWorkerFrameHeader {

@@ -28,7 +28,10 @@ import type {
 import type { QueuedMessageLane, QueuedMessageMutation } from "../../core/session-action-store.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
-import { CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE } from "../../sdk-features.js";
+import {
+	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+	type RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE,
+} from "../../sdk-features.js";
 import type {
 	AgentConnectionAgentStatus,
 	AgentConnectionHeartbeat,
@@ -81,8 +84,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 27 adds a capability-gated authoritative owned-session cleanup query.
 // Revision 28 negotiates fresh snapshot generations and adds private worker chunk routing metadata.
 // Revision 29 capability-gates exact caller-owned launch environments and observable cleanup results.
-export const DAEMON_SCHEMA_REVISION = 29;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-5450eb231171";
+// Revision 30 adds capability-gated same-supervisor recoverable owned-session adoption.
+export const DAEMON_SCHEMA_REVISION = 30;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-2e0904d3ad1a";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -141,7 +145,8 @@ export type DaemonServerCapability =
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
 	| "snapshot_generation_nonce_v1"
-	| "authoritative_owned_session_cleanup_v1";
+	| "authoritative_owned_session_cleanup_v1"
+	| "daemon_recoverable_owned_session_adoption_v1";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -199,7 +204,25 @@ export const DAEMON_SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapabil
 	...DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	"authoritative_owned_session_cleanup_v1",
 	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+	"daemon_recoverable_owned_session_adoption_v1",
 ];
+
+export function daemonSupervisorServerCapabilities(
+	platform: NodeJS.Platform = process.platform,
+): readonly DaemonServerCapability[] {
+	return platform === "win32"
+		? DAEMON_SUPERVISOR_SERVER_CAPABILITIES.filter(
+				(capability) => capability !== "daemon_recoverable_owned_session_adoption_v1",
+			)
+		: DAEMON_SUPERVISOR_SERVER_CAPABILITIES;
+}
+
+export function isDaemonRecoveryRequestId(value: unknown): value is string {
+	if (typeof value !== "string" || value.length > 256) return false;
+	if (/^[0-9a-f]{32,}$/i.test(value) && value.length % 2 === 0) return true;
+	if (/^[A-Za-z0-9_-]{22,}$/.test(value)) return true;
+	return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
 
 export interface DaemonRuntimeIdentity {
 	buildId: string;
@@ -469,6 +492,35 @@ export type DaemonSavedSessionListCommand =
 			scope: AgentConnectionSavedSessionScope;
 	  };
 
+export interface DaemonRecoverableOwnedSessionCreateResult {
+	state: SessionSummary;
+	recoveryHandle: string;
+	supervisorGeneration: string;
+	ownershipGeneration: number;
+}
+
+export interface DaemonRecoverableOwnedSessionAdoptionProof {
+	feature: typeof RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE;
+	status: "adopted";
+	supervisorGeneration: string;
+	ownershipGeneration: number;
+	activeSessionId: string;
+	sessionId: string;
+	correlationId: string;
+	lifecycle: PromptLifecycleSnapshot | { correlationId: string; expired: true; deliveryCrossed: boolean };
+	cursor: DaemonEventCursor;
+	mcpOwnerId: string;
+}
+
+export interface DaemonRecoverableOwnedSessionPrepareResult extends DaemonAttachResult {
+	recoveryHandle: string;
+	proof: DaemonRecoverableOwnedSessionAdoptionProof;
+}
+
+export interface DaemonRecoverableOwnedSessionConfirmResult {
+	status: "confirmed";
+}
+
 export type DaemonCommand =
 	| {
 			id?: string;
@@ -480,6 +532,57 @@ export type DaemonCommand =
 	  }
 	| DaemonSavedSessionListCommand
 	| { id?: string; type: "list_agent_peers"; workerToken: string }
+	| ({
+			id?: string;
+			type: "create_recoverable_owned_session";
+			requestId: string;
+			expectedSupervisorGeneration: string;
+			correlationId: string;
+			mcpOwnerId: string;
+			recoveryConfig: AgentSessionRuntimeConfig;
+			sessionPath?: string;
+			continueRecent?: boolean;
+			noSession?: boolean;
+			name?: string;
+			config?: AgentSessionRuntimeConfig;
+			runtimeMetadata?: AgentSessionRuntimeMetadata;
+	  } & DaemonClientEnv &
+			DaemonLaunchEnv & { launchEnv: Record<string, string>; launchEnvMode: "replace" })
+	| {
+			id?: string;
+			type: "prepare_recoverable_owned_session_adoption";
+			requestId: string;
+			recoveryHandle: string;
+			expectedSupervisorGeneration: string;
+			activeSessionId: string;
+			sessionId: string;
+			correlationId: string;
+			cursor: DaemonEventCursor;
+			previousMcpOwnerId: string;
+			mcpOwnerId: string;
+			recoveryConfig: AgentSessionRuntimeConfig;
+			launchEnv: Record<string, string>;
+			clientId: DaemonClientId;
+			capabilities: readonly DaemonClientCapability[];
+			supportsExtensionUi?: boolean;
+			telemetryDisabled?: true;
+	  }
+	| {
+			id?: string;
+			type: "commit_recoverable_owned_session_adoption";
+			requestId: string;
+			expectedSupervisorGeneration: string;
+			recoveryHandle: string;
+			proof: DaemonRecoverableOwnedSessionAdoptionProof;
+	  }
+	| {
+			id?: string;
+			type: "confirm_recoverable_owned_session_adoption";
+			requestId: string;
+			expectedSupervisorGeneration: string;
+			recoveryHandle: string;
+			proof: DaemonRecoverableOwnedSessionAdoptionProof;
+	  }
 	| ({
 			id?: string;
 			type: "create";
@@ -499,6 +602,7 @@ export type DaemonCommand =
 			id?: string;
 			type: "attach";
 			activeSessionId: string;
+			expectedSupervisorGeneration?: string;
 			supportsExtensionUi?: boolean;
 			/** A retry nonce forces a fresh transcript payload generation after a failed transfer. */
 			snapshotGenerationNonce?: string;
@@ -810,6 +914,11 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 	minProtocol: 7,
 	capability: "client_owned_sessions",
 } as const;
+const RECOVERABLE_OWNED_SESSION_ADOPTION_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 30,
+	capability: "daemon_recoverable_owned_session_adoption_v1",
+} as const;
 const AUTHORITATIVE_OWNED_SESSION_CLEANUP_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 27,
@@ -864,6 +973,10 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	list: LEGACY_DAEMON_COMMAND,
 	list_saved_sessions: LEGACY_DAEMON_COMMAND,
 	list_agent_peers: AGENT_PEER_LIST_COMMAND,
+	create_recoverable_owned_session: RECOVERABLE_OWNED_SESSION_ADOPTION_COMMAND,
+	prepare_recoverable_owned_session_adoption: RECOVERABLE_OWNED_SESSION_ADOPTION_COMMAND,
+	commit_recoverable_owned_session_adoption: RECOVERABLE_OWNED_SESSION_ADOPTION_COMMAND,
+	confirm_recoverable_owned_session_adoption: RECOVERABLE_OWNED_SESSION_ADOPTION_COMMAND,
 	create: LEGACY_DAEMON_COMMAND,
 	attach: LEGACY_DAEMON_COMMAND,
 	reattach: LEGACY_DAEMON_COMMAND,
@@ -1022,7 +1135,8 @@ export type DaemonErrorInfo =
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId }
-	| { code: "owned_session_owner_mismatch" };
+	| { code: "owned_session_owner_mismatch" }
+	| { code: "owned_session_adoption_unavailable" };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 export type DaemonClosingReason = "shutdown" | "update";

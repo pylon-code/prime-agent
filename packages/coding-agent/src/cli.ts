@@ -10,6 +10,20 @@ const supported = assertNodeVersion({
 });
 
 if (supported) {
+	const workerProtocol = await import("./modes/daemon/daemon-worker-protocol.js");
+	const authenticatedWorkerLaunch =
+		workerProtocol.isDaemonWorkerProcess() &&
+		process.env[workerProtocol.DAEMON_WORKER_TOKEN_ENV] !== undefined &&
+		process.env[workerProtocol.DAEMON_WORKER_STARTUP_GATE_FD_ENV] !== undefined;
+	let daemonWorkerBootstrap: ReturnType<typeof workerProtocol.readDaemonWorkerBootstrapEnvironment> | undefined;
+	try {
+		if (authenticatedWorkerLaunch) {
+			workerProtocol.waitForDaemonWorkerStartupGate();
+			daemonWorkerBootstrap = workerProtocol.readDaemonWorkerBootstrapEnvironment();
+		}
+	} finally {
+		workerProtocol.sanitizeDaemonWorkerBootstrapEnvironment(process.env);
+	}
 	const { runCli } = await import("./cli-main.js");
-	await runCli();
+	await runCli(daemonWorkerBootstrap);
 }

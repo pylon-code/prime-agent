@@ -165,7 +165,7 @@ import {
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { AcpMcpServerConfig } from "./mcp/acp-mcp-types.js";
-import type { McpManager } from "./mcp/mcp-manager.js";
+import type { AcpMcpOwnerTransferProof, McpManager } from "./mcp/mcp-manager.js";
 import {
 	type BashExecutionMessage,
 	type CompactionOutcome,
@@ -1060,6 +1060,14 @@ function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	parentUsage.totalTokens = parentContextTokens;
 }
 
+const MISSING_MCP_OWNER_TRANSFER_RETENTION_MS = 5 * 60_000;
+const MISSING_MCP_OWNER_TRANSFER_RECEIPT_LIMIT = 256;
+
+interface MissingMcpOwnerTransferReceipt {
+	proof: AcpMcpOwnerTransferProof;
+	expiresAt: number;
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -1172,6 +1180,7 @@ export class AgentSession {
 	private _agentMessageController?: AgentSessionMessageController;
 	private _agentObserveController?: AgentObserveController;
 	private _mcpManager?: McpManager;
+	private readonly _missingMcpOwnerTransfers = new Map<string, MissingMcpOwnerTransferReceipt>();
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
@@ -1387,6 +1396,94 @@ export class AgentSession {
 		});
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
+	}
+
+	transferAcpMcpServersOwner(previousOwnerId: string, nextOwnerId: string): void {
+		this._mcpManager?.transferAcpServersOwner(previousOwnerId, nextOwnerId);
+	}
+
+	transferAcpMcpServersOwnerTransaction(
+		transactionId: string,
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): AcpMcpOwnerTransferProof {
+		if (!this._mcpManager) {
+			const existing = this.getMissingMcpOwnerTransfer(transactionId);
+			if (existing) {
+				if (existing.previousOwnerId !== previousOwnerId || existing.nextOwnerId !== nextOwnerId) {
+					throw new Error("ACP MCP owner transfer transaction tuple changed");
+				}
+				return { ...existing };
+			}
+			const proof = { transactionId, previousOwnerId, nextOwnerId, changed: false, state: "transferred" as const };
+			this.rememberMissingMcpOwnerTransfer(proof);
+			return { ...proof };
+		}
+		return this._mcpManager.transferAcpServersOwnerTransaction(transactionId, previousOwnerId, nextOwnerId);
+	}
+
+	queryAcpMcpServersOwnerTransaction(
+		transactionId: string,
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): AcpMcpOwnerTransferProof {
+		if (!this._mcpManager) {
+			const proof = this.getMissingMcpOwnerTransfer(transactionId);
+			if (!proof || proof.previousOwnerId !== previousOwnerId || proof.nextOwnerId !== nextOwnerId) {
+				throw new Error("ACP MCP owner transfer transaction is unknown");
+			}
+			return { ...proof };
+		}
+		return this._mcpManager.queryAcpServersOwnerTransaction(transactionId, previousOwnerId, nextOwnerId);
+	}
+
+	rollbackAcpMcpServersOwnerTransaction(
+		transactionId: string,
+		previousOwnerId: string,
+		nextOwnerId: string,
+	): AcpMcpOwnerTransferProof {
+		if (!this._mcpManager) {
+			const proof = this.queryAcpMcpServersOwnerTransaction(transactionId, previousOwnerId, nextOwnerId);
+			const rolledBack = { ...proof, state: "rolled_back" as const };
+			this.rememberMissingMcpOwnerTransfer(rolledBack);
+			return { ...rolledBack };
+		}
+		return this._mcpManager.rollbackAcpServersOwnerTransaction(transactionId, previousOwnerId, nextOwnerId);
+	}
+
+	retireAcpMcpServersOwnerTransaction(transactionId: string, previousOwnerId: string, nextOwnerId: string): void {
+		if (this._mcpManager) {
+			this._mcpManager.retireAcpServersOwnerTransaction(transactionId, previousOwnerId, nextOwnerId);
+			return;
+		}
+		const proof = this.getMissingMcpOwnerTransfer(transactionId);
+		if (proof && (proof.previousOwnerId !== previousOwnerId || proof.nextOwnerId !== nextOwnerId)) {
+			throw new Error("ACP MCP owner transfer transaction tuple changed");
+		}
+		this._missingMcpOwnerTransfers.delete(transactionId);
+	}
+
+	private getMissingMcpOwnerTransfer(transactionId: string): AcpMcpOwnerTransferProof | undefined {
+		const receipt = this._missingMcpOwnerTransfers.get(transactionId);
+		if (!receipt) return undefined;
+		if (receipt.expiresAt <= Date.now()) {
+			this._missingMcpOwnerTransfers.delete(transactionId);
+			return undefined;
+		}
+		return receipt.proof;
+	}
+
+	private rememberMissingMcpOwnerTransfer(proof: AcpMcpOwnerTransferProof): void {
+		this._missingMcpOwnerTransfers.delete(proof.transactionId);
+		this._missingMcpOwnerTransfers.set(proof.transactionId, {
+			proof,
+			expiresAt: Date.now() + MISSING_MCP_OWNER_TRANSFER_RETENTION_MS,
+		});
+		while (this._missingMcpOwnerTransfers.size > MISSING_MCP_OWNER_TRANSFER_RECEIPT_LIMIT) {
+			const oldest = this._missingMcpOwnerTransfers.keys().next().value;
+			if (oldest === undefined) break;
+			this._missingMcpOwnerTransfers.delete(oldest);
+		}
 	}
 
 	replaceAcpMcpServers(servers: readonly AcpMcpServerConfig[], ownerId: string): void {

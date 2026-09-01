@@ -32,7 +32,11 @@ import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { SessionStats } from "../../core/session-stats.js";
-import { CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE, PRIME_AGENT_SDK_FEATURES } from "../../sdk-features.js";
+import {
+	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+	PRIME_AGENT_SDK_FEATURES,
+	RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE,
+} from "../../sdk-features.js";
 import {
 	DaemonCapabilityUnavailableError,
 	type DaemonClient,
@@ -45,6 +49,7 @@ import {
 	collectDaemonLaunchEnv,
 	DAEMON_PROTOCOL_NAME,
 	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_REVISION,
 	DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION,
 	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonAttachResult,
@@ -54,6 +59,8 @@ import {
 	type DaemonOutbound,
 	type DaemonOwnedSessionCleanupResult,
 	type DaemonOwnedSessionCompletionResult,
+	type DaemonRecoverableOwnedSessionAdoptionProof,
+	type DaemonRecoverableOwnedSessionPrepareResult,
 	type DaemonReplayInfo,
 	type DaemonResponse,
 	type DaemonSessionClosedReason,
@@ -62,6 +69,11 @@ import {
 } from "../daemon/daemon-protocol.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
+import {
+	appendRecoverableOwnedFrame,
+	reconcileRecoverableOwnedFrames,
+	serializeRecoverableOwnedFrame,
+} from "../daemon/owned-session-adoption-buffer.js";
 import {
 	deleteDaemonSavedSession,
 	listDaemonSavedSessions,
@@ -360,6 +372,36 @@ export interface DaemonAgentConnectionOptions {
 	telemetryDisabled?: true;
 }
 
+export interface DaemonRecoverableOwnedSessionAdoptionOptions {
+	requestId: string;
+	recoveryHandle: string;
+	expectedSupervisorGeneration: string;
+	activeSessionId: string;
+	sessionId: string;
+	correlationId: string;
+	cursor: DaemonEventCursor;
+	previousMcpOwnerId: string;
+	mcpOwnerId: string;
+	recoveryConfig: AgentSessionRuntimeConfig;
+	launchEnv: Readonly<Record<string, string>>;
+	connectionOptions?: Omit<
+		DaemonAgentConnectionOptions,
+		"ownedSession" | "ownedSessionRecoveryConfig" | "ownedSessionLaunchEnv"
+	>;
+}
+
+export interface DaemonRecoverableOwnedSessionAdoptionResult {
+	connection: DaemonAgentConnection;
+	recoveryHandle: string;
+	proof: DaemonRecoverableOwnedSessionAdoptionProof;
+}
+
+interface RecoverableOwnedClientFrame {
+	payload: Buffer;
+	message: DaemonOutbound;
+	cursor?: DaemonEventCursor;
+}
+
 export interface DaemonOwnedSessionDaemonIdentity {
 	readonly protocolName: typeof DAEMON_PROTOCOL_NAME;
 	readonly protocolVersion: number;
@@ -568,6 +610,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private childRosterSequence: number | undefined;
 	private latestSnapshot: AgentConnectionSnapshot | undefined;
 	private latestSnapshotIsFresh = false;
+	private lastAttachmentReplay: DaemonReplayInfo | undefined;
 	private attachedSessionId: string | undefined;
 	private attachedSessionFile: string | undefined;
 	private daemonLogPath: string | undefined;
@@ -588,6 +631,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private attachmentAdmissionRevision = 0;
 	private attachmentAdmissionInFlight = false;
 	private attachmentInvalidationRevision = 0;
+	private attachmentSupervisorGenerationFence: string | undefined;
 	private negotiatedCapabilities: ReadonlySet<DaemonClientCapability> = new Set();
 	private negotiatedTransportGeneration: number | undefined;
 	private negotiatedRuntimeCapabilities: ReadonlySet<DaemonClientCapability> = new Set();
@@ -601,8 +645,38 @@ export class DaemonAgentConnection implements AgentConnection {
 	private sessionCloseRetirementInProgress = false;
 	private disposing = false;
 	private disposed = false;
+	private recoverableAdoptionStaging = false;
+	private recoverableAdoptionFrames: RecoverableOwnedClientFrame[] = [];
+	private recoverableAdoptionBufferedBytes = 0;
+	private recoverableAdoptionError?: Error;
 
 	private dispatchDaemonMessage(message: DaemonOutbound): void {
+		if (this.recoverableAdoptionStaging) {
+			if (this.recoverableAdoptionError) return;
+			try {
+				const meta = (message as { meta?: { activeSessionId?: unknown; cursor?: DaemonEventCursor } }).meta;
+				const envelopeActiveSessionId = (message as { activeSessionId?: unknown }).activeSessionId;
+				const metaActiveSessionId = meta?.activeSessionId;
+				const targetsCurrent =
+					envelopeActiveSessionId === this.activeSessionId || metaActiveSessionId === this.activeSessionId;
+				if (!targetsCurrent) return;
+				if (
+					(envelopeActiveSessionId !== undefined && envelopeActiveSessionId !== this.activeSessionId) ||
+					(metaActiveSessionId !== undefined && metaActiveSessionId !== this.activeSessionId) ||
+					!meta?.cursor
+				) {
+					throw new Error("Recoverable owned session adoption is unavailable");
+				}
+				this.recoverableAdoptionBufferedBytes = appendRecoverableOwnedFrame(
+					this.recoverableAdoptionFrames,
+					this.recoverableAdoptionBufferedBytes,
+					{ payload: serializeRecoverableOwnedFrame(message), message, cursor: meta.cursor },
+				);
+			} catch {
+				this.recoverableAdoptionError = new Error("Recoverable owned session adoption is unavailable");
+			}
+			return;
+		}
 		if (this.replacementReconciliationFailed) return;
 		if (this.deferNegotiatedRuntimeFrame(message)) return;
 		const pendingChunkedReplacement = this.pendingChunkedReplacement;
@@ -801,6 +875,201 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
+	static async attachRecoverableOwnedSessionCreation(
+		client: DaemonClient,
+		activeSessionId: string,
+		sessionId: string,
+		expectedSupervisorGeneration: string,
+		options: DaemonAgentConnectionOptions,
+	): Promise<DaemonAgentConnection> {
+		const connection = new DaemonAgentConnection(client, activeSessionId, options);
+		try {
+			connection.attachmentSupervisorGenerationFence = expectedSupervisorGeneration;
+			await connection.attach();
+			connection.assertRecoverableOwnedCreationAttachment(activeSessionId, sessionId, expectedSupervisorGeneration);
+			connection.attachmentSupervisorGenerationFence = undefined;
+			return connection;
+		} catch (error) {
+			connection.attachmentSupervisorGenerationFence = undefined;
+			await connection.cleanupFailedRecoverableOwnedCreation(expectedSupervisorGeneration);
+			throw error;
+		}
+	}
+
+	static async adoptRecoverableOwnedSession(
+		client: DaemonClient,
+		options: DaemonRecoverableOwnedSessionAdoptionOptions,
+	): Promise<DaemonRecoverableOwnedSessionAdoptionResult> {
+		await client.waitForHello();
+		if (
+			process.platform === "win32" ||
+			!Object.isFrozen(PRIME_AGENT_SDK_FEATURES) ||
+			!PRIME_AGENT_SDK_FEATURES.includes(RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE) ||
+			!PRIME_AGENT_SDK_FEATURES.includes(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE) ||
+			!client.supportsServerCapability("daemon_recoverable_owned_session_adoption_v1") ||
+			!client.supportsServerCapability(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE) ||
+			!client.supportsServerCapability("authoritative_owned_session_cleanup_v1") ||
+			(client.hello?.schemaRevision ?? 0) < DAEMON_SCHEMA_REVISION
+		) {
+			throw new Error("Recoverable owned session adoption is unavailable");
+		}
+		let launchEnv: Record<string, string>;
+		try {
+			launchEnv = cloneCallerOwnedSessionLaunchEnv(options.launchEnv) as Record<string, string>;
+		} catch {
+			throw new Error("Recoverable owned session adoption is unavailable");
+		}
+		const connection = new DaemonAgentConnection(client, options.activeSessionId, {
+			...options.connectionOptions,
+			ownedSession: true,
+			ownedSessionRecoveryConfig: options.recoveryConfig,
+			ownedSessionLaunchEnv: launchEnv,
+		});
+		connection.recoverableAdoptionStaging = true;
+		connection.reserveSharedAttachment(options.activeSessionId);
+		try {
+			const supportsExtensionUi = options.connectionOptions?.supportsExtensionUi !== false;
+			const capabilities: DaemonClientCapability[] = [
+				"attach_snapshot",
+				"event_sequence",
+				"slim_attach",
+				"correlated_prompt_lifecycle_v1",
+				"client_owned_sessions",
+				CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+				...(supportsExtensionUi ? (["extension_ui"] as const) : []),
+			];
+			const prepared = await connection.requestData<DaemonRecoverableOwnedSessionPrepareResult>(
+				{
+					type: "prepare_recoverable_owned_session_adoption",
+					requestId: options.requestId,
+					recoveryHandle: options.recoveryHandle,
+					expectedSupervisorGeneration: options.expectedSupervisorGeneration,
+					activeSessionId: options.activeSessionId,
+					sessionId: options.sessionId,
+					correlationId: options.correlationId,
+					cursor: options.cursor,
+					previousMcpOwnerId: options.previousMcpOwnerId,
+					mcpOwnerId: options.mcpOwnerId,
+					recoveryConfig: options.recoveryConfig,
+					launchEnv,
+					clientId: connection.clientId,
+					capabilities,
+					supportsExtensionUi,
+					telemetryDisabled: options.connectionOptions?.telemetryDisabled,
+				},
+				DAEMON_SNAPSHOT_TIMEOUT_MS,
+				{ recoverAcrossReconnect: true },
+			);
+			validateDaemonSnapshotIdentity(prepared.snapshot, options.activeSessionId);
+			if (
+				prepared.replay.status !== "complete" ||
+				prepared.snapshot.state.sessionId !== options.sessionId ||
+				prepared.proof.feature !== RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE ||
+				prepared.proof.status !== "adopted" ||
+				prepared.proof.supervisorGeneration !== options.expectedSupervisorGeneration ||
+				prepared.proof.activeSessionId !== options.activeSessionId ||
+				prepared.proof.sessionId !== options.sessionId ||
+				prepared.proof.correlationId !== options.correlationId ||
+				prepared.proof.mcpOwnerId !== options.mcpOwnerId ||
+				prepared.proof.cursor.generation !== prepared.snapshot.lastEventCursor?.generation ||
+				prepared.proof.cursor.sequence !== prepared.snapshot.lastEventCursor?.sequence
+			) {
+				throw new Error("Recoverable owned session adoption is unavailable");
+			}
+			const snapshotLifecycle = prepared.snapshot.promptLifecycles?.records.find(
+				(entry) => entry.correlationId === options.correlationId,
+			);
+			const snapshotExpired = prepared.snapshot.promptLifecycles?.expired.find(
+				(entry) => entry.correlationId === options.correlationId,
+			);
+			if (
+				!isDeepStrictEqual(
+					prepared.proof.lifecycle,
+					snapshotLifecycle ?? (snapshotExpired ? { ...snapshotExpired, expired: true } : undefined),
+				)
+			) {
+				throw new Error("Recoverable owned session adoption is unavailable");
+			}
+			const negotiated = connection.negotiatedCapabilitiesFromAttach(prepared, capabilities);
+			if (
+				!negotiated.has("correlated_prompt_lifecycle_v1") ||
+				!negotiated.has("event_sequence") ||
+				!negotiated.has("client_owned_sessions") ||
+				!negotiated.has(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE)
+			) {
+				throw new Error("Recoverable owned session adoption is unavailable");
+			}
+			const staged = connection.stageSnapshotCommit(prepared.snapshot, {
+				purpose: "attach",
+				includePromptLifecycles: true,
+				envelopeActiveSessionId: options.activeSessionId,
+				expectedSessionId: options.sessionId,
+				expectedState: prepared.snapshot.state,
+				replay: prepared.replay,
+				resetEventProgress: true,
+				progress: [
+					{ cursor: prepared.lastEventCursor, sequence: prepared.lastEventSequence },
+					{ cursor: prepared.snapshot.lastEventCursor, sequence: prepared.snapshot.lastEventSequence },
+				],
+			});
+			if (connection.recoverableAdoptionError) throw connection.recoverableAdoptionError;
+			const beforeCommit = reconcileRecoverableOwnedFrames(
+				connection.recoverableAdoptionFrames,
+				prepared.proof.cursor,
+			);
+			connection.recoverableAdoptionFrames = beforeCommit.frames;
+			connection.recoverableAdoptionBufferedBytes = beforeCommit.bufferedBytes;
+			const proof = await connection.requestData<DaemonRecoverableOwnedSessionAdoptionProof>(
+				{
+					type: "commit_recoverable_owned_session_adoption",
+					requestId: options.requestId,
+					expectedSupervisorGeneration: options.expectedSupervisorGeneration,
+					recoveryHandle: prepared.recoveryHandle,
+					proof: prepared.proof,
+				},
+				DAEMON_SNAPSHOT_TIMEOUT_MS,
+				{ recoverAcrossReconnect: true },
+			);
+			if (!isDeepStrictEqual(proof, prepared.proof) || connection.recoverableAdoptionError) {
+				throw new Error("Recoverable owned session adoption is unavailable");
+			}
+			const afterCommit = reconcileRecoverableOwnedFrames(
+				connection.recoverableAdoptionFrames,
+				prepared.proof.cursor,
+			);
+			connection.commitStagedSnapshot(staged);
+			connection.publishNegotiatedCapabilityProof(negotiated, client.getTransportGeneration());
+			const attachedContractProof = connection.getOwnedSessionContractProof();
+			if (
+				!attachedContractProof ||
+				attachedContractProof.feature !== CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE ||
+				attachedContractProof.status !== "attached" ||
+				attachedContractProof.daemon.supervisorGeneration !== options.expectedSupervisorGeneration
+			) {
+				throw new Error("Recoverable owned session adoption is unavailable");
+			}
+			connection.recoverableAdoptionStaging = false;
+			connection.recoverableAdoptionFrames = [];
+			connection.recoverableAdoptionBufferedBytes = 0;
+			for (const frame of afterCommit.frames) connection.dispatchDaemonMessage(frame.message);
+			if (connection.replacementReconciliationFailed) {
+				throw new Error("Recoverable owned session adoption is unavailable");
+			}
+			return { connection, recoveryHandle: prepared.recoveryHandle, proof };
+		} catch {
+			connection.recoverableAdoptionStaging = false;
+			connection.recoverableAdoptionFrames = [];
+			connection.recoverableAdoptionBufferedBytes = 0;
+			connection.recoverableAdoptionError = undefined;
+			connection.invalidateNegotiatedCapabilityProof();
+			connection.unsubscribeDaemonMessages();
+			connection.unsubscribeDaemonClose();
+			connection.disposed = true;
+			if (options.connectionOptions?.closeClientOnDispose) client.close();
+			throw new Error("Recoverable owned session adoption is unavailable");
+		}
+	}
+
 	async attach(): Promise<void> {
 		if (this.disposing || this.disposed) throw new Error("Daemon connection is disposing");
 		await this.attachSession(this.activeSessionId, this.lastEventCursor, false);
@@ -819,6 +1088,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.attachmentAdmissionInFlight = true;
 		this.fenceSnapshotTransfersForAttachmentAdmission(preserveRuntimeSnapshotAttempt);
 		this.retirePendingChunkedReplacement();
+		this.lastAttachmentReplay = undefined;
 		this.invalidateNegotiatedCapabilityProof();
 		if (this.replacementReconciliationFailed) {
 			if (this.attachmentAdmissionRevision === admissionRevision) this.attachmentAdmissionInFlight = false;
@@ -892,6 +1162,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				result = await this.requestData<SessionSummary | DaemonAttachResult>({
 					type: "attach",
 					activeSessionId: requestedActiveSessionId,
+					expectedSupervisorGeneration: this.attachmentSupervisorGenerationFence,
 					...(this.supportsSnapshotGenerationNonce() ? { snapshotGenerationNonce: randomUUID() } : {}),
 					supportsExtensionUi,
 					clientId: this.clientId,
@@ -982,6 +1253,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			);
 			this.commitStagedSnapshot(staged);
 			this.publishNegotiatedCapabilityProof(negotiatedCapabilities, transportGeneration);
+			this.lastAttachmentReplay = result.replay;
 		} else {
 			validateSummaryIdentity(result, nextActiveSessionId);
 			this.assertAttachmentCommit(
@@ -998,6 +1270,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.latestSnapshot = undefined;
 			this.latestSnapshotIsFresh = false;
 			this.publishNegotiatedCapabilityProof(negotiatedCapabilities, transportGeneration);
+			this.lastAttachmentReplay = undefined;
 		}
 		this.captureDaemonLogPath();
 		this.updateReconnectFailed = false;
@@ -1141,6 +1414,54 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	supportsAcpMcpServers(): boolean {
 		return this.client.supportsServerCapability("acp_mcp_servers");
+	}
+
+	private assertRecoverableOwnedCreationAttachment(
+		activeSessionId: string,
+		sessionId: string,
+		expectedSupervisorGeneration: string,
+	): void {
+		const contract = this.getOwnedSessionContractProof();
+		const requiredCapabilities: readonly DaemonClientCapability[] = [
+			"attach_snapshot",
+			"event_sequence",
+			"correlated_prompt_lifecycle_v1",
+			"client_owned_sessions",
+			CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+		];
+		if (
+			this.client.hello?.supervisorGeneration !== expectedSupervisorGeneration ||
+			this.lastAttachmentReplay?.status !== "complete" ||
+			!this.latestSnapshotIsFresh ||
+			this.activeSessionId !== activeSessionId ||
+			this.attachedSessionId !== sessionId ||
+			this.latestSnapshot?.state.sessionId !== sessionId ||
+			this.sharedAttachmentActiveSessionId !== activeSessionId ||
+			sharedAttachmentOwners.get(this.client)?.get(activeSessionId) !== this ||
+			!contract ||
+			contract.status !== "attached" ||
+			contract.daemon.supervisorGeneration !== expectedSupervisorGeneration ||
+			contract.daemon.transportGeneration !== this.client.getTransportGeneration() ||
+			requiredCapabilities.some((capability) => !this.supportsNegotiatedCapability(capability))
+		) {
+			throw new Error("Recoverable owned session adoption is unavailable");
+		}
+	}
+
+	private async cleanupFailedRecoverableOwnedCreation(expectedSupervisorGeneration: string): Promise<void> {
+		const transportGeneration = this.client.getTransportGeneration();
+		if (
+			this.client.isConnected &&
+			this.client.hello?.supervisorGeneration === expectedSupervisorGeneration &&
+			this.client.getTransportGeneration() === transportGeneration
+		) {
+			await this.client
+				.request({ type: "complete_owned_session", activeSessionId: this.activeSessionId }, 2_000, {
+					recoverAcrossReconnect: false,
+				})
+				.catch(() => undefined);
+		}
+		await this.finalizeDisposedConnection(this.activeSessionId, "none");
 	}
 
 	/** Current secret-free proof that this owned attachment uses the caller-owned environment contract. */
