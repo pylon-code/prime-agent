@@ -72,6 +72,10 @@ import {
 	validateApprovedAttestationWorkflow,
 	validateApprovedWorkflowBytes,
 } from "./lib/pylon-workflow-policy.mjs";
+import {
+	PYLON_PUBLICATION_RULESET_GRAPHQL_QUERY,
+	PYLON_PUBLICATION_RULESET_GRAPHQL_VARIABLES,
+} from "./lib/pylon-ruleset-auditor.mjs";
 import { validatePreviewWorkflowRunEvidence, verifyGhAttestationResult } from "./verify-pylon-publication-attestations.mjs";
 import { recordPreviewHighWater } from "./verify-pylon-preview-history.mjs";
 import { verifyStableHistoryWithState } from "./verify-pylon-stable-history.mjs";
@@ -226,6 +230,7 @@ function githubScriptForStep(workflowPath, stepName) {
 function exactPublicationTagRuleset() {
 	return {
 		id: 21_950_766,
+		node_id: "RRS_lACqUmVwb3NpdG9yec5QaCQtzgFO8S4",
 		name: "Pylon immutable publication tags",
 		target: "tag",
 		source_type: "Repository",
@@ -246,28 +251,85 @@ function exactPublicationTagRuleset() {
 	};
 }
 
-async function inlinePublicationTagRulesetValidator(responses) {
+function exactPublicationTagRulesetGraphql() {
+	return {
+		repository: {
+			id: "R_kgDOUGgkLQ",
+			databaseId: 1_349_002_285,
+			nameWithOwner: "pylon-code/prime-agent",
+			ruleset: {
+				id: "RRS_lACqUmVwb3NpdG9yec5QaCQtzgFO8S4",
+				databaseId: 21_950_766,
+				name: "Pylon immutable publication tags",
+				enforcement: "ACTIVE",
+				target: "TAG",
+				source: {
+					__typename: "Repository",
+					id: "R_kgDOUGgkLQ",
+					databaseId: 1_349_002_285,
+					nameWithOwner: "pylon-code/prime-agent",
+				},
+				bypassActors: { totalCount: 0 },
+				conditions: {
+					refName: { include: ["refs/tags/pylon-build-*", "refs/tags/pylon-stable-*"], exclude: [] },
+					organizationProperty: null,
+					repositoryId: null,
+					repositoryName: null,
+					repositoryProperty: null,
+				},
+				rules: {
+					totalCount: 2,
+					nodes: [
+						{ type: "UPDATE", parameters: { __typename: "UpdateParameters", updateAllowsFetchAndMerge: false } },
+						{ type: "DELETION", parameters: null },
+					],
+				},
+			},
+		},
+	};
+}
+
+async function inlinePublicationTagRulesetValidator(restResponses, graphqlResponses = [exactPublicationTagRulesetGraphql()]) {
 	const script = githubScriptForStep(
 		".github/workflows/pylon-preview-release.yml",
 		"Require authoritative publication tag ruleset before preview tag CAS",
 	);
 	const validate = new AsyncFunction("github", script);
-	let request = 0;
+	let restRequest = 0;
+	let graphqlRequest = 0;
+	const order = [];
 	const github = {
 		request: async (route, parameters) => {
+			order.push("REST");
 			assert.equal(route, "GET /repos/{owner}/{repo}/rulesets/{ruleset_id}");
 			assert.deepEqual(parameters, {
-				owner: "pylon-code", repo: "prime-agent", ruleset_id: 21_950_766,
+				owner: "pylon-code", repo: "prime-agent", ruleset_id: 21_950_766, includes_parents: false,
 				headers: { accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
 			});
-			const response = responses[Math.min(request, responses.length - 1)];
-			request += 1;
+			const response = restResponses[Math.min(restRequest, restResponses.length - 1)];
+			restRequest += 1;
 			if (response instanceof Error) throw response;
 			if (response && Object.hasOwn(response, "status") && Object.hasOwn(response, "data")) return response;
 			return { status: 200, data: response };
 		},
+		graphql: async (query, variables) => {
+			order.push("GraphQL");
+			assert.equal(query, PYLON_PUBLICATION_RULESET_GRAPHQL_QUERY);
+			assert.deepEqual(variables, PYLON_PUBLICATION_RULESET_GRAPHQL_VARIABLES);
+			const response = graphqlResponses[Math.min(graphqlRequest, graphqlResponses.length - 1)];
+			graphqlRequest += 1;
+			if (response instanceof Error) throw response;
+			return response;
+		},
 	};
-	return { validate: () => validate(github), requests: () => request };
+	return {
+		validate: async () => {
+			const result = await validate(github);
+			assert.equal(order.at(-1), "GraphQL", "GraphQL must be the last authoritative read before return");
+			return result;
+		},
+		requests: () => ({ rest: restRequest, graphql: graphqlRequest, order: [...order] }),
+	};
 }
 
 test("canonical publication JSON sorts every object key and rejects unsupported values", () => {
@@ -2479,7 +2541,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 	}
 });
 
-test("admission is non-authoritative and every protected mutation has a fresh App-authenticated ruleset audit", async () => {
+test("admission is non-authoritative and every protected mutation has a fresh combined App audit", async () => {
 	for (const [workflow, step] of [
 		[".github/workflows/pylon-preview-release.yml", "Require the canonical protected push"],
 		[".github/workflows/pylon-preview-release.yml", "Verify exact checks and freeze the approved preview draft"],
@@ -2504,19 +2566,31 @@ test("admission is non-authoritative and every protected mutation has a fresh Ap
 		[".github/workflows/pylon-stable-release.yml", "Require authoritative publication tag ruleset before immutable stable publish"],
 	];
 	const frozenValidators = new Set(authoritativeSteps.map(([workflow, step]) => githubScriptForStep(workflow, step)));
-	assert.equal(frozenValidators.size, 1, "every protected mutation must use the same frozen authoritative validator bytes");
+	assert.equal(frozenValidators.size, 1, "every protected mutation must use the same frozen combined validator bytes");
 	for (const script of frozenValidators) {
-		assert.match(script, /Object\.hasOwn\(ruleset, "bypass_actors"\)/);
-		assert.match(script, /Object\.hasOwn\(ruleset, "current_user_can_bypass"\)/);
-		assert.match(script, /current_user_can_bypass !== "never"/);
-		assert.match(script, /refs\/tags\/pylon-stable-sequence-000001/);
+		assert.match(script, /ruleset_id: 21950766, includes_parents: false/);
+		assert.match(script, /restRuleset\.node_id !== "RRS_lACqUmVwb3NpdG9yec5QaCQtzgFO8S4"/);
+		assert.match(script, /Object\.hasOwn\(restRuleset, "bypass_actors"\)/);
+		assert.match(script, /Object\.hasOwn\(restRuleset, "current_user_can_bypass"\)/);
+		assert.match(script, /ruleset\(databaseId: \$rulesetDatabaseId, includeParents: false\)/);
+		assert.ok(script.indexOf("await github.request") < script.indexOf("await github.graphql"));
+		assert.doesNotMatch(script.slice(script.indexOf("await github.graphql") + 1), /await github\./,
+			"GraphQL must remain the last authoritative GitHub read");
 	}
 
-	const valid = exactPublicationTagRuleset();
-	await (await inlinePublicationTagRulesetValidator([valid])).validate();
-	const mutations = [
+	const validRest = exactPublicationTagRuleset();
+	const validGraphql = exactPublicationTagRulesetGraphql();
+	await (await inlinePublicationTagRulesetValidator([validRest], [validGraphql])).validate();
+	const restWithoutVisibilityFields = structuredClone(validRest);
+	delete restWithoutVisibilityFields.bypass_actors;
+	delete restWithoutVisibilityFields.current_user_can_bypass;
+	await (await inlinePublicationTagRulesetValidator([restWithoutVisibilityFields], [validGraphql])).validate();
+
+	const restMutations = [
 		(value) => delete value.id,
 		(value) => (value.id = 1),
+		(value) => delete value.node_id,
+		(value) => (value.node_id = "RRS_wrong"),
 		(value) => delete value.name,
 		(value) => (value.name = "Other ruleset"),
 		(value) => delete value.source_type,
@@ -2527,10 +2601,10 @@ test("admission is non-authoritative and every protected mutation has a fresh Ap
 		(value) => (value.target = "branch"),
 		(value) => delete value.enforcement,
 		(value) => (value.enforcement = "disabled"),
-		(value) => delete value.bypass_actors,
 		(value) => (value.bypass_actors = [{ actor_type: "RepositoryRole", actor_id: 5 }]),
-		(value) => delete value.current_user_can_bypass,
+		(value) => (value.bypass_actors = undefined),
 		(value) => (value.current_user_can_bypass = "always"),
+		(value) => (value.current_user_can_bypass = undefined),
 		(value) => delete value.conditions,
 		(value) => (value.conditions.extra = {}),
 		(value) => delete value.conditions.ref_name,
@@ -2550,27 +2624,96 @@ test("admission is non-authoritative and every protected mutation has a fresh Ap
 		(value) => (value.rules[1].extra = false),
 		(value) => value.rules.push({ type: "creation" }),
 	];
-	for (const mutate of mutations) {
-		const changed = structuredClone(valid);
+	for (const mutate of restMutations) {
+		const changed = structuredClone(validRest);
 		mutate(changed);
-		const rejected = await inlinePublicationTagRulesetValidator([changed]);
-		await assert.rejects(() => rejected.validate(), /Authoritative ruleset-auditor response/);
+		const rejected = await inlinePublicationTagRulesetValidator([changed], [validGraphql]);
+		await assert.rejects(() => rejected.validate(), /REST ruleset-auditor response/);
 	}
 	for (const unavailable of [
 		new Error("ruleset auth or endpoint unavailable"),
-		{ status: 401, data: valid },
+		{ status: 401, data: validRest },
 		{ status: 403, data: { message: "Resource not accessible by integration" } },
-		{ status: 200, data: { ...valid, bypass_actors: undefined } },
 	]) {
-		const rejected = await inlinePublicationTagRulesetValidator([unavailable]);
-		await assert.rejects(() => rejected.validate(), /unavailable|Authoritative ruleset-auditor response/);
+		const rejected = await inlinePublicationTagRulesetValidator([unavailable], [validGraphql]);
+		await assert.rejects(() => rejected.validate(), /unavailable|REST ruleset-auditor response/);
 	}
-	const stale = structuredClone(valid);
-	stale.enforcement = "disabled";
-	const pointInTime = await inlinePublicationTagRulesetValidator([valid, stale]);
-	await pointInTime.validate();
-	await assert.rejects(() => pointInTime.validate(), /Authoritative ruleset-auditor response/);
-	assert.equal(pointInTime.requests(), 2, "a stale admission proof must not authorize a later write");
+
+	const graphqlMutations = [
+		() => null,
+		() => ({ repository: null }),
+		(value) => (value.errors = [{ message: "redacted" }]),
+		(value) => delete value.repository.id,
+		(value) => (value.repository.id = "R_wrong"),
+		(value) => delete value.repository.databaseId,
+		(value) => (value.repository.databaseId = 1),
+		(value) => delete value.repository.nameWithOwner,
+		(value) => (value.repository.nameWithOwner = "fork/prime-agent"),
+		(value) => (value.repository.ruleset = null),
+		(value) => delete value.repository.ruleset.id,
+		(value) => (value.repository.ruleset.id = "RRS_wrong"),
+		(value) => delete value.repository.ruleset.databaseId,
+		(value) => (value.repository.ruleset.databaseId = 1),
+		(value) => (value.repository.ruleset.name = "Other ruleset"),
+		(value) => (value.repository.ruleset.enforcement = "DISABLED"),
+		(value) => (value.repository.ruleset.target = "BRANCH"),
+		(value) => (value.repository.ruleset.source = null),
+		(value) => (value.repository.ruleset.source.id = "R_wrong"),
+		(value) => (value.repository.ruleset.source.databaseId = 1),
+		(value) => (value.repository.ruleset.source.nameWithOwner = "fork/prime-agent"),
+		(value) => (value.repository.ruleset.source.__typename = "Organization"),
+		(value) => (value.repository.ruleset.bypassActors = null),
+		(value) => (value.repository.ruleset.bypassActors.totalCount = null),
+		(value) => (value.repository.ruleset.bypassActors.totalCount = "0"),
+		(value) => (value.repository.ruleset.bypassActors.totalCount = 1),
+		(value) => (value.repository.ruleset.bypassActors.extra = 0),
+		(value) => (value.repository.ruleset.conditions = null),
+		(value) => (value.repository.ruleset.conditions.organizationProperty = { __typename: "OrganizationPropertyConditionTarget" }),
+		(value) => (value.repository.ruleset.conditions.repositoryId = { __typename: "RepositoryIdConditionTarget" }),
+		(value) => (value.repository.ruleset.conditions.extra = null),
+		(value) => (value.repository.ruleset.conditions.refName = null),
+		(value) => value.repository.ruleset.conditions.refName.include.pop(),
+		(value) => value.repository.ruleset.conditions.refName.exclude.push("refs/tags/unsafe-*"),
+		(value) => (value.repository.ruleset.rules = null),
+		(value) => (value.repository.ruleset.rules.totalCount = null),
+		(value) => (value.repository.ruleset.rules.totalCount = 3),
+		(value) => (value.repository.ruleset.rules.nodes = null),
+		(value) => (value.repository.ruleset.rules.nodes[0] = null),
+		(value) => value.repository.ruleset.rules.nodes.push({ type: "CREATION", parameters: null }),
+		(value) => (value.repository.ruleset.rules.nodes[0].type = "DELETION"),
+		(value) => (value.repository.ruleset.rules.nodes[0].parameters = null),
+		(value) => (value.repository.ruleset.rules.nodes[0].parameters.__typename = "OtherParameters"),
+		(value) => (value.repository.ruleset.rules.nodes[0].parameters.updateAllowsFetchAndMerge = true),
+		(value) => (value.repository.ruleset.rules.nodes[0].parameters.extra = false),
+		(value) => (value.repository.ruleset.rules.nodes[1].parameters = {}),
+		(value) => (value.repository.ruleset.rules.nodes[1].extra = null),
+	];
+	for (const mutate of graphqlMutations) {
+		let changed = structuredClone(validGraphql);
+		const replacement = mutate(changed);
+		if (replacement !== undefined) changed = replacement;
+		const rejected = await inlinePublicationTagRulesetValidator([validRest], [changed]);
+		await assert.rejects(() => rejected.validate(), /GraphQL ruleset-auditor response|Cannot read/);
+	}
+	for (const unavailable of [new Error("GraphQL errors: forbidden"), new Error("GraphQL response was redacted")]) {
+		const rejected = await inlinePublicationTagRulesetValidator([validRest], [unavailable]);
+		await assert.rejects(() => rejected.validate(), /GraphQL/);
+	}
+
+	const staleRest = structuredClone(validRest);
+	staleRest.enforcement = "disabled";
+	const restPointInTime = await inlinePublicationTagRulesetValidator([validRest, staleRest], [validGraphql]);
+	await restPointInTime.validate();
+	await assert.rejects(() => restPointInTime.validate(), /REST ruleset-auditor response/);
+	assert.deepEqual(restPointInTime.requests(), { rest: 2, graphql: 1, order: ["REST", "GraphQL", "REST"] });
+	const staleGraphql = structuredClone(validGraphql);
+	staleGraphql.repository.ruleset.bypassActors.totalCount = 1;
+	const graphqlPointInTime = await inlinePublicationTagRulesetValidator([validRest], [validGraphql, staleGraphql]);
+	await graphqlPointInTime.validate();
+	await assert.rejects(() => graphqlPointInTime.validate(), /GraphQL ruleset-auditor response/);
+	assert.deepEqual(graphqlPointInTime.requests(), {
+		rest: 2, graphql: 2, order: ["REST", "GraphQL", "REST", "GraphQL"],
+	});
 
 	const executeProtectedMutation = async ({ appId, privateKey, mint, audit, mutate }) => {
 		if (!appId || !privateKey) throw new Error("GitHub App credentials are required");
@@ -2834,8 +2977,32 @@ test("workflow static policy proves direct approvals and every contents-write gr
 		preview.replace("needs: [pack, reproducibility, install]", "needs: pack"),
 		preview.replace("      - name: Generate build provenance", "      - run: node scripts/untrusted.mjs\n      - name: Generate build provenance"),
 		preview.replace("private-key: ${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}", "private-key: ''"),
+		preview.replace("private-key: ${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}", "private-key: ${{ env.APP_KEY }}"),
 		preview.replace("permission-administration: read", "permission-administration: write"),
+		preview.replace("permission-administration: read", "permission-administration: read\n          permission-contents: read"),
+		preview.replace("permission-administration: read", "permission-administration: read\n          github-api-url: https://api.github.com"),
+		preview.replace("permission-administration: read", "permission-administration: read\n          skip-token-revoke: true"),
+		preview.replace("id: ruleset-auditor", "id: ruleset-auditor\n        id: decoy"),
 		preview.replace("id: ruleset-auditor", "id: ruleset-auditor\n        continue-on-error: true"),
+		preview.replace("id: ruleset-auditor", "id: ruleset-auditor\n        env:\n          APP_KEY: ${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}"),
+		preview.replace("id: ruleset-auditor", "id: ruleset-auditor\n        run: echo ${{ steps.ruleset-auditor.outputs.token }}"),
+		preview.replace("id: ruleset-auditor", "id: ruleset-auditor\n        outputs:\n          token: ${{ steps.ruleset-auditor.outputs.token }}"),
+		preview.replace("id: ruleset-auditor", "id: ruleset-auditor # trusted"),
+		preview.replace("        with:\n          app-id:", "        with: &auditor\n          app-id:"),
+		preview.replace("        with:\n          app-id:", "        with: *auditor\n          app-id:"),
+		preview.replace("          owner: pylon-code", "          owner: pylon-code\n          owner: attacker"),
+		preview.replace(CREATE_GITHUB_APP_TOKEN_ACTION, `${CREATE_GITHUB_APP_TOKEN_ACTION} # mutable comment`),
+		preview.replace(CREATE_GITHUB_APP_TOKEN_ACTION, "actions/create-github-app-token@" + "f".repeat(40)),
+		preview.replace("      - name: Require live pylon immediately", `      # decoy ${CREATE_GITHUB_APP_TOKEN_ACTION}\n      - name: Require live pylon immediately`),
+		preview.replace("github-token: ${{ steps.ruleset-auditor.outputs.token }}", "github-token: ${{ fromJSON(steps.ruleset-auditor.outputs.token) }}"),
+		preview.replace("github-token: ${{ steps.ruleset-auditor.outputs.token }}", "github-token: ${{ steps.ruleset-auditor.outputs.token }}\n          token: ${{ steps.ruleset-auditor.outputs.token }}"),
+		preview.replace("      - name: Create or refetch the exact protected preview tag", "      - name: Token exposure\n        env:\n          TOKEN: ${{ steps.ruleset-auditor.outputs.token }}\n        run: node scripts/untrusted.mjs\n      - name: Create or refetch the exact protected preview tag"),
+		preview.replace("      - name: Create or refetch the exact protected preview tag", "      - name: Indirect step exposure\n        env:\n          STEPS: ${{ toJSON(steps) }}\n      - name: Create or refetch the exact protected preview tag"),
+		preview.replace("      - name: Create or refetch the exact protected preview tag", "      - name: Bracket step exposure\n        env:\n          TOKEN: ${{ steps['ruleset-' + 'auditor'].outputs.token }}\n      - name: Create or refetch the exact protected preview tag"),
+		preview.replace("github-token: ${{ steps.ruleset-auditor.outputs.token }}", "github-token: ${{\n            steps.ruleset-auditor.outputs.token\n          }}"),
+		preview.replace("      - name: Require authoritative publication tag ruleset before preview tag CAS\n        uses:", "      - name: Require authoritative publication tag ruleset before preview tag CAS\n        continue-on-error: true\n        uses:"),
+		preview.replace("      - name: Require authoritative publication tag ruleset before preview tag CAS\n        uses:", "      - name: Require authoritative publication tag ruleset before preview tag CAS\n        if: false\n        uses:"),
+		preview.replace("          script: |\n            const response = await github.request", "          script: |\n            core.setOutput('token', await github.auth());\n            const response = await github.request"),
 	]) assert.throws(() => validateApprovedAttestationWorkflow(changed, "preview"));
 
 	const approvedWriters = new Set([

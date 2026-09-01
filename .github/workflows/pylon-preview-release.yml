@@ -303,7 +303,7 @@ jobs:
 
       - name: Mint repository-scoped ruleset auditor token
         id: ruleset-auditor
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
         with:
           app-id: ${{ vars.PYLON_RULESET_AUDITOR_APP_ID }}
           private-key: ${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}
@@ -326,40 +326,107 @@ jobs:
           github-token: ${{ steps.ruleset-auditor.outputs.token }}
           script: |
             const response = await github.request("GET /repos/{owner}/{repo}/rulesets/{ruleset_id}", {
-              owner: "pylon-code", repo: "prime-agent", ruleset_id: 21950766,
+              owner: "pylon-code", repo: "prime-agent", ruleset_id: 21950766, includes_parents: false,
               headers: { accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
             });
-            const ruleset = response?.data;
+            const restRuleset = response?.data;
             const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) &&
               JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
-            const conditions = ruleset?.conditions;
-            const refName = conditions?.ref_name;
-            const includes = refName?.include;
-            const excludes = refName?.exclude;
-            const rules = ruleset?.rules;
-            const updateRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "update") : [];
-            const deletionRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "deletion") : [];
+            const exactSortedStrings = (value, expected) => Array.isArray(value) && value.every((entry) => typeof entry === "string") &&
+              JSON.stringify([...value].sort()) === JSON.stringify([...expected].sort());
             const expectedIncludes = ["refs/tags/pylon-build-*", "refs/tags/pylon-stable-*"];
-            const stableReservationRef = "refs/tags/pylon-stable-sequence-000001";
-            const stableReservationCovered = Array.isArray(includes) && includes.some((pattern) =>
-              typeof pattern === "string" && pattern.endsWith("*") && stableReservationRef.startsWith(pattern.slice(0, -1))
-            );
+            const restConditions = restRuleset?.conditions;
+            const restRefName = restConditions?.ref_name;
+            const restRules = restRuleset?.rules;
+            const restUpdateRules = Array.isArray(restRules) ? restRules.filter((rule) => rule?.type === "update") : [];
+            const restDeletionRules = Array.isArray(restRules) ? restRules.filter((rule) => rule?.type === "deletion") : [];
             if (
-              response?.status !== 200 || !ruleset || ruleset.id !== 21950766 || ruleset.name !== "Pylon immutable publication tags" ||
-              ruleset.source_type !== "Repository" || ruleset.source !== "pylon-code/prime-agent" ||
-              ruleset.target !== "tag" || ruleset.enforcement !== "active" ||
-              !Object.hasOwn(ruleset, "bypass_actors") || !Array.isArray(ruleset.bypass_actors) || ruleset.bypass_actors.length !== 0 ||
-              !Object.hasOwn(ruleset, "current_user_can_bypass") || ruleset.current_user_can_bypass !== "never" ||
-              !exactKeys(conditions, ["ref_name"]) || !exactKeys(refName, ["exclude", "include"]) ||
-              !Array.isArray(excludes) || excludes.length !== 0 || !Array.isArray(includes) ||
-              JSON.stringify([...includes].sort()) !== JSON.stringify(expectedIncludes) || !stableReservationCovered ||
-              !Array.isArray(rules) || rules.length !== 2 || updateRules.length !== 1 || deletionRules.length !== 1 ||
-              !exactKeys(updateRules[0], ["parameters", "type"]) ||
-              !exactKeys(updateRules[0]?.parameters, ["update_allows_fetch_and_merge"]) ||
-              updateRules[0]?.parameters?.update_allows_fetch_and_merge !== false ||
-              !exactKeys(deletionRules[0], ["type"])
-            ) throw new Error("Authoritative ruleset-auditor response is missing, redacted, or differs from the exact active non-bypassable immutable tag ruleset.");
-
+              response?.status !== 200 || !restRuleset || restRuleset.id !== 21950766 ||
+              restRuleset.node_id !== "RRS_lACqUmVwb3NpdG9yec5QaCQtzgFO8S4" || restRuleset.name !== "Pylon immutable publication tags" ||
+              restRuleset.source_type !== "Repository" || restRuleset.source !== "pylon-code/prime-agent" ||
+              restRuleset.target !== "tag" || restRuleset.enforcement !== "active" ||
+              Object.hasOwn(restRuleset, "bypass_actors") && (!Array.isArray(restRuleset.bypass_actors) || restRuleset.bypass_actors.length !== 0) ||
+              Object.hasOwn(restRuleset, "current_user_can_bypass") && restRuleset.current_user_can_bypass !== "never" ||
+              !exactKeys(restConditions, ["ref_name"]) || !exactKeys(restRefName, ["exclude", "include"]) ||
+              !exactSortedStrings(restRefName.exclude, []) || !exactSortedStrings(restRefName.include, expectedIncludes) ||
+              !Array.isArray(restRules) || restRules.length !== 2 || restUpdateRules.length !== 1 || restDeletionRules.length !== 1 ||
+              !exactKeys(restUpdateRules[0], ["parameters", "type"]) ||
+              !exactKeys(restUpdateRules[0]?.parameters, ["update_allows_fetch_and_merge"]) ||
+              restUpdateRules[0]?.parameters?.update_allows_fetch_and_merge !== false || !exactKeys(restDeletionRules[0], ["type"])
+            ) throw new Error("REST ruleset-auditor response differs from the exact active immutable tag ruleset.");
+            const query = `query PylonPublicationRulesetAudit($owner: String!, $repo: String!, $rulesetDatabaseId: Int!) {
+              repository(owner: $owner, name: $repo) {
+                id
+                databaseId
+                nameWithOwner
+                ruleset(databaseId: $rulesetDatabaseId, includeParents: false) {
+                  id
+                  databaseId
+                  name
+                  enforcement
+                  target
+                  source {
+                    __typename
+                    ... on Repository {
+                      id
+                      databaseId
+                      nameWithOwner
+                    }
+                  }
+                  bypassActors { totalCount }
+                  conditions {
+                    refName { include exclude }
+                    organizationProperty { __typename }
+                    repositoryId { __typename }
+                    repositoryName { __typename }
+                    repositoryProperty { __typename }
+                  }
+                  rules(first: 100) {
+                    totalCount
+                    nodes {
+                      type
+                      parameters {
+                        __typename
+                        ... on UpdateParameters { updateAllowsFetchAndMerge }
+                      }
+                    }
+                  }
+                }
+              }
+            }`;
+            const authoritative = await github.graphql(query, {
+              owner: "pylon-code", repo: "prime-agent", rulesetDatabaseId: 21950766,
+            });
+            const repository = authoritative?.repository;
+            const ruleset = repository?.ruleset;
+            const source = ruleset?.source;
+            const bypassActors = ruleset?.bypassActors;
+            const conditions = ruleset?.conditions;
+            const refName = conditions?.refName;
+            const rules = ruleset?.rules;
+            const nodes = rules?.nodes;
+            const updateRules = Array.isArray(nodes) ? nodes.filter((rule) => rule?.type === "UPDATE") : [];
+            const deletionRules = Array.isArray(nodes) ? nodes.filter((rule) => rule?.type === "DELETION") : [];
+            if (
+              Object.hasOwn(authoritative ?? {}, "errors") || !repository || repository.id !== "R_kgDOUGgkLQ" ||
+              repository.databaseId !== 1349002285 || repository.nameWithOwner !== "pylon-code/prime-agent" ||
+              !ruleset || ruleset.id !== restRuleset.node_id || ruleset.id !== "RRS_lACqUmVwb3NpdG9yec5QaCQtzgFO8S4" ||
+              ruleset.databaseId !== 21950766 || ruleset.name !== "Pylon immutable publication tags" ||
+              ruleset.enforcement !== "ACTIVE" || ruleset.target !== "TAG" ||
+              !exactKeys(source, ["__typename", "databaseId", "id", "nameWithOwner"]) || source.__typename !== "Repository" ||
+              source.id !== repository.id || source.databaseId !== repository.databaseId || source.nameWithOwner !== repository.nameWithOwner ||
+              !exactKeys(bypassActors, ["totalCount"]) || !Number.isInteger(bypassActors.totalCount) || bypassActors.totalCount !== 0 ||
+              !exactKeys(conditions, ["organizationProperty", "refName", "repositoryId", "repositoryName", "repositoryProperty"]) ||
+              conditions.organizationProperty !== null || conditions.repositoryId !== null || conditions.repositoryName !== null ||
+              conditions.repositoryProperty !== null || !exactKeys(refName, ["exclude", "include"]) ||
+              !exactSortedStrings(refName.exclude, []) || !exactSortedStrings(refName.include, expectedIncludes) ||
+              !exactKeys(rules, ["nodes", "totalCount"]) || !Number.isInteger(rules.totalCount) || rules.totalCount !== 2 ||
+              !Array.isArray(nodes) || nodes.length !== 2 || nodes.some((node) => node === null) ||
+              updateRules.length !== 1 || deletionRules.length !== 1 || !exactKeys(updateRules[0], ["parameters", "type"]) ||
+              !exactKeys(updateRules[0].parameters, ["__typename", "updateAllowsFetchAndMerge"]) ||
+              updateRules[0].parameters.__typename !== "UpdateParameters" || updateRules[0].parameters.updateAllowsFetchAndMerge !== false ||
+              !exactKeys(deletionRules[0], ["parameters", "type"]) || deletionRules[0].parameters !== null
+            ) throw new Error("GraphQL ruleset-auditor response is null, partial, redacted, or differs from the exact non-bypassable target contract.");
       - name: Create or refetch the exact protected preview tag
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         env:
@@ -885,7 +952,7 @@ jobs:
       - name: Mint repository-scoped ruleset auditor token
         id: ruleset-auditor
         if: steps.finalize.outputs.release_id != ''
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
         with:
           app-id: ${{ vars.PYLON_RULESET_AUDITOR_APP_ID }}
           private-key: ${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}
@@ -943,40 +1010,107 @@ jobs:
           github-token: ${{ steps.ruleset-auditor.outputs.token }}
           script: |
             const response = await github.request("GET /repos/{owner}/{repo}/rulesets/{ruleset_id}", {
-              owner: "pylon-code", repo: "prime-agent", ruleset_id: 21950766,
+              owner: "pylon-code", repo: "prime-agent", ruleset_id: 21950766, includes_parents: false,
               headers: { accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
             });
-            const ruleset = response?.data;
+            const restRuleset = response?.data;
             const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) &&
               JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
-            const conditions = ruleset?.conditions;
-            const refName = conditions?.ref_name;
-            const includes = refName?.include;
-            const excludes = refName?.exclude;
-            const rules = ruleset?.rules;
-            const updateRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "update") : [];
-            const deletionRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "deletion") : [];
+            const exactSortedStrings = (value, expected) => Array.isArray(value) && value.every((entry) => typeof entry === "string") &&
+              JSON.stringify([...value].sort()) === JSON.stringify([...expected].sort());
             const expectedIncludes = ["refs/tags/pylon-build-*", "refs/tags/pylon-stable-*"];
-            const stableReservationRef = "refs/tags/pylon-stable-sequence-000001";
-            const stableReservationCovered = Array.isArray(includes) && includes.some((pattern) =>
-              typeof pattern === "string" && pattern.endsWith("*") && stableReservationRef.startsWith(pattern.slice(0, -1))
-            );
+            const restConditions = restRuleset?.conditions;
+            const restRefName = restConditions?.ref_name;
+            const restRules = restRuleset?.rules;
+            const restUpdateRules = Array.isArray(restRules) ? restRules.filter((rule) => rule?.type === "update") : [];
+            const restDeletionRules = Array.isArray(restRules) ? restRules.filter((rule) => rule?.type === "deletion") : [];
             if (
-              response?.status !== 200 || !ruleset || ruleset.id !== 21950766 || ruleset.name !== "Pylon immutable publication tags" ||
-              ruleset.source_type !== "Repository" || ruleset.source !== "pylon-code/prime-agent" ||
-              ruleset.target !== "tag" || ruleset.enforcement !== "active" ||
-              !Object.hasOwn(ruleset, "bypass_actors") || !Array.isArray(ruleset.bypass_actors) || ruleset.bypass_actors.length !== 0 ||
-              !Object.hasOwn(ruleset, "current_user_can_bypass") || ruleset.current_user_can_bypass !== "never" ||
-              !exactKeys(conditions, ["ref_name"]) || !exactKeys(refName, ["exclude", "include"]) ||
-              !Array.isArray(excludes) || excludes.length !== 0 || !Array.isArray(includes) ||
-              JSON.stringify([...includes].sort()) !== JSON.stringify(expectedIncludes) || !stableReservationCovered ||
-              !Array.isArray(rules) || rules.length !== 2 || updateRules.length !== 1 || deletionRules.length !== 1 ||
-              !exactKeys(updateRules[0], ["parameters", "type"]) ||
-              !exactKeys(updateRules[0]?.parameters, ["update_allows_fetch_and_merge"]) ||
-              updateRules[0]?.parameters?.update_allows_fetch_and_merge !== false ||
-              !exactKeys(deletionRules[0], ["type"])
-            ) throw new Error("Authoritative ruleset-auditor response is missing, redacted, or differs from the exact active non-bypassable immutable tag ruleset.");
-
+              response?.status !== 200 || !restRuleset || restRuleset.id !== 21950766 ||
+              restRuleset.node_id !== "RRS_lACqUmVwb3NpdG9yec5QaCQtzgFO8S4" || restRuleset.name !== "Pylon immutable publication tags" ||
+              restRuleset.source_type !== "Repository" || restRuleset.source !== "pylon-code/prime-agent" ||
+              restRuleset.target !== "tag" || restRuleset.enforcement !== "active" ||
+              Object.hasOwn(restRuleset, "bypass_actors") && (!Array.isArray(restRuleset.bypass_actors) || restRuleset.bypass_actors.length !== 0) ||
+              Object.hasOwn(restRuleset, "current_user_can_bypass") && restRuleset.current_user_can_bypass !== "never" ||
+              !exactKeys(restConditions, ["ref_name"]) || !exactKeys(restRefName, ["exclude", "include"]) ||
+              !exactSortedStrings(restRefName.exclude, []) || !exactSortedStrings(restRefName.include, expectedIncludes) ||
+              !Array.isArray(restRules) || restRules.length !== 2 || restUpdateRules.length !== 1 || restDeletionRules.length !== 1 ||
+              !exactKeys(restUpdateRules[0], ["parameters", "type"]) ||
+              !exactKeys(restUpdateRules[0]?.parameters, ["update_allows_fetch_and_merge"]) ||
+              restUpdateRules[0]?.parameters?.update_allows_fetch_and_merge !== false || !exactKeys(restDeletionRules[0], ["type"])
+            ) throw new Error("REST ruleset-auditor response differs from the exact active immutable tag ruleset.");
+            const query = `query PylonPublicationRulesetAudit($owner: String!, $repo: String!, $rulesetDatabaseId: Int!) {
+              repository(owner: $owner, name: $repo) {
+                id
+                databaseId
+                nameWithOwner
+                ruleset(databaseId: $rulesetDatabaseId, includeParents: false) {
+                  id
+                  databaseId
+                  name
+                  enforcement
+                  target
+                  source {
+                    __typename
+                    ... on Repository {
+                      id
+                      databaseId
+                      nameWithOwner
+                    }
+                  }
+                  bypassActors { totalCount }
+                  conditions {
+                    refName { include exclude }
+                    organizationProperty { __typename }
+                    repositoryId { __typename }
+                    repositoryName { __typename }
+                    repositoryProperty { __typename }
+                  }
+                  rules(first: 100) {
+                    totalCount
+                    nodes {
+                      type
+                      parameters {
+                        __typename
+                        ... on UpdateParameters { updateAllowsFetchAndMerge }
+                      }
+                    }
+                  }
+                }
+              }
+            }`;
+            const authoritative = await github.graphql(query, {
+              owner: "pylon-code", repo: "prime-agent", rulesetDatabaseId: 21950766,
+            });
+            const repository = authoritative?.repository;
+            const ruleset = repository?.ruleset;
+            const source = ruleset?.source;
+            const bypassActors = ruleset?.bypassActors;
+            const conditions = ruleset?.conditions;
+            const refName = conditions?.refName;
+            const rules = ruleset?.rules;
+            const nodes = rules?.nodes;
+            const updateRules = Array.isArray(nodes) ? nodes.filter((rule) => rule?.type === "UPDATE") : [];
+            const deletionRules = Array.isArray(nodes) ? nodes.filter((rule) => rule?.type === "DELETION") : [];
+            if (
+              Object.hasOwn(authoritative ?? {}, "errors") || !repository || repository.id !== "R_kgDOUGgkLQ" ||
+              repository.databaseId !== 1349002285 || repository.nameWithOwner !== "pylon-code/prime-agent" ||
+              !ruleset || ruleset.id !== restRuleset.node_id || ruleset.id !== "RRS_lACqUmVwb3NpdG9yec5QaCQtzgFO8S4" ||
+              ruleset.databaseId !== 21950766 || ruleset.name !== "Pylon immutable publication tags" ||
+              ruleset.enforcement !== "ACTIVE" || ruleset.target !== "TAG" ||
+              !exactKeys(source, ["__typename", "databaseId", "id", "nameWithOwner"]) || source.__typename !== "Repository" ||
+              source.id !== repository.id || source.databaseId !== repository.databaseId || source.nameWithOwner !== repository.nameWithOwner ||
+              !exactKeys(bypassActors, ["totalCount"]) || !Number.isInteger(bypassActors.totalCount) || bypassActors.totalCount !== 0 ||
+              !exactKeys(conditions, ["organizationProperty", "refName", "repositoryId", "repositoryName", "repositoryProperty"]) ||
+              conditions.organizationProperty !== null || conditions.repositoryId !== null || conditions.repositoryName !== null ||
+              conditions.repositoryProperty !== null || !exactKeys(refName, ["exclude", "include"]) ||
+              !exactSortedStrings(refName.exclude, []) || !exactSortedStrings(refName.include, expectedIncludes) ||
+              !exactKeys(rules, ["nodes", "totalCount"]) || !Number.isInteger(rules.totalCount) || rules.totalCount !== 2 ||
+              !Array.isArray(nodes) || nodes.length !== 2 || nodes.some((node) => node === null) ||
+              updateRules.length !== 1 || deletionRules.length !== 1 || !exactKeys(updateRules[0], ["parameters", "type"]) ||
+              !exactKeys(updateRules[0].parameters, ["__typename", "updateAllowsFetchAndMerge"]) ||
+              updateRules[0].parameters.__typename !== "UpdateParameters" || updateRules[0].parameters.updateAllowsFetchAndMerge !== false ||
+              !exactKeys(deletionRules[0], ["parameters", "type"]) || deletionRules[0].parameters !== null
+            ) throw new Error("GraphQL ruleset-auditor response is null, partial, redacted, or differs from the exact non-bypassable target contract.");
       - name: Publish the exact approved preview draft
         if: steps.finalize.outputs.release_id != ''
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1

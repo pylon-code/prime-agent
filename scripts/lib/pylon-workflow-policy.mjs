@@ -44,6 +44,62 @@ function stepBlocks(block) {
 	}));
 }
 
+function parseStepShape(step, description) {
+	const lines = step.block.split("\n");
+	const root = {};
+	const nested = {};
+	const first = /^      - ([a-z-]+):\s*(.+)$/.exec(lines[0]);
+	if (!first) throw new Error(`${description} is not one closed named YAML step.`);
+	root[first[1]] = first[2];
+	for (let index = 1; index < lines.length; index += 1) {
+		const line = lines[index];
+		if (!line) continue;
+		const entry = /^        ([a-z-]+):(?:\s*(.*))?$/.exec(line);
+		if (!entry) continue;
+		if (Object.hasOwn(root, entry[1])) throw new Error(`${description} has a duplicate step key.`);
+		root[entry[1]] = entry[2] ?? "";
+		if (entry[2]) continue;
+		const values = {};
+		for (index += 1; index < lines.length; index += 1) {
+			const child = /^          ([a-z-]+):\s*(.*)$/.exec(lines[index]);
+			if (!child) {
+				index -= 1;
+				break;
+			}
+			if (Object.hasOwn(values, child[1])) throw new Error(`${description} has a duplicate ${entry[1]} key.`);
+			values[child[1]] = child[2];
+			if (child[2] === "|") {
+				while (index + 1 < lines.length && (!lines[index + 1] || lines[index + 1].startsWith("            "))) index += 1;
+			}
+		}
+		nested[entry[1]] = values;
+	}
+	return { root, nested };
+}
+
+function assertExactRulesetAuditorMint(step, description, expectedIf) {
+	if (/[#&]|(?:^|\s)\*[^/]|<<:/m.test(step.block)) {
+		throw new Error(`${description} may not use YAML comments, anchors, aliases, or merge keys.`);
+	}
+	const parsed = parseStepShape(step, description);
+	const expectedRoot = {
+		name: "Mint repository-scoped ruleset auditor token",
+		id: "ruleset-auditor",
+		uses: CREATE_GITHUB_APP_TOKEN_ACTION,
+		with: "",
+	};
+	if (expectedIf !== null) expectedRoot.if = expectedIf;
+	exactObject(parsed.root, expectedRoot, `${description} step mapping`);
+	exactObject(parsed.nested.with ?? {}, {
+		"app-id": "${{ vars.PYLON_RULESET_AUDITOR_APP_ID }}",
+		"private-key": "${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}",
+		owner: "pylon-code",
+		repositories: "prime-agent",
+		"permission-administration": "read",
+	}, `${description} with mapping`);
+	if (Object.keys(parsed.nested).length !== 1) throw new Error(`${description} has an unexpected nested mapping.`);
+}
+
 function scalar(block, name) {
 	const matches = [...block.matchAll(new RegExp(`^    ${name}:\\s*([^\\n]+)\\s*$`, "gm"))];
 	if (matches.length !== 1) throw new Error(`Approved job needs one exact ${name} value.`);
@@ -184,35 +240,46 @@ export function validateApprovedAttestationWorkflow(workflow, channel) {
 	const expectedAudits = channel === "preview" ? { "stage-draft": 1, publish: 1 } : { publish: 3 };
 	const authoritativeValidators = new Set();
 	const protectedMutations = [];
+	let mintCount = 0;
+	let auditCount = 0;
 	for (const [name, expectedAuditCount] of Object.entries(expectedAudits)) {
 		const block = blocks.get(name);
 		const steps = stepBlocks(block);
-		const mintSteps = steps.filter((step) => step.block.includes(`uses: ${CREATE_GITHUB_APP_TOKEN_ACTION}`));
+		const mintSteps = steps.filter((step) => /^        uses: actions\/create-github-app-token@/m.test(step.block));
 		if (mintSteps.length !== 1) throw new Error(`${name} needs one exact ruleset-auditor token mint.`);
-		const mint = mintSteps[0].block;
-		for (const required of [
-			"id: ruleset-auditor",
-			"app-id: ${{ vars.PYLON_RULESET_AUDITOR_APP_ID }}",
-			"private-key: ${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}",
-			"owner: pylon-code",
-			"repositories: prime-agent",
-			"permission-administration: read",
-		]) if (!mint.includes(required)) throw new Error(`${name} ruleset-auditor mint input differs.`);
-		if (/continue-on-error:|skip-token-revoke:|permission-contents:|permission-administration:\s*write/.test(mint)) {
-			throw new Error(`${name} ruleset-auditor token is not fail-closed, revocable, and read-only.`);
-		}
+		const expectedMintIf = channel === "preview" && name === "publish" ? "steps.finalize.outputs.release_id != ''" : null;
+		assertExactRulesetAuditorMint(mintSteps[0], `${name} ruleset-auditor mint`, expectedMintIf);
+		mintCount += 1;
 		const audits = steps.filter((step) => step.block.includes("github-token: ${{ steps.ruleset-auditor.outputs.token }}"));
 		if (audits.length !== expectedAuditCount) throw new Error(`${name} lacks one fresh authoritative audit per protected mutation.`);
+		auditCount += audits.length;
 		for (const audit of audits) {
+			const parsedAudit = parseStepShape(audit, `${name} ruleset audit`);
+			const expectedAuditRoot = {
+				name: audit.name,
+				uses: "actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1",
+				with: "",
+			};
+			if (Object.hasOwn(parsedAudit.root, "if")) expectedAuditRoot.if = parsedAudit.root.if;
+			exactObject(parsedAudit.root, expectedAuditRoot, `${name} ruleset audit step mapping`);
+			const githubMemberReferences = [...audit.block.matchAll(/\bgithub\.([A-Za-z]+)/g)].map((match) => match[1]).sort();
 			if (
+				parsedAudit.nested.with?.["github-token"] !== "${{ steps.ruleset-auditor.outputs.token }}" ||
+				parsedAudit.nested.with?.script !== "|" || Object.keys(parsedAudit.nested.with).length !== 2 ||
+				Object.keys(parsedAudit.nested).length !== 1 ||
+				canonicalList(githubMemberReferences) !== canonicalList(["graphql", "request"]) ||
+				/\b(?:arguments|console|context|core|fetch|globalThis|process|require)\b/.test(audit.block) ||
 				!/GET \/repos\/\{owner\}\/\{repo\}\/rulesets\/\{ruleset_id\}/.test(audit.block) ||
-				!/ruleset_id: 21950766/.test(audit.block) ||
-				!/Object\.hasOwn\(ruleset, "bypass_actors"\)/.test(audit.block) ||
-				!/Object\.hasOwn\(ruleset, "current_user_can_bypass"\)/.test(audit.block) ||
-				!/current_user_can_bypass !== "never"/.test(audit.block) ||
-				!/refs\/tags\/pylon-stable-sequence-000001/.test(audit.block) ||
+				!/ruleset_id: 21950766, includes_parents: false/.test(audit.block) ||
+				!/restRuleset\.node_id !== "RRS_lACqUmVwb3NpdG9yec5QaCQtzgFO8S4"/.test(audit.block) ||
+				!/Object\.hasOwn\(restRuleset, "bypass_actors"\)/.test(audit.block) ||
+				!/Object\.hasOwn\(restRuleset, "current_user_can_bypass"\)/.test(audit.block) ||
+				!/ruleset\(databaseId: \$rulesetDatabaseId, includeParents: false\)/.test(audit.block) ||
+				!/const authoritative = await github\.graphql\(query/.test(audit.block) ||
+				!/bypassActors\.totalCount !== 0/.test(audit.block) ||
+				!/updateAllowsFetchAndMerge !== false/.test(audit.block) ||
 				/github\.rest\.git\.createRef|github\.rest\.repos\.updateRelease|github\.rest\.git\.createTag|repos\.createRelease/.test(audit.block)
-			) throw new Error(`${name} ruleset audit is not the exact read-only authoritative proof.`);
+			) throw new Error(`${name} ruleset audit is not the exact read-only combined REST and GraphQL proof.`);
 			const script = audit.block.slice(audit.block.indexOf("          script: |"));
 			authoritativeValidators.add(script);
 		}
@@ -224,11 +291,36 @@ export function validateApprovedAttestationWorkflow(workflow, channel) {
 			if (!audit?.block.includes("github-token: ${{ steps.ruleset-auditor.outputs.token }}")) {
 				throw new Error(`${name} protected mutation lacks an adjacent fresh authoritative audit.`);
 			}
+			const auditIf = parseStepShape(audit, `${name} adjacent ruleset audit`).root.if ?? null;
+			const mutationIf = parseStepShape(mutation, `${name} protected mutation`).root.if ?? null;
+			if (auditIf !== mutationIf) throw new Error(`${name} protected mutation and adjacent audit conditions differ.`);
 			if (mutation.block.includes("steps.ruleset-auditor.outputs.token") || mutation.block.includes("PYLON_RULESET_AUDITOR")) {
 				throw new Error(`${name} passes the ruleset-auditor credential to a contents mutation.`);
 			}
 		}
 	}
+	const occurrenceCount = (value) => workflow.split(value).length - 1;
+	const allExpressions = [...workflow.matchAll(/\$\{\{[\s\S]*?\}\}/g)].map((match) => match[0]);
+	const sensitiveExpressions = allExpressions
+		.filter((expression) => /PYLON_RULESET_AUDITOR|ruleset-auditor/.test(expression));
+	const expectedSensitiveExpressions = [
+		...Array.from({ length: mintCount }, () => "${{ vars.PYLON_RULESET_AUDITOR_APP_ID }}"),
+		...Array.from({ length: mintCount }, () => "${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}"),
+		...Array.from({ length: auditCount }, () => "${{ steps.ruleset-auditor.outputs.token }}"),
+	];
+	if (
+		canonicalList(sensitiveExpressions) !== canonicalList(expectedSensitiveExpressions) ||
+		canonicalList(allExpressions.filter((expression) => /\bsecrets\b/.test(expression))) !==
+			canonicalList(Array.from({ length: mintCount }, () => "${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}")) ||
+		canonicalList(allExpressions.filter((expression) => /\bvars\b/.test(expression))) !==
+			canonicalList(Array.from({ length: mintCount }, () => "${{ vars.PYLON_RULESET_AUDITOR_APP_ID }}")) ||
+		occurrenceCount(CREATE_GITHUB_APP_TOKEN_ACTION) !== mintCount || occurrenceCount("private-key:") !== mintCount ||
+		occurrenceCount("id: ruleset-auditor") !== mintCount || occurrenceCount("PYLON_RULESET_AUDITOR_APP_ID") !== mintCount ||
+		occurrenceCount("PYLON_RULESET_AUDITOR_PRIVATE_KEY") !== mintCount ||
+		occurrenceCount("steps.ruleset-auditor.outputs.token") !== auditCount || occurrenceCount("github-token:") !== auditCount ||
+		/\$\{\{[\s\S]*?(?:toJSON|toJson)\s*\(\s*(?:steps|secrets|vars)\b/.test(workflow) ||
+		/\$\{\{\s*steps\s*\}\}/.test(workflow) || /\bsteps\s*\[/.test(workflow)
+	) throw new Error("Ruleset-auditor credentials or token outputs escape the exact mint and audit roles.");
 	if (authoritativeValidators.size !== 1) throw new Error("Protected mutations do not share one frozen authoritative ruleset validator.");
 	const expectedMutations = channel === "preview"
 		? ["publish:Publish the exact approved preview draft", "stage-draft:Create or refetch the exact protected preview tag"]
