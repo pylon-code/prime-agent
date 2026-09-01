@@ -151,9 +151,12 @@ function canonicalList(values) {
 	return JSON.stringify([...values].sort());
 }
 
-export function validateApprovedAttestationWorkflow(workflow, channel) {
+function validateApprovedAttestationWorkflowForRevision(workflow, channel, publicationPolicyRevision) {
 	if (typeof workflow !== "string" || !workflow.endsWith("\n") || workflow.includes("\r")) {
 		throw new Error("Approved workflow bytes must be normalized text.");
+	}
+	if (!Number.isSafeInteger(publicationPolicyRevision) || publicationPolicyRevision < 1) {
+		throw new Error("Workflow semantics need an exact positive publication policy revision.");
 	}
 	const policy = channel === "preview"
 		? {
@@ -174,10 +177,12 @@ export function validateApprovedAttestationWorkflow(workflow, channel) {
 			: null;
 	if (!policy) throw new Error("Unknown approved attestation channel.");
 	if (!/^permissions:\s*\{\}\s*$/m.test(workflow)) throw new Error("Approved publication workflow needs deny-by-default permissions.");
-	assertNoBranchProtectionAdministrationRead(workflow, "Default-token publication workflow");
-	const admission = jobBlock(workflow, "admission");
-	if (/^    environment:|PYLON_RULESET_AUDITOR|permission-administration|github-token:/m.test(admission)) {
-		throw new Error("Source admission may not receive the protected ruleset-auditor environment or credential.");
+	if (publicationPolicyRevision >= 2) {
+		assertNoBranchProtectionAdministrationRead(workflow, "Default-token publication workflow");
+		const admission = jobBlock(workflow, "admission");
+		if (/^    environment:|PYLON_RULESET_AUDITOR|permission-administration|github-token:/m.test(admission)) {
+			throw new Error("Source admission may not receive the protected ruleset-auditor environment or credential.");
+		}
 	}
 	const attest = jobBlock(workflow, "attest");
 	if (scalar(attest, "environment") !== policy.environment) throw new Error("Attester lacks its exact approval environment.");
@@ -362,6 +367,11 @@ export function validateApprovedAttestationWorkflow(workflow, channel) {
 	return { workflow: policy.workflow, environment: policy.environment };
 }
 
+// Historical semantics are reachable only after validateApprovedWorkflowBytes verifies the registered hash.
+export function validateApprovedAttestationWorkflow(workflow, channel) {
+	return validateApprovedAttestationWorkflowForRevision(workflow, channel, 2);
+}
+
 export function readWorkflowAtSignerDigest(workflowPath, signerDigest) {
 	if (![PYLON_PREVIEW_WORKFLOW, PYLON_STABLE_WORKFLOW].includes(workflowPath)) throw new Error("Unsupported attestation workflow path.");
 	if (!/^[0-9a-f]{40}$/.test(signerDigest)) throw new Error("Workflow signer digest must be a full lowercase Git SHA.");
@@ -405,7 +415,7 @@ export function validateApprovedWorkflowBytes(
 	if (actualDigest !== expectedDigest) {
 		throw new Error(`Signer workflow bytes differ from publication policy p${publicationPolicyRevision} for ${channel}.`);
 	}
-	return validateApprovedAttestationWorkflow(workflowText, channel);
+	return validateApprovedAttestationWorkflowForRevision(workflowText, channel, publicationPolicyRevision);
 }
 
 export function verifyApprovedWorkflowAtSignerDigest(workflowPath, signerDigest, channel, publicationPolicyRevision) {

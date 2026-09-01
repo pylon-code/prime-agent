@@ -879,15 +879,15 @@ test("merged changelog proof never relabels a PR-head check as merge-SHA evidenc
 	}
 });
 
-test("merged changelog workflow accepts the live deleted-head response with an empty run pull_requests array", async () => {
+test("merged changelog workflow accepts the actual deleted PR-head run response with an empty pull_requests array", async () => {
 	const mergeSha = "c34a2dd3b393700d512b0cbb30eb0bf66bd6dcc8";
-	const headSha = "d".repeat(40);
-	const pullNumber = 32;
-	const headRef = "fix/protected-pylon-publication";
-	const checkSuiteId = 771;
-	const checkRunId = 772;
-	const workflowRunId = 33_539_105_742;
-	const workflowId = 773;
+	const headSha = "f4d9ef03b529faf2e07031c8b7cd703363316ae5";
+	const pullNumber = 42;
+	const headRef = "feat/pylon-protected-publication";
+	const checkSuiteId = 90_698_064_557;
+	const checkRunId = 99_743_581_069;
+	const workflowRunId = 33_472_036_328;
+	const workflowId = 344_179_420;
 	const listAssociated = async () => {};
 	const listChecks = async () => {};
 	const script = githubScriptForStep(
@@ -929,7 +929,7 @@ test("merged changelog workflow accepts the live deleted-head response with an e
 					status: "completed",
 					conclusion: "success",
 					check_suite: { id: checkSuiteId },
-					details_url: `https://github.com/pylon-code/prime-agent/actions/runs/${workflowRunId}/job/774`,
+					details_url: `https://github.com/pylon-code/prime-agent/actions/runs/${workflowRunId}/job/${checkRunId}`,
 				}];
 			}
 			throw new Error("Unexpected pagination endpoint.");
@@ -943,7 +943,7 @@ test("merged changelog workflow accepts the live deleted-head response with an e
 					assert.deepEqual(parameters, { owner: "pylon-code", repo: "prime-agent", pull_number: pullNumber });
 					return { data: {
 						number: pullNumber,
-						merged_at: "2026-09-01T00:00:00Z",
+						merged_at: "2026-09-01T17:39:57Z",
 						merge_commit_sha: mergeSha,
 						base: { ref: "pylon", repo: { full_name: PYLON_PUBLICATION_REPOSITORY } },
 						head: { ref: headRef, sha: headSha, repo: { full_name: PYLON_PUBLICATION_REPOSITORY } },
@@ -1246,6 +1246,50 @@ test("recipe and publication policy registries close independent immutable ident
 		"stable",
 		policy.publicationPolicyRevision,
 	), { workflow: policy.stableWorkflowPath, environment: "pylon-stable" });
+	const retiredAdministrationRead = "branchProtectionRule requiredStatusChecks";
+	const legacyPreviewShape = preview.replace(
+		"// Exact-SHA workflow proof is checked by the final publisher after the push checks can complete.",
+		`// ${retiredAdministrationRead}`,
+	);
+	const legacyStableShape = stable.replace(
+		'            const requestedPreview = process.env.PREVIEW_TAG;\n',
+		`            // ${retiredAdministrationRead}\n            const requestedPreview = process.env.PREVIEW_TAG;\n`,
+	);
+	const legacyShapePolicy = {
+		...historicalPolicy,
+		previewWorkflowSha256: createHash("sha256").update(legacyPreviewShape).digest("hex"),
+		stableWorkflowSha256: createHash("sha256").update(legacyStableShape).digest("hex"),
+	};
+	for (const [workflowPath, workflow, channel, environment] of [
+		[legacyShapePolicy.previewWorkflowPath, legacyPreviewShape, "preview", "pylon-preview"],
+		[legacyShapePolicy.stableWorkflowPath, legacyStableShape, "stable", "pylon-stable"],
+	]) {
+		assert.match(workflow, /branchProtectionRule requiredStatusChecks/);
+		assert.deepEqual(
+			validateApprovedWorkflowBytes(workflowPath, workflow, channel, 1, [legacyShapePolicy]),
+			{ workflow: workflowPath, environment },
+		);
+		assert.throws(
+			() => validateApprovedWorkflowBytes(workflowPath, workflow, channel, 1, policies),
+			/bytes differ/,
+			"p1 revision dispatch must remain behind the exact registered workflow hash",
+		);
+		const revision2ShapePolicy = { ...legacyShapePolicy, publicationPolicyRevision: 2 };
+		assert.throws(
+			() => validateApprovedWorkflowBytes(workflowPath, workflow, channel, 2, [revision2ShapePolicy]),
+			/Administration-gated branch-protection read/,
+		);
+	}
+	assert.throws(
+		() => validateApprovedWorkflowBytes(
+			legacyShapePolicy.previewWorkflowPath,
+			`${legacyPreviewShape}# arbitrary p1 bytes\n`,
+			"preview",
+			1,
+			[legacyShapePolicy],
+		),
+		/bytes differ/,
+	);
 	for (const changed of [
 		`${preview}\n  rogue:\n    permissions: write-all\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo arbitrary\n`,
 		`${stable}\n  rogue-oidc:\n    permissions:\n      id-token: write\n      attestations: write\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo sign\n`,
@@ -2909,7 +2953,7 @@ test("stable recovery body durably carries bounded exact canonical manifest byte
 	}), /49152/);
 });
 
-test("stable zero-asset recovery reuses the body-carried attested bytes and excludes only its draft", async () => {
+test("stable p1 zero-asset recovery carries the historical policy revision to attestation", async () => {
 	const fixture = mkdtempSync(join(tmpdir(), "pylon-stable-recovery-"));
 	try {
 		const manifest = firstStable();
@@ -2938,6 +2982,7 @@ test("stable zero-asset recovery reuses the body-carried attested bytes and excl
 			},
 			verifyAttestation: (path, policyCommit, policyTree) => {
 				assert.equal(readFileSync(path).equals(bytes), true);
+				assert.equal(JSON.parse(readFileSync(path, "utf8")).promotion.publicationPolicyRevision, 1);
 				assert.equal(policyCommit, source.commit);
 				assert.equal(policyTree, source.tree);
 				verified = true;
