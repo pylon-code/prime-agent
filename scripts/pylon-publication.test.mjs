@@ -1139,6 +1139,10 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			stateMaxBytes: 1024,
 			now: () => clock.value,
 			hooks,
+			processKill: (pid, signal) => {
+				if (pid === 999_999) throw Object.assign(new Error("dead fixture owner"), { code: "ESRCH" });
+				return process.kill(pid, signal);
+			},
 			startHeartbeat: ({ beat }) => {
 				beats.push(beat);
 				return async () => {};
@@ -1152,7 +1156,10 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		writeFileSync(path, value, { mode: 0o600 });
 		chmodSync(path, 0o600);
 	};
-	const v1Fixture = (statePath, { projection = "one", secondTransition = false, terminal = true, applied = false } = {}) => {
+	const v1Fixture = (
+		statePath,
+		{ projection = "one", secondTransition = false, terminal = true, applied = false, ownerPid = 999_999 } = {},
+	) => {
 		const lockDirectory = `${statePath}.lock`;
 		const transactionDirectory = `${statePath}.transactions`;
 		mkdirSync(lockDirectory, { mode: 0o700 });
@@ -1174,7 +1181,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			candidateDigest: secondDigest,
 			candidateBase64: secondBytes.toString("base64"),
 		};
-		const claim = { schemaVersion: 1, generation: 1, token, ownerPid: process.pid, createdAtMs: 1 };
+		const claim = { schemaVersion: 1, generation: 1, token, ownerPid, createdAtMs: 1 };
 		const heartbeat = { schemaVersion: 1, generation: 1, token, refreshedAtMs: 1 };
 		const commit = { schemaVersion: 1, generation: 1, token, outcome: "commit", transactions: [firstTransaction, secondTransaction] };
 		writePrivate(join(lockDirectory, "claim-0000000000000001.json"), metadata(claim));
@@ -1307,6 +1314,12 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		assert.equal(readFileSync(v1MigrationPath).equals(migratedV1.secondBytes), true, "the immutable v1 decision repairs a one-behind projection");
 		assert.equal(statSync(`${v1MigrationPath}.lock`).isFile(), true);
 		assert.equal(statSync(`${v1MigrationPath}.lock.v1-retired`).isDirectory(), true);
+		assert.equal(existsSync(join(migratedV1.transactionDirectory, `${migratedV1.firstDigest}.json`)), true);
+		assert.equal(
+			readdirSync(`${v1MigrationPath}.lock.v1-retired`).some((name) => name.startsWith("applied-")),
+			true,
+			"a definitively dead incomplete v1 commit is completed only behind the durable guard",
+		);
 		await withConsumerStateLock(v1MigrationPath, async (_path, transaction) => {
 			assert.equal(transaction.readStateBytes().equals(migratedV1.secondBytes), true);
 		}, manualRuntime({ value: 3 }));
@@ -1368,10 +1381,11 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			/malformed or extra entry/,
 		);
 		const activeMigrationPath = join(fixture, "v1-active-migration.json");
-		v1Fixture(activeMigrationPath, { terminal: false });
+		const activeV1 = v1Fixture(activeMigrationPath, { terminal: false, ownerPid: process.pid });
+		rmSync(join(activeV1.transactionDirectory, `${"0".repeat(64)}.json`));
 		await assert.rejects(
 			() => migrateConsumerStateJournal(activeMigrationPath, manualRuntime({ value: 100 })),
-			/every old client and claim to quiesce/,
+			/live or uncertain incomplete v1 commit owner/,
 		);
 		const falseAppliedPath = join(fixture, "v1-false-applied.json");
 		v1Fixture(falseAppliedPath, { applied: true });
@@ -1379,6 +1393,85 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			() => migrateConsumerStateJournal(falseAppliedPath, manualRuntime({ value: 1 })),
 			/applied marker is missing its completed transition/,
 		);
+
+		const liveCommitPath = join(fixture, "v1-live-incomplete-commit.json");
+		const liveCommit = v1Fixture(liveCommitPath, { ownerPid: process.pid });
+		await assert.rejects(
+			() => migrateConsumerStateJournal(liveCommitPath, manualRuntime({ value: 1 }, {
+				afterMigrationAuthorityRead: async ({ legacy }) => {
+					const [missing] = legacy.recoveries[0].missingTransactions;
+					writePrivate(join(liveCommit.transactionDirectory, `${missing.baseDigest}.json`), metadata(missing));
+				},
+			})),
+			/live or uncertain incomplete v1 commit owner/,
+		);
+		assert.equal(statSync(liveCommit.lockDirectory).isDirectory(), true);
+		assert.equal(existsSync(`${liveCommitPath}.lock.v1-retired`), false);
+		assert.equal(existsSync(join(liveCommit.transactionDirectory, `${liveCommit.firstDigest}.json`)), true);
+
+		for (const [label, processKill] of [
+			["pid-reuse", () => {}],
+			["eperm", () => { throw Object.assign(new Error("uncertain"), { code: "EPERM" }); }],
+		]) {
+			const uncertainPath = join(fixture, `v1-${label}.json`);
+			v1Fixture(uncertainPath);
+			await assert.rejects(
+				() => migrateConsumerStateJournal(uncertainPath, { ...manualRuntime({ value: 1 }), processKill }),
+				/live or uncertain incomplete v1 commit owner/,
+			);
+			assert.equal(statSync(`${uncertainPath}.lock`).isDirectory(), true);
+			assert.equal(existsSync(`${uncertainPath}.lock.v1-retired`), false);
+		}
+
+		const completeAppliedPath = join(fixture, "v1-complete-applied.json");
+		const completeApplied = v1Fixture(completeAppliedPath, {
+			secondTransition: true,
+			applied: true,
+			ownerPid: process.pid,
+		});
+		const completeAppliedResult = await migrateConsumerStateJournal(completeAppliedPath, {
+			...manualRuntime({ value: 1 }),
+			processKill: () => { throw Object.assign(new Error("must not inspect a complete owner"), { code: "EPERM" }); },
+		});
+		assert.equal(completeAppliedResult.tipSha256, completeApplied.secondDigest);
+
+		const mutableBeforeSuccessPath = join(fixture, "v1-mutable-before-success.json");
+		v1Fixture(mutableBeforeSuccessPath, { secondTransition: true, applied: true });
+		let mutatedBeforeSuccess = false;
+		await assert.rejects(
+			() => migrateConsumerStateJournal(mutableBeforeSuccessPath, manualRuntime({ value: 1 }, {
+				beforeProjectionWrite: async () => {
+					if (mutatedBeforeSuccess) return;
+					mutatedBeforeSuccess = true;
+					const token = "87654321-4321-4321-8321-cba987654321";
+					const claim = { schemaVersion: 1, generation: 2, token, ownerPid: 999_998, createdAtMs: 2 };
+					const heartbeat = { schemaVersion: 1, generation: 2, token, refreshedAtMs: 2 };
+					const terminal = { schemaVersion: 1, generation: 2, token, outcome: "released" };
+					const retired = `${mutableBeforeSuccessPath}.lock.v1-retired`;
+					writePrivate(join(retired, "claim-0000000000000002.json"), metadata(claim));
+					writePrivate(join(retired, `heartbeat-0000000000000002-${token}.json`), metadata(heartbeat));
+					writePrivate(join(retired, `terminal-0000000000000002-${token}.json`), metadata(terminal));
+				},
+			})),
+			/does not authenticate the complete prior v1 authority and tip/,
+		);
+		assert.equal(mutatedBeforeSuccess, true);
+
+		const dualAuthorityPath = join(fixture, "v1-dual-authority.json");
+		v1Fixture(dualAuthorityPath);
+		await assert.rejects(
+			() => migrateConsumerStateJournal(dualAuthorityPath, manualRuntime({ value: 1 }, {
+				afterMigrationLockRename: async () => mkdirSync(`${dualAuthorityPath}.lock`, { mode: 0o700 }),
+			})),
+			/Live and retired v1 consumer lock authority both exist|Legacy consumer lock directory exists/,
+		);
+		assert.equal(statSync(`${dualAuthorityPath}.lock`).isDirectory(), true);
+		assert.equal(statSync(`${dualAuthorityPath}.lock.v1-retired`).isDirectory(), true);
+		await assert.rejects(
+			() => migrateConsumerStateJournal(dualAuthorityPath, manualRuntime({ value: 2 })),
+			/Live and retired v1 consumer lock authority both exist/,
+		);
+		assert.equal(statSync(`${dualAuthorityPath}.lock.v1-retired`).isDirectory(), true);
 
 		for (const hookName of ["afterFileSync", "afterMetadataLink", "afterMetadataDirectorySync"]) {
 			const bootstrapCrashPath = join(fixture, `bootstrap-crash-${hookName}.json`);
@@ -1696,12 +1789,29 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			),
 			/claim epoch is exhausted/,
 		);
+		const finalCrashJournal = consumerJournal(finalClaimCrashPath);
+		const finalCrashCheckpoint = JSON.parse(readFileSync(finalCrashJournal.checkpoint));
+		const finalCrashClaim = JSON.parse(readFileSync(join(
+			finalCrashJournal.epoch,
+			readdirSync(finalCrashJournal.epoch).find((name) => name === "claim-0000000000000002.json"),
+		)));
+		const finalCrashTemporaryDirectory = join(finalCrashJournal.journal, ".owned-temporaries-v2");
+		for (let index = 0; index < 17; index += 1) {
+			const temporaryName = `.pylon-consumer-tmp-v1-p999999-e${finalCrashCheckpoint.epochId}` +
+				`-g0000000000000002-w${finalCrashClaim.token}-n${index.toString(16).padStart(12, "0")}` +
+				`-ktransition-t${"c".repeat(64)}.tmp`;
+			writePrivate(join(finalCrashTemporaryDirectory, temporaryName), "dead final-claim temporary");
+		}
 		let rotationClaimHooks = 0;
 		assert.equal((await rotateConsumerStateJournal(finalClaimCrashPath, {
 			...manualRuntime({ value: 100 }, { afterClaim: async () => { rotationClaimHooks += 1; } }),
 			maxLockGenerations: 2,
 		})).epoch, 2);
 		assert.equal(rotationClaimHooks, 0, "rotation never consumes a normal claim, including the finite final claim");
+		assert.deepEqual(readdirSync(finalCrashTemporaryDirectory), []);
+		await withConsumerStateLock(finalClaimCrashPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("normal-after-final-crash-rotation"));
+		}, { ...manualRuntime({ value: 101 }), maxLockGenerations: 2 });
 
 		const temporaryFloodPath = join(fixture, "temporary-flood.json");
 		await withConsumerStateLock(temporaryFloodPath, async () => {}, {
@@ -1775,18 +1885,63 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		const bothRotationsReady = deferred();
 		const releaseRotations = deferred();
 		let rotationEpochWriters = 0;
-		const concurrentRotationOptions = manualRuntime({ value: 2 }, {
+		const concurrentRotationHooks = {
 			afterRotationEpochSync: async () => {
 				rotationEpochWriters += 1;
 				if (rotationEpochWriters === 2) bothRotationsReady.resolve();
 				await releaseRotations.promise;
 			},
+		};
+		const firstRotation = rotateConsumerStateJournal(concurrentRotationPath, {
+			...manualRuntime({ value: 2 }, concurrentRotationHooks),
+			maxLockGenerations: 2,
+			maxTransactionDepth: 1,
 		});
-		const firstRotation = rotateConsumerStateJournal(concurrentRotationPath, concurrentRotationOptions);
-		const secondRotation = rotateConsumerStateJournal(concurrentRotationPath, concurrentRotationOptions);
+		const secondRotation = rotateConsumerStateJournal(concurrentRotationPath, {
+			...manualRuntime({ value: 2 }, concurrentRotationHooks),
+			maxLockGenerations: 19,
+			maxTransactionDepth: 17,
+		});
 		await bothRotationsReady.promise;
 		releaseRotations.resolve();
-		assert.deepEqual((await Promise.all([firstRotation, secondRotation])).map((result) => result.epoch), [2, 2]);
+		const concurrentRotations = await Promise.all([firstRotation, secondRotation]);
+		assert.deepEqual(concurrentRotations, [concurrentRotations[0], concurrentRotations[0]]);
+		assert.equal(concurrentRotations[0].epoch, 2);
+		await withConsumerStateLock(concurrentRotationPath, async (_path, transaction) => {
+			assert.deepEqual(JSON.parse(transaction.readStateBytes()), { value: "concurrent-anchor" });
+			await transaction.commitState(bytes("concurrent-after-rotation"));
+		}, { ...manualRuntime({ value: 3 }), maxLockGenerations: 2 });
+
+		for (const [hookName, wantedKind] of [
+			["afterMetadataLink", "checkpoint"],
+			["afterMetadataDirectorySync", "checkpoint"],
+			["afterRotationCheckpoint", null],
+		]) {
+			const responseLossPath = join(fixture, `rotation-response-loss-${hookName}.json`);
+			await withConsumerStateLock(responseLossPath, async (_path, transaction) => {
+				await transaction.commitState(bytes("response-loss-anchor"));
+			}, manualRuntime({ value: 1 }));
+			let armed = true;
+			const firstResult = await rotateConsumerStateJournal(responseLossPath, {
+				...manualRuntime({ value: 2 }, {
+					[hookName]: async (event = {}) => {
+						if (!armed || (wantedKind !== null && event.kind !== wantedKind)) return;
+						armed = false;
+						throw new Error(`simulated response loss at ${hookName}`);
+					},
+				}),
+				maxLockGenerations: 2,
+			});
+			const retriedResult = await rotateConsumerStateJournal(responseLossPath, {
+				...manualRuntime({ value: 3 }),
+				maxLockGenerations: 23,
+			});
+			assert.deepEqual(retriedResult, firstResult);
+			assert.equal(retriedResult.epoch, 2);
+			await withConsumerStateLock(responseLossPath, async (_path, transaction) => {
+				assert.deepEqual(JSON.parse(transaction.readStateBytes()), { value: "response-loss-anchor" });
+			}, manualRuntime({ value: 4 }));
+		}
 
 		for (const [hookName, wantedKind] of [
 			["beforeRotationDecision", null],

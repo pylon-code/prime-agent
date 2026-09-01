@@ -13,11 +13,13 @@ const LOCK_SCHEMA_VERSION = 2;
 const LEGACY_LOCK_SCHEMA_VERSION = 1;
 const TRANSACTION_SCHEMA_VERSION = 1;
 const CHECKPOINT_SCHEMA_VERSION = 2;
-const ROTATION_INTENT_SCHEMA_VERSION = 1;
+const ROTATION_INTENT_SCHEMA_VERSION = 2;
 const LEGACY_GUARD_SCHEMA_VERSION = 1;
 const GENESIS_DIGEST = "0".repeat(64);
 const DEFAULT_STATE_MAX_BYTES = 1024 * 1024;
+const MAX_STATE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_JOURNAL_MAX_BYTES = 64 * 1024 * 1024;
+const MAX_JOURNAL_BYTES = 256 * 1024 * 1024;
 const MAX_TRANSACTION_DEPTH = 4096;
 const MAX_LOCK_GENERATIONS = 65_536;
 const MAX_JOURNAL_ROOT_ENTRIES = 16;
@@ -28,7 +30,7 @@ const uuidPattern = new RegExp(`^${uuidSource}$`);
 const claimPattern = /^claim-([0-9]{16})\.json$/;
 const transitionPattern = /^transition-([0-9a-f]{64})\.json$/;
 const legacyTransitionPattern = /^([0-9a-f]{64})\.json$/;
-const rotationIntentPattern = /^rotation-intent-([0-9a-f]{64})-([0-9]{16})\.json$/;
+const rotationIntentPattern = /^rotation-intent-([0-9a-f]{64})\.json$/;
 const checkpointPattern = new RegExp(`^checkpoint-([0-9]{16})-(${uuidSource})\\.json$`);
 const epochPattern = new RegExp(`^epoch-([0-9]{16})-(${uuidSource})$`);
 const heartbeatPattern = new RegExp(`^heartbeat-([0-9]{16})-(${uuidSource})\\.json$`);
@@ -91,12 +93,12 @@ function transitionPath(context, baseDigest) {
 	return join(context.epochDirectory, `transition-${baseDigest}.json`);
 }
 
-function rotationIntentName(tipDigest, claimCap) {
-	return `rotation-intent-${tipDigest}-${generationName(claimCap)}.json`;
+function rotationIntentName(tipDigest) {
+	return `rotation-intent-${tipDigest}.json`;
 }
 
-function rotationIntentPath(context, tipDigest, claimCap) {
-	return join(context.epochDirectory, rotationIntentName(tipDigest, claimCap));
+function rotationIntentPath(context, tipDigest) {
+	return join(context.epochDirectory, rotationIntentName(tipDigest));
 }
 
 function validateClaim(value) {
@@ -198,11 +200,10 @@ function validateCheckpoint(value, stateMaxBytes) {
 
 function validateRotationIntent(value, context, stateMaxBytes) {
 	if (
-		!exactKeys(value, ["schemaVersion", "epoch", "epochId", "checkpointSha256", "tipSha256", "claimCap", "checkpoint"]) ||
+		!exactKeys(value, ["schemaVersion", "epoch", "epochId", "checkpointSha256", "tipSha256", "checkpoint"]) ||
 		value.schemaVersion !== ROTATION_INTENT_SCHEMA_VERSION || value.epoch !== context.checkpoint.epoch ||
 		value.epochId !== context.checkpoint.epochId || value.checkpointSha256 !== context.checkpointDigest ||
-		!/^[0-9a-f]{64}$/.test(value.tipSha256 ?? "") || !Number.isSafeInteger(value.claimCap) ||
-		value.claimCap < 2 || value.claimCap > MAX_LOCK_GENERATIONS
+		!/^[0-9a-f]{64}$/.test(value.tipSha256 ?? "")
 	) throw new Error("Consumer high-water rotation intent is malformed.");
 	const checkpoint = validateCheckpoint(value.checkpoint, stateMaxBytes).value;
 	if (
@@ -523,7 +524,17 @@ async function revalidateAuthority(context, operation, options) {
 	}
 }
 
-async function publishImmutable({ path, bytes, directory, kind, context, writer, options, revalidate = true }) {
+async function publishImmutable({
+	path,
+	bytes,
+	directory,
+	kind,
+	context,
+	writer,
+	options,
+	revalidate = true,
+	beforeLink,
+}) {
 	if (revalidate) await revalidateAuthority(context, kind, options);
 	const temporary = join(context.temporaryDirectory, temporaryName(path, kind, writer, context));
 	let handle;
@@ -536,6 +547,7 @@ async function publishImmutable({ path, bytes, directory, kind, context, writer,
 		await handle.close();
 		handle = undefined;
 		await options.hooks?.afterFileSync?.({ kind, path, temporary });
+		await beforeLink?.();
 		if (revalidate) await revalidateAuthority(context, `${kind}-link`, options);
 		try {
 			await options.linkFile(temporary, path);
@@ -664,12 +676,21 @@ async function scanJournalRoot(statePath, journalDirectory, options) {
 		throw new Error("Consumer high-water journal root exceeds its safe entry bound.");
 	}
 	checkpointEntries.sort((left, right) => left.checkpoint.epoch - right.checkpoint.epoch);
+	epochEntries.sort((left, right) => left.epoch - right.epoch);
 	if (checkpointEntries.length > 2 || epochEntries.length > 2) {
 		throw new Error("Consumer high-water journal root contains unbounded checkpoint metadata.");
 	}
 	for (let index = 1; index < checkpointEntries.length; index += 1) {
+		if (checkpointEntries[index - 1].checkpoint.epoch === checkpointEntries[index].checkpoint.epoch) {
+			throw new Error("Consumer high-water journal contains competing checkpoints for one parent epoch.");
+		}
 		if (checkpointEntries[index - 1].checkpoint.epoch + 1 !== checkpointEntries[index].checkpoint.epoch) {
 			throw new Error("Consumer high-water journal checkpoints are not contiguous.");
+		}
+	}
+	for (let index = 1; index < epochEntries.length; index += 1) {
+		if (epochEntries[index - 1].epoch === epochEntries[index].epoch) {
+			throw new Error("Consumer high-water journal contains competing epoch directories for one parent epoch.");
 		}
 	}
 	const head = checkpointEntries.at(-1) ?? null;
@@ -690,7 +711,13 @@ async function scanJournalRoot(statePath, journalDirectory, options) {
 	return { checkpointEntries, epochEntries, temporaries, head, missingHeadEpoch };
 }
 
-async function initializeJournal(statePath, journalDirectory, options, bootstrapCheckpoint = genesisCheckpoint(statePath)) {
+async function initializeJournal(
+	statePath,
+	journalDirectory,
+	options,
+	bootstrapCheckpoint = genesisCheckpoint(statePath),
+	beforeCheckpointLink,
+) {
 	let scan = await scanJournalRoot(statePath, journalDirectory, options);
 	if (scan.head) {
 		if (!scan.missingHeadEpoch) return scan;
@@ -726,6 +753,7 @@ async function initializeJournal(statePath, journalDirectory, options, bootstrap
 		writer: bootstrap,
 		options,
 		revalidate: false,
+		beforeLink: beforeCheckpointLink,
 	});
 	await ensureDirectory(bootstrapContext.epochDirectory, "Consumer high-water epoch directory", options);
 	scan = await scanJournalRoot(statePath, journalDirectory, options);
@@ -883,7 +911,7 @@ async function scanEpoch(context, options) {
 			appliedNames.set(`${Number(match[1])}:${match[2]}`, name);
 			authoritativeEntryCount += 1;
 		} else if ((match = rotationIntentPattern.exec(name))) {
-			const key = `${match[1]}:${Number(match[2])}`;
+			const key = match[1];
 			if (rotationNames.has(key)) throw new Error("Consumer high-water epoch contains a duplicate rotation intent.");
 			rotationNames.set(key, name);
 			authoritativeEntryCount += 1;
@@ -973,10 +1001,13 @@ async function scanEpoch(context, options) {
 			options,
 			budget,
 		);
-		if (`${intent.tipSha256}:${intent.claimCap}` !== key || name !== rotationIntentName(intent.tipSha256, intent.claimCap)) {
-			throw new Error("Consumer high-water rotation intent name differs from its exact tip and cap.");
+		if (intent.tipSha256 !== key || name !== rotationIntentName(intent.tipSha256)) {
+			throw new Error("Consumer high-water rotation intent name differs from its exact tip.");
 		}
 		rotationIntents.push(intent);
+	}
+	if (rotationIntents.length > 1) {
+		throw new Error("Consumer high-water epoch contains competing rotation intents for one parent epoch.");
 	}
 	return { claims, terminals, rotationIntents, temporaries };
 }
@@ -1086,9 +1117,9 @@ async function finishCommit(context, claim, terminal, options) {
 	await publishApplied(context, claim, terminal, options);
 }
 
-function rotationCheckpoint(context, tip, claimCap) {
+function rotationCheckpoint(context, tip) {
 	const epochId = deterministicUuid(
-		`pylon-consumer-rotation:${context.checkpointDigest}:${tip.tipDigest}:${claimCap}`,
+		`pylon-consumer-rotation-v2:${context.checkpointDigest}:${tip.tipDigest}`,
 	);
 	const checkpoint = {
 		schemaVersion: CHECKPOINT_SCHEMA_VERSION,
@@ -1110,15 +1141,14 @@ function rotationCheckpoint(context, tip, claimCap) {
 	return checkpoint;
 }
 
-function rotationIntentFor(context, tip, claimCap) {
+function rotationIntentFor(context, tip) {
 	return {
 		schemaVersion: ROTATION_INTENT_SCHEMA_VERSION,
 		epoch: context.checkpoint.epoch,
 		epochId: context.checkpoint.epochId,
 		checkpointSha256: context.checkpointDigest,
 		tipSha256: tip.tipDigest,
-		claimCap,
-		checkpoint: rotationCheckpoint(context, tip, claimCap),
+		checkpoint: rotationCheckpoint(context, tip),
 	};
 }
 
@@ -1136,11 +1166,11 @@ async function effectiveTip(context, options) {
 }
 
 async function publishRotationIntent(context, tip, options) {
-	const wanted = rotationIntentFor(context, tip, options.maxLockGenerations);
+	const wanted = rotationIntentFor(context, tip);
 	const writer = rotationWriter(wanted);
-	await options.hooks?.beforeRotationDecision?.({ intent: wanted });
+	await options.hooks?.beforeRotationDecision?.({ intent: structuredClone(wanted) });
 	const result = await publishMetadata(
-		rotationIntentPath(context, wanted.tipSha256, wanted.claimCap),
+		rotationIntentPath(context, wanted.tipSha256),
 		wanted,
 		"rotation-intent",
 		context,
@@ -1151,18 +1181,17 @@ async function publishRotationIntent(context, tip, options) {
 	if (!metadataBytes(actual).equals(metadataBytes(wanted))) {
 		throw new Error("Consumer high-water rotation lost its immutable exact-tip intent.");
 	}
-	await options.hooks?.afterRotationIntent?.({ intent: actual });
+	await options.hooks?.afterRotationIntent?.({ intent: structuredClone(actual) });
 	return actual;
 }
 
-function currentRotationIntent(scan, tip, options) {
-	const matching = scan.rotationIntents.filter((intent) => intent.tipSha256 === tip.tipDigest);
-	if (matching.length === 0) return null;
-	const exact = matching.find((intent) => intent.claimCap === options.maxLockGenerations);
-	if (!exact) {
-		throw new Error("Consumer high-water rotation intent requires retry with its exact original claim cap.");
+function currentRotationIntent(scan, tip) {
+	if (scan.rotationIntents.length === 0) return null;
+	const [intent] = scan.rotationIntents;
+	if (intent.tipSha256 !== tip.tipDigest) {
+		throw new Error("Consumer high-water rotation intent no longer matches its exact authoritative tip.");
 	}
-	return exact;
+	return intent;
 }
 
 async function finishRotationCheckpoint(context, checkpoint, writer, options) {
@@ -1186,7 +1215,12 @@ async function finishRotationCheckpoint(context, checkpoint, writer, options) {
 	) throw new Error("Consumer high-water rotation does not anchor the exact immutable tip.");
 	const nextEpoch = join(context.journalDirectory, epochName(checkpoint));
 	await ensureDirectory(nextEpoch, "Consumer high-water epoch directory", options);
-	await options.hooks?.afterRotationEpochSync?.({ checkpoint, nextEpoch });
+	await options.hooks?.afterRotationEpochSync?.({ checkpoint: structuredClone(checkpoint), nextEpoch });
+	await secureDirectory(nextEpoch, "Consumer high-water next epoch directory", options);
+	await options.syncDirectory(nextEpoch);
+	if ((await options.readDirectory(nextEpoch)).length !== 0) {
+		throw new Error("Consumer high-water rotation found a competing next-epoch directory for the same parent.");
+	}
 	const nextPath = join(context.journalDirectory, checkpointName(checkpoint));
 	await publishImmutable({
 		path: nextPath,
@@ -1197,7 +1231,7 @@ async function finishRotationCheckpoint(context, checkpoint, writer, options) {
 		writer,
 		options,
 	});
-	await options.hooks?.afterRotationCheckpoint?.({ checkpoint, nextPath });
+	await options.hooks?.afterRotationCheckpoint?.({ checkpoint: structuredClone(checkpoint), nextPath });
 }
 
 async function finishRotation(context, claim, terminal, options) {
@@ -1269,7 +1303,7 @@ async function acquireClaim(context, options) {
 		}
 		if (scan.rotationIntents.length > 0) {
 			const tip = await effectiveTip(context, options);
-			const intent = currentRotationIntent(scan, tip, options);
+			const intent = currentRotationIntent(scan, tip);
 			if (intent) {
 				await helpRotationIntent(context, intent, options);
 				return { rotated: true };
@@ -1284,7 +1318,7 @@ async function acquireClaim(context, options) {
 		const afterClaim = await scanEpoch(context, options);
 		if (afterClaim.rotationIntents.length > 0) {
 			const tip = await effectiveTip(context, options);
-			const intent = currentRotationIntent(afterClaim, tip, options);
+			const intent = currentRotationIntent(afterClaim, tip);
 			if (intent) {
 				const released = {
 					schemaVersion: LOCK_SCHEMA_VERSION,
@@ -1301,10 +1335,21 @@ async function acquireClaim(context, options) {
 	}
 }
 
-function temporaryIsFenced(temporary, context, claim) {
+function temporaryIsFenced(temporary, context, writer) {
 	if (temporary.epochId !== context.checkpoint.epochId) return true;
-	if (temporary.generation === 0 || temporary.generation < claim.generation) return true;
-	return temporary.generation === claim.generation && temporary.token !== claim.token;
+	if (writer.generation === 0) {
+		return temporary.generation !== 0 || temporary.token !== writer.token;
+	}
+	if (temporary.generation === 0 || temporary.generation < writer.generation) return true;
+	return temporary.generation === writer.generation && temporary.token !== writer.token;
+}
+
+function temporaryBelongsToRetiredClaim(temporary, context, epochAuthority) {
+	if (!epochAuthority || temporary.epochId !== context.checkpoint.epochId || temporary.generation === 0) return false;
+	const claim = epochAuthority.claims.find((candidate) => (
+		candidate.generation === temporary.generation && candidate.token === temporary.token
+	));
+	return claim !== undefined && epochAuthority.terminals.has(`${claim.generation}:${claim.token}`);
 }
 
 function temporaryProcessIsAlive(temporary, options) {
@@ -1325,6 +1370,7 @@ async function cleanupAuthority(
 	epochTemporaries,
 	options,
 	requireQuiescent,
+	epochAuthority = null,
 	allowedNextEpoch = null,
 ) {
 	await revalidateAuthority(context, "cleanup", options);
@@ -1350,8 +1396,18 @@ async function cleanupAuthority(
 		if (!fenced && temporary.token !== writer.token) {
 			throw new Error("Consumer high-water journal contains a live or future owned temporary.");
 		}
-		if (!fenced) continue;
-		if (temporaryProcessIsAlive(temporary, options)) {
+		if (!fenced) {
+			if (!requireQuiescent) continue;
+			if (temporaryProcessIsAlive(temporary, options)) {
+				throw new Error("Consumer high-water journal rotation intent is pending until every prior owned temporary writer quiesces.");
+			}
+			await options.removeFile(temporary.path, { force: true });
+			await options.syncDirectory(dirname(temporary.path));
+			continue;
+		}
+		const retiredClaimTemporary = writer.generation === 0 &&
+			temporaryBelongsToRetiredClaim(temporary, context, epochAuthority);
+		if (!retiredClaimTemporary && temporaryProcessIsAlive(temporary, options)) {
 			if (requireQuiescent) {
 				throw new Error("Consumer high-water journal rotation intent is pending until every prior owned temporary writer quiesces.");
 			}
@@ -1441,7 +1497,7 @@ async function helpRotationIntent(context, intent, options) {
 	}
 	const tip = await effectiveTip(context, options);
 	if (tip.tipDigest !== intent.tipSha256) return false;
-	const current = currentRotationIntent(scan, tip, options);
+	const current = currentRotationIntent(scan, tip);
 	if (!current || !metadataBytes(current).equals(metadataBytes(intent))) {
 		throw new Error("Consumer high-water rotation intent changed during recovery.");
 	}
@@ -1454,6 +1510,7 @@ async function helpRotationIntent(context, intent, options) {
 		scan.temporaries,
 		options,
 		true,
+		scan,
 		nextEpochName,
 	);
 	await finishRotationCheckpoint(context, intent.checkpoint, rotationWriter(intent), options);
@@ -1533,10 +1590,10 @@ function normalizeOptions({
 } = {}) {
 	if (
 		!Number.isSafeInteger(stale) || !Number.isSafeInteger(update) || update < 1 || stale <= update ||
-		!Number.isSafeInteger(stateMaxBytes) || stateMaxBytes < 1 || stateMaxBytes > 16 * 1024 * 1024 ||
+		!Number.isSafeInteger(stateMaxBytes) || stateMaxBytes < 1 || stateMaxBytes > MAX_STATE_BYTES ||
 		!Number.isSafeInteger(maxTransactionDepth) || maxTransactionDepth < 1 || maxTransactionDepth > MAX_TRANSACTION_DEPTH ||
 		!Number.isSafeInteger(maxLockGenerations) || maxLockGenerations < 2 || maxLockGenerations > MAX_LOCK_GENERATIONS ||
-		!Number.isSafeInteger(maxJournalBytes) || maxJournalBytes < stateMaxBytes || maxJournalBytes > 256 * 1024 * 1024 ||
+		!Number.isSafeInteger(maxJournalBytes) || maxJournalBytes < stateMaxBytes || maxJournalBytes > MAX_JOURNAL_BYTES ||
 		!Number.isSafeInteger(currentUid) || currentUid < 0
 	) throw new Error("Consumer high-water lock timing, state-size, journal, or transaction bound is invalid.");
 	return {
@@ -1564,6 +1621,17 @@ function normalizeOptions({
 		currentUid,
 		activeWriter: null,
 	};
+}
+
+function normalizeRotationOptions(rawOptions) {
+	const options = normalizeOptions(rawOptions);
+	options.stateMaxBytes = MAX_STATE_BYTES;
+	options.maxTransactionDepth = MAX_TRANSACTION_DEPTH;
+	options.maxLockGenerations = MAX_LOCK_GENERATIONS;
+	options.maxJournalBytes = MAX_JOURNAL_BYTES;
+	options.maxJournalEntries = MAX_LOCK_GENERATIONS * 4 + MAX_TRANSACTION_DEPTH + 32;
+	options.metadataMaxBytes = MAX_STATE_BYTES * 3 + 8192;
+	return options;
 }
 
 async function lstatOrNull(path, options) {
@@ -1710,9 +1778,6 @@ async function readLegacyAuthority(statePath, lockDirectory, transactionDirector
 	for (const claim of claims) {
 		const key = `${claim.generation}:${claim.token}`;
 		if (!heartbeatNames.has(key)) throw new Error("Legacy consumer high-water claim lacks its exact heartbeat.");
-		if (!terminals.has(key)) {
-			throw new Error("Legacy consumer high-water migration requires every old client and claim to quiesce.");
-		}
 	}
 	const appliedTerminals = new Set();
 	for (const [key, name] of appliedNames) {
@@ -1739,7 +1804,7 @@ async function readLegacyAuthority(statePath, lockDirectory, transactionDirector
 	let decidedLength = 0;
 	for (const claim of claims) {
 		const terminal = terminals.get(`${claim.generation}:${claim.token}`);
-		if (terminal.outcome !== "commit") continue;
+		if (!terminal || terminal.outcome !== "commit") continue;
 		for (const transaction of terminal.transactions) {
 			if (transaction.baseDigest !== tipDigest) {
 				throw new Error("Legacy consumer high-water commit decisions do not form one exact authoritative chain.");
@@ -1791,6 +1856,23 @@ async function readLegacyAuthority(statePath, lockDirectory, transactionDirector
 			}
 		}
 	}
+	const recoveries = [];
+	for (const claim of claims) {
+		const key = `${claim.generation}:${claim.token}`;
+		const terminal = terminals.get(key);
+		if (!terminal) {
+			recoveries.push({ kind: "retire", claim });
+			continue;
+		}
+		if (terminal.outcome === "commit" && !appliedTerminals.has(key)) {
+			recoveries.push({
+				kind: "commit",
+				claim,
+				terminal,
+				missingTransactions: terminal.transactions.filter((transaction) => !actualTransactions.has(transaction.baseDigest)),
+			});
+		}
+	}
 	if (migrationAnchor !== undefined) {
 		if (decidedLength === 0 && migrationAnchor !== null) {
 			tipBytes = migrationAnchor;
@@ -1823,6 +1905,8 @@ async function readLegacyAuthority(statePath, lockDirectory, transactionDirector
 		tipBytes,
 		length: decidedLength,
 		authoritySha256: authorityDigest(authorityEntries, tipDigest, tipBytes),
+		authorityEntries,
+		recoveries,
 	};
 }
 
@@ -1845,6 +1929,163 @@ function migrationCheckpoint(statePath, legacy) {
 	};
 	validateCheckpoint(checkpoint, Number.MAX_SAFE_INTEGER);
 	return checkpoint;
+}
+
+function sameLegacyAuthority(left, right) {
+	return left.authoritySha256 === right.authoritySha256 && left.tipDigest === right.tipDigest &&
+		(left.tipBytes === null ? right.tipBytes === null : right.tipBytes !== null && left.tipBytes.equals(right.tipBytes));
+}
+
+function legacyOwnerIsDefinitivelyDead(claim, options) {
+	try {
+		options.processKill(claim.ownerPid, 0);
+		return false;
+	} catch (error) {
+		if (error?.code === "ESRCH") return true;
+		return false;
+	}
+}
+
+function requireRecoverableLegacyOwners(legacy, options) {
+	for (const recovery of legacy.recoveries) {
+		if (!legacyOwnerIsDefinitivelyDead(recovery.claim, options)) {
+			throw new Error(
+				"Legacy consumer high-water migration is blocked by a live or uncertain incomplete v1 commit owner.",
+			);
+		}
+	}
+}
+
+function recoveredLegacyAuthorityEntries(legacy) {
+	const entries = [];
+	for (const recovery of legacy.recoveries) {
+		if (recovery.kind === "retire") {
+			const terminal = {
+				schemaVersion: LEGACY_LOCK_SCHEMA_VERSION,
+				generation: recovery.claim.generation,
+				token: recovery.claim.token,
+				outcome: "retired",
+			};
+			entries.push([`lock/${legacyTerminalFileName(recovery.claim)}`, metadataBytes(terminal)]);
+			continue;
+		}
+		for (const transaction of recovery.missingTransactions) {
+			entries.push([`transactions/${transaction.baseDigest}.json`, metadataBytes(transaction)]);
+		}
+		const applied = {
+			schemaVersion: LEGACY_LOCK_SCHEMA_VERSION,
+			generation: recovery.claim.generation,
+			token: recovery.claim.token,
+			terminalSha256: digest(metadataBytes(recovery.terminal)),
+		};
+		entries.push([`lock/${legacyAppliedFileName(recovery.claim)}`, metadataBytes(applied)]);
+	}
+	return entries;
+}
+
+function expectedRecoveredLegacyAuthoritySha256(legacy) {
+	return authorityDigest(
+		[...legacy.authorityEntries, ...recoveredLegacyAuthorityEntries(legacy)],
+		legacy.tipDigest,
+		legacy.tipBytes,
+	);
+}
+
+function legacyAuthorityIsExactRecoveryProgress(previous, current) {
+	if (
+		previous.tipDigest !== current.tipDigest ||
+		(previous.tipBytes === null
+			? current.tipBytes !== null
+			: current.tipBytes === null || !previous.tipBytes.equals(current.tipBytes))
+	) return false;
+	const required = new Map(previous.authorityEntries);
+	const allowed = new Map(recoveredLegacyAuthorityEntries(previous));
+	const actual = new Map(current.authorityEntries);
+	if (required.size !== previous.authorityEntries.length || actual.size !== current.authorityEntries.length) return false;
+	for (const [name, bytes] of required) {
+		if (!actual.get(name)?.equals(bytes)) return false;
+	}
+	for (const [name, bytes] of actual) {
+		if (required.has(name)) continue;
+		if (!allowed.get(name)?.equals(bytes)) return false;
+	}
+	return true;
+}
+async function publishExactLegacyMetadata(path, value, validate, description, directory, context, writer, kind, options) {
+	await publishImmutable({
+		path,
+		bytes: metadataBytes(value),
+		directory,
+		kind,
+		context,
+		writer,
+		options,
+		revalidate: false,
+	});
+	const actual = await readExactMetadata(path, options.metadataMaxBytes, validate, description, options);
+	if (!metadataBytes(actual).equals(metadataBytes(value))) {
+		throw new Error(`${description} lost its immutable exact-value publication.`);
+	}
+}
+
+async function helpLegacyAuthority(retiredLockDirectory, transactionDirectory, legacy, context, options) {
+	for (const recovery of legacy.recoveries) {
+		if (await inspectLegacyGuard(context, options) !== "guard") {
+			throw new Error("Legacy consumer authority recovery requires its exact permanent downgrade guard.");
+		}
+		if (recovery.kind === "retire") {
+			const terminal = {
+				schemaVersion: LEGACY_LOCK_SCHEMA_VERSION,
+				generation: recovery.claim.generation,
+				token: recovery.claim.token,
+				outcome: "retired",
+			};
+			await publishExactLegacyMetadata(
+				join(retiredLockDirectory, legacyTerminalFileName(recovery.claim)),
+				terminal,
+				(value) => validateLegacyTerminal(value, recovery.claim, options.stateMaxBytes),
+				"Legacy consumer high-water recovered terminal marker",
+				retiredLockDirectory,
+				context,
+				recovery.claim,
+				"terminal-retired",
+				options,
+			);
+			continue;
+		}
+		for (const transaction of recovery.missingTransactions) {
+			await publishExactLegacyMetadata(
+				join(transactionDirectory, `${transaction.baseDigest}.json`),
+				transaction,
+				(value) => validateTransaction(value, transaction.baseDigest, options.stateMaxBytes).value,
+				"Legacy consumer high-water recovered transition",
+				transactionDirectory,
+				context,
+				recovery.claim,
+				"transition",
+				options,
+			);
+		}
+		const applied = {
+			schemaVersion: LEGACY_LOCK_SCHEMA_VERSION,
+			generation: recovery.claim.generation,
+			token: recovery.claim.token,
+			terminalSha256: digest(metadataBytes(recovery.terminal)),
+		};
+		await publishExactLegacyMetadata(
+			join(retiredLockDirectory, legacyAppliedFileName(recovery.claim)),
+			applied,
+			(value) => validateLegacyApplied(value, recovery.claim, recovery.terminal),
+			"Legacy consumer high-water recovered applied marker",
+			retiredLockDirectory,
+			context,
+			recovery.claim,
+			"applied",
+			options,
+		);
+	}
+	await options.syncDirectory(retiredLockDirectory);
+	await options.syncDirectory(transactionDirectory);
 }
 
 async function validateMigratedAuthority(context, options) {
@@ -1887,33 +2128,88 @@ export async function migrateConsumerStateJournal(statePath, rawOptions = {}) {
 	}
 	const guardPath = `${absoluteStatePath}.lock`;
 	const retiredLockDirectory = `${absoluteStatePath}.lock.v1-retired`;
-	const guardEntry = await lstatOrNull(guardPath, options);
-	const retiredEntry = await lstatOrNull(retiredLockDirectory, options);
+	let guardEntry = await lstatOrNull(guardPath, options);
+	let retiredEntry = await lstatOrNull(retiredLockDirectory, options);
+	if (retiredEntry && (!retiredEntry.isDirectory() || retiredEntry.isSymbolicLink?.())) {
+		throw new Error("Prior retired v1 consumer lock authority must be one real directory and is never replaced.");
+	}
+	if (guardEntry?.isDirectory() && !guardEntry.isSymbolicLink?.() && retiredEntry) {
+		throw new Error("Live and retired v1 consumer lock authority both exist; migration fails closed.");
+	}
 	let sourceLockDirectory;
-	if (guardEntry?.isDirectory() && !guardEntry.isSymbolicLink?.()) sourceLockDirectory = guardPath;
-	else if (retiredEntry?.isDirectory() && !retiredEntry.isSymbolicLink?.()) sourceLockDirectory = retiredLockDirectory;
-	else throw new Error("Prior v1 consumer lock authority is absent, unsafe, or ambiguous.");
-	const legacy = await readLegacyAuthority(absoluteStatePath, sourceLockDirectory, transactionDirectory, options);
-	const checkpoint = migrationCheckpoint(absoluteStatePath, legacy);
-	await options.hooks?.afterMigrationAuthorityRead?.({ checkpoint, legacy });
-	if (sourceLockDirectory === guardPath) {
+	let renameLiveAuthority = false;
+	if (retiredEntry) {
+		if (guardEntry === null) {
+			sourceLockDirectory = retiredLockDirectory;
+		} else if (guardEntry.isFile() && !guardEntry.isSymbolicLink?.()) {
+			await inspectLegacyGuard({ statePath: absoluteStatePath, guardPath }, options);
+			sourceLockDirectory = retiredLockDirectory;
+		} else {
+			throw new Error("Retired v1 consumer authority can resume only while the live path is absent or the exact regular guard.");
+		}
+	} else if (guardEntry?.isDirectory() && !guardEntry.isSymbolicLink?.()) {
+		sourceLockDirectory = guardPath;
+		renameLiveAuthority = true;
+	} else {
+		throw new Error("Prior v1 consumer lock authority is absent, unsafe, or ambiguous.");
+	}
+
+	const initialLegacy = await readLegacyAuthority(absoluteStatePath, sourceLockDirectory, transactionDirectory, options);
+	const initialCheckpoint = migrationCheckpoint(absoluteStatePath, initialLegacy);
+	await options.hooks?.afterMigrationAuthorityRead?.({
+		checkpoint: structuredClone(initialCheckpoint),
+		legacy: structuredClone(initialLegacy),
+	});
+	requireRecoverableLegacyOwners(initialLegacy, options);
+
+	if (renameLiveAuthority) {
+		if (await lstatOrNull(retiredLockDirectory, options) !== null) {
+			throw new Error("Retired v1 consumer lock authority appeared and will never be renamed over or replaced.");
+		}
 		try {
 			await options.renameFile(guardPath, retiredLockDirectory);
 		} catch (error) {
 			if (error?.code !== "ENOENT") throw error;
+			guardEntry = await lstatOrNull(guardPath, options);
+			retiredEntry = await lstatOrNull(retiredLockDirectory, options);
+			if (guardEntry?.isDirectory() && !guardEntry.isSymbolicLink?.() && retiredEntry?.isDirectory()) {
+				throw new Error("Live and retired v1 consumer lock authority both exist; migration fails closed.");
+			}
+			if (!retiredEntry?.isDirectory() || retiredEntry.isSymbolicLink?.()) {
+				throw new Error("Concurrent v1 migration did not leave one exact retired authority.");
+			}
+			if (guardEntry !== null) {
+				if (!guardEntry.isFile() || guardEntry.isSymbolicLink?.()) {
+					throw new Error("Concurrent v1 migration left an unsafe or ambiguous live lock path.");
+				}
+				await inspectLegacyGuard({ statePath: absoluteStatePath, guardPath }, options);
+			}
 		}
 		await options.syncDirectory(directory);
-		const retired = await readLegacyAuthority(absoluteStatePath, retiredLockDirectory, transactionDirectory, options);
-		if (retired.authoritySha256 !== legacy.authoritySha256 || retired.tipDigest !== legacy.tipDigest) {
-			throw new Error("Concurrent v1 migration changed the authenticated legacy authority.");
-		}
+	}
+
+	guardEntry = await lstatOrNull(guardPath, options);
+	retiredEntry = await lstatOrNull(retiredLockDirectory, options);
+	if (!retiredEntry?.isDirectory() || retiredEntry.isSymbolicLink?.()) {
+		throw new Error("Prior retired v1 consumer lock authority is absent or unsafe after migration handoff.");
+	}
+	if (guardEntry?.isDirectory() && !guardEntry.isSymbolicLink?.()) {
+		throw new Error("Live and retired v1 consumer lock authority both exist; migration fails closed.");
+	}
+	if (guardEntry !== null) await inspectLegacyGuard({ statePath: absoluteStatePath, guardPath }, options);
+	const renamedLegacy = await readLegacyAuthority(absoluteStatePath, retiredLockDirectory, transactionDirectory, options);
+	if (!sameLegacyAuthority(initialLegacy, renamedLegacy) &&
+		!legacyAuthorityIsExactRecoveryProgress(initialLegacy, renamedLegacy)) {
+		throw new Error("Concurrent v1 migration changed the exact authenticated legacy authority or tip.");
 	}
 	await options.hooks?.afterMigrationLockRename?.({ retiredLockDirectory });
+
 	const journalDirectory = `${absoluteStatePath}.journal`;
 	await ensureDirectory(journalDirectory, "Consumer high-water journal directory", options);
 	const temporaryDirectory = join(journalDirectory, TEMPORARY_DIRECTORY_NAME);
 	await ensureDirectory(temporaryDirectory, "Consumer high-water temporary directory", options);
-	const bootstrapContext = {
+	let checkpoint = migrationCheckpoint(absoluteStatePath, renamedLegacy);
+	let bootstrapContext = {
 		statePath: absoluteStatePath,
 		guardPath,
 		journalDirectory,
@@ -1933,13 +2229,74 @@ export async function migrateConsumerStateJournal(statePath, rawOptions = {}) {
 		options,
 		revalidate: false,
 	});
-	const guardBytes = await readSecureFile(guardPath, options.metadataMaxBytes, "Legacy consumer lock guard", options);
-	if (guardBytes === null || !guardBytes.equals(metadataBytes(legacyGuardFor(absoluteStatePath)))) {
+	if (await inspectLegacyGuard(bootstrapContext, options) !== "guard") {
 		throw new Error("V1 migration could not publish the exact permanent downgrade guard.");
 	}
 	await options.syncDirectory(directory);
 	await options.hooks?.afterMigrationGuard?.({ guardPath });
-	const scan = await initializeJournal(absoluteStatePath, journalDirectory, options, checkpoint);
+
+	const guardedLegacy = await readLegacyAuthority(absoluteStatePath, retiredLockDirectory, transactionDirectory, options);
+	if (!sameLegacyAuthority(renamedLegacy, guardedLegacy) &&
+		!legacyAuthorityIsExactRecoveryProgress(renamedLegacy, guardedLegacy)) {
+		throw new Error("V1 authority mutated across its exact durable handoff guard.");
+	}
+	requireRecoverableLegacyOwners(guardedLegacy, options);
+	const expectedRecoveredAuthoritySha256 = expectedRecoveredLegacyAuthoritySha256(guardedLegacy);
+	await helpLegacyAuthority(
+		retiredLockDirectory,
+		transactionDirectory,
+		guardedLegacy,
+		bootstrapContext,
+		options,
+	);
+	const recoveredLegacy = await readLegacyAuthority(absoluteStatePath, retiredLockDirectory, transactionDirectory, options);
+	if (
+		recoveredLegacy.recoveries.length !== 0 ||
+		recoveredLegacy.authoritySha256 !== expectedRecoveredAuthoritySha256 ||
+		recoveredLegacy.tipDigest !== guardedLegacy.tipDigest ||
+		(guardedLegacy.tipBytes === null
+			? recoveredLegacy.tipBytes !== null
+			: recoveredLegacy.tipBytes === null || !guardedLegacy.tipBytes.equals(recoveredLegacy.tipBytes))
+	) {
+		throw new Error("V1 authority recovery did not produce only the exact authenticated dead-owner completion.");
+	}
+	checkpoint = migrationCheckpoint(absoluteStatePath, recoveredLegacy);
+	bootstrapContext = {
+		...bootstrapContext,
+		checkpoint,
+		checkpointPath: join(journalDirectory, checkpointName(checkpoint)),
+		checkpointDigest: digest(metadataBytes(checkpoint)),
+		epochDirectory: join(journalDirectory, epochName(checkpoint)),
+	};
+	const beforeCheckpoint = await readLegacyAuthority(
+		absoluteStatePath,
+		retiredLockDirectory,
+		transactionDirectory,
+		options,
+		recoveredLegacy.tipBytes,
+	);
+	if (!sameLegacyAuthority(recoveredLegacy, beforeCheckpoint)) {
+		throw new Error("V1 authority mutated immediately before migration checkpoint publication.");
+	}
+	const authenticateBeforeCheckpointLink = async () => {
+		const current = await readLegacyAuthority(
+			absoluteStatePath,
+			retiredLockDirectory,
+			transactionDirectory,
+			options,
+			recoveredLegacy.tipBytes,
+		);
+		if (!sameLegacyAuthority(recoveredLegacy, current)) {
+			throw new Error("V1 authority mutated immediately before migration checkpoint publication.");
+		}
+	};
+	const scan = await initializeJournal(
+		absoluteStatePath,
+		journalDirectory,
+		options,
+		checkpoint,
+		authenticateBeforeCheckpointLink,
+	);
 	if (!scan.head || !metadataBytes(scan.head.checkpoint).equals(metadataBytes(checkpoint))) {
 		throw new Error("V1 migration encountered a different existing v2 journal checkpoint.");
 	}
@@ -1949,7 +2306,9 @@ export async function migrateConsumerStateJournal(statePath, rawOptions = {}) {
 		generation: 0,
 		token: checkpoint.epochId,
 	});
-	await options.hooks?.afterMigrationComplete?.({ checkpoint });
+	await validateMigratedAuthority(context, options);
+	await options.hooks?.afterMigrationComplete?.({ checkpoint: structuredClone(checkpoint) });
+	await validateMigratedAuthority(context, options);
 	return { epoch: 1, tipSha256: checkpoint.anchorDigest, sourceAuthoritySha256: checkpoint.sourceAuthoritySha256 };
 }
 
@@ -2108,27 +2467,43 @@ async function completedRotationResult(context, intent, options) {
 	return null;
 }
 
+async function recoverCompletedCurrentRotation(context, scan, options) {
+	if (context.checkpoint.epoch === 1 || scan.claims.length !== 0 || scan.rotationIntents.length !== 0) return null;
+	const tip = await effectiveTip(context, options);
+	if (tip.length !== 0 || tip.tipDigest !== context.checkpoint.anchorDigest) return null;
+	const writer = { generation: 0, token: context.checkpoint.epochId };
+	await repairProjection(context, tip, options, writer);
+	const rootScan = await scanJournalRoot(context.statePath, context.journalDirectory, options);
+	await cleanupAuthority(context, writer, rootScan, scan.temporaries, options, false, scan);
+	return { epoch: context.checkpoint.epoch, tipSha256: context.checkpoint.anchorDigest };
+}
+
 async function runRotation(statePath, rawOptions) {
-	const options = normalizeOptions(rawOptions);
+	const options = normalizeRotationOptions(rawOptions);
 	for (;;) {
 		const { context } = await prepareContext(statePath, options);
 		await ensureLegacyGuard(context, { generation: 0, token: context.checkpoint.epochId }, options);
 		let scan = await scanEpoch(context, options);
+		const completed = await recoverCompletedCurrentRotation(context, scan, options);
+		if (completed) return completed;
 		const latest = scan.claims.at(-1);
 		if (latest) {
 			const resolved = await resolveLatestClaim(context, latest, options);
 			if (resolved === "rotated") continue;
-			if (resolved !== "active") scan = await scanEpoch(context, options);
+			if (resolved === "active") {
+				throw new Error("Consumer high-water state is actively locked; rotation will retry after the claim quiesces.");
+			}
+			scan = await scanEpoch(context, options);
 		}
 		const tip = await effectiveTip(context, options);
-		let intent = currentRotationIntent(scan, tip, options);
+		let intent = currentRotationIntent(scan, tip);
 		if (!intent) intent = await publishRotationIntent(context, tip, options);
 		try {
 			const helped = await helpRotationIntent(context, intent, options);
 			if (!helped) continue;
 		} catch (error) {
-			const completed = await completedRotationResult(context, intent, options).catch(() => null);
-			if (completed) return completed;
+			const completedResult = await completedRotationResult(context, intent, options).catch(() => null);
+			if (completedResult) return completedResult;
 			throw error;
 		}
 		return { epoch: intent.checkpoint.epoch, tipSha256: intent.checkpoint.anchorDigest };
