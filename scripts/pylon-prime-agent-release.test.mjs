@@ -272,10 +272,8 @@ test("smokes the exact caller-owned session SDK contract", () => {
 	assert.match(smokeSource, /disposeOwnedSession\(\{ timeoutMs: 15_000 \}\)/);
 });
 
-test("bounds hosted Windows artifact installation without weakening POSIX checks", () => {
-	assert.equal(releaseInstallTimeoutMs("win32"), 360_000);
-	assert.equal(releaseInstallTimeoutMs("linux"), 180_000);
-	assert.equal(releaseInstallTimeoutMs("darwin"), 180_000);
+test("bounds supported Linux and macOS artifact installation", () => {
+	assert.equal(releaseInstallTimeoutMs(), 180_000);
 });
 
 test("uses the pinned npm CLI path for cross-platform release subprocesses", () => {

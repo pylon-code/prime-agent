@@ -384,3 +384,18 @@ decisions:
     revisit_when:
       - Pylon no longer maintains a Prime distribution or the upstream artifact recipe can emit the exact fork-owned deterministic contract without publication side effects.
       - The source, recipe, toolchain, manifest, internal URL, and digest invariants can be preserved without fork-specific release code.
+
+  protected-pylon-publication:
+    area: distribution
+    state: candidate
+    owner: pylon-fork
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/29
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/32
+    fork_change: protected-preview-and-append-only-stable-publication-v1
+    upstream_support: Prime's inherited publication path targets upstream R2 and npm channels and does not provide canonical Pylon-only exact-SHA admission, six immutable preview subjects, byte-preserving manual promotion, signed monotonic stable history, or append-only withdrawal.
+    revisit_when:
+      - Prime ships a repository-neutral immutable release and promotion primitive that preserves Pylon's exact source, workflow, attestation, stable-history, and withdrawal policy without upstream credentials or channel names.
+      - Pylon adopts another verifiable distribution transport that fully supersedes GitHub immutable Releases.

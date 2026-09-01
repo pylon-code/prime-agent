@@ -1,0 +1,75 @@
+name: Merged changelog proof
+
+on:
+  push:
+    branches: [pylon]
+
+permissions: {}
+
+jobs:
+  merged-changelog-proof:
+    name: Check changelog fragment
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Prove the merged pull request head check
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const repository = `${owner}/${repo}`;
+            const mergeSha = context.sha;
+            if (
+              repository !== "pylon-code/prime-agent" || context.eventName !== "push" ||
+              context.ref !== "refs/heads/pylon" || !/^[0-9a-f]{40}$/.test(mergeSha)
+            ) throw new Error("Merged changelog proof requires the canonical exact pylon push.");
+            const associated = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
+              owner, repo, commit_sha: mergeSha, per_page: 100,
+            });
+            const pullRequests = [];
+            for (const candidate of associated) {
+              const pull = (await github.rest.pulls.get({ owner, repo, pull_number: candidate.number })).data;
+              if (
+                pull.merged_at && pull.merge_commit_sha === mergeSha && pull.base.ref === "pylon" &&
+                pull.base.repo.full_name === repository
+              ) pullRequests.push(pull);
+            }
+            if (pullRequests.length !== 1) throw new Error("Merge SHA does not resolve to exactly one merged pylon pull request.");
+            const pull = pullRequests[0];
+            if (
+              pull.head.repo?.full_name !== repository || !/^[0-9a-f]{40}$/.test(pull.head.sha) ||
+              pull.head.sha === mergeSha
+            ) throw new Error("Merged pull request head is not an exact canonical pre-merge SHA.");
+            const checks = await github.paginate(github.rest.checks.listForRef, {
+              owner, repo, ref: pull.head.sha, filter: "latest", per_page: 100,
+            });
+            const candidates = checks.filter((check) =>
+              check.name === "Check changelog fragment" && check.head_sha === pull.head.sha &&
+              check.app?.id === 15368 && check.status === "completed" && check.conclusion === "success"
+            );
+            let proved = false;
+            for (const check of candidates) {
+              const suite = (await github.rest.checks.getSuite({ owner, repo, check_suite_id: check.check_suite.id })).data;
+              const runId = /^https:\/\/github\.com\/pylon-code\/prime-agent\/actions\/runs\/([0-9]+)(?:\/job\/[0-9]+)?$/.exec(check.details_url ?? "")?.[1];
+              if (!runId) continue;
+              const run = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: Number(runId) })).data;
+              const workflow = (await github.rest.actions.getWorkflow({ owner, repo, workflow_id: run.workflow_id })).data;
+              if (
+                suite.app?.id === 15368 && suite.head_sha === pull.head.sha && suite.status === "completed" &&
+                suite.conclusion === "success" && run.check_suite_id === suite.id && run.event === "pull_request" &&
+                run.status === "completed" && run.conclusion === "success" && run.head_sha === pull.head.sha &&
+                run.head_branch === pull.head.ref && run.head_repository?.id === 1349002285 &&
+                run.head_repository?.full_name === repository && run.repository?.id === 1349002285 &&
+                run.repository?.full_name === repository && workflow.path === ".github/workflows/changelog-fragment.yml" &&
+                run.pull_requests?.some((candidate) => candidate.number === pull.number)
+              ) {
+                proved = true;
+                break;
+              }
+            }
+            if (!proved) throw new Error("No successful GitHub Actions PR-head changelog check has the exact required provenance.");

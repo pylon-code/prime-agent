@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -13,6 +12,7 @@ import {
 	run,
 } from "./lib/pylon-release.mjs";
 import { verifyPylonPrimeAgentRelease } from "./verify-pylon-prime-agent-release.mjs";
+import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultArtifacts = join(root, ".npm", "pylon-release", "artifacts");
@@ -24,13 +24,18 @@ export const PYLON_RELEASE_EXPECTED_SDK_FEATURES = Object.freeze([
 ]);
 
 function parseArgs(args) {
-	if (args.length === 0) return defaultArtifacts;
-	if (args.length === 2 && args[0] === "--artifact-dir") return resolve(root, args[1]);
-	throw new Error("Usage: node scripts/smoke-pylon-prime-agent-release.mjs [--artifact-dir path]");
+	const historicalIndex = args.indexOf("--historical");
+	const historical = historicalIndex !== -1;
+	const remaining = args.filter((_, index) => index !== historicalIndex);
+	if (remaining.length === 0) return { artifactsDir: defaultArtifacts, historical };
+	if (remaining.length === 2 && remaining[0] === "--artifact-dir") {
+		return { artifactsDir: resolve(root, remaining[1]), historical };
+	}
+	throw new Error("Usage: smoke-pylon-prime-agent-release [--historical] [--artifact-dir path]");
 }
 
-export function releaseInstallTimeoutMs(platform = process.platform) {
-	return platform === "win32" ? 360_000 : 180_000;
+export function releaseInstallTimeoutMs() {
+	return 180_000;
 }
 
 function runCli(command, args, options = {}) {
@@ -104,21 +109,6 @@ function isProcessAlive(pid) {
 
 function getProcessStartId(pid) {
 	if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
-	if (process.platform === "win32") {
-		const result = runCli(
-			"powershell.exe",
-			[
-				"-NoLogo",
-				"-NoProfile",
-				"-NonInteractive",
-				"-Command",
-				`([System.Diagnostics.Process]::GetProcessById(${pid})).StartTime.ToUniversalTime().Ticks`,
-			],
-			{ timeoutMs: 2_000, maxBuffer: 4096 },
-		);
-		const ticks = result.status === 0 && !result.error ? result.stdout.trim() : "";
-		return /^\d+$/.test(ticks) ? `win:${ticks}` : undefined;
-	}
 	try {
 		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
 		const commandEnd = stat.lastIndexOf(")");
@@ -627,201 +617,6 @@ console.log(JSON.stringify({ connected }));
 	}
 	if (failure) throw failure;
 }
-async function smokeWindowsAcp({ probesDir, fixture }) {
-	const runnerPath = join(probesDir, "acp-runner.mjs");
-	writeFileSync(
-		runnerPath,
-		`import { main } from "prime-agent";
-await main(process.argv.slice(2), { extensionFactories: [() => {}] });
-`,
-	);
-	const pipe = `\\\\.\\pipe\\pylon-prime-artifact-${process.pid}-${randomUUID()}`;
-	const child = spawn(
-		process.execPath,
-		[
-			runnerPath,
-			"--mode",
-			"acp",
-			"--provider",
-			"artifact-faux",
-			"--model",
-			"artifact-faux",
-			"--no-session",
-			"--no-tools",
-			"--no-extensions",
-			"--no-skills",
-			"--no-prompt-templates",
-			"--no-themes",
-			"--no-context-files",
-			"--offline",
-			"--daemon-socket",
-			pipe,
-		],
-		{ cwd: fixture.projectDir, env: fixture.env, stdio: ["pipe", "pipe", "pipe"], shell: false, detached: false },
-	);
-	const output = diagnostics(child, 1024 * 1024);
-	let buffer = "";
-	let response;
-	let resolveResponse;
-	let rejectResponse;
-	const responsePromise = new Promise((resolveValue, rejectValue) => {
-		resolveResponse = resolveValue;
-		rejectResponse = rejectValue;
-	});
-	child.stdout.on("data", (chunk) => {
-		buffer += chunk.toString("utf8");
-		if (Buffer.byteLength(buffer) > 1024 * 1024) {
-			rejectResponse(new Error("ACP stdout exceeded 1 MiB."));
-			return;
-		}
-		let newline;
-		while ((newline = buffer.indexOf("\n")) >= 0) {
-			const line = buffer.slice(0, newline).trim();
-			buffer = buffer.slice(newline + 1);
-			if (!line) continue;
-			try {
-				const frame = JSON.parse(line);
-				if (frame.id === 1) {
-					response = frame;
-					resolveResponse(frame);
-				}
-			} catch {
-				rejectResponse(new Error("ACP emitted non-JSON stdout."));
-			}
-		}
-	});
-	child.once("close", () => {
-		if (!response) rejectResponse(new Error("ACP exited before initialize response."));
-	});
-	const timer = setTimeout(() => rejectResponse(new Error("ACP initialize timed out.")), 45_000);
-	let failure;
-	try {
-		child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: 1, clientCapabilities: {} } })}\n`);
-		const frame = await responsePromise;
-		clearTimeout(timer);
-		if (
-			frame.jsonrpc !== "2.0" ||
-			frame.error !== undefined ||
-			frame.result?.protocolVersion !== 1 ||
-			frame.result?.agentInfo?.name !== "prime-agent"
-		) {
-			throw new Error(`Unexpected ACP initialize response: ${JSON.stringify(frame)}`);
-		}
-		child.stdin.end();
-		if (!(await waitForExit(child, 10_000))) throw new Error("ACP did not exit after input EOF.");
-		if (child.exitCode !== 0 || output.overflow || output.error) {
-			throw new Error(`Installed ACP fallback failed.\n${output.stderr || output.stdout}`);
-		}
-	} catch (error) {
-		failure = error;
-	} finally {
-		clearTimeout(timer);
-		try {
-			await terminateCapturedChild(child);
-		} catch (terminationError) {
-			failure = failure ?? terminationError;
-		}
-	}
-
-	const cleanupReceiptPath = join(probesDir, "unexpected-daemon.json");
-	const cleanupPath = join(probesDir, "acp-daemon-cleanup.mjs");
-	writeFileSync(
-		cleanupPath,
-		`${staticSdkImport()}import { writeFileSync } from "node:fs";
-const [pipe, receiptPath] = process.argv.slice(2);
-const client = new sdk.DaemonClient(pipe);
-let connected = false;
-try {
-  await client.connect(500);
-  await client.waitForHello(500);
-  connected = true;
-  writeFileSync(receiptPath, JSON.stringify({
-    supervisorPid: client.hello?.supervisorPid,
-    supervisorProcessStartId: client.hello?.supervisorProcessStartId
-  }));
-  const shutdown = await client.request({ type: "shutdown", force: true }, 10_000);
-  if (!shutdown.success) throw new Error(shutdown.error);
-} catch (error) {
-  if (connected) throw error;
-} finally {
-  client.close();
-}
-console.log(JSON.stringify({ connected }));
-`,
-	);
-	const beforeCleanup = recordedWorkerIdentities(fixture.agentDir);
-	try {
-		const cleanup = spawn(process.execPath, [cleanupPath, pipe, cleanupReceiptPath], {
-			cwd: probesDir,
-			env: fixture.env,
-			stdio: ["ignore", "pipe", "pipe"],
-			shell: false,
-			detached: false,
-		});
-		const cleanupResult = await collectChild(cleanup, 15_000);
-		if (cleanupResult.status !== 0) {
-			throw new Error(`Unexpected ACP daemon cleanup failed.\n${cleanupResult.stderr || cleanupResult.stdout}`);
-		}
-		const cleanupReceipt = JSON.parse(cleanupResult.stdout.trim().split("\n").at(-1));
-		if (cleanupReceipt.connected === true) {
-			failure = failure ?? new Error("ACP fallback unexpectedly launched a detached daemon.");
-		}
-	} catch (cleanupError) {
-		failure = failure ?? cleanupError;
-	} finally {
-		try {
-			if (existsSync(cleanupReceiptPath)) {
-				const supervisor = JSON.parse(readFileSync(cleanupReceiptPath, "utf8"));
-				if (
-					Number.isSafeInteger(supervisor.supervisorPid) &&
-					supervisor.supervisorPid > 1 &&
-					typeof supervisor.supervisorProcessStartId === "string"
-				) {
-					const identity = {
-						pid: supervisor.supervisorPid,
-						processStartId: supervisor.supervisorProcessStartId,
-					};
-					const state = await waitForTrackedIdentityChange(identity, 10_000);
-					if (state === "current") await terminateTrackedIdentity(identity);
-					else if (state === "unknown") {
-						throw unsafeCleanupError(
-							`Could not prove the start identity of unexpected ACP daemon ${identity.pid}.`,
-						);
-					}
-				} else if (
-					Number.isSafeInteger(supervisor.supervisorPid) &&
-					supervisor.supervisorPid > 1 &&
-					isProcessAlive(supervisor.supervisorPid)
-				) {
-					throw unsafeCleanupError(
-						`Unexpected ACP daemon ${supervisor.supervisorPid} lacked a start identity; refusing to signal it.`,
-					);
-				}
-			}
-			const afterCleanup = recordedWorkerIdentities(fixture.agentDir);
-			const identities = new Map(
-				[...beforeCleanup.identities, ...afterCleanup.identities].map((identity) => [
-					`${identity.pid}:${identity.processStartId}`,
-					identity,
-				]),
-			);
-			for (const identity of identities.values()) await terminateTrackedIdentity(identity);
-			for (const pid of [...beforeCleanup.unprovedPids, ...afterCleanup.unprovedPids]) {
-				if (isProcessAlive(pid)) {
-					throw unsafeCleanupError(`Worker ${pid} remained alive without a start identity; refusing to signal it.`);
-				}
-			}
-		} catch (terminationError) {
-			if (terminationError && typeof terminationError === "object" && terminationError.preserveTempRoot === true) {
-				if (failure) terminationError.message = `${failure.message}\nCleanup failure: ${terminationError.message}`;
-				failure = terminationError;
-			} else {
-				failure = failure ?? terminationError;
-			}
-		}
-	}
-	if (failure) throw failure;
-}
 function createLocalAssetConsumer(prefix, artifactsDir, manifest) {
 	const bySourceName = new Map(
 		PYLON_RELEASE_PACKAGES.map((releasePackage) => [
@@ -838,8 +633,13 @@ function createLocalAssetConsumer(prefix, artifactsDir, manifest) {
 	);
 }
 
-export async function smokePylonPrimeAgentRelease(artifactsDir) {
-	const manifest = verifyPylonPrimeAgentRelease(artifactsDir);
+export async function smokePylonPrimeAgentRelease(artifactsDir, { historical = false } = {}) {
+	if (process.platform === "win32") {
+		throw new Error("Native Windows artifact runtime verification is deferred; use the supported WSL2/Linux path.");
+	}
+	const manifest = historical
+		? verifyPreviewPublication(artifactsDir, { historical: true }).releaseManifest
+		: verifyPylonPrimeAgentRelease(artifactsDir);
 	const tempRoot = mkdtempSync(join(tmpdir(), "pylon-prime-release-"));
 	let removeTempRoot = true;
 	try {
@@ -898,11 +698,7 @@ export async function smokePylonPrimeAgentRelease(artifactsDir) {
 			throw new Error("Pylon artifact did not block the stock self-updater with Pylon release guidance.");
 		}
 
-		if (process.platform === "win32" || process.env.PYLON_RELEASE_SMOKE_TEST_FORCE_ACP === "1") {
-			await smokeWindowsAcp({ probesDir, fixture });
-		} else {
-			await smokePosixDaemon({ tempRoot, probesDir, cliEntry, fixture, expectedBuildId: manifest.build.id });
-		}
+		await smokePosixDaemon({ tempRoot, probesDir, cliEntry, fixture, expectedBuildId: manifest.build.id });
 		console.log(`Installed and verified ${manifest.build.id} on ${process.platform}.`);
 		return manifest;
 	} catch (error) {
@@ -918,7 +714,8 @@ export async function smokePylonPrimeAgentRelease(artifactsDir) {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
 	try {
-		await smokePylonPrimeAgentRelease(parseArgs(process.argv.slice(2)));
+		const args = parseArgs(process.argv.slice(2));
+		await smokePylonPrimeAgentRelease(args.artifactsDir, { historical: args.historical });
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : String(error));
 		process.exit(1);
