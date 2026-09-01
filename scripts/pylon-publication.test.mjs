@@ -68,6 +68,7 @@ import {
 } from "./lib/pylon-publication.mjs";
 import {
 	ATTEST_ACTION_CHAIN,
+	CREATE_GITHUB_APP_TOKEN_ACTION,
 	validateApprovedAttestationWorkflow,
 	validateApprovedWorkflowBytes,
 } from "./lib/pylon-workflow-policy.mjs";
@@ -230,6 +231,8 @@ function exactPublicationTagRuleset() {
 		source_type: "Repository",
 		source: "pylon-code/prime-agent",
 		enforcement: "active",
+		bypass_actors: [],
+		current_user_can_bypass: "never",
 		conditions: {
 			ref_name: {
 				exclude: [],
@@ -244,14 +247,11 @@ function exactPublicationTagRuleset() {
 }
 
 async function inlinePublicationTagRulesetValidator(responses) {
-	const script = githubScriptForStep(".github/workflows/pylon-preview-release.yml", "Require the canonical protected push");
-	const start = script.indexOf("const requireExactPublicationTagRuleset = async () => {");
-	const end = script.indexOf("\nawait requireExactPublicationTagRuleset();", start);
-	assert.ok(start >= 0 && end > start, "preview admission lacks the frozen tag-ruleset validator");
-	const create = new AsyncFunction(
-		"github", "owner", "repo",
-		`${script.slice(start, end)}\nreturn requireExactPublicationTagRuleset;`,
+	const script = githubScriptForStep(
+		".github/workflows/pylon-preview-release.yml",
+		"Require authoritative publication tag ruleset before preview tag CAS",
 	);
+	const validate = new AsyncFunction("github", script);
 	let request = 0;
 	const github = {
 		request: async (route, parameters) => {
@@ -263,10 +263,11 @@ async function inlinePublicationTagRulesetValidator(responses) {
 			const response = responses[Math.min(request, responses.length - 1)];
 			request += 1;
 			if (response instanceof Error) throw response;
+			if (response && Object.hasOwn(response, "status") && Object.hasOwn(response, "data")) return response;
 			return { status: 200, data: response };
 		},
 	};
-	return { validate: await create(github, "pylon-code", "prime-agent"), requests: () => request };
+	return { validate: () => validate(github), requests: () => request };
 }
 
 test("canonical publication JSON sorts every object key and rejects unsupported values", () => {
@@ -2478,12 +2479,12 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 	}
 });
 
-test("every inline admission and final publisher closes the exact branch-check trust root", async () => {
+test("admission is non-authoritative and every protected mutation has a fresh App-authenticated ruleset audit", async () => {
 	for (const [workflow, step] of [
 		[".github/workflows/pylon-preview-release.yml", "Require the canonical protected push"],
-		[".github/workflows/pylon-preview-release.yml", "Verify exact checks and publish once"],
+		[".github/workflows/pylon-preview-release.yml", "Verify exact checks and freeze the approved preview draft"],
 		[".github/workflows/pylon-stable-release.yml", "Require protected pylon and an exact verified preview source"],
-		[".github/workflows/pylon-stable-release.yml", "Re-download the exact draft, reserve N once, and publish only that draft"],
+		[".github/workflows/pylon-stable-release.yml", "Re-download and validate the exact stable transaction"],
 	]) {
 		const script = githubScriptForStep(workflow, step);
 		for (const value of [
@@ -2491,79 +2492,109 @@ test("every inline admission and final publisher closes the exact branch-check t
 			".github/workflows/changelog-merged-proof.yml", ".github/workflows/ci.yml",
 		]) assert.ok(script.includes(value), `${workflow}:${step} lacks ${value}`);
 		assert.match(script, /JSON\.stringify\(actualPolicy\) !== JSON\.stringify/);
-		assert.doesNotMatch(script, /appId === null|!expectedPath/);
+		assert.doesNotMatch(script, /rulesets\/\{ruleset_id\}|bypass_actors|current_user_can_bypass/,
+			"normal GITHUB_TOKEN admission must not claim authoritative ruleset visibility");
 	}
 
-	const rulesetSteps = [
-		[".github/workflows/pylon-preview-release.yml", "Require the canonical protected push", 1],
-		[".github/workflows/pylon-preview-release.yml", "Create or finish the exact durable draft", 2],
-		[".github/workflows/pylon-preview-release.yml", "Verify exact checks and publish once", 2],
-		[".github/workflows/pylon-stable-release.yml", "Require protected pylon and an exact verified preview source", 1],
-		[".github/workflows/pylon-stable-release.yml", "Re-download the exact draft, reserve N once, and publish only that draft", 4],
+	const authoritativeSteps = [
+		[".github/workflows/pylon-preview-release.yml", "Require authoritative publication tag ruleset before preview tag CAS"],
+		[".github/workflows/pylon-preview-release.yml", "Require authoritative publication tag ruleset before immutable preview publish"],
+		[".github/workflows/pylon-stable-release.yml", "Require authoritative publication tag ruleset before reservation CAS"],
+		[".github/workflows/pylon-stable-release.yml", "Require authoritative publication tag ruleset before final stable tag CAS"],
+		[".github/workflows/pylon-stable-release.yml", "Require authoritative publication tag ruleset before immutable stable publish"],
 	];
-	const frozenValidators = new Set();
-	for (const [workflow, step, expectedCalls] of rulesetSteps) {
-		const script = githubScriptForStep(workflow, step);
-		const start = script.indexOf("const requireExactPublicationTagRuleset = async () => {");
-		const end = script.indexOf("\nawait requireExactPublicationTagRuleset();", start);
-		assert.ok(start >= 0 && end > start, `${workflow}:${step} lacks an inline tag-ruleset proof`);
-		frozenValidators.add(script.slice(start, end));
-		assert.equal((script.match(/await requireExactPublicationTagRuleset\(\);/g) ?? []).length, expectedCalls);
+	const frozenValidators = new Set(authoritativeSteps.map(([workflow, step]) => githubScriptForStep(workflow, step)));
+	assert.equal(frozenValidators.size, 1, "every protected mutation must use the same frozen authoritative validator bytes");
+	for (const script of frozenValidators) {
+		assert.match(script, /Object\.hasOwn\(ruleset, "bypass_actors"\)/);
+		assert.match(script, /Object\.hasOwn\(ruleset, "current_user_can_bypass"\)/);
+		assert.match(script, /current_user_can_bypass !== "never"/);
 		assert.match(script, /refs\/tags\/pylon-stable-sequence-000001/);
 	}
-	assert.equal(frozenValidators.size, 1, "every writer must use the same frozen inline validator bytes");
 
 	const valid = exactPublicationTagRuleset();
-	const { validate } = await inlinePublicationTagRulesetValidator([valid]);
-	await validate();
+	await (await inlinePublicationTagRulesetValidator([valid])).validate();
 	const mutations = [
+		(value) => delete value.id,
+		(value) => (value.id = 1),
+		(value) => delete value.name,
+		(value) => (value.name = "Other ruleset"),
+		(value) => delete value.source_type,
+		(value) => (value.source_type = "Organization"),
+		(value) => delete value.source,
+		(value) => (value.source = "fork/prime-agent"),
+		(value) => delete value.target,
+		(value) => (value.target = "branch"),
+		(value) => delete value.enforcement,
 		(value) => (value.enforcement = "disabled"),
+		(value) => delete value.bypass_actors,
 		(value) => (value.bypass_actors = [{ actor_type: "RepositoryRole", actor_id: 5 }]),
+		(value) => delete value.current_user_can_bypass,
+		(value) => (value.current_user_can_bypass = "always"),
+		(value) => delete value.conditions,
+		(value) => (value.conditions.extra = {}),
+		(value) => delete value.conditions.ref_name,
+		(value) => delete value.conditions.ref_name.exclude,
 		(value) => value.conditions.ref_name.exclude.push("refs/tags/pylon-stable-sequence-*"),
+		(value) => delete value.conditions.ref_name.include,
 		(value) => (value.conditions.ref_name.include[1] = "refs/tags/pylon-stable-[0-9]*"),
 		(value) => value.conditions.ref_name.include.pop(),
+		(value) => delete value.rules,
 		(value) => value.rules.pop(),
+		(value) => delete value.rules[0].type,
+		(value) => delete value.rules[0].parameters,
+		(value) => delete value.rules[0].parameters.update_allows_fetch_and_merge,
 		(value) => (value.rules[0].parameters.update_allows_fetch_and_merge = true),
 		(value) => (value.rules[0].parameters.extra = false),
+		(value) => delete value.rules[1].type,
+		(value) => (value.rules[1].extra = false),
 		(value) => value.rules.push({ type: "creation" }),
-		(value) => (value.id = 1),
-		(value) => (value.name = "Other ruleset"),
-		(value) => (value.source = "fork/prime-agent"),
-		(value) => (value.target = "branch"),
-		(value) => delete value.conditions.ref_name.exclude,
-		(value) => (value.conditions.extra = {}),
 	];
 	for (const mutate of mutations) {
 		const changed = structuredClone(valid);
 		mutate(changed);
 		const rejected = await inlinePublicationTagRulesetValidator([changed]);
-		await assert.rejects(() => rejected.validate(), /exact active non-bypassable immutable tag ruleset/);
+		await assert.rejects(() => rejected.validate(), /Authoritative ruleset-auditor response/);
 	}
-	const unavailable = await inlinePublicationTagRulesetValidator([new Error("ruleset auth or endpoint unavailable")]);
-	await assert.rejects(() => unavailable.validate(), /unavailable/);
+	for (const unavailable of [
+		new Error("ruleset auth or endpoint unavailable"),
+		{ status: 401, data: valid },
+		{ status: 403, data: { message: "Resource not accessible by integration" } },
+		{ status: 200, data: { ...valid, bypass_actors: undefined } },
+	]) {
+		const rejected = await inlinePublicationTagRulesetValidator([unavailable]);
+		await assert.rejects(() => rejected.validate(), /unavailable|Authoritative ruleset-auditor response/);
+	}
 	const stale = structuredClone(valid);
 	stale.enforcement = "disabled";
 	const pointInTime = await inlinePublicationTagRulesetValidator([valid, stale]);
 	await pointInTime.validate();
-	await assert.rejects(() => pointInTime.validate(), /exact active non-bypassable immutable tag ruleset/);
+	await assert.rejects(() => pointInTime.validate(), /Authoritative ruleset-auditor response/);
 	assert.equal(pointInTime.requests(), 2, "a stale admission proof must not authorize a later write");
 
-	for (const workflow of [
-		readFileSync(join(root, ".github/workflows/pylon-preview-release.yml"), "utf8"),
-		readFileSync(join(root, ".github/workflows/pylon-stable-release.yml"), "utf8"),
-	]) {
-		for (const mutation of workflow.matchAll(/github\.rest\.git\.createRef/g)) {
-			const proof = workflow.lastIndexOf("await requireExactPublicationTagRuleset();", mutation.index);
-			const between = workflow.slice(proof + "await requireExactPublicationTagRuleset();".length, mutation.index).replace(/\(?await\s*$/, "");
-			assert.ok(proof >= 0 && !/\bawait\b/.test(between), "tag CAS lacks an immediately fresh ruleset proof");
-		}
-		for (const mutation of workflow.matchAll(/github\.rest\.repos\.updateRelease/g)) {
-			const proof = workflow.lastIndexOf("await requireExactPublicationTagRuleset();", mutation.index);
-			const between = workflow.slice(proof + "await requireExactPublicationTagRuleset();".length, mutation.index).replace(/\(?await\s*$/, "");
-			assert.ok(proof >= 0 && !/\bawait\b/.test(between), "immutable publish lacks an immediately fresh ruleset proof");
-		}
-	}
+	const executeProtectedMutation = async ({ appId, privateKey, mint, audit, mutate }) => {
+		if (!appId || !privateKey) throw new Error("GitHub App credentials are required");
+		const token = await mint({ appId, privateKey });
+		if (!token) throw new Error("GitHub App token creation returned no token");
+		await audit(token);
+		await mutate();
+	};
+	let protectedMutationCalls = 0;
+	const base = {
+		appId: "1234",
+		privateKey: "test-private-key",
+		audit: async () => {},
+		mutate: async () => { protectedMutationCalls += 1; },
+	};
+	await assert.rejects(() => executeProtectedMutation({ ...base, privateKey: "", mint: async () => "token" }), /credentials/);
+	await assert.rejects(() => executeProtectedMutation({
+		...base,
+		mint: async () => { throw new Error("simulated create-github-app-token failure"); },
+	}), /simulated create-github-app-token failure/);
+	await assert.rejects(() => executeProtectedMutation({ ...base, mint: async () => "" }), /returned no token/);
+	assert.equal(protectedMutationCalls, 0);
 });
+
 
 test("stable recovery body durably carries bounded exact canonical manifest bytes", () => {
 	const manifest = firstStable();
@@ -2754,10 +2785,14 @@ test("final tag CAS models reject squats and preserve reservation-tag-publish or
 	assert.ok(preview.lastIndexOf("await requireExactTag()") < preview.lastIndexOf("repos.updateRelease"));
 	const stable = readFileSync(join(root, ".github/workflows/pylon-stable-release.yml"), "utf8");
 	const publish = stable.slice(stable.indexOf("name: Reserve and publish immutable stable sequence"));
-	assert.ok(publish.indexOf('POST /repos/{owner}/{repo}/releases/{release_id}/assets') < publish.indexOf("refs/tags/${reservationTag}"));
-	assert.ok(publish.indexOf("downloadedBytes.equals(bytes)") < publish.indexOf("refs/tags/${reservationTag}"));
-	assert.ok(publish.indexOf("refs/tags/${reservationTag}") < publish.indexOf("refs/tags/${manifest.tag}"));
-	assert.ok(publish.indexOf("refs/tags/${manifest.tag}") < publish.indexOf("repos.updateRelease"));
+	const reservationCas = publish.indexOf("- name: Create the exact protected stable reservation ref");
+	const stableTagCas = publish.indexOf("- name: Create or refetch the exact protected stable tag");
+	const immutablePublish = publish.indexOf("- name: Publish only the exact protected stable draft");
+	assert.ok(publish.indexOf('POST /repos/{owner}/{repo}/releases/{release_id}/assets') < reservationCas);
+	assert.ok(publish.indexOf("downloadedBytes.equals(bytes)") < reservationCas);
+	assert.ok(reservationCas >= 0 && reservationCas < stableTagCas);
+	assert.ok(stableTagCas < immutablePublish);
+	assert.ok(immutablePublish < publish.indexOf("repos.updateRelease"));
 });
 
 test("workflow static policy proves direct approvals and every contents-write graph", () => {
@@ -2780,6 +2815,7 @@ test("workflow static policy proves direct approvals and every contents-write gr
 	};
 	const needs = (block, job) => new RegExp(`^    needs:.*(?:\\[|, | )${job}(?:\\]|,|$)`, "m").test(block);
 	assert.equal(ATTEST_ACTION_CHAIN, "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d");
+	assert.equal(CREATE_GITHUB_APP_TOKEN_ACTION, "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349");
 	const preview = workflows.get(".github/workflows/pylon-preview-release.yml");
 	const stable = workflows.get(".github/workflows/pylon-stable-release.yml");
 	assert.deepEqual(validateApprovedAttestationWorkflow(preview, "preview"), {
@@ -2797,6 +2833,9 @@ test("workflow static policy proves direct approvals and every contents-write gr
 		preview.replace("subject-path: .npm/pylon-release/artifacts/*", "subject-path: publication/*"),
 		preview.replace("needs: [pack, reproducibility, install]", "needs: pack"),
 		preview.replace("      - name: Generate build provenance", "      - run: node scripts/untrusted.mjs\n      - name: Generate build provenance"),
+		preview.replace("private-key: ${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}", "private-key: ''"),
+		preview.replace("permission-administration: read", "permission-administration: write"),
+		preview.replace("id: ruleset-auditor", "id: ruleset-auditor\n        continue-on-error: true"),
 	]) assert.throws(() => validateApprovedAttestationWorkflow(changed, "preview"));
 
 	const approvedWriters = new Set([
@@ -2817,17 +2856,33 @@ test("workflow static policy proves direct approvals and every contents-write gr
 				assert.doesNotMatch(block, /actions\/checkout|actions\/setup-node|npm (?:ci|run|install)|node scripts\/|\.tgz\b.*(?:exec|run)/);
 			}
 			assert.doesNotMatch(block, /id-token: write|attestations: write/);
+			const protectedMutationWriter = new Set([
+				".github/workflows/pylon-preview-release.yml:stage-draft",
+				".github/workflows/pylon-preview-release.yml:publish",
+				".github/workflows/pylon-stable-release.yml:publish",
+			]).has(identity);
+			if (protectedMutationWriter) {
+				assert.match(block, new RegExp(`^    environment: pylon-${file.includes("preview") ? "preview" : "stable"}$`, "m"));
+				assert.match(block, new RegExp(CREATE_GITHUB_APP_TOKEN_ACTION.replaceAll("/", "\\/")));
+				assert.match(block, /app-id: \$\{\{ vars\.PYLON_RULESET_AUDITOR_APP_ID \}\}/);
+				assert.match(block, /private-key: \$\{\{ secrets\.PYLON_RULESET_AUDITOR_PRIVATE_KEY \}\}/);
+				assert.match(block, /permission-administration: read/);
+				assert.doesNotMatch(block, /skip-token-revoke:|permission-contents:|continue-on-error:/);
+			}
 		}
 	}
 	assert.deepEqual(foundWriters, approvedWriters);
 	const previewJobs = blocks(preview);
 	assert.ok(needs(previewJobs.get("stage-draft"), "verify-attestation"));
+	assert.match(previewJobs.get("stage-draft"), /^    environment: pylon-preview$/m);
 	assert.ok(needs(previewJobs.get("publish"), "stage-draft"));
+	assert.match(previewJobs.get("publish"), /^    environment: pylon-preview$/m);
 	assert.ok(needs(previewJobs.get("publish"), "verify-attestation"));
 	const stableJobs = blocks(stable);
 	assert.ok(needs(stableJobs.get("stage-draft"), "verify-attestation"));
 	assert.ok(needs(stableJobs.get("publish"), "stage-draft"));
 	assert.ok(needs(stableJobs.get("publish"), "authorize-stable-resume"));
+	assert.match(stableJobs.get("publish"), /^    environment: pylon-stable$/m);
 	assert.match(stableJobs.get("authorize-stable-resume"), /environment: pylon-stable/);
 	assert.match(stableJobs.get("authorize-stable-resume"), /permissions: \{\}/);
 	assert.match(stableJobs.get("attest"), /if: .*mode == 'normal'/);
@@ -2836,12 +2891,42 @@ test("workflow static policy proves direct approvals and every contents-write gr
 	assert.match(upstream.get("sync"), /environment: pylon-upstream-sync/);
 	assert.doesNotMatch(workflows.get(".github/workflows/pylon-upstream-sync.yml"), /authorize-upstream-sync/);
 	assert.match(stable, /group: pylon-stable-publication[\s\S]*cancel-in-progress: false/);
-	assert.match(stable, /final live read authorizes the current tip/i);
+	assert.match(stable, /final publish ruleset audit/i);
+	assert.equal((stable.match(/github-token: \$\{\{ steps\.ruleset-auditor\.outputs\.token \}\}/g) ?? []).length, 3);
+	assert.equal((preview.match(/github-token: \$\{\{ steps\.ruleset-auditor\.outputs\.token \}\}/g) ?? []).length, 2);
 	assert.match(stable, /refetched state and stopped without N\+1, move, or delete/);
 	assert.match(stable, /Draft release: \$\{draft\.id\}/);
 	assert.match(stable, /Withdraw build tag:/);
-	assert.match(stable, /separate lightweight tag CAS/);
+	assert.match(stable, /final stable tag CAS/);
 	assert.doesNotMatch(stable, /manifest\.sequence\s*\+\+|updateRef|deleteRef|deleteRelease|deleteReleaseAsset/);
+	const stepBlocks = (job) => {
+		const matches = [...job.matchAll(/^      - name: (.+)$/gm)];
+		return matches.map((match, index) => ({
+			name: match[1],
+			block: job.slice(match.index, matches[index + 1]?.index ?? job.length),
+		}));
+	};
+	const mutationInventory = [];
+	for (const [workflow, jobs] of [["preview", previewJobs], ["stable", stableJobs]]) {
+		for (const [jobName, job] of jobs) {
+			const steps = stepBlocks(job);
+			for (let index = 0; index < steps.length; index += 1) {
+				if (!/github\.rest\.git\.createRef|github\.rest\.repos\.updateRelease/.test(steps[index].block)) continue;
+				mutationInventory.push(`${workflow}:${jobName}:${steps[index].name}`);
+				assert.match(steps[index - 1].block, /github-token: \$\{\{ steps\.ruleset-auditor\.outputs\.token \}\}/,
+					"each protected mutation needs an adjacent fresh App-authenticated audit");
+				assert.doesNotMatch(steps[index].block, /ruleset-auditor\.outputs\.token|PYLON_RULESET_AUDITOR/,
+					"the App token must not enter a contents-write step");
+			}
+		}
+	}
+	assert.deepEqual(mutationInventory.sort(), [
+		"preview:publish:Publish the exact approved preview draft",
+		"preview:stage-draft:Create or refetch the exact protected preview tag",
+		"stable:publish:Create or refetch the exact protected stable tag",
+		"stable:publish:Create the exact protected stable reservation ref",
+		"stable:publish:Publish only the exact protected stable draft",
+	].sort());
 	const attestationVerifier = readFileSync(join(root, "scripts/verify-pylon-publication-attestations.mjs"), "utf8");
 	for (const flag of ["--cert-identity", "--signer-digest", "--source-ref", "--source-digest", "--cert-oidc-issuer", "--predicate-type", "--deny-self-hosted-runners"]) {
 		assert.match(attestationVerifier, new RegExp(flag));

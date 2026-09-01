@@ -11,6 +11,7 @@ import {
 export const ATTEST_BUILD_PROVENANCE_ACTION = "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8";
 // The pinned composite action above immutably delegates to this reviewed signer implementation.
 export const ATTEST_ACTION_CHAIN = "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d";
+export const CREATE_GITHUB_APP_TOKEN_ACTION = "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349";
 
 function jobNames(workflow) {
 	const lines = workflow.replaceAll("\r\n", "\n").split("\n");
@@ -33,6 +34,14 @@ function jobBlock(workflow, jobName) {
 		}
 	}
 	return lines.slice(start, end).join("\n");
+}
+
+function stepBlocks(block) {
+	const matches = [...block.matchAll(/^      - name: (.+)$/gm)];
+	return matches.map((match, index) => ({
+		name: match[1],
+		block: block.slice(match.index, matches[index + 1]?.index ?? block.length),
+	}));
 }
 
 function scalar(block, name) {
@@ -156,12 +165,84 @@ export function validateApprovedAttestationWorkflow(workflow, channel) {
 	}
 	const stage = blocks.get("stage-draft");
 	const publisher = blocks.get("publish");
+	const protectedMutationJobs = channel === "preview" ? new Set(["stage-draft", "publish"]) : new Set(["publish"]);
 	for (const [name, block] of [["stage-draft", stage], ["publish", publisher]]) {
-		if (mapping(block, "permissions").contents !== "write" || /id-token:\s*write|attestations:\s*write|^    environment:/m.test(block)) {
-			throw new Error(`${name} does not isolate contents write from approval and OIDC.`);
+		if (mapping(block, "permissions").contents !== "write" || /id-token:\s*write|attestations:\s*write/.test(block)) {
+			throw new Error(`${name} does not isolate contents write from OIDC.`);
+		}
+		const environmentMatches = [...block.matchAll(/^    environment:\s*(\S+)\s*$/gm)].map((match) => match[1]);
+		if (protectedMutationJobs.has(name)) {
+			if (environmentMatches.length !== 1 || environmentMatches[0] !== policy.environment) {
+				throw new Error(`${name} lacks its direct protected mutation environment.`);
+			}
+		} else if (environmentMatches.length !== 0) {
+			throw new Error(`${name} unexpectedly carries a protected environment.`);
 		}
 		assertNoDownloadedOrRepositoryExecution(block, `${name} contents publisher`);
 	}
+
+	const expectedAudits = channel === "preview" ? { "stage-draft": 1, publish: 1 } : { publish: 3 };
+	const authoritativeValidators = new Set();
+	const protectedMutations = [];
+	for (const [name, expectedAuditCount] of Object.entries(expectedAudits)) {
+		const block = blocks.get(name);
+		const steps = stepBlocks(block);
+		const mintSteps = steps.filter((step) => step.block.includes(`uses: ${CREATE_GITHUB_APP_TOKEN_ACTION}`));
+		if (mintSteps.length !== 1) throw new Error(`${name} needs one exact ruleset-auditor token mint.`);
+		const mint = mintSteps[0].block;
+		for (const required of [
+			"id: ruleset-auditor",
+			"app-id: ${{ vars.PYLON_RULESET_AUDITOR_APP_ID }}",
+			"private-key: ${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}",
+			"owner: pylon-code",
+			"repositories: prime-agent",
+			"permission-administration: read",
+		]) if (!mint.includes(required)) throw new Error(`${name} ruleset-auditor mint input differs.`);
+		if (/continue-on-error:|skip-token-revoke:|permission-contents:|permission-administration:\s*write/.test(mint)) {
+			throw new Error(`${name} ruleset-auditor token is not fail-closed, revocable, and read-only.`);
+		}
+		const audits = steps.filter((step) => step.block.includes("github-token: ${{ steps.ruleset-auditor.outputs.token }}"));
+		if (audits.length !== expectedAuditCount) throw new Error(`${name} lacks one fresh authoritative audit per protected mutation.`);
+		for (const audit of audits) {
+			if (
+				!/GET \/repos\/\{owner\}\/\{repo\}\/rulesets\/\{ruleset_id\}/.test(audit.block) ||
+				!/ruleset_id: 21950766/.test(audit.block) ||
+				!/Object\.hasOwn\(ruleset, "bypass_actors"\)/.test(audit.block) ||
+				!/Object\.hasOwn\(ruleset, "current_user_can_bypass"\)/.test(audit.block) ||
+				!/current_user_can_bypass !== "never"/.test(audit.block) ||
+				!/refs\/tags\/pylon-stable-sequence-000001/.test(audit.block) ||
+				/github\.rest\.git\.createRef|github\.rest\.repos\.updateRelease|github\.rest\.git\.createTag|repos\.createRelease/.test(audit.block)
+			) throw new Error(`${name} ruleset audit is not the exact read-only authoritative proof.`);
+			const script = audit.block.slice(audit.block.indexOf("          script: |"));
+			authoritativeValidators.add(script);
+		}
+		for (let index = 0; index < steps.length; index += 1) {
+			const mutation = steps[index];
+			if (!/github\.rest\.git\.createRef|github\.rest\.repos\.updateRelease/.test(mutation.block)) continue;
+			protectedMutations.push(`${name}:${mutation.name}`);
+			const audit = steps[index - 1];
+			if (!audit?.block.includes("github-token: ${{ steps.ruleset-auditor.outputs.token }}")) {
+				throw new Error(`${name} protected mutation lacks an adjacent fresh authoritative audit.`);
+			}
+			if (mutation.block.includes("steps.ruleset-auditor.outputs.token") || mutation.block.includes("PYLON_RULESET_AUDITOR")) {
+				throw new Error(`${name} passes the ruleset-auditor credential to a contents mutation.`);
+			}
+		}
+	}
+	if (authoritativeValidators.size !== 1) throw new Error("Protected mutations do not share one frozen authoritative ruleset validator.");
+	const expectedMutations = channel === "preview"
+		? ["publish:Publish the exact approved preview draft", "stage-draft:Create or refetch the exact protected preview tag"]
+		: [
+			"publish:Create or refetch the exact protected stable tag",
+			"publish:Create the exact protected stable reservation ref",
+			"publish:Publish only the exact protected stable draft",
+		];
+	if (canonicalList(protectedMutations) !== canonicalList(expectedMutations)) {
+		throw new Error("Protected mutation inventory differs from the closed ruleset-auditor policy.");
+	}
+	const nonAuditRulesetReads = [...workflow.matchAll(/GET \/repos\/\{owner\}\/\{repo\}\/rulesets\/\{ruleset_id\}/g)].length -
+		Object.values(expectedAudits).reduce((total, count) => total + count, 0);
+	if (nonAuditRulesetReads !== 0) throw new Error("Normal GITHUB_TOKEN ruleset admission is incorrectly treated as authoritative.");
 	if (!needs(stage).includes("verify-attestation")) throw new Error("Draft staging is not directly downstream of verified approval evidence.");
 	if (!needs(publisher).includes("stage-draft") || !needs(publisher).includes("verify-attestation") && channel === "preview") {
 		throw new Error("Final publisher dependency path differs from the approved graph.");

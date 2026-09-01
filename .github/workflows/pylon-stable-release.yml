@@ -88,43 +88,6 @@ jobs:
               (originalOperation === "withdraw" && !/^pylon-stable-[0-9]{6}-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(process.env.REVOKE_STABLE_TAG)) ||
               (originalOperation === "withdraw" && !/^[a-z0-9][a-z0-9-]{2,63}$/.test(process.env.REASON))
             ) throw new Error("Stable operation or recovery inputs are malformed.");
-            const requireExactPublicationTagRuleset = async () => {
-              const response = await github.request("GET /repos/{owner}/{repo}/rulesets/{ruleset_id}", {
-                owner, repo, ruleset_id: 21950766,
-                headers: { accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
-              });
-              const ruleset = response?.data;
-              const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) &&
-                JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
-              const bypassActors = ruleset && Object.hasOwn(ruleset, "bypass_actors") ? ruleset.bypass_actors : [];
-              const conditions = ruleset?.conditions;
-              const refName = conditions?.ref_name;
-              const includes = refName?.include;
-              const excludes = refName?.exclude;
-              const rules = ruleset?.rules;
-              const updateRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "update") : [];
-              const deletionRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "deletion") : [];
-              const expectedIncludes = ["refs/tags/pylon-build-*", "refs/tags/pylon-stable-*"];
-              const stableReservationRef = "refs/tags/pylon-stable-sequence-000001";
-              const stableReservationCovered = Array.isArray(includes) && includes.some((pattern) =>
-                typeof pattern === "string" && pattern.endsWith("*") && stableReservationRef.startsWith(pattern.slice(0, -1))
-              );
-              if (
-                response?.status !== 200 || ruleset?.id !== 21950766 || ruleset?.name !== "Pylon immutable publication tags" ||
-                ruleset?.source_type !== "Repository" || ruleset?.source !== "pylon-code/prime-agent" ||
-                ruleset?.target !== "tag" || ruleset?.enforcement !== "active" ||
-                !Array.isArray(bypassActors) || bypassActors.length !== 0 ||
-                !exactKeys(conditions, ["ref_name"]) || !exactKeys(refName, ["exclude", "include"]) ||
-                !Array.isArray(excludes) || excludes.length !== 0 || !Array.isArray(includes) ||
-                JSON.stringify([...includes].sort()) !== JSON.stringify(expectedIncludes) || !stableReservationCovered ||
-                !Array.isArray(rules) || rules.length !== 2 || updateRules.length !== 1 || deletionRules.length !== 1 ||
-                !exactKeys(updateRules[0], ["parameters", "type"]) ||
-                !exactKeys(updateRules[0]?.parameters, ["update_allows_fetch_and_merge"]) ||
-                updateRules[0]?.parameters?.update_allows_fetch_and_merge !== false ||
-                !exactKeys(deletionRules[0], ["type"])
-              ) throw new Error("Pylon publication requires the one exact active non-bypassable immutable tag ruleset.");
-            };
-            await requireExactPublicationTagRuleset();
             const pylon = await github.rest.git.getRef({ owner, repo, ref: "heads/pylon" });
             if (pylon.data.object.type !== "commit" || pylon.data.object.sha !== context.sha) {
               throw new Error("Stable dispatch is stale relative to protected pylon.");
@@ -788,12 +751,14 @@ jobs:
     needs: [admission, install, prepare, attest, verify-attestation, stage-draft, authorize-stable-resume]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    environment: pylon-stable
     permissions:
       actions: read
       checks: read
       contents: write
     steps:
-      - name: Re-download the exact draft, reserve N once, and publish only that draft
+      - name: Re-download and validate the exact stable transaction
+        id: transaction
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         env:
           DRAFT_ID: ${{ needs.stage-draft.outputs.draft_id || needs.prepare.outputs.draft_id }}
@@ -819,43 +784,6 @@ jobs:
               repository !== "pylon-code/prime-agent" || context.eventName !== "workflow_dispatch" || context.ref !== "refs/heads/pylon" ||
               !Number.isSafeInteger(draftId) || draftId < 1 || !["normal", "resume"].includes(mode) || !["promote", "withdraw"].includes(operation)
             ) throw new Error("Stable publisher requires one exact canonical transaction.");
-            const requireExactPublicationTagRuleset = async () => {
-              const response = await github.request("GET /repos/{owner}/{repo}/rulesets/{ruleset_id}", {
-                owner, repo, ruleset_id: 21950766,
-                headers: { accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
-              });
-              const ruleset = response?.data;
-              const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) &&
-                JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
-              const bypassActors = ruleset && Object.hasOwn(ruleset, "bypass_actors") ? ruleset.bypass_actors : [];
-              const conditions = ruleset?.conditions;
-              const refName = conditions?.ref_name;
-              const includes = refName?.include;
-              const excludes = refName?.exclude;
-              const rules = ruleset?.rules;
-              const updateRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "update") : [];
-              const deletionRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "deletion") : [];
-              const expectedIncludes = ["refs/tags/pylon-build-*", "refs/tags/pylon-stable-*"];
-              const stableReservationRef = "refs/tags/pylon-stable-sequence-000001";
-              const stableReservationCovered = Array.isArray(includes) && includes.some((pattern) =>
-                typeof pattern === "string" && pattern.endsWith("*") && stableReservationRef.startsWith(pattern.slice(0, -1))
-              );
-              if (
-                response?.status !== 200 || ruleset?.id !== 21950766 || ruleset?.name !== "Pylon immutable publication tags" ||
-                ruleset?.source_type !== "Repository" || ruleset?.source !== "pylon-code/prime-agent" ||
-                ruleset?.target !== "tag" || ruleset?.enforcement !== "active" ||
-                !Array.isArray(bypassActors) || bypassActors.length !== 0 ||
-                !exactKeys(conditions, ["ref_name"]) || !exactKeys(refName, ["exclude", "include"]) ||
-                !Array.isArray(excludes) || excludes.length !== 0 || !Array.isArray(includes) ||
-                JSON.stringify([...includes].sort()) !== JSON.stringify(expectedIncludes) || !stableReservationCovered ||
-                !Array.isArray(rules) || rules.length !== 2 || updateRules.length !== 1 || deletionRules.length !== 1 ||
-                !exactKeys(updateRules[0], ["parameters", "type"]) ||
-                !exactKeys(updateRules[0]?.parameters, ["update_allows_fetch_and_merge"]) ||
-                updateRules[0]?.parameters?.update_allows_fetch_and_merge !== false ||
-                !exactKeys(deletionRules[0], ["type"])
-              ) throw new Error("Pylon publication requires the one exact active non-bypassable immutable tag ruleset.");
-            };
-            await requireExactPublicationTagRuleset();
             const current = await github.rest.git.getRef({ owner, repo, ref: "heads/pylon" });
             if (current.data.object.type !== "commit" || current.data.object.sha !== context.sha) throw new Error("Stable publication run is stale relative to live pylon.");
             let draft = (await github.rest.repos.getRelease({ owner, repo, release_id: draftId })).data;
@@ -1098,9 +1026,11 @@ jobs:
               ) throw new Error("Stable reservation belongs to a different exact transaction.");
               return annotation;
             };
+            let reservationSha;
             if (process.env.RESERVATION_PRESENT === "true") {
               if (mode !== "resume") throw new Error("Only explicit recovery may consume an existing reservation.");
               await requireReservation();
+              reservationSha = reservation.object.sha;
             } else {
               if (reservation) throw new Error("A draft-only transaction found an unexpected sequence reservation; explicit reservation recovery is required.");
               const annotated = (await github.rest.git.createTag({
@@ -1111,56 +1041,312 @@ jobs:
                   date: new Date().toISOString(),
                 },
               })).data;
-              // GitHub has no multi-ref conditional transaction. This final live read authorizes the current tip at this instant.
-              // No fallible build, upload, or validation work occurs between it and the sole N-only compare-and-set ref creation.
-              const finalPylon = await github.rest.git.getRef({ owner, repo, ref: "heads/pylon" });
-              if (finalPylon.data.object.type !== "commit" || finalPylon.data.object.sha !== context.sha) throw new Error("Stable transaction became stale immediately before CAS.");
-              await requireExactPublicationTagRuleset();
-              try {
-                reservation = (await github.rest.git.createRef({
-                  owner, repo, ref: `refs/tags/${reservationTag}`, sha: annotated.sha,
-                })).data;
-              } catch (error) {
-                if (error.status === 422) {
-                  try { reservation = (await github.rest.git.getRef({ owner, repo, ref: `tags/${reservationTag}` })).data; } catch {}
-                  throw new Error("Stable sequence reservation raced (422); refetched state and stopped without N+1, move, or delete.");
-                }
-                throw error;
-              }
+              if (!/^[0-9a-f]{40}$/.test(annotated.sha ?? "")) throw new Error("Stable reservation annotation lacks an exact object id.");
+              reservationSha = annotated.sha;
             }
-            // The annotated reservation freezes N and its approved tuple. The separate lightweight tag CAS
-            // binds the release name to the exact policy commit before GitHub makes the release immutable.
-            const finalPylon = await github.rest.git.getRef({ owner, repo, ref: "heads/pylon" });
-            if (finalPylon.data.object.type !== "commit" || finalPylon.data.object.sha !== context.sha) {
-              throw new Error("Stable transaction became stale immediately before final tag CAS.");
-            }
-            await requireExactPublicationTagRuleset();
-            if (!stableRef) {
-              try {
-                stableRef = (await github.rest.git.createRef({
-                  owner, repo, ref: `refs/tags/${manifest.tag}`, sha: manifest.promotion.policyCommit,
-                })).data;
-              } catch (error) {
-                if (error.status !== 422) throw error;
-                await requireStableRef();
-              }
-            }
-            await requireStableRef();
-            await requireExactPublicationTagRuleset();
-            await github.rest.repos.updateRelease({ owner, repo, release_id: draft.id, draft: false });
+            core.setOutput("create_reservation", process.env.RESERVATION_PRESENT === "true" ? "false" : "true");
+            core.setOutput("reservation_tag", reservationTag);
+            core.setOutput("reservation_sha", reservationSha);
+            core.setOutput("create_stable_tag", stableRef ? "false" : "true");
+            core.setOutput("stable_tag", manifest.tag);
+            core.setOutput("stable_sha", manifest.promotion.policyCommit);
+            core.setOutput("draft_id", String(draft.id));
 
-            const immutable = (await github.rest.repos.getRelease({ owner, repo, release_id: draft.id })).data;
+      - name: Mint repository-scoped ruleset auditor token
+        id: ruleset-auditor
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.PYLON_RULESET_AUDITOR_APP_ID }}
+          private-key: ${{ secrets.PYLON_RULESET_AUDITOR_PRIVATE_KEY }}
+          owner: pylon-code
+          repositories: prime-agent
+          permission-administration: read
+
+      - name: Require live pylon before the reservation ruleset audit
+        if: steps.transaction.outputs.create_reservation == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const pylon = await github.rest.git.getRef({ ...context.repo, ref: "heads/pylon" });
+            if (pylon.data.object.type !== "commit" || pylon.data.object.sha !== context.sha) {
+              throw new Error("Stable transaction became stale before its reservation ruleset audit.");
+            }
+
+      - name: Require authoritative publication tag ruleset before reservation CAS
+        if: steps.transaction.outputs.create_reservation == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          github-token: ${{ steps.ruleset-auditor.outputs.token }}
+          script: |
+            const response = await github.request("GET /repos/{owner}/{repo}/rulesets/{ruleset_id}", {
+              owner: "pylon-code", repo: "prime-agent", ruleset_id: 21950766,
+              headers: { accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+            });
+            const ruleset = response?.data;
+            const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) &&
+              JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
+            const conditions = ruleset?.conditions;
+            const refName = conditions?.ref_name;
+            const includes = refName?.include;
+            const excludes = refName?.exclude;
+            const rules = ruleset?.rules;
+            const updateRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "update") : [];
+            const deletionRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "deletion") : [];
+            const expectedIncludes = ["refs/tags/pylon-build-*", "refs/tags/pylon-stable-*"];
+            const stableReservationRef = "refs/tags/pylon-stable-sequence-000001";
+            const stableReservationCovered = Array.isArray(includes) && includes.some((pattern) =>
+              typeof pattern === "string" && pattern.endsWith("*") && stableReservationRef.startsWith(pattern.slice(0, -1))
+            );
             if (
-              immutable.immutable !== true || immutable.draft || immutable.tag_name !== manifest.tag || immutable.name !== name ||
-              immutable.body !== body || immutable.prerelease !== false || immutable.target_commitish !== manifest.promotion.policyCommit ||
+              response?.status !== 200 || !ruleset || ruleset.id !== 21950766 || ruleset.name !== "Pylon immutable publication tags" ||
+              ruleset.source_type !== "Repository" || ruleset.source !== "pylon-code/prime-agent" ||
+              ruleset.target !== "tag" || ruleset.enforcement !== "active" ||
+              !Object.hasOwn(ruleset, "bypass_actors") || !Array.isArray(ruleset.bypass_actors) || ruleset.bypass_actors.length !== 0 ||
+              !Object.hasOwn(ruleset, "current_user_can_bypass") || ruleset.current_user_can_bypass !== "never" ||
+              !exactKeys(conditions, ["ref_name"]) || !exactKeys(refName, ["exclude", "include"]) ||
+              !Array.isArray(excludes) || excludes.length !== 0 || !Array.isArray(includes) ||
+              JSON.stringify([...includes].sort()) !== JSON.stringify(expectedIncludes) || !stableReservationCovered ||
+              !Array.isArray(rules) || rules.length !== 2 || updateRules.length !== 1 || deletionRules.length !== 1 ||
+              !exactKeys(updateRules[0], ["parameters", "type"]) ||
+              !exactKeys(updateRules[0]?.parameters, ["update_allows_fetch_and_merge"]) ||
+              updateRules[0]?.parameters?.update_allows_fetch_and_merge !== false ||
+              !exactKeys(deletionRules[0], ["type"])
+            ) throw new Error("Authoritative ruleset-auditor response is missing, redacted, or differs from the exact active non-bypassable immutable tag ruleset.");
+
+      - name: Create the exact protected stable reservation ref
+        if: steps.transaction.outputs.create_reservation == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          RESERVATION_TAG: ${{ steps.transaction.outputs.reservation_tag }}
+          RESERVATION_SHA: ${{ steps.transaction.outputs.reservation_sha }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.RESERVATION_TAG;
+            const sha = process.env.RESERVATION_SHA;
+            if (`${owner}/${repo}` !== "pylon-code/prime-agent" || !/^pylon-stable-sequence-[0-9]{6}$/.test(tag ?? "") || !/^[0-9a-f]{40}$/.test(sha ?? "")) {
+              throw new Error("Stable reservation CAS identity is malformed.");
+            }
+            try {
+              await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha });
+            } catch (error) {
+              if (error.status === 422) {
+                try { await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` }); } catch {}
+                throw new Error("Stable sequence reservation raced (422); refetched state and stopped without N+1, move, or delete.");
+              }
+              throw error;
+            }
+
+      - name: Require the exact reservation and live pylon before final-tag ruleset audit
+        if: steps.transaction.outputs.create_stable_tag == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          RESERVATION_TAG: ${{ steps.transaction.outputs.reservation_tag }}
+          RESERVATION_SHA: ${{ steps.transaction.outputs.reservation_sha }}
+        with:
+          script: |
+            const reservation = await github.rest.git.getRef({ ...context.repo, ref: `tags/${process.env.RESERVATION_TAG}` });
+            if (reservation.data.object.type !== "tag" || reservation.data.object.sha !== process.env.RESERVATION_SHA) {
+              throw new Error("Stable reservation changed before final-tag ruleset audit.");
+            }
+            const pylon = await github.rest.git.getRef({ ...context.repo, ref: "heads/pylon" });
+            if (pylon.data.object.type !== "commit" || pylon.data.object.sha !== context.sha) {
+              throw new Error("Stable transaction became stale before final-tag ruleset audit.");
+            }
+
+      - name: Require authoritative publication tag ruleset before final stable tag CAS
+        if: steps.transaction.outputs.create_stable_tag == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          github-token: ${{ steps.ruleset-auditor.outputs.token }}
+          script: |
+            const response = await github.request("GET /repos/{owner}/{repo}/rulesets/{ruleset_id}", {
+              owner: "pylon-code", repo: "prime-agent", ruleset_id: 21950766,
+              headers: { accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+            });
+            const ruleset = response?.data;
+            const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) &&
+              JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
+            const conditions = ruleset?.conditions;
+            const refName = conditions?.ref_name;
+            const includes = refName?.include;
+            const excludes = refName?.exclude;
+            const rules = ruleset?.rules;
+            const updateRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "update") : [];
+            const deletionRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "deletion") : [];
+            const expectedIncludes = ["refs/tags/pylon-build-*", "refs/tags/pylon-stable-*"];
+            const stableReservationRef = "refs/tags/pylon-stable-sequence-000001";
+            const stableReservationCovered = Array.isArray(includes) && includes.some((pattern) =>
+              typeof pattern === "string" && pattern.endsWith("*") && stableReservationRef.startsWith(pattern.slice(0, -1))
+            );
+            if (
+              response?.status !== 200 || !ruleset || ruleset.id !== 21950766 || ruleset.name !== "Pylon immutable publication tags" ||
+              ruleset.source_type !== "Repository" || ruleset.source !== "pylon-code/prime-agent" ||
+              ruleset.target !== "tag" || ruleset.enforcement !== "active" ||
+              !Object.hasOwn(ruleset, "bypass_actors") || !Array.isArray(ruleset.bypass_actors) || ruleset.bypass_actors.length !== 0 ||
+              !Object.hasOwn(ruleset, "current_user_can_bypass") || ruleset.current_user_can_bypass !== "never" ||
+              !exactKeys(conditions, ["ref_name"]) || !exactKeys(refName, ["exclude", "include"]) ||
+              !Array.isArray(excludes) || excludes.length !== 0 || !Array.isArray(includes) ||
+              JSON.stringify([...includes].sort()) !== JSON.stringify(expectedIncludes) || !stableReservationCovered ||
+              !Array.isArray(rules) || rules.length !== 2 || updateRules.length !== 1 || deletionRules.length !== 1 ||
+              !exactKeys(updateRules[0], ["parameters", "type"]) ||
+              !exactKeys(updateRules[0]?.parameters, ["update_allows_fetch_and_merge"]) ||
+              updateRules[0]?.parameters?.update_allows_fetch_and_merge !== false ||
+              !exactKeys(deletionRules[0], ["type"])
+            ) throw new Error("Authoritative ruleset-auditor response is missing, redacted, or differs from the exact active non-bypassable immutable tag ruleset.");
+
+      - name: Create or refetch the exact protected stable tag
+        if: steps.transaction.outputs.create_stable_tag == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          STABLE_TAG: ${{ steps.transaction.outputs.stable_tag }}
+          STABLE_SHA: ${{ steps.transaction.outputs.stable_sha }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = process.env.STABLE_TAG;
+            const sha = process.env.STABLE_SHA;
+            if (`${owner}/${repo}` !== "pylon-code/prime-agent" || !/^pylon-stable-[0-9]{6}-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(tag ?? "") || !/^[0-9a-f]{40}$/.test(sha ?? "")) {
+              throw new Error("Stable tag CAS identity is malformed.");
+            }
+            try {
+              await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha });
+            } catch (error) {
+              if (error.status !== 422) throw error;
+            }
+            const stable = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+            if (stable.data.object.type !== "commit" || stable.data.object.sha !== sha) {
+              throw new Error("Stable publication tag is annotated or targets a different commit.");
+            }
+
+      - name: Require exact refs, draft, and live pylon before final publish ruleset audit
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          DRAFT_ID: ${{ steps.transaction.outputs.draft_id }}
+          EXPECTED_MANIFEST_SHA256: ${{ needs.prepare.outputs.manifest_sha256 }}
+          RESERVATION_TAG: ${{ steps.transaction.outputs.reservation_tag }}
+          RESERVATION_SHA: ${{ steps.transaction.outputs.reservation_sha }}
+          STABLE_TAG: ${{ steps.transaction.outputs.stable_tag }}
+          STABLE_SHA: ${{ steps.transaction.outputs.stable_sha }}
+        with:
+          script: |
+            const crypto = require("node:crypto");
+            const pylon = await github.rest.git.getRef({ ...context.repo, ref: "heads/pylon" });
+            if (pylon.data.object.type !== "commit" || pylon.data.object.sha !== context.sha) {
+              throw new Error("Stable transaction became stale before final publish ruleset audit.");
+            }
+            const reservation = await github.rest.git.getRef({ ...context.repo, ref: `tags/${process.env.RESERVATION_TAG}` });
+            if (reservation.data.object.type !== "tag" || reservation.data.object.sha !== process.env.RESERVATION_SHA) {
+              throw new Error("Stable reservation changed before final publish ruleset audit.");
+            }
+            const stable = await github.rest.git.getRef({ ...context.repo, ref: `tags/${process.env.STABLE_TAG}` });
+            if (stable.data.object.type !== "commit" || stable.data.object.sha !== process.env.STABLE_SHA) {
+              throw new Error("Stable tag changed before final publish ruleset audit.");
+            }
+            const draft = (await github.rest.repos.getRelease({ ...context.repo, release_id: Number(process.env.DRAFT_ID) })).data;
+            const encoded = /^Manifest base64: ([A-Za-z0-9+/]+={0,2})$/m.exec(draft.body ?? "")?.[1];
+            const encodedSize = /^Manifest bytes: ([1-9][0-9]*)$/m.exec(draft.body ?? "")?.[1];
+            const encodedDigest = /^Manifest sha256: ([0-9a-f]{64})$/m.exec(draft.body ?? "")?.[1];
+            const bytes = encoded ? Buffer.from(encoded, "base64") : Buffer.alloc(0);
+            const digest = crypto.createHash("sha256").update(bytes).digest("hex");
+            const asset = draft.assets?.[0];
+            if (
+              !draft.draft || draft.immutable === true || draft.tag_name !== process.env.STABLE_TAG ||
+              draft.name !== `Pylon Prime stable ${process.env.STABLE_TAG}` || draft.prerelease !== false ||
+              draft.target_commitish !== process.env.STABLE_SHA || bytes.toString("base64") !== encoded ||
+              bytes.length !== Number(encodedSize) || digest !== encodedDigest || digest !== process.env.EXPECTED_MANIFEST_SHA256 ||
+              draft.assets?.length !== 1 || asset.name !== "pylon-stable-channel-v1.json" ||
+              asset.size !== bytes.length || asset.digest !== `sha256:${digest}`
+            ) throw new Error("Stable draft changed before final publish ruleset audit.");
+
+      - name: Require authoritative publication tag ruleset before immutable stable publish
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          github-token: ${{ steps.ruleset-auditor.outputs.token }}
+          script: |
+            const response = await github.request("GET /repos/{owner}/{repo}/rulesets/{ruleset_id}", {
+              owner: "pylon-code", repo: "prime-agent", ruleset_id: 21950766,
+              headers: { accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
+            });
+            const ruleset = response?.data;
+            const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) &&
+              JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
+            const conditions = ruleset?.conditions;
+            const refName = conditions?.ref_name;
+            const includes = refName?.include;
+            const excludes = refName?.exclude;
+            const rules = ruleset?.rules;
+            const updateRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "update") : [];
+            const deletionRules = Array.isArray(rules) ? rules.filter((rule) => rule?.type === "deletion") : [];
+            const expectedIncludes = ["refs/tags/pylon-build-*", "refs/tags/pylon-stable-*"];
+            const stableReservationRef = "refs/tags/pylon-stable-sequence-000001";
+            const stableReservationCovered = Array.isArray(includes) && includes.some((pattern) =>
+              typeof pattern === "string" && pattern.endsWith("*") && stableReservationRef.startsWith(pattern.slice(0, -1))
+            );
+            if (
+              response?.status !== 200 || !ruleset || ruleset.id !== 21950766 || ruleset.name !== "Pylon immutable publication tags" ||
+              ruleset.source_type !== "Repository" || ruleset.source !== "pylon-code/prime-agent" ||
+              ruleset.target !== "tag" || ruleset.enforcement !== "active" ||
+              !Object.hasOwn(ruleset, "bypass_actors") || !Array.isArray(ruleset.bypass_actors) || ruleset.bypass_actors.length !== 0 ||
+              !Object.hasOwn(ruleset, "current_user_can_bypass") || ruleset.current_user_can_bypass !== "never" ||
+              !exactKeys(conditions, ["ref_name"]) || !exactKeys(refName, ["exclude", "include"]) ||
+              !Array.isArray(excludes) || excludes.length !== 0 || !Array.isArray(includes) ||
+              JSON.stringify([...includes].sort()) !== JSON.stringify(expectedIncludes) || !stableReservationCovered ||
+              !Array.isArray(rules) || rules.length !== 2 || updateRules.length !== 1 || deletionRules.length !== 1 ||
+              !exactKeys(updateRules[0], ["parameters", "type"]) ||
+              !exactKeys(updateRules[0]?.parameters, ["update_allows_fetch_and_merge"]) ||
+              updateRules[0]?.parameters?.update_allows_fetch_and_merge !== false ||
+              !exactKeys(deletionRules[0], ["type"])
+            ) throw new Error("Authoritative ruleset-auditor response is missing, redacted, or differs from the exact active non-bypassable immutable tag ruleset.");
+
+      - name: Publish only the exact protected stable draft
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          DRAFT_ID: ${{ steps.transaction.outputs.draft_id }}
+          RESERVATION_TAG: ${{ steps.transaction.outputs.reservation_tag }}
+          RESERVATION_SHA: ${{ steps.transaction.outputs.reservation_sha }}
+          STABLE_TAG: ${{ steps.transaction.outputs.stable_tag }}
+          STABLE_SHA: ${{ steps.transaction.outputs.stable_sha }}
+        with:
+          script: |
+            const crypto = require("node:crypto");
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const draftId = Number(process.env.DRAFT_ID);
+            if (`${owner}/${repo}` !== "pylon-code/prime-agent" || !Number.isSafeInteger(draftId) || draftId < 1) {
+              throw new Error("Stable immutable publication identity is malformed.");
+            }
+            await github.rest.repos.updateRelease({ owner, repo, release_id: draftId, draft: false });
+            const immutable = (await github.rest.repos.getRelease({ owner, repo, release_id: draftId })).data;
+            const encoded = /^Manifest base64: ([A-Za-z0-9+/]+={0,2})$/m.exec(immutable.body ?? "")?.[1];
+            const encodedSize = /^Manifest bytes: ([1-9][0-9]*)$/m.exec(immutable.body ?? "")?.[1];
+            const encodedDigest = /^Manifest sha256: ([0-9a-f]{64})$/m.exec(immutable.body ?? "")?.[1];
+            const bytes = encoded ? Buffer.from(encoded, "base64") : Buffer.alloc(0);
+            const digest = crypto.createHash("sha256").update(bytes).digest("hex");
+            if (bytes.toString("base64") !== encoded || bytes.length !== Number(encodedSize) || digest !== encodedDigest) {
+              throw new Error("Published stable recovery envelope differs from its exact manifest bytes.");
+            }
+            const manifest = JSON.parse(bytes);
+            const name = `Pylon Prime stable ${manifest.tag}`;
+            if (
+              immutable.immutable !== true || immutable.draft || immutable.tag_name !== process.env.STABLE_TAG || immutable.name !== name ||
+              immutable.prerelease !== false || immutable.target_commitish !== process.env.STABLE_SHA ||
+              manifest.tag !== process.env.STABLE_TAG || manifest.promotion?.policyCommit !== process.env.STABLE_SHA ||
               immutable.assets?.length !== 1 || immutable.assets[0].name !== "pylon-stable-channel-v1.json" ||
               immutable.assets[0].size !== bytes.length || immutable.assets[0].digest !== `sha256:${digest}`
             ) throw new Error("Stable release immutable postconditions differ from the reserved transaction.");
-            await requireStableRef();
-            reservation = (await github.rest.git.getRef({ owner, repo, ref: `tags/${reservationTag}` })).data;
-            await requireReservation();
-            const after = (await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 }))
+            const stable = await github.rest.git.getRef({ owner, repo, ref: `tags/${process.env.STABLE_TAG}` });
+            if (stable.data.object.type !== "commit" || stable.data.object.sha !== process.env.STABLE_SHA) {
+              throw new Error("Published stable tag differs from the exact policy commit.");
+            }
+            const reservation = await github.rest.git.getRef({ owner, repo, ref: `tags/${process.env.RESERVATION_TAG}` });
+            if (reservation.data.object.type !== "tag" || reservation.data.object.sha !== process.env.RESERVATION_SHA) {
+              throw new Error("Published stable reservation differs from its exact annotation.");
+            }
+            const releases = (await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 }))
               .filter((release) => /^pylon-stable-[0-9]{6}-g/.test(release.tag_name ?? ""));
-            if (after.filter((release) => Number(/^pylon-stable-([0-9]{6})-/.exec(release.tag_name)[1]) === manifest.sequence).length !== 1) {
+            if (releases.filter((release) => release.tag_name === manifest.tag).length !== 1) {
               throw new Error("Stable publication did not retain one globally unique sequence.");
             }

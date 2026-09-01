@@ -11,14 +11,40 @@ Publication fails closed unless all of these controls exist:
 - `pylon-preview` and `pylon-stable` use custom deployment branches with only `pylon`, require reviewer `rynfar` (user id `11325514`), set `prevent_self_review: false`, and set `can_admins_bypass: false`;
 - `pylon-upstream-sync` has the same sole custom `pylon` branch, reviewer, `prevent_self_review: false`, and `can_admins_bypass: false` policy before the scheduled sync workflow is enabled;
 - the stable workflow keeps `pylon-stable-publication` serialized with `cancel-in-progress: false`;
-- active no-bypass repository ruleset `21950766`, **Pylon immutable publication tags**, targets `refs/tags/pylon-build-*` and `refs/tags/pylon-stable-*`, permits creation, and forbids every update and deletion; and
+- active no-bypass repository ruleset `21950766`, **Pylon immutable publication tags**, targets exactly `refs/tags/pylon-build-*` and `refs/tags/pylon-stable-*` with no excludes, reports `bypass_actors: []` and `current_user_can_bypass: never`, permits creation, and forbids every update and deletion; and
 - repository action policy requires full commit-SHA pins.
 
 Before enabling any writer, read back all three environment protection-rule responses. Each must show `can_admins_bypass: false`, reviewer `rynfar`, `prevent_self_review: false`, and exactly one custom deployment branch named `pylon`. Treat a missing, extra, or different value as a publication blocker.
 
-The normal preview and stable attester jobs carry `pylon-preview` and `pylon-stable` directly. Approval therefore occurs before OIDC signing. Read-only verification follows. Every contents writer is downstream of that verified attestation. An explicit stable recovery creates no new attestation, so its mutually exclusive zero-write `authorize-stable-resume` job carries `pylon-stable` instead. The upstream-sync contents writer carries `pylon-upstream-sync` directly. Each path asks for one approval.
+The normal preview and stable attester jobs carry `pylon-preview` and `pylon-stable` directly. Approval therefore occurs before OIDC signing. Read-only verification follows. Every contents writer remains directly downstream of verified attestation or of the mutually exclusive approved recovery path. Every job that creates a protected publication ref or makes a release immutable also carries its channel environment directly. An explicit stable recovery creates no new attestation, so its zero-write `authorize-stable-resume` job carries `pylon-stable`, and the final publisher carries it again. The upstream-sync contents writer carries `pylon-upstream-sync` directly.
 
-The jobs use only `GITHUB_TOKEN`. Do not add npm, R2, PAT, app, or repository secrets. Upstream sync checks out exactly `${{ github.sha }}` and, in the same shell that executes repository code, proves the canonical repository/event/ref, exact `HEAD`, workspace, and immediate live `pylon` SHA; a stale approved run stops before the sync script.
+Environment approval applies per deployment job, not once per workflow. A preview run can therefore ask for approval for attestation, preview-tag staging, and final immutable publication. A normal stable run can ask at attestation and final publication. A recovery run can ask at recovery authorization and final publication. Do not remove a later gate because an earlier job used the same environment. GitHub can group pending deployments in one approval screen, but operators must review every named job before approving it.
+
+Publication uses `GITHUB_TOKEN` for the existing minimum contents/checks/actions operations. It additionally uses one read-only GitHub App installation token only in dedicated inline ruleset-audit steps. The App token never enters a contents mutation, checkout, downloaded artifact, shell, or repository script. The pinned mint action masks the token and revokes it in its post step. Do not set `skip-token-revoke`. Do not add npm, R2, PAT, or other repository secrets. Upstream sync does not use the auditor App. It checks out exactly `${{ github.sha }}` and, in the same shell that executes repository code, proves the canonical repository/event/ref, exact `HEAD`, workspace, and immediate live `pylon` SHA; a stale approved run stops before the sync script.
+
+### Ruleset-auditor GitHub App
+
+Create a dedicated GitHub App for publication ruleset readback:
+
+1. Grant only repository **Administration: read**. Grant no write permission, including no Contents write.
+2. Install it for **Only select repositories**, with only `pylon-code/prime-agent` selected. Do not install it organization-wide.
+3. Generate a private key. Store the App id as the protected-environment variable `PYLON_RULESET_AUDITOR_APP_ID` and the PEM as the protected-environment secret `PYLON_RULESET_AUDITOR_PRIVATE_KEY` in both `pylon-preview` and `pylon-stable`. Do not create repository-level fallbacks.
+4. Keep the pinned `actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349` inputs closed to `owner: pylon-code`, `repositories: prime-agent`, and `permission-administration: read`. Its inspected v2 bundle calls `core.setSecret` before exposing the token and revokes it with `DELETE /installation/token` in the post action.
+
+A missing environment variable, omitted secret, unavailable installation, token-mint failure, endpoint/auth failure, redacted response, or token-revocation setup change blocks mutation. The normal public `GITHUB_TOKEN` response can omit `bypass_actors` and `current_user_can_bypass`. Admission therefore does not treat that response as authoritative and never converts a missing field to an empty or safe value. Only the fresh App-authenticated response immediately adjacent to a protected ref CAS or immutable publish is authoritative.
+
+For a live readback, first place a short-lived installation token from this App in `PYLON_RULESET_AUDITOR_INSTALLATION_TOKEN` using approved secret tooling. Do not use `gh auth token`, a user token, or the App private key for this command. The command sends the token without printing it or the key:
+
+```sh
+GH_TOKEN="$PYLON_RULESET_AUDITOR_INSTALLATION_TOKEN" gh api \
+  --method GET \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'X-GitHub-Api-Version: 2022-11-28' \
+  repos/pylon-code/prime-agent/rulesets/21950766 \
+  --jq '{id,name,source_type,source,target,enforcement,bypass_actors,current_user_can_bypass,conditions,rules}'
+```
+
+Require the two sensitive fields to be present with exact values `[]` and `"never"`. Also require the exact repository source, active tag target, empty excludes, the two includes, reservation-ref coverage, and exactly the update block with `update_allows_fetch_and_merge: false` plus deletion. Missing, extra, or different rules fail closed. Unset the installation token after readback.
 
 ## Preview publication
 
@@ -54,7 +80,7 @@ The canonical preview manifest binds the full source commit/tree, artifact recip
 
 The approved attester signs exactly six subjects with pinned `actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8`, whose reviewed pinned chain delegates to `actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d`. A read-only job verifies the exact subject set, SLSA v1 workflow predicate, GitHub OIDC issuer, signer digest/ref, public Rekor entry, and run invocation. Only then can checkout-free contents jobs fully stage and publish the exact draft.
 
-A publisher re-reads live `pylon` before its first mutation and again at the final tag/publication boundary. It creates or refetches the exact lightweight preview tag and requires the full source commit before making the release immutable. GitHub does not offer an atomic transaction across branch reads, tag creation, and release publication. Each read and compare-and-set is a separate fail-closed point-in-time check; this design does not claim cross-resource atomicity.
+The directly `pylon-preview`-gated staging job re-reads live `pylon`, then a dedicated App-authenticated step reads exact ruleset `21950766` immediately before the separate `GITHUB_TOKEN` preview-tag CAS step. The directly gated publisher repeats live branch/tag checks and a fresh authoritative App read immediately before the separate immutable-release update. A stale admission read is irrelevant. GitHub does not offer an atomic transaction across branch reads, tag creation, and release publication. Each read and compare-and-set is a separate fail-closed point-in-time check; this design does not claim cross-resource atomicity.
 
 ## Preview consumer high-water
 
@@ -111,9 +137,9 @@ Normal stable transaction order is strict:
 4. Prepare one canonical next manifest. The directly `pylon-stable`-gated attester signs that singleton. A separate read-only job verifies it.
 5. A checkout-free contents writer creates or resumes one exact draft. Creation durably places the exact canonical manifest bytes, byte count, and SHA-256 in the bounded release-body recovery envelope before asset upload. It uploads and re-downloads/re-hashes the singleton.
 6. The final checkout-free publisher re-downloads the draft from GitHub Releases, not an old Actions artifact. For a zero-asset crash draft, it recovers only the exact body-carried attested bytes, uploads the missing singleton once, and re-downloads/re-hashes it before any CAS. It rechecks the live current tip/checks, old policy tree/ancestry/checks, immutable preview, recipe, N-1 history, operation fields, and draft id/digest.
-7. It first creates annotated `pylon-stable-sequence-NNNNNN` as the sequence compare-and-set. It then creates or refetches the exact lightweight stable tag at the full policy commit. Only after both exact refs exist does it make that draft immutable and check postconditions.
+7. The directly `pylon-stable`-gated publisher mints one repository-scoped auditor token. Immediately before creating annotated `pylon-stable-sequence-NNNNNN`, before creating or refetching the exact lightweight stable tag, and before making the draft immutable, a separate read-only step uses that token to require the full authoritative ruleset response. Each following mutation step uses only `GITHUB_TOKEN`. Only after both exact refs exist does it make that draft immutable and check postconditions.
 
-The reservation annotation binds sequence, policy commit/tree, the exact promote/withdraw tuple and reason, stable and preview tags, stable-manifest SHA-256, and draft release id. A reservation `422` refetches and stops for explicit recovery. Final tag `422` handling refetches and accepts only the exact lightweight full-commit target; a wrong or annotated object fails before immutable publication. No path selects N+1, moves, deletes, or reuses a ref. The reservation freezes the approved old policy tuple if `pylon` advances later. Reservation CAS, final tag CAS, and release publication are ordered GitHub operations, not one atomic GitHub transaction.
+The reservation annotation binds sequence, policy commit/tree, the exact promote/withdraw tuple and reason, stable and preview tags, stable-manifest SHA-256, and draft release id. A reservation `422` refetches and stops for explicit recovery. Final tag `422` handling refetches and accepts only the exact lightweight full-commit target; a wrong or annotated object fails before immutable publication. No path selects N+1, moves, deletes, or reuses a ref. The reservation freezes the approved old policy tuple if `pylon` advances later. Reservation CAS, final tag CAS, and release publication are ordered GitHub operations, not one atomic GitHub transaction. Each protected mutation has a new ruleset GET; the earlier admission and the prior mutation's GET do not authorize it.
 
 Stable tags remain:
 
