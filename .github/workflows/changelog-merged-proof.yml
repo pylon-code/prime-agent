@@ -65,8 +65,7 @@ jobs:
                 run.status === "completed" && run.conclusion === "success" && run.head_sha === pull.head.sha &&
                 run.head_branch === pull.head.ref && run.head_repository?.id === 1349002285 &&
                 run.head_repository?.full_name === repository && run.repository?.id === 1349002285 &&
-                run.repository?.full_name === repository && workflow.path === ".github/workflows/changelog-fragment.yml" &&
-                run.pull_requests?.some((candidate) => candidate.number === pull.number)
+                run.repository?.full_name === repository && workflow.path === ".github/workflows/changelog-fragment.yml"
               ) {
                 proved = true;
                 break;

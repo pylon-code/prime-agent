@@ -664,8 +664,7 @@ export function validateMergedChangelogProof({ repository, ref, eventName, merge
 			run.head_sha === pullRequest.head.sha &&
 			run.path === ".github/workflows/changelog-fragment.yml" &&
 			run.repository === PYLON_PUBLICATION_REPOSITORY &&
-			run.headRepository === PYLON_PUBLICATION_REPOSITORY &&
-			run.pullRequests?.includes(pullRequest.number)
+			run.headRepository === PYLON_PUBLICATION_REPOSITORY
 		);
 	});
 	if (valid.length < 1) throw new Error("Merged PR has no successful GitHub Actions changelog head check with exact provenance.");

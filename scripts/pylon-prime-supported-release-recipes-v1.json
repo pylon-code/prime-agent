@@ -16,6 +16,13 @@
 			"previewWorkflowSha256": "e790a5da7063bd40fbd886e84945c3200291194fdbd5b002079349e45356a41d",
 			"stableWorkflowPath": ".github/workflows/pylon-stable-release.yml",
 			"stableWorkflowSha256": "dfcecdf6b58f143f9b7a543eadd124c190350ae29ac9eadccb907f1398b0958a"
+		},
+		{
+			"publicationPolicyRevision": 2,
+			"previewWorkflowPath": ".github/workflows/pylon-preview-release.yml",
+			"previewWorkflowSha256": "9f4e3f38fb0bdb9c11662310c5369fb792765a3090e0f74b0ec0b34127b43ed8",
+			"stableWorkflowPath": ".github/workflows/pylon-stable-release.yml",
+			"stableWorkflowSha256": "0f04d1f55f54312d933087d88de6883e8408bb0cd9f060d3b5851d710698b1af"
 		}
 	]
 }

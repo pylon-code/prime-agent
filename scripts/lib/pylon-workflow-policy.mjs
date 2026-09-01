@@ -141,6 +141,12 @@ function assertNoDownloadedOrRepositoryExecution(block, description) {
 	) throw new Error(`${description} may not checkout or execute repository/downloaded code.`);
 }
 
+function assertNoBranchProtectionAdministrationRead(block, description) {
+	if (
+		/branchProtectionRule|requiredStatusChecks|github\.rest\.repos\.(?:getBranchProtection|getAdminBranchProtection)|\/branches\/[^\s"'`]+\/protection/.test(block)
+	) throw new Error(`${description} may not make an Administration-gated branch-protection read.`);
+}
+
 function canonicalList(values) {
 	return JSON.stringify([...values].sort());
 }
@@ -168,6 +174,11 @@ export function validateApprovedAttestationWorkflow(workflow, channel) {
 			: null;
 	if (!policy) throw new Error("Unknown approved attestation channel.");
 	if (!/^permissions:\s*\{\}\s*$/m.test(workflow)) throw new Error("Approved publication workflow needs deny-by-default permissions.");
+	assertNoBranchProtectionAdministrationRead(workflow, "Default-token publication workflow");
+	const admission = jobBlock(workflow, "admission");
+	if (/^    environment:|PYLON_RULESET_AUDITOR|permission-administration|github-token:/m.test(admission)) {
+		throw new Error("Source admission may not receive the protected ruleset-auditor environment or credential.");
+	}
 	const attest = jobBlock(workflow, "attest");
 	if (scalar(attest, "environment") !== policy.environment) throw new Error("Attester lacks its exact approval environment.");
 	exactObject(mapping(attest, "permissions"), {
