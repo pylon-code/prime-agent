@@ -1399,7 +1399,31 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		writeFileSync(path, value, { mode: 0o600 });
 		chmodSync(path, 0o600);
 	};
-	const runConsumerChild = (statePath, candidate) => new Promise((resolveChild, rejectChild) => {
+	const capturedChildren = new Set();
+	const captureChild = (args, options) => {
+		const child = spawn(process.execPath, args, options);
+		let spawnError = null;
+		child.once("error", (error) => { spawnError = error; });
+		const closed = new Promise((resolveChild) => {
+			child.once("close", (code, signal) => resolveChild({ code, signal, spawnError }));
+		});
+		const captured = { child, closed };
+		capturedChildren.add(captured);
+		void closed.then(() => capturedChildren.delete(captured));
+		return captured;
+	};
+	const terminateCapturedChildren = async () => {
+		const children = [...capturedChildren];
+		for (const { child } of children) {
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+		}
+		await Promise.all(children.map(({ closed }) => closed));
+	};
+	const closedChildError = (description, status, stderr) => {
+		if (status.spawnError !== null) return new Error(`${description} failed to spawn: ${status.spawnError.message}`);
+		return new Error(`${description} failed with ${status.code ?? status.signal}: ${stderr}`);
+	};
+	const runConsumerChild = (statePath, candidate) => {
 		const source = `
 			import { withConsumerStateLock } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/pylon-consumer-lock.mjs")).href)};
 			const statePath = process.argv[1];
@@ -1414,20 +1438,19 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 				else { console.error(error.stack); process.exitCode = 1; }
 			}
 		`;
-		const child = spawn(process.execPath, ["--input-type=module", "--eval", source, statePath, candidate], {
-			cwd: resolve("."),
-			stdio: ["ignore", "pipe", "pipe"],
-		});
+		const captured = captureChild(
+			["--input-type=module", "--eval", source, statePath, candidate],
+			{ cwd: resolve("."), stdio: ["ignore", "ignore", "pipe"] },
+		);
 		let stderr = "";
-		child.stderr.setEncoding("utf8");
-		child.stderr.on("data", (chunk) => { stderr += chunk; });
-		child.on("error", rejectChild);
-		child.on("close", (code) => {
-			if ([0, 2].includes(code)) resolveChild(code);
-			else rejectChild(new Error(`consumer child failed with ${code}: ${stderr}`));
+		captured.child.stderr.setEncoding("utf8");
+		captured.child.stderr.on("data", (chunk) => { stderr += chunk; });
+		return captured.closed.then((status) => {
+			if ([0, 2].includes(status.code) && status.spawnError === null) return status.code;
+			throw closedChildError("consumer child", status, stderr);
 		});
-	});
-	const runRotationChild = (statePath) => new Promise((resolveChild, rejectChild) => {
+	};
+	const runRotationChild = (statePath) => {
 		const source = `
 			import { rotateConsumerStateJournal } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/pylon-consumer-lock.mjs")).href)};
 			try {
@@ -1438,22 +1461,66 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 				process.exitCode = 1;
 			}
 		`;
-		const child = spawn(process.execPath, ["--input-type=module", "--eval", source, statePath], {
-			cwd: resolve("."),
-			stdio: ["ignore", "pipe", "pipe"],
-		});
+		const captured = captureChild(
+			["--input-type=module", "--eval", source, statePath],
+			{ cwd: resolve("."), stdio: ["ignore", "pipe", "pipe"] },
+		);
 		let stdout = "";
 		let stderr = "";
-		child.stdout.setEncoding("utf8");
-		child.stderr.setEncoding("utf8");
-		child.stdout.on("data", (chunk) => { stdout += chunk; });
-		child.stderr.on("data", (chunk) => { stderr += chunk; });
-		child.on("error", rejectChild);
-		child.on("close", (code) => {
-			if (code === 0) resolveChild(JSON.parse(stdout));
-			else rejectChild(new Error(`rotation child failed with ${code}: ${stderr}`));
+		captured.child.stdout.setEncoding("utf8");
+		captured.child.stderr.setEncoding("utf8");
+		captured.child.stdout.on("data", (chunk) => { stdout += chunk; });
+		captured.child.stderr.on("data", (chunk) => { stderr += chunk; });
+		return captured.closed.then((status) => {
+			if (status.code === 0 && status.spawnError === null) return JSON.parse(stdout);
+			throw closedChildError("rotation child", status, stderr);
 		});
-	});
+	};
+	const startLegacyLockChild = async (statePath, afterReleasePath = "") => {
+		const source = `
+			import { open } from "node:fs/promises";
+			import { createRequire } from "node:module";
+			const require = createRequire(import.meta.url);
+			const properLockfile = require(${JSON.stringify(nodeRequire.resolve("proper-lockfile"))});
+			const release = await properLockfile.lock(process.argv[1], { realpath: false, retries: 0 });
+			process.stdout.write("locked\\n");
+			process.stdin.resume();
+			await new Promise((resolveInput) => process.stdin.once("end", resolveInput));
+			await release();
+			if (process.argv[2]) {
+				const handle = await open(process.argv[2], "w", 0o600);
+				try {
+					await handle.writeFile("closed\\n");
+					await handle.sync();
+				} finally {
+					await handle.close();
+				}
+			}
+		`;
+		const captured = captureChild(
+			["--input-type=module", "--eval", source, statePath, afterReleasePath],
+			{ cwd: resolve("."), stdio: ["pipe", "pipe", "pipe"] },
+		);
+		const ready = deferred();
+		let stdout = "";
+		let stderr = "";
+		captured.child.stdout.setEncoding("utf8");
+		captured.child.stderr.setEncoding("utf8");
+		captured.child.stdout.on("data", (chunk) => {
+			stdout += chunk;
+			if (stdout.includes("locked\n")) ready.resolve();
+		});
+		captured.child.stderr.on("data", (chunk) => { stderr += chunk; });
+		await Promise.race([
+			ready.promise,
+			captured.closed.then((status) => { throw closedChildError("legacy lock child", status, stderr); }),
+		]);
+		return async () => {
+			captured.child.stdin.end();
+			const status = await captured.closed;
+			if (status.code !== 0 || status.spawnError !== null) throw closedChildError("legacy lock child", status, stderr);
+		};
+	};
 	const v1Fixture = (
 		statePath,
 		{ projection = "one", secondTransition = false, terminal = true, applied = false, ownerPid = 999_999 } = {},
@@ -1556,13 +1623,22 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 	try {
 		const properLockfile = nodeRequire("proper-lockfile");
 		const legacyLivePath = join(fixture, "legacy-live.json");
-		const releaseLegacy = await properLockfile.lock(legacyLivePath, { realpath: false, retries: 0 });
+		const legacyHelperCompletionPath = join(fixture, "legacy-helper-complete");
+		const releaseLegacy = await startLegacyLockChild(legacyLivePath, legacyHelperCompletionPath);
 		await assert.rejects(
 			() => withConsumerStateLock(legacyLivePath, async () => {}, manualRuntime({ value: 1 })),
 			/Legacy consumer lock directory exists.*confirm that no owner remains.*manually/i,
 		);
 		assert.equal(statSync(`${legacyLivePath}.lock`).isDirectory(), true);
 		await releaseLegacy();
+		assert.equal(
+			readFileSync(legacyHelperCompletionPath, "utf8"),
+			"closed\n",
+			"captured helper completion includes its final async write and file-handle close",
+		);
+		rmSync(legacyHelperCompletionPath);
+		await new Promise((resolveImmediate) => setImmediate(resolveImmediate));
+		assert.equal(existsSync(legacyHelperCompletionPath), false, "a captured helper cannot write after completion");
 		await withConsumerStateLock(legacyLivePath, async () => {}, manualRuntime({ value: 1 }));
 		assert.equal(statSync(`${legacyLivePath}.lock`).isFile(), true, "the handoff guard is a permanent regular file");
 		await assert.rejects(
@@ -1581,7 +1657,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			},
 		}));
 		await guardReady.promise;
-		const releaseRaceLegacy = await properLockfile.lock(legacyRacePath, { realpath: false, retries: 0 });
+		const releaseRaceLegacy = await startLegacyLockChild(legacyRacePath);
 		letGuardLink.resolve();
 		await assert.rejects(currentRacer, /Legacy consumer lock directory exists/);
 		await releaseRaceLegacy();
@@ -1960,10 +2036,11 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			}, { stale: 20, update: 10, now: () => 1, startHeartbeat: () => async () => {} });
 			clearInterval(hold);
 		`;
-		const crashingChild = spawn(process.execPath, ["--input-type=module", "--eval", crashingSource, stagedCrashPath], {
-			cwd: resolve("."),
-			stdio: ["ignore", "pipe", "pipe"],
-		});
+		const crashingCapture = captureChild(
+			["--input-type=module", "--eval", crashingSource, stagedCrashPath],
+			{ cwd: resolve("."), stdio: ["ignore", "pipe", "pipe"] },
+		);
+		const crashingChild = crashingCapture.child;
 		const crashingChildStaged = deferred();
 		let crashingChildOutput = "";
 		let crashingChildError = "";
@@ -1974,14 +2051,11 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			if (crashingChildOutput.includes("staged\n")) crashingChildStaged.resolve();
 		});
 		crashingChild.stderr.on("data", (chunk) => { crashingChildError += chunk; });
-		const crashingChildClosed = new Promise((resolveChild, rejectChild) => {
-			crashingChild.on("error", rejectChild);
-			crashingChild.on("close", (code, signal) => resolveChild({ code, signal }));
-		});
+		const crashingChildClosed = crashingCapture.closed;
 		await Promise.race([
 			crashingChildStaged.promise,
-			crashingChildClosed.then(({ code, signal }) => {
-				throw new Error(`staged crash child exited before staging (${code ?? signal}): ${crashingChildError}`);
+			crashingChildClosed.then((status) => {
+				throw closedChildError("staged crash child exited before staging", status, crashingChildError);
 			}),
 		]);
 		assert.equal(crashingChild.kill("SIGKILL"), true);
@@ -2715,6 +2789,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		);
 		assert.equal(swapped, true, "the injected component swap reached the immediate path revalidation boundary");
 	} finally {
+		await terminateCapturedChildren();
 		rmSync(fixture, { recursive: true, force: true });
 	}
 });
