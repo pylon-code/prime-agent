@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
 	chmodSync,
 	closeSync,
@@ -31,6 +32,7 @@ import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { lstat as lstatFile, open as openFileHandle, readdir as readDirectoryEntries } from "node:fs/promises";
 import { test } from "node:test";
+import { parse as parseYaml } from "yaml";
 
 import {
 	createReleaseManifest,
@@ -83,6 +85,21 @@ import {
 	PYLON_PUBLICATION_RULESET_GRAPHQL_VARIABLES,
 } from "./lib/pylon-ruleset-auditor.mjs";
 import { validatePreviewWorkflowRunEvidence, verifyGhAttestationResult } from "./verify-pylon-publication-attestations.mjs";
+import {
+	assertContainerRemoved,
+	assertExactDockerRunArgs,
+	buildDockerRunArgs,
+	copyBoundedSubjects,
+	exactArtifactDirectory,
+	formatPublicFailure,
+	installSignalCleanup,
+	PYLON_SANDBOX_POLICY,
+	PYLON_SANDBOX_PUBLIC_FAIL_STAGES,
+	readFinalReceipt,
+	releaseOnlyCopy,
+	runDetachedProcessGroup,
+	validateImageInspection,
+} from "./run-pylon-release-sandbox.mjs";
 import { recordPreviewHighWater } from "./verify-pylon-preview-history.mjs";
 import { verifyStableHistoryWithState } from "./verify-pylon-stable-history.mjs";
 import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
@@ -376,7 +393,7 @@ test("preview manifest binds the full source tree, build, recipe, and build-mani
 	]) assert.throws(() => createPreviewManifest(release, releaseBytes, invalid), /sequence identity/);
 	for (const invalid of [
 		{ ...invocation, publicationPolicyRevision: 0 },
-		{ ...invocation, publicationPolicyRevision: 3 },
+		{ ...invocation, publicationPolicyRevision: 4 },
 		{ sequenceEpoch: 1, sequence: 17, workflowRunId: "33428882721" },
 	]) assert.throws(() => createPreviewManifest(release, releaseBytes, invalid), /policy revision/);
 	for (const mutate of [
@@ -3139,7 +3156,7 @@ test("stable manifest nested schema rejects extras, malformed identities, unsafe
 		(value) => (value.build.source.tree = "abc"),
 		(value) => (value.build.recipeRevision = 2),
 		(value) => delete value.build.publicationPolicyRevision,
-		(value) => (value.build.publicationPolicyRevision = 3),
+		(value) => (value.build.publicationPolicyRevision = 4),
 		(value) => (value.build.releaseManifest.file = "other.json"),
 		(value) => (value.build.previewManifest.file = "other.json"),
 		(value) => (value.build.assets[0].file = "../escape.tgz"),
@@ -3149,7 +3166,7 @@ test("stable manifest nested schema rejects extras, malformed identities, unsafe
 		(value) => value.build.assets.reverse(),
 		(value) => (value.promotion.policyTree = "abc"),
 		(value) => delete value.promotion.publicationPolicyRevision,
-		(value) => (value.promotion.publicationPolicyRevision = 3),
+		(value) => (value.promotion.publicationPolicyRevision = 4),
 	]) {
 		const changed = structuredClone(stable);
 		mutate(changed);
@@ -3598,10 +3615,13 @@ test("recipe and publication policy registries close independent immutable ident
 	const registry = parseSupportedReleaseRecipeRegistry(registryText);
 	const policies = registry.publicationPolicies;
 	const historicalPolicy = policies[0];
+	const previousPolicy = policies[1];
 	const policy = policies.at(-1);
-	assert.deepEqual(policies.map((candidate) => candidate.publicationPolicyRevision), [1, 2]);
+	assert.deepEqual(policies.map((candidate) => candidate.publicationPolicyRevision), [1, 2, 3]);
 	assert.equal(historicalPolicy.previewWorkflowSha256, "e790a5da7063bd40fbd886e84945c3200291194fdbd5b002079349e45356a41d");
 	assert.equal(historicalPolicy.stableWorkflowSha256, "dfcecdf6b58f143f9b7a543eadd124c190350ae29ac9eadccb907f1398b0958a");
+	assert.equal(previousPolicy.previewWorkflowSha256, "9f4e3f38fb0bdb9c11662310c5369fb792765a3090e0f74b0ec0b34127b43ed8");
+	assert.equal(previousPolicy.stableWorkflowSha256, "0f04d1f55f54312d933087d88de6883e8408bb0cd9f060d3b5851d710698b1af");
 	const preview = readFileSync(join(root, policy.previewWorkflowPath), "utf8");
 	const stable = readFileSync(join(root, policy.stableWorkflowPath), "utf8");
 	assert.deepEqual(validateApprovedWorkflowBytes(
@@ -3680,11 +3700,11 @@ test("recipe and publication policy registries close independent immutable ident
 		/Administration-gated branch-protection read/,
 	);
 
-	assert.match(preview, /--publication-policy-revision 2/);
-	assert.match(preview, /preview(?:Manifest)?\.publicationPolicyRevision !== 2/);
-	assert.match(stable, /--publication-policy-revision 2/);
-	assert.match(stable, /promotion\?\.publicationPolicyRevision !== 2/);
-	assert.match(stable, /!\[1, 2\]\.includes\(manifest\.build\.publicationPolicyRevision\)/);
+	assert.match(preview, /--publication-policy-revision 3/);
+	assert.match(preview, /preview(?:Manifest)?\.publicationPolicyRevision !== 3/);
+	assert.match(stable, /--publication-policy-revision 3/);
+	assert.match(stable, /promotion\?\.publicationPolicyRevision !== 3/);
+	assert.match(stable, /!\[1, 2, 3\]\.includes\(manifest\.build\.publicationPolicyRevision\)/);
 	assert.throws(
 		() => validateApprovedWorkflowBytes(historicalPolicy.previewWorkflowPath, preview, "preview", 1, policies),
 		/bytes differ/,
@@ -3693,12 +3713,12 @@ test("recipe and publication policy registries close independent immutable ident
 		() => validateApprovedWorkflowBytes(historicalPolicy.stableWorkflowPath, stable, "stable", 1, policies),
 		/bytes differ/,
 	);
-	const promotedByR2 = firstStable();
-	promotedByR2.promotion.publicationPolicyRevision = 2;
-	assert.equal(validateStableManifest(promotedByR2, registry.recipes, policies), promotedByR2);
-	assert.equal(promotedByR2.build.recipeRevision, 1);
-	assert.equal(promotedByR2.build.publicationPolicyRevision, 1);
-	assert.equal(promotedByR2.promotion.publicationPolicyRevision, 2);
+	const promotedByR3 = firstStable();
+	promotedByR3.promotion.publicationPolicyRevision = 3;
+	assert.equal(validateStableManifest(promotedByR3, registry.recipes, policies), promotedByR3);
+	assert.equal(promotedByR3.build.recipeRevision, 1);
+	assert.equal(promotedByR3.build.publicationPolicyRevision, 1);
+	assert.equal(promotedByR3.promotion.publicationPolicyRevision, 3);
 	const stableVerifier = readFileSync(join(root, "scripts/verify-pylon-stable-attestation.mjs"), "utf8");
 	assert.match(stableVerifier, /manifest\.promotion\.publicationPolicyRevision/);
 	assert.doesNotMatch(stableVerifier, /"stable",\s*manifest\.build\.recipeRevision/);
@@ -3706,11 +3726,11 @@ test("recipe and publication policy registries close independent immutable ident
 	assert.match(previewVerifier, /verified\.previewManifest\.publicationPolicyRevision/);
 	for (const mutate of [
 		(value) => delete value.promotion.publicationPolicyRevision,
-		(value) => (value.promotion.publicationPolicyRevision = 3),
+		(value) => (value.promotion.publicationPolicyRevision = 4),
 		(value) => (value.promotion.publicationPolicyRevision = 0),
 		(value) => delete value.build.publicationPolicyRevision,
 	]) {
-		const changed = structuredClone(promotedByR2);
+		const changed = structuredClone(promotedByR3);
 		mutate(changed);
 		assert.throws(() => validateStableManifest(changed, registry.recipes, policies), /policy revision/);
 	}
@@ -6456,7 +6476,7 @@ test("stable stage survives a crash after createRelease by recovering its exact 
 	const oldManifest = process.env.STABLE_MANIFEST;
 	try {
 		const manifest = firstStable();
-		manifest.promotion.publicationPolicyRevision = 2;
+		manifest.promotion.publicationPolicyRevision = 3;
 		const bytes = Buffer.from(canonicalJson(manifest));
 		const manifestPath = join(fixture, PYLON_STABLE_MANIFEST);
 		writeFileSync(manifestPath, bytes);
@@ -6543,6 +6563,877 @@ test("final tag CAS models reject squats and preserve reservation-tag-publish or
 	assert.ok(reservationCas >= 0 && reservationCas < stableTagCas);
 	assert.ok(stableTagCas < immutablePublish);
 	assert.ok(immutablePublish < publish.indexOf("repos.updateRelease"));
+});
+
+test("release sandbox exports a closed Docker argv policy and workflows have exact parsed schemas", async () => {
+	assert.equal(new Set(PYLON_SANDBOX_PUBLIC_FAIL_STAGES).size, PYLON_SANDBOX_PUBLIC_FAIL_STAGES.length);
+	assert.ok(PYLON_SANDBOX_PUBLIC_FAIL_STAGES.every((stage) => /^E_[A-Z_]+$/.test(stage)));
+	for (const stage of PYLON_SANDBOX_PUBLIC_FAIL_STAGES) {
+		assert.equal(formatPublicFailure(stage), `::error::Pylon release sandbox failed closed [${stage}].`);
+	}
+	assert.equal(formatPublicFailure("/private/secret"), "::error::Pylon release sandbox failed closed [E_INTERNAL].");
+	const rejectedArguments = spawnSync(process.execPath, [join(root, "scripts/run-pylon-release-sandbox.mjs"), "--unsafe"], {
+		encoding: "utf8",
+		env: {},
+	});
+	assert.equal(rejectedArguments.status, 1);
+	assert.equal(rejectedArguments.stdout, "");
+	assert.equal(rejectedArguments.stderr.trim(), "::error::Pylon release sandbox failed closed [E_ARGUMENTS].");
+
+	const fixture = (phase, mode = "preview") => ({
+		cidfile: `/control/${phase}.cid`,
+		gid: "1001",
+		mode,
+		name: `pylon-${phase}-fixture`,
+		paths: phase === "contracts" ? { candidate: "/scratch/contract-candidate", dependencies: "/scratch/build/node_modules", source: "/scratch/source" } :
+			phase === "prepare" ? { candidate: "/scratch/real-candidate", source: "/scratch/source" } :
+				phase === "final" ? { candidate: "/scratch/real-candidate", control: "/control/verification", source: "/scratch/source" } :
+					["smoke-cache", "smoke"].includes(phase) ? { artifacts: "/scratch/artifacts", cache: "/scratch/cache", npm: "/scratch/npm.tgz", source: "/scratch/source" } : {
+						build: "/scratch/build",
+						...(phase === "pack" ? { dependencies: "/scratch/build/node_modules" } : {}),
+						git: "/scratch/source/.git",
+						npm: "/scratch/npm.tgz",
+						source: "/scratch/source",
+					},
+		phase,
+		publicationPolicyRevision: 3,
+		runId: "123",
+		runNumber: "456",
+		uid: "1001",
+	});
+	const valueAfter = (args, flag) => {
+		const indexes = args.flatMap((value, index) => value === flag ? [index] : []);
+		assert.equal(indexes.length, 1, `${flag} must be singleton`);
+		return args[indexes[0] + 1];
+	};
+	const expectedDestinations = {
+		dependencies: ["/build", "/build/.git", "/input/npm.tgz", "/source"],
+		pack: ["/build", "/build/.git", "/build/node_modules", "/input/npm.tgz", "/source"],
+		contracts: ["/candidate", "/source", "/source/node_modules"],
+		prepare: ["/candidate", "/source"],
+		final: ["/candidate", "/control", "/source"],
+		"smoke-cache": ["/artifacts", "/cache", "/input/npm.tgz", "/source"],
+		smoke: ["/artifacts", "/cache", "/input/npm.tgz", "/source"],
+	};
+	const writableDestination = { dependencies: "/build", pack: "/build", contracts: "/candidate", prepare: "/candidate", final: "/control", "smoke-cache": "/cache", smoke: "/cache" };
+	const validateArgs = (args, spec) => {
+		assert.equal(assertExactDockerRunArgs(args, spec), true);
+		assert.equal(args[0], "run");
+		assert.equal(valueAfter(args, "--user"), "1001:1001");
+		assert.equal(valueAfter(args, "--pids-limit"), "512");
+		assert.equal(valueAfter(args, "--cpus"), "2");
+		assert.equal(valueAfter(args, "--memory"), "3g");
+		assert.equal(valueAfter(args, "--memory-swap"), "3g");
+		assert.equal(valueAfter(args, "--cap-drop"), "ALL");
+		assert.equal(valueAfter(args, "--security-opt"), "no-new-privileges");
+		assert.equal(valueAfter(args, "--platform"), "linux/amd64");
+		assert.equal(valueAfter(args, "--pull"), "never");
+		assert.equal(valueAfter(args, "--entrypoint"), "/usr/bin/env");
+		assert.equal(args.filter((value) => value === "--init").length, 1);
+		assert.equal(args.filter((value) => value === "--read-only").length, 1);
+		assert.equal(args.filter((value) => value === "--no-healthcheck").length, 1);
+		assert.equal(valueAfter(args, "--network"), ["dependencies", "smoke-cache"].includes(spec.phase) ? "bridge" : "none");
+		assert.equal(args.filter((value) => value === "--tmpfs").length, spec.phase === "smoke" ? 3 : 2);
+		const imageIndex = args.indexOf(PYLON_SANDBOX_POLICY.image);
+		assert.ok(imageIndex > 0);
+		assert.equal(args[imageIndex + 1], "-i");
+		assert.ok(args.slice(imageIndex + 1).includes("/usr/local/bin/node"));
+		assert.doesNotMatch(args.join("\n"), /(?:docker\.sock|\/original|\/runner|\/home\/runner|GITHUB_ENV|GITHUB_PATH|GITHUB_TOKEN|GH_TOKEN|BASH_ENV|NODE_OPTIONS|LD_)/);
+		assert.ok(!args.includes("--env"));
+		assert.ok(!args.includes("--rm"));
+		assert.ok(!args.includes("--privileged"));
+		assert.ok(!args.includes("--cap-add"));
+		assert.ok(!args.includes("--pid"));
+		assert.doesNotMatch(args.slice(imageIndex + 1).join("\n"), /(?:\/bin\/sh|\/usr\/bin\/bash|^sh$|^bash$)/m);
+		const mounts = args.flatMap((value, index) => args[index - 1] === "--mount" ? [value] : []);
+		const destinations = mounts.map((value) => value.match(/(?:^|,)dst=([^,]+)/)?.[1]);
+		assert.equal(new Set(destinations).size, destinations.length);
+		assert.deepEqual([...destinations].sort(), [...expectedDestinations[spec.phase]].sort());
+		for (const [index, mount] of mounts.entries()) {
+			if (destinations[index] === writableDestination[spec.phase]) assert.doesNotMatch(mount, /,readonly$/);
+			else assert.match(mount, /,readonly$/);
+		}
+	};
+	for (const phase of ["dependencies", "pack", "contracts", "prepare", "final", "smoke-cache", "smoke"]) {
+		const spec = fixture(phase);
+		const args = buildDockerRunArgs(spec);
+		validateArgs(args, spec);
+		const imageIndex = args.indexOf(PYLON_SANDBOX_POLICY.image);
+		const entrypointIndex = args.indexOf("--entrypoint");
+		const healthcheckIndex = args.indexOf("--no-healthcheck");
+		const mutations = [
+			[...args.slice(0, imageIndex), "--network", "host", ...args.slice(imageIndex)],
+			[...args.slice(0, imageIndex), "--user", "0:0", ...args.slice(imageIndex)],
+			[...args.slice(0, imageIndex), "--pids-limit", "-1", ...args.slice(imageIndex)],
+			[...args.slice(0, imageIndex), "--cpus", "999", ...args.slice(imageIndex)],
+			[...args.slice(0, imageIndex), "--memory", "64g", ...args.slice(imageIndex)],
+			[...args.slice(0, imageIndex), "--cap-add", "ALL", ...args.slice(imageIndex)],
+			[...args.slice(0, imageIndex), "--pid", "host", ...args.slice(imageIndex)],
+			[...args.slice(0, imageIndex), "--privileged", ...args.slice(imageIndex)],
+			[...args.slice(0, imageIndex), "--mount", "type=bind,src=/original,dst=/build", ...args.slice(imageIndex)],
+			[...args.slice(0, imageIndex), "--mount", "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock", ...args.slice(imageIndex)],
+			[...args.slice(0, entrypointIndex), ...args.slice(entrypointIndex + 2)],
+			[...args.slice(0, imageIndex), "--entrypoint", "bin/env", ...args.slice(imageIndex)],
+			[...args.slice(0, imageIndex), "--entrypoint", "/bin/sh", ...args.slice(imageIndex)],
+			[...args.slice(0, healthcheckIndex), ...args.slice(healthcheckIndex + 1)],
+			[...args.slice(0, imageIndex), "--no-healthcheck", ...args.slice(imageIndex)],
+			["run", ...args],
+			[...args.slice(0, imageIndex + 1), "/bin/sh", "-c", ...args.slice(imageIndex + 1)],
+		];
+		for (const mutation of mutations) assert.throws(() => assertExactDockerRunArgs(mutation, spec));
+	}
+	validateArgs(buildDockerRunArgs(fixture("smoke", "historical")), fixture("smoke", "historical"));
+
+	const imageInspection = {
+		Architecture: "amd64",
+		Config: {
+			Cmd: ["node"],
+			Entrypoint: ["docker-entrypoint.sh"],
+			Env: [
+				"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+				"NODE_VERSION=22.23.2",
+				"YARN_VERSION=1.22.22",
+			],
+		},
+		Id: PYLON_SANDBOX_POLICY.imageConfigId,
+		Os: "linux",
+		RepoDigests: [PYLON_SANDBOX_POLICY.image],
+	};
+	const githubImageInspection = {
+		Architecture: "amd64",
+		Config: {
+			ArgsEscaped: true,
+			AttachStderr: false,
+			AttachStdin: false,
+			AttachStdout: false,
+			Cmd: ["node"],
+			Domainname: "",
+			Entrypoint: ["docker-entrypoint.sh"],
+			Env: [
+				"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+				"NODE_VERSION=22.23.2",
+				"YARN_VERSION=1.22.22",
+			],
+			ExposedPorts: null,
+			Healthcheck: null,
+			Hostname: "",
+			Image: "",
+			Labels: null,
+			MacAddress: "",
+			NetworkDisabled: false,
+			OnBuild: null,
+			OpenStdin: false,
+			Shell: null,
+			StdinOnce: false,
+			StopSignal: "",
+			StopTimeout: null,
+			Tty: false,
+			User: "",
+			Volumes: null,
+			WorkingDir: "",
+		},
+		Id: PYLON_SANDBOX_POLICY.imageConfigId,
+		Os: "linux",
+		RepoDigests: [`docker.io/library/${PYLON_SANDBOX_POLICY.image}`],
+		Variant: null,
+	};
+	const emptyImageInspection = structuredClone(githubImageInspection);
+	emptyImageInspection.Config.ExposedPorts = {};
+	emptyImageInspection.Config.Healthcheck = {};
+	emptyImageInspection.Config.OnBuild = [];
+	emptyImageInspection.Config.Shell = [];
+	emptyImageInspection.Config.Volumes = {};
+	emptyImageInspection.RepoDigests.push(PYLON_SANDBOX_POLICY.image);
+	for (const inspection of [imageInspection, githubImageInspection, emptyImageInspection]) {
+		assert.equal(validateImageInspection(inspection), true);
+	}
+	for (const mutate of [
+		(value) => { value.Config.Volumes = { "/data": {} }; },
+		(value) => { value.Config.Healthcheck = { Test: ["CMD-SHELL", "true"] }; },
+		(value) => { value.Config.User = "node"; },
+		(value) => { value.Config.WorkingDir = "/app"; },
+		(value) => { value.Config.ExposedPorts = { "3000/tcp": {} }; },
+		(value) => { value.Config.OnBuild = ["RUN id"]; },
+		(value) => { value.Config.Shell = ["/bin/sh", "-c"]; },
+		(value) => { value.Config.StopSignal = "SIGTERM"; },
+		(value) => { value.Config.StopTimeout = 1; },
+		(value) => { value.Config.NetworkDisabled = true; },
+		(value) => { value.Config.Hostname = "poison"; },
+		(value) => { value.Config.Entrypoint = ["/bin/sh"]; },
+		(value) => { value.Config.Cmd = ["-c", "id"]; },
+		(value) => { value.Config.Env[1] = "NODE_VERSION=latest"; },
+		(value) => { value.Id = `sha256:${"a".repeat(64)}`; },
+		(value) => { value.Os = "darwin"; },
+		(value) => { value.Architecture = "arm64"; },
+		(value) => { value.Variant = "v8"; },
+		(value) => { value.RepoDigests = []; },
+		(value) => { value.RepoDigests = [`evil.example/node@${PYLON_SANDBOX_POLICY.image.split("@")[1]}`]; },
+		(value) => { value.RepoDigests.push(value.RepoDigests[0]); },
+		(value) => { value.Config = null; },
+	]) {
+		const changed = structuredClone(githubImageInspection);
+		mutate(changed);
+		assert.throws(() => validateImageInspection(changed));
+	}
+
+	const containerId = "b".repeat(64);
+	const removal = { error: undefined, signal: null, status: 0, stdout: `${containerId}\n` };
+	const inspection = { error: undefined, signal: null, status: 1, stderr: `Error response from daemon: No such container: ${containerId}\n` };
+	assert.equal(assertContainerRemoved(containerId, removal, inspection), true);
+	for (const [changedRemoval, changedInspection] of [
+		[{ ...removal, status: 1 }, inspection],
+		[{ ...removal, stdout: "" }, inspection],
+		[removal, { ...inspection, status: 0 }],
+		[removal, { ...inspection, status: null, signal: "SIGTERM" }],
+		[removal, { ...inspection, error: new Error("daemon unavailable") }],
+		[removal, { ...inspection, stderr: "daemon unavailable" }],
+	]) assert.throws(() => assertContainerRemoved(containerId, changedRemoval, changedInspection));
+
+	const packageManifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+	const packageLock = JSON.parse(readFileSync(join(root, "package-lock.json"), "utf8"));
+	assert.equal(packageManifest.devDependencies.yaml, "2.9.0");
+	assert.equal(packageLock.packages[""].devDependencies.yaml, "2.9.0");
+
+	const expectedJobs = {
+  "ciPack": {
+    "name": "Pylon artifact pack (${{ matrix.copy }})",
+    "needs": "trust",
+    "if": "needs.trust.outputs.allowed == 'true'",
+    "runs-on": "ubuntu-24.04",
+    "timeout-minutes": 20,
+    "strategy": {
+      "fail-fast": false,
+      "matrix": {
+        "copy": [
+          "a",
+          "b"
+        ]
+      }
+    },
+    "env": {
+      "PYLON_RELEASE_NODE": "22.23.2",
+      "PYLON_RELEASE_MODE": "ci",
+      "PYLON_RELEASE_NPM": "11.10.1"
+    },
+    "steps": [
+      {
+        "name": "Checkout exact source",
+        "uses": "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+        "with": {
+          "ref": "${{ inputs.checkout_ref || github.ref }}",
+          "persist-credentials": false,
+          "fetch-depth": 1
+        }
+      },
+      {
+        "name": "Setup pinned Node.js",
+        "uses": "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+        "with": {
+          "node-version": "${{ env.PYLON_RELEASE_NODE }}"
+        }
+      },
+      {
+        "name": "Run isolated release sandbox",
+        "id": "sandbox",
+        "shell": "/usr/bin/bash --noprofile --norc -euo pipefail {0}",
+        "run": "node_path=\"$(node -e 'process.stdout.write(require(\"node:fs\").realpathSync.native(process.execPath))')\"\n/usr/bin/env -i \\\n  \"HOME=/tmp\" \\\n  \"PATH=${node_path%/*}:/usr/bin:/bin\" \\\n  \"$node_path\" \"$GITHUB_WORKSPACE/scripts/run-pylon-release-sandbox.mjs\" \\\n  --task pack \\\n  --mode \"$PYLON_RELEASE_MODE\" \\\n  --host-os \"${{ runner.os }}\" \\\n  --workspace \"$GITHUB_WORKSPACE\" \\\n  --github-output \"$GITHUB_OUTPUT\" \\\n  --run-id \"${{ github.run_id }}\" \\\n  --run-number \"${{ github.run_number }}\" \\\n  --publication-policy-revision 3\n"
+      },
+      {
+        "name": "Upload isolated subjects",
+        "uses": "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        "with": {
+          "name": "pylon-prime-pack-${{ matrix.copy }}",
+          "path": "${{ steps.sandbox.outputs.artifact_dir }}",
+          "include-hidden-files": true,
+          "if-no-files-found": "error",
+          "retention-days": 3
+        }
+      }
+    ]
+  },
+  "ciInstall": {
+    "name": "Pylon artifact install (${{ matrix.os }})",
+    "needs": [
+      "trust",
+      "pylon-artifact-pack",
+      "pylon-artifact-reproducibility"
+    ],
+    "if": "needs.trust.outputs.allowed == 'true'",
+    "runs-on": "${{ matrix.os }}",
+    "timeout-minutes": 15,
+    "permissions": {
+      "actions": "read",
+      "contents": "read"
+    },
+    "strategy": {
+      "fail-fast": false,
+      "matrix": {
+        "os": [
+          "ubuntu-24.04",
+          "macos-15"
+        ]
+      }
+    },
+    "env": {
+      "PYLON_RELEASE_NODE": "22.23.2",
+      "PYLON_RELEASE_MODE": "ci",
+      "PYLON_RELEASE_NPM": "11.10.1"
+    },
+    "steps": [
+      {
+        "name": "Checkout exact source",
+        "uses": "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+        "with": {
+          "ref": "${{ inputs.checkout_ref || github.ref }}",
+          "persist-credentials": false,
+          "fetch-depth": 1
+        }
+      },
+      {
+        "name": "Setup pinned Node.js",
+        "uses": "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+        "with": {
+          "node-version": "${{ env.PYLON_RELEASE_NODE }}"
+        }
+      },
+      {
+        "name": "Download reproducible pack",
+        "uses": "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "with": {
+          "name": "pylon-prime-pack-a",
+          "path": ".npm/pylon-release/artifacts"
+        }
+      },
+      {
+        "name": "Run isolated artifact smoke",
+        "shell": "/usr/bin/bash --noprofile --norc -euo pipefail {0}",
+        "run": "node_path=\"$(node -e 'process.stdout.write(require(\"node:fs\").realpathSync.native(process.execPath))')\"\n/usr/bin/env -i \\\n  \"HOME=/tmp\" \\\n  \"PATH=${node_path%/*}:/usr/bin:/bin\" \\\n  \"$node_path\" \"$GITHUB_WORKSPACE/scripts/run-pylon-release-sandbox.mjs\" \\\n  --task smoke \\\n  --mode \"$PYLON_RELEASE_MODE\" \\\n  --host-os \"${{ runner.os }}\" \\\n  --workspace \"$GITHUB_WORKSPACE\" \\\n  --artifact-dir \"$GITHUB_WORKSPACE/.npm/pylon-release/artifacts\" \\\n  --run-id \"${{ github.run_id }}\" \\\n  --run-number \"${{ github.run_number }}\" \\\n  --publication-policy-revision 3\n"
+      }
+    ]
+  },
+  "previewPack": {
+    "name": "Preview offline pack (${{ matrix.copy }})",
+    "needs": "admission",
+    "runs-on": "ubuntu-24.04",
+    "timeout-minutes": 20,
+    "env": {
+      "PYLON_RELEASE_MODE": "preview"
+    },
+    "permissions": {
+      "contents": "read"
+    },
+    "strategy": {
+      "fail-fast": false,
+      "matrix": {
+        "copy": [
+          "a",
+          "b"
+        ]
+      }
+    },
+    "steps": [
+      {
+        "name": "Checkout exact source",
+        "uses": "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+        "with": {
+          "ref": "${{ github.sha }}",
+          "persist-credentials": false,
+          "fetch-depth": 1
+        }
+      },
+      {
+        "name": "Setup pinned Node.js",
+        "uses": "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+        "with": {
+          "node-version": "${{ env.PYLON_RELEASE_NODE }}"
+        }
+      },
+      {
+        "name": "Run isolated release sandbox",
+        "id": "sandbox",
+        "shell": "/usr/bin/bash --noprofile --norc -euo pipefail {0}",
+        "run": "node_path=\"$(node -e 'process.stdout.write(require(\"node:fs\").realpathSync.native(process.execPath))')\"\n/usr/bin/env -i \\\n  \"HOME=/tmp\" \\\n  \"PATH=${node_path%/*}:/usr/bin:/bin\" \\\n  \"$node_path\" \"$GITHUB_WORKSPACE/scripts/run-pylon-release-sandbox.mjs\" \\\n  --task pack \\\n  --mode \"$PYLON_RELEASE_MODE\" \\\n  --host-os \"${{ runner.os }}\" \\\n  --workspace \"$GITHUB_WORKSPACE\" \\\n  --github-output \"$GITHUB_OUTPUT\" \\\n  --run-id \"${{ github.run_id }}\" \\\n  --run-number \"${{ github.run_number }}\" \\\n  --publication-policy-revision 3\n"
+      },
+      {
+        "name": "Upload isolated subjects",
+        "uses": "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        "with": {
+          "name": "pylon-preview-pack-${{ matrix.copy }}",
+          "path": "${{ steps.sandbox.outputs.artifact_dir }}",
+          "include-hidden-files": true,
+          "if-no-files-found": "error",
+          "retention-days": 3
+        }
+      }
+    ]
+  },
+  "previewInstall": {
+    "name": "Preview installed artifact (${{ matrix.os }})",
+    "needs": [
+      "pack",
+      "reproducibility"
+    ],
+    "runs-on": "${{ matrix.os }}",
+    "timeout-minutes": 15,
+    "env": {
+      "PYLON_RELEASE_MODE": "preview"
+    },
+    "permissions": {
+      "actions": "read",
+      "contents": "read"
+    },
+    "strategy": {
+      "fail-fast": false,
+      "matrix": {
+        "os": [
+          "ubuntu-24.04",
+          "macos-15"
+        ]
+      }
+    },
+    "steps": [
+      {
+        "name": "Checkout exact source",
+        "uses": "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+        "with": {
+          "ref": "${{ github.sha }}",
+          "persist-credentials": false,
+          "fetch-depth": 1
+        }
+      },
+      {
+        "name": "Setup pinned Node.js",
+        "uses": "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+        "with": {
+          "node-version": "${{ env.PYLON_RELEASE_NODE }}"
+        }
+      },
+      {
+        "name": "Verify workflow artifact provenance",
+        "uses": "actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea",
+        "with": {
+          "script": "const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;\nconst workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;\nif (\n  context.repo.owner !== \"pylon-code\" || context.repo.repo !== \"prime-agent\" ||\n  run.id !== context.runId || run.run_number !== Number(process.env.GITHUB_RUN_NUMBER) ||\n  String(run.run_attempt) !== process.env.GITHUB_RUN_ATTEMPT || run.repository?.id !== 1349002285 ||\n  run.repository?.full_name !== \"pylon-code/prime-agent\" || run.head_repository?.id !== 1349002285 ||\n  run.head_repository?.full_name !== \"pylon-code/prime-agent\" || run.event !== context.eventName ||\n  run.head_sha !== context.sha || run.head_branch !== \"pylon\" || context.ref !== \"refs/heads/pylon\" ||\n  workflow.path !== \".github/workflows/pylon-preview-release.yml\"\n) throw new Error(\"Artifact workflow provenance is not canonical.\");\nconst artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {\n  ...context.repo, run_id: context.runId, per_page: 100,\n});\nconst matches = artifacts.filter((artifact) => artifact.name === \"pylon-preview-pack-a\");\nif (matches.length !== 1 || matches[0].expired || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest ?? \"\")) {\n  throw new Error(\"Artifact is ambiguous, expired, or lacks a SHA-256 transport digest.\");\n}\n"
+        }
+      },
+      {
+        "name": "Download byte-identical preview subjects",
+        "uses": "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "with": {
+          "name": "pylon-preview-pack-a",
+          "path": ".npm/pylon-release/artifacts"
+        }
+      },
+      {
+        "name": "Run isolated artifact smoke",
+        "shell": "/usr/bin/bash --noprofile --norc -euo pipefail {0}",
+        "run": "node_path=\"$(node -e 'process.stdout.write(require(\"node:fs\").realpathSync.native(process.execPath))')\"\n/usr/bin/env -i \\\n  \"HOME=/tmp\" \\\n  \"PATH=${node_path%/*}:/usr/bin:/bin\" \\\n  \"$node_path\" \"$GITHUB_WORKSPACE/scripts/run-pylon-release-sandbox.mjs\" \\\n  --task smoke \\\n  --mode \"$PYLON_RELEASE_MODE\" \\\n  --host-os \"${{ runner.os }}\" \\\n  --workspace \"$GITHUB_WORKSPACE\" \\\n  --artifact-dir \"$GITHUB_WORKSPACE/.npm/pylon-release/artifacts\" \\\n  --run-id \"${{ github.run_id }}\" \\\n  --run-number \"${{ github.run_number }}\" \\\n  --publication-policy-revision 3\n"
+      }
+    ]
+  },
+  "stableInstall": {
+    "name": "Stable candidate installed artifact (${{ matrix.os }})",
+    "needs": [
+      "admission",
+      "verify-preview"
+    ],
+    "runs-on": "${{ matrix.os }}",
+    "timeout-minutes": 15,
+    "env": {
+      "PYLON_RELEASE_MODE": "historical"
+    },
+    "permissions": {
+      "actions": "read",
+      "contents": "read"
+    },
+    "strategy": {
+      "fail-fast": false,
+      "matrix": {
+        "os": [
+          "ubuntu-24.04",
+          "macos-15"
+        ]
+      }
+    },
+    "steps": [
+      {
+        "name": "Checkout exact source",
+        "uses": "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+        "with": {
+          "ref": "${{ github.sha }}",
+          "persist-credentials": false,
+          "fetch-depth": 1
+        }
+      },
+      {
+        "name": "Setup pinned Node.js",
+        "uses": "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
+        "with": {
+          "node-version": "${{ env.PYLON_RELEASE_NODE }}"
+        }
+      },
+      {
+        "name": "Verify workflow artifact provenance",
+        "uses": "actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea",
+        "with": {
+          "script": "const run = (await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId })).data;\nconst workflow = (await github.rest.actions.getWorkflow({ ...context.repo, workflow_id: run.workflow_id })).data;\nif (\n  context.repo.owner !== \"pylon-code\" || context.repo.repo !== \"prime-agent\" || run.repository?.id !== 1349002285 ||\n  run.repository?.full_name !== \"pylon-code/prime-agent\" || run.head_repository?.id !== 1349002285 ||\n  run.head_repository?.full_name !== \"pylon-code/prime-agent\" || run.event !== context.eventName ||\n  run.head_sha !== context.sha || run.head_branch !== \"pylon\" || context.ref !== \"refs/heads/pylon\" ||\n  workflow.path !== \".github/workflows/pylon-stable-release.yml\"\n) throw new Error(\"Artifact workflow provenance is not canonical.\");\nconst artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {\n  ...context.repo, run_id: context.runId, per_page: 100,\n});\nconst matches = artifacts.filter((artifact) => artifact.name === \"verified-stable-preview\");\nif (matches.length !== 1 || matches[0].expired || !/^sha256:[0-9a-f]{64}$/.test(matches[0].digest ?? \"\")) {\n  throw new Error(\"Artifact is ambiguous, expired, or lacks a SHA-256 transport digest.\");\n}\n"
+        }
+      },
+      {
+        "name": "Download verified preview bytes",
+        "uses": "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "with": {
+          "name": "verified-stable-preview",
+          "path": ".npm/pylon-release/artifacts"
+        }
+      },
+      {
+        "name": "Run isolated artifact smoke",
+        "shell": "/usr/bin/bash --noprofile --norc -euo pipefail {0}",
+        "run": "node_path=\"$(node -e 'process.stdout.write(require(\"node:fs\").realpathSync.native(process.execPath))')\"\n/usr/bin/env -i \\\n  \"HOME=/tmp\" \\\n  \"PATH=${node_path%/*}:/usr/bin:/bin\" \\\n  \"$node_path\" \"$GITHUB_WORKSPACE/scripts/run-pylon-release-sandbox.mjs\" \\\n  --task smoke \\\n  --mode \"$PYLON_RELEASE_MODE\" \\\n  --host-os \"${{ runner.os }}\" \\\n  --workspace \"$GITHUB_WORKSPACE\" \\\n  --artifact-dir \"$GITHUB_WORKSPACE/.npm/pylon-release/artifacts\" \\\n  --run-id \"${{ github.run_id }}\" \\\n  --run-number \"${{ github.run_number }}\" \\\n  --publication-policy-revision 3\n"
+      }
+    ]
+  }
+};
+	const expectedWorkflowRoots = {
+		ci: {
+			env: undefined,
+			keys: ["concurrency", "jobs", "name", "on", "permissions"],
+		},
+		preview: {
+			env: {
+				PYLON_RELEASE_NODE: "22.23.2",
+				PYLON_RELEASE_NPM: "11.10.1",
+			},
+			keys: ["concurrency", "env", "jobs", "name", "on", "permissions"],
+		},
+		stable: {
+			env: {
+				PYLON_RELEASE_NODE: "22.23.2",
+				PYLON_RELEASE_NPM: "11.10.1",
+			},
+			keys: ["concurrency", "env", "jobs", "name", "on", "permissions"],
+		},
+	};
+	const parseExactWorkflowRoot = (workflow, expected) => {
+		const parsed = parseYaml(workflow, { merge: false, uniqueKeys: true });
+		assert.ok(parsed && typeof parsed === "object" && !Array.isArray(parsed));
+		assert.deepEqual(Object.keys(parsed).sort(), expected.keys);
+		assert.deepEqual(parsed.env, expected.env);
+		assert.ok(parsed.jobs && typeof parsed.jobs === "object" && !Array.isArray(parsed.jobs));
+		return parsed;
+	};
+	const preview = readFileSync(join(root, ".github/workflows/pylon-preview-release.yml"), "utf8");
+	const ci = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8");
+	const stable = readFileSync(join(root, ".github/workflows/pylon-stable-release.yml"), "utf8");
+	const assertExactWorkflows = (ciWorkflow, previewWorkflow, stableWorkflow) => {
+		const parsedCi = parseExactWorkflowRoot(ciWorkflow, expectedWorkflowRoots.ci);
+		const parsedPreview = parseExactWorkflowRoot(previewWorkflow, expectedWorkflowRoots.preview);
+		const parsedStable = parseExactWorkflowRoot(stableWorkflow, expectedWorkflowRoots.stable);
+		assert.deepEqual(parsedCi.jobs["pylon-artifact-pack"], expectedJobs.ciPack);
+		assert.deepEqual(parsedCi.jobs["pylon-artifact-install"], expectedJobs.ciInstall);
+		assert.deepEqual(parsedPreview.jobs.pack, expectedJobs.previewPack);
+		assert.deepEqual(parsedPreview.jobs.install, expectedJobs.previewInstall);
+		assert.deepEqual(parsedStable.jobs.install, expectedJobs.stableInstall);
+	};
+	assertExactWorkflows(ci, preview, stable);
+	assert.doesNotMatch(`${preview}\n${ci}\n${stable}`, /(?:npm install --global|\/usr\/bin\/realpath|\/usr\/bin\/dirname)/);
+	for (const job of [expectedJobs.ciPack, expectedJobs.ciInstall, expectedJobs.previewPack, expectedJobs.previewInstall, expectedJobs.stableInstall]) {
+		const sandbox = job.steps.find((step) => step.name.startsWith("Run isolated"));
+		assert.match(sandbox.run, /^node_path="\$\(node -e 'process\.stdout\.write\(require\("node:fs"\)\.realpathSync\.native\(process\.execPath\)\)'\)"/);
+		assert.match(sandbox.run, /"PATH=\$\{node_path%\/\*\}:\/usr\/bin:\/bin"/);
+	}
+	const capture = spawnSync(process.execPath, ["-e", 'process.stdout.write(require("node:fs").realpathSync.native(process.execPath))'], { encoding: "utf8", env: {} });
+	assert.equal(capture.status, 0);
+	assert.equal(capture.stdout, realpathSync.native(process.execPath));
+
+	const workflowMutations = [
+		[ci.replace("permissions:\n  contents: read", "arbitrary-root-policy: unsafe\n\npermissions:\n  contents: read"), preview, stable],
+		[ci, preview.replace("  PYLON_RELEASE_NPM: 11.10.1", "  PYLON_RELEASE_NPM: 11.10.1\n  BASH_ENV: /tmp/poison"), stable],
+		[ci, preview.replace("  PYLON_RELEASE_NPM: 11.10.1", "  PYLON_RELEASE_NPM: 11.10.1\n  NODE_OPTIONS: --require=/tmp/poison.cjs"), stable],
+		[ci, preview.replace("  PYLON_RELEASE_NPM: 11.10.1", "  PYLON_RELEASE_NPM: 11.10.1\n  GITHUB_PATH: /tmp/poison"), stable],
+		[ci, preview.replace("  PYLON_RELEASE_NODE: 22.23.2", "  PYLON_RELEASE_NODE: latest"), stable],
+		[ci.replace("    name: Pylon artifact pack", "    unknown-policy: true\n    name: Pylon artifact pack"), preview, stable],
+		[ci.replace("      PYLON_RELEASE_MODE: ci", "      PYLON_RELEASE_MODE: ci\n      POISON: yes"), preview, stable],
+		[ci.replace("        id: sandbox", "        id: sandbox\n        env:\n          POISON: yes"), preview, stable],
+		[ci.replace("      - name: Upload isolated subjects", "      - name: Extra host command\n        run: echo unsafe\n\n      - name: Upload isolated subjects"), preview, stable],
+		[ci.replace("        id: sandbox", "        id: sandbox\n        run: echo duplicate"), preview, stable],
+		[ci.replace("        id: sandbox", "        id: sandbox\n        mystery: unsafe"), preview, stable],
+		[ci.replace("          node_path=", "          echo unsafe\n          node_path="), preview, stable],
+		[ci.replace("            --publication-policy-revision 3", "            --publication-policy-revision 3\n          echo unsafe"), preview, stable],
+		[ci.replace("          /usr/bin/env -i", "          sudo /usr/bin/env -i"), preview, stable],
+	];
+	for (const [changedCi, changedPreview, changedStable] of workflowMutations) {
+		assert.throws(() => assertExactWorkflows(changedCi, changedPreview, changedStable));
+	}
+
+	const exerciseRepeatedSignal = async (primarySignal, repeatedSignals) => {
+		const signalTarget = new EventEmitter();
+		const signaledState = {
+			activePgid: null,
+			containers: [{ id: "d".repeat(64) }],
+			control: "/private/control",
+			scratch: "/private/scratch",
+		};
+		const signalCleanup = [];
+		let cleanupCalls = 0;
+		let exitCalls = 0;
+		let capturedPgid;
+		let resolveSignalExit;
+		const signalExit = new Promise((resolveExit) => { resolveSignalExit = resolveExit; });
+		const removeSignalCleanup = installSignalCleanup(signaledState, {
+			cleanupContainers: (state) => {
+				cleanupCalls += 1;
+				assert.equal(state.containers.length, 1);
+				state.containers.length = 0;
+				signalCleanup.push("containers-absent");
+				return true;
+			},
+			exit: (code) => {
+				exitCalls += 1;
+				assert.equal(signaledState.activePgid, null);
+				assert.equal(signaledState.containers.length, 0);
+				assert.throws(() => process.kill(-capturedPgid, 0), (error) => error?.code === "ESRCH");
+				resolveSignalExit(code);
+			},
+			removeOwnedTree: (path) => signalCleanup.push(`removed:${path}`),
+			signalTarget,
+		});
+		const interruptedMacSmoke = runDetachedProcessGroup(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			cwd: root,
+			env: {},
+			lifecycle: signaledState,
+			timeoutMs: 30_000,
+		});
+		const interruptedMacSmokeRejection = assert.rejects(interruptedMacSmoke);
+		capturedPgid = signaledState.activePgid;
+		assert.ok(Number.isSafeInteger(capturedPgid) && capturedPgid > 0);
+		signalTarget.emit(primarySignal);
+		assert.equal(signalTarget.listenerCount("SIGINT"), 1);
+		assert.equal(signalTarget.listenerCount("SIGTERM"), 1);
+		for (const repeatedSignal of repeatedSignals) signalTarget.emit(repeatedSignal);
+		assert.equal(signalTarget.listenerCount("SIGINT"), 1);
+		assert.equal(signalTarget.listenerCount("SIGTERM"), 1);
+		const exitCode = await signalExit;
+		await interruptedMacSmokeRejection;
+		assert.equal(signaledState.activePgid, null);
+		assert.equal(cleanupCalls, 1);
+		assert.equal(exitCalls, 1);
+		assert.deepEqual(signalCleanup, ["containers-absent", "removed:/private/scratch", "removed:/private/control"]);
+		assert.equal(signalTarget.listenerCount("SIGINT"), 0);
+		assert.equal(signalTarget.listenerCount("SIGTERM"), 0);
+		await removeSignalCleanup();
+		return exitCode;
+	};
+	assert.equal(await exerciseRepeatedSignal("SIGTERM", ["SIGTERM", "SIGINT"]), 143);
+	assert.equal(await exerciseRepeatedSignal("SIGINT", ["SIGINT"]), 130);
+
+	const cleanupBoundaryTarget = new EventEmitter();
+	const cleanupBoundaryState = {
+		activePgid: null,
+		containers: [{ id: "c".repeat(64) }],
+		control: "/private/final-control",
+		scratch: "/private/final-scratch",
+	};
+	let absenceProved = false;
+	let resolveBoundaryExit;
+	const boundaryExit = new Promise((resolveExit) => { resolveBoundaryExit = resolveExit; });
+	const removeBoundaryCleanup = installSignalCleanup(cleanupBoundaryState, {
+		cleanupContainers: (state) => {
+			assert.equal(state.containers.length, 1);
+			state.containers.length = 0;
+			absenceProved = true;
+			return true;
+		},
+		exit: (code) => {
+			assert.equal(absenceProved, true);
+			resolveBoundaryExit(code);
+		},
+		removeOwnedTree: () => {},
+		signalTarget: cleanupBoundaryTarget,
+	});
+	const finalHandlerRelease = removeBoundaryCleanup();
+	queueMicrotask(() => {
+		cleanupBoundaryTarget.emit("SIGINT");
+		assert.equal(cleanupBoundaryTarget.listenerCount("SIGINT"), 1);
+		assert.equal(cleanupBoundaryTarget.listenerCount("SIGTERM"), 1);
+		cleanupBoundaryTarget.emit("SIGINT");
+		cleanupBoundaryTarget.emit("SIGTERM");
+	});
+	await finalHandlerRelease;
+	assert.equal(await boundaryExit, 130);
+	assert.equal(cleanupBoundaryState.containers.length, 0);
+	assert.equal(cleanupBoundaryTarget.listenerCount("SIGINT"), 0);
+	assert.equal(cleanupBoundaryTarget.listenerCount("SIGTERM"), 0);
+
+	const processReceipt = await runDetachedProcessGroup(process.execPath, ["-e", "process.exit(0)"], { cwd: root, env: {}, timeoutMs: 30_000 });
+	assert.ok(Number.isSafeInteger(processReceipt.pid) && processReceipt.pid > 0);
+	assert.equal(processReceipt.status, 0);
+	assert.equal(processReceipt.signal, null);
+	await assert.rejects(runDetachedProcessGroup(process.execPath, ["-e", `
+const { spawn } = require("node:child_process");
+const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+child.unref();
+`], { cwd: root, env: {}, timeoutMs: 30_000 }));
+});
+
+test("bounded final subject copy binds receipt, metadata, sparse allocation, and disposable watcher isolation", async () => {
+	const makeSource = () => {
+		const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "pylon-final-copy-")));
+		const source = join(parent, "source");
+		mkdirSync(source, { mode: 0o700 });
+		for (let index = 0; index < 5; index += 1) {
+			const file = join(source, `subject-${index}.tgz`);
+			writeFileSync(file, `subject-${index}`, { mode: 0o644 });
+			chmodSync(file, 0o644);
+		}
+		return { parent, source, destination: join(parent, "final") };
+	};
+	const clean = (parent) => {
+		for (const directory of [join(parent, "historical"), join(parent, "preview"), join(parent, "disposable"), join(parent, "final"), join(parent, "source"), parent]) {
+			try { chmodSync(directory, 0o700); } catch {}
+		}
+		rmSync(parent, { force: true, recursive: true });
+	};
+	const canonicalReceiptBytes = (files) => Buffer.from(`${JSON.stringify({ files, schemaVersion: 1 })}\n`);
+	const writeReceipt = (path, files) => {
+		writeFileSync(path, canonicalReceiptBytes(files), { flag: "wx", mode: 0o644 });
+		chmodSync(path, 0o644);
+	};
+	{
+		const fixture = makeSource();
+		try {
+			const initial = copyBoundedSubjects(fixture.source, fixture.destination, { expectedCount: 5, freeze: true, inputGid: null });
+			assert.equal(initial.names.length, 5);
+			assert.equal(lstatSync(fixture.destination).mode & 0o7777, 0o555);
+			for (const name of initial.names) {
+				const metadata = lstatSync(join(fixture.destination, name));
+				assert.equal(metadata.mode & 0o7777, 0o444);
+				assert.equal(metadata.nlink, 1);
+			}
+		} finally { clean(fixture.parent); }
+	}
+	const mutations = [
+		({ source }) => { chmodSync(join(source, "subject-0.tgz"), 0o666); },
+		({ source }) => { rmSync(join(source, "subject-0.tgz")); symlinkSync("subject-1.tgz", join(source, "subject-0.tgz")); },
+		({ source }) => { rmSync(join(source, "subject-0.tgz")); linkSync(join(source, "subject-1.tgz"), join(source, "subject-0.tgz")); },
+		({ source }) => { truncateSync(join(source, "subject-0.tgz"), 1024 * 1024); },
+		({ source }) => {
+			rmSync(join(source, "subject-0.tgz"));
+			const result = spawnSync("/usr/bin/mkfifo", [join(source, "subject-0.tgz")], { stdio: "pipe" });
+			assert.equal(result.status, 0);
+		},
+		({ source }) => { writeFileSync(join(source, "extra.tgz"), "extra", { mode: 0o644 }); },
+	];
+	for (const mutate of mutations) {
+		const fixture = makeSource();
+		try {
+			mutate(fixture);
+			assert.throws(() => copyBoundedSubjects(fixture.source, fixture.destination, { expectedCount: 5, freeze: true }));
+			assert.equal(existsSync(fixture.destination), false);
+		} finally { clean(fixture.parent); }
+	}
+	{
+		const fixture = makeSource();
+		const linked = join(fixture.parent, "linked-source");
+		try {
+			symlinkSync(fixture.source, linked);
+			assert.throws(() => exactArtifactDirectory(linked));
+			assert.throws(() => copyBoundedSubjects(linked, fixture.destination, { expectedCount: 5, freeze: true }));
+		} finally { clean(fixture.parent); }
+	}
+	{
+		const fixture = makeSource();
+		try {
+			const probe = copyBoundedSubjects(fixture.source, join(fixture.parent, "probe"), { expectedCount: 5 });
+			const receiptPath = join(fixture.parent, "receipt.json");
+			writeReceipt(receiptPath, probe.files);
+			const receipt = readFinalReceipt(receiptPath, 5);
+			copyBoundedSubjects(fixture.source, fixture.destination, { expectedCount: 5, expectedReceipt: receipt, freeze: true });
+			assert.throws(() => readFinalReceipt(join(fixture.parent, "missing-receipt.json"), 5));
+			const wrongPath = join(fixture.parent, "wrong.json");
+			const wrong = structuredClone(probe.files);
+			wrong[0].sha256 = "f".repeat(64);
+			writeReceipt(wrongPath, wrong);
+			const wrongReceipt = readFinalReceipt(wrongPath, 5);
+			assert.throws(() => copyBoundedSubjects(fixture.source, join(fixture.parent, "wrong-final"), { expectedCount: 5, expectedReceipt: wrongReceipt, freeze: true }));
+			writeFileSync(join(fixture.source, "subject-0.tgz"), "stale-source-bytes");
+			assert.throws(() => copyBoundedSubjects(fixture.source, join(fixture.parent, "stale-final"), { expectedCount: 5, expectedReceipt: receipt, freeze: true }));
+			const unsorted = join(fixture.parent, "unsorted.json");
+			writeReceipt(unsorted, [...probe.files].reverse());
+			assert.throws(() => readFinalReceipt(unsorted, 5));
+			const noncanonical = join(fixture.parent, "noncanonical.json");
+			writeFileSync(noncanonical, `${JSON.stringify({ schemaVersion: 1, files: probe.files }, null, 2)}\n`, { mode: 0o644 });
+			chmodSync(noncanonical, 0o644);
+			assert.throws(() => readFinalReceipt(noncanonical, 5));
+		} finally { clean(fixture.parent); }
+	}
+	{
+		const fixture = makeSource();
+		let watcher;
+		try {
+			const receipt = copyBoundedSubjects(fixture.source, join(fixture.parent, "probe"), { expectedCount: 5 });
+			const disposable = join(fixture.parent, "disposable");
+			copyBoundedSubjects(fixture.source, disposable, { expectedCount: 5 });
+			const properLockfileWatcher = `
+const { writeFileSync } = require("node:fs");
+const target = process.argv[1];
+let running = true;
+process.stdin.once("data", () => { running = false; });
+process.stdout.write("ready\\n");
+const mutate = () => {
+  writeFileSync(target, "malicious-proper-lockfile-watcher");
+  if (running) setImmediate(mutate);
+  else process.exit(0);
+};
+mutate();`;
+			watcher = spawn(process.execPath, ["-e", properLockfileWatcher, join(disposable, "subject-0.tgz")], { stdio: ["pipe", "pipe", "inherit"] });
+			await new Promise((resolveReady, rejectReady) => {
+				const timer = setTimeout(() => rejectReady(new Error("watcher readiness timed out")), 10_000);
+				watcher.once("error", rejectReady);
+				watcher.stdout.once("data", (chunk) => {
+					clearTimeout(timer);
+					if (!chunk.toString("utf8").includes("ready")) rejectReady(new Error("watcher readiness malformed"));
+					else resolveReady();
+				});
+			});
+			copyBoundedSubjects(fixture.source, fixture.destination, { expectedCount: 5, expectedReceipt: { files: receipt.files, schemaVersion: 1 }, freeze: true });
+			watcher.stdin.end("stop");
+			await new Promise((resolveClose, rejectClose) => {
+				const timer = setTimeout(() => rejectClose(new Error("watcher exit timed out")), 10_000);
+				watcher.once("error", rejectClose);
+				watcher.once("close", (status) => {
+					clearTimeout(timer);
+					if (status !== 0) rejectClose(new Error("watcher failed"));
+					else resolveClose();
+				});
+			});
+			watcher = undefined;
+			assert.equal(readFileSync(join(fixture.source, "subject-0.tgz"), "utf8"), "subject-0");
+			assert.equal(readFileSync(join(fixture.destination, "subject-0.tgz"), "utf8"), "subject-0");
+			assert.equal(readFileSync(join(disposable, "subject-0.tgz"), "utf8"), "malicious-proper-lockfile-watcher");
+		} finally {
+			if (watcher && watcher.exitCode === null) watcher.kill("SIGKILL");
+			clean(fixture.parent);
+		}
+	}
+	{
+		const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "pylon-historical-copy-")));
+		const source = join(parent, "source");
+		mkdirSync(source, { mode: 0o700 });
+		const assets = ["pylon-prime-agent-0.8.1.tgz", "pylon-prime-agent-ai-0.8.1.tgz", "pylon-prime-agent-core-0.8.1.tgz", "pylon-prime-agent-tui-0.8.1.tgz"];
+		for (const name of assets) writeFileSync(join(source, name), name, { mode: 0o444 });
+		writeFileSync(join(source, "pylon-prime-agent-release-v1.json"), `${JSON.stringify({ assets: assets.map((file) => ({ file })) })}\n`, { mode: 0o444 });
+		writeFileSync(join(source, "pylon-preview-channel-v1.json"), "channel\n", { mode: 0o444 });
+		for (const name of readdirSync(source)) chmodSync(join(source, name), 0o444);
+		try {
+			const preview = releaseOnlyCopy(source, join(parent, "preview"), { historical: false });
+			assert.equal(preview.names.length, 5);
+			assert.equal(preview.names.includes("pylon-preview-channel-v1.json"), false);
+			const historical = releaseOnlyCopy(source, join(parent, "historical"), { historical: true });
+			assert.equal(historical.names.length, 6);
+			assert.equal(historical.names.includes("pylon-preview-channel-v1.json"), true);
+		} finally { clean(parent); }
+	}
 });
 
 test("workflow static policy proves direct approvals and every contents-write graph", () => {
