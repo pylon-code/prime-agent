@@ -2879,6 +2879,437 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			tipSha256: sha256Bytes(bytes("removed-claim-handoff-anchor")),
 		});
 
+
+		const retainedCheckpointHandoffPath = join(fixture, "retained-checkpoint-completion-handoff.json");
+		await withConsumerStateLock(retainedCheckpointHandoffPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("retained-checkpoint-handoff-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const retainedCheckpointPublished = deferred();
+		const releaseRetainedCheckpointWinner = deferred();
+		const retainedCheckpointWinner = rotateConsumerStateJournal(
+			retainedCheckpointHandoffPath,
+			manualRuntime({ value: 2 }, {
+				afterRotationCheckpoint: async () => {
+					retainedCheckpointPublished.resolve();
+					await releaseRetainedCheckpointWinner.promise;
+				},
+			}),
+		);
+		await retainedCheckpointPublished.promise;
+		const retainedCheckpointJournal = `${retainedCheckpointHandoffPath}.journal`;
+		const retainedCheckpointNames = readdirSync(retainedCheckpointJournal)
+			.filter((name) => name.startsWith("checkpoint-"))
+			.sort();
+		assert.equal(retainedCheckpointNames.length, 2);
+		const retainedCheckpointPath = join(retainedCheckpointJournal, retainedCheckpointNames[0]);
+		const retainedCheckpointReadReached = deferred();
+		const releaseRetainedCheckpointRead = deferred();
+		let retainedCheckpointReads = 0;
+		const retainedCheckpointStale = rotateConsumerStateJournal(
+			retainedCheckpointHandoffPath,
+			manualRuntime({ value: 3 }, {
+				metadataRead: {
+					afterInitialStat: async ({ path }) => {
+						if (path !== retainedCheckpointPath) return;
+						retainedCheckpointReads += 1;
+						if (retainedCheckpointReads !== 2) return;
+						retainedCheckpointReadReached.resolve();
+						await releaseRetainedCheckpointRead.promise;
+					},
+				},
+			}),
+		);
+		await retainedCheckpointReadReached.promise;
+		const retainedCurrentCheckpoint = JSON.parse(readFileSync(join(
+			retainedCheckpointJournal,
+			retainedCheckpointNames[1],
+		)));
+		rmSync(join(retainedCheckpointJournal, retainedCurrentCheckpoint.retiredEpochDirectory), { recursive: true });
+		rmSync(retainedCheckpointPath);
+		assert.equal(existsSync(retainedCheckpointPath), false);
+		releaseRetainedCheckpointRead.resolve();
+		const retainedCheckpointStaleReceipt = await retainedCheckpointStale;
+		releaseRetainedCheckpointWinner.resolve();
+		const retainedCheckpointWinnerReceipt = await retainedCheckpointWinner;
+		assert.equal(Buffer.from(JSON.stringify(retainedCheckpointStaleReceipt)).equals(
+			Buffer.from(JSON.stringify(retainedCheckpointWinnerReceipt)),
+		), true, "a removed digest-anchored retained checkpoint converges to the byte-identical epoch receipt");
+		assert.deepEqual(
+			readdirSync(retainedCheckpointJournal).filter((name) => !name.startsWith(".")).sort(),
+			readdirSync(retainedCheckpointJournal).filter((name) => !name.startsWith(".")).filter(
+				(name) => name.startsWith("checkpoint-") || name.startsWith("epoch-"),
+			).sort(),
+		);
+		assert.equal(readdirSync(retainedCheckpointJournal).filter((name) => name.startsWith("checkpoint-")).length, 1);
+		assert.equal(readdirSync(retainedCheckpointJournal).filter((name) => name.startsWith("epoch-")).length, 1);
+
+		const currentCheckpointHandoffPath = join(fixture, "current-checkpoint-completion-handoff.json");
+		await withConsumerStateLock(currentCheckpointHandoffPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("current-checkpoint-handoff-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const currentCheckpointJournal = consumerJournal(currentCheckpointHandoffPath);
+		const currentCheckpointReadReached = deferred();
+		const releaseCurrentCheckpointRead = deferred();
+		const currentCheckpointEarlyReached = deferred();
+		const releaseCurrentCheckpointEarly = deferred();
+		const currentCheckpointPublished = deferred();
+		const releaseCurrentCheckpointWinner = deferred();
+		let currentCheckpointWinnerPublished = false;
+		let currentCheckpointEarlyWalks = 0;
+		const currentCheckpointStale = rotateConsumerStateJournal(currentCheckpointHandoffPath, manualRuntime({ value: 2 }, {
+			beforePathOperation: async ({ operation }) => {
+				if (operation !== "walk-transactions") return;
+				currentCheckpointEarlyWalks += 1;
+				if (currentCheckpointEarlyWalks !== 1) return;
+				currentCheckpointEarlyReached.resolve();
+				await releaseCurrentCheckpointEarly.promise;
+			},
+			metadataRead: {
+				afterInitialStat: async ({ path }) => {
+					if (!currentCheckpointWinnerPublished || path !== currentCheckpointJournal.checkpoint) return;
+					currentCheckpointReadReached.resolve();
+					await releaseCurrentCheckpointRead.promise;
+				},
+			},
+		}));
+		await currentCheckpointEarlyReached.promise;
+		const currentCheckpointWinner = rotateConsumerStateJournal(currentCheckpointHandoffPath, manualRuntime({ value: 3 }, {
+			afterRotationCheckpoint: async () => {
+				currentCheckpointWinnerPublished = true;
+				currentCheckpointPublished.resolve();
+				await releaseCurrentCheckpointWinner.promise;
+			},
+		}));
+		await currentCheckpointPublished.promise;
+		releaseCurrentCheckpointEarly.resolve();
+		await currentCheckpointReadReached.promise;
+		rmSync(currentCheckpointJournal.epoch, { recursive: true });
+		rmSync(currentCheckpointJournal.checkpoint);
+		assert.equal(existsSync(currentCheckpointJournal.checkpoint), false);
+		releaseCurrentCheckpointRead.resolve();
+		const currentCheckpointStaleReceipt = await currentCheckpointStale;
+		releaseCurrentCheckpointWinner.resolve();
+		const currentCheckpointWinnerReceipt = await currentCheckpointWinner;
+		assert.equal(Buffer.from(JSON.stringify(currentCheckpointStaleReceipt)).equals(
+			Buffer.from(JSON.stringify(currentCheckpointWinnerReceipt)),
+		), true, "a removed digest-anchored current checkpoint authenticates exactly one immediate successor");
+		assert.deepEqual(currentCheckpointWinnerReceipt, {
+			epoch: 2,
+			tipSha256: sha256Bytes(bytes("current-checkpoint-handoff-anchor")),
+		});
+
+
+
+		const forgedDescendantPath = join(fixture, "forged-descendant-checkpoint.json");
+		await withConsumerStateLock(forgedDescendantPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("forged-descendant-base"));
+		}, manualRuntime({ value: 1 }));
+		let validDescendantCheckpoint;
+		const capturedValidDescendant = new Error("capture exact valid descendant checkpoint");
+		await assert.rejects(
+			() => rotateConsumerStateJournal(forgedDescendantPath, manualRuntime({ value: 2 }, {
+				beforeRotationDecision: async ({ claim }) => {
+					validDescendantCheckpoint = claim.intent.checkpoint;
+					throw capturedValidDescendant;
+				},
+			})),
+			(error) => error === capturedValidDescendant,
+		);
+		const forgedDescendantJournal = consumerJournal(forgedDescendantPath);
+		const validDescendantCheckpointPath = join(
+			forgedDescendantJournal.journal,
+			`checkpoint-${String(validDescendantCheckpoint.epoch).padStart(16, "0")}-${validDescendantCheckpoint.epochId}.json`,
+		);
+		const validDescendantEpochPath = join(
+			forgedDescendantJournal.journal,
+			`epoch-${String(validDescendantCheckpoint.epoch).padStart(16, "0")}-${validDescendantCheckpoint.epochId}`,
+		);
+		const forgedAnchorBytes = bytes("forged-descendant-anchor");
+		const forgedSourceTipBytes = bytes("forged-descendant-source-tip");
+		const forgedDescendantCheckpoint = {
+			...validDescendantCheckpoint,
+			epochId: randomUUID(),
+			historySha256: "d".repeat(64),
+			anchorDigest: sha256Bytes(forgedAnchorBytes),
+			anchorBase64: forgedAnchorBytes.toString("base64"),
+			previousTipSha256: sha256Bytes(forgedAnchorBytes),
+			sourceAuthoritySha256: "e".repeat(64),
+			sourceAuthorityTipDigest: sha256Bytes(forgedSourceTipBytes),
+			sourceAuthorityTipBase64: forgedSourceTipBytes.toString("base64"),
+		};
+		assert.equal(
+			forgedDescendantCheckpoint.previousCheckpointSha256,
+			validDescendantCheckpoint.previousCheckpointSha256,
+		);
+		assert.equal(forgedDescendantCheckpoint.retiredEpochDirectory, validDescendantCheckpoint.retiredEpochDirectory);
+		for (const field of ["epochId", "historySha256", "sourceAuthoritySha256", "anchorDigest"]) {
+			assert.notEqual(forgedDescendantCheckpoint[field], validDescendantCheckpoint[field]);
+		}
+		const forgedDescendantCheckpointPath = join(
+			forgedDescendantJournal.journal,
+			`checkpoint-${String(forgedDescendantCheckpoint.epoch).padStart(16, "0")}-${forgedDescendantCheckpoint.epochId}.json`,
+		);
+		const forgedDescendantEpochPath = join(
+			forgedDescendantJournal.journal,
+			`epoch-${String(forgedDescendantCheckpoint.epoch).padStart(16, "0")}-${forgedDescendantCheckpoint.epochId}`,
+		);
+		const forgedProjectionReady = deferred();
+		const releaseForgedProjection = deferred();
+		let forgedProjectionHeld = false;
+		let forgedSuccessorPublished = false;
+		let forgedCurrentOperation = null;
+		let forgedRetryRootReads = 0;
+		const forgedDescendantWriter = withConsumerStateLock(
+			forgedDescendantPath,
+			async (_path, transaction) => {
+				await transaction.commitState(bytes("forged-descendant-candidate"));
+			},
+			{
+				...manualRuntime({ value: 3 }, {
+					beforePathOperation: async ({ operation }) => {
+						forgedCurrentOperation = operation;
+					},
+					afterProjectionFileSync: async () => {
+						if (forgedProjectionHeld) return;
+						forgedProjectionHeld = true;
+						forgedProjectionReady.resolve();
+						await releaseForgedProjection.promise;
+					},
+				}),
+				readDirectory: async (path) => {
+					const names = await readDirectoryEntries(path);
+					if (
+						forgedSuccessorPublished && path === forgedDescendantJournal.journal &&
+						forgedCurrentOperation === "finish-commit-retry-authentication"
+					) {
+						forgedRetryRootReads += 1;
+						if (forgedRetryRootReads === 4) {
+							rmSync(validDescendantCheckpointPath);
+							rmSync(validDescendantEpochPath, { recursive: true });
+							mkdirSync(forgedDescendantEpochPath, { mode: 0o700 });
+							writePrivate(forgedDescendantCheckpointPath, metadata(forgedDescendantCheckpoint));
+						}
+					}
+					return names;
+				},
+			},
+		);
+		await forgedProjectionReady.promise;
+		const forgedProjectionBefore = readFileSync(forgedDescendantPath);
+		const forgedOperationEntriesBefore = new Map(
+			readdirSync(forgedDescendantJournal.epoch)
+				.filter((name) => /^(?:claim(?:-index)?-|terminal-|transition-|applied-)/.test(name))
+				.sort()
+				.map((name) => [name, readFileSync(join(forgedDescendantJournal.epoch, name))]),
+		);
+		assert.equal(
+			[...forgedOperationEntriesBefore.keys()].some((name) => name.startsWith("terminal-")),
+			true,
+			"the forged-descendant barrier holds one terminal operation before any repair",
+		);
+		mkdirSync(validDescendantEpochPath, { mode: 0o700 });
+		writePrivate(validDescendantCheckpointPath, metadata(validDescendantCheckpoint));
+		rmSync(forgedDescendantJournal.checkpoint);
+		forgedSuccessorPublished = true;
+		releaseForgedProjection.resolve();
+		await assert.rejects(
+			forgedDescendantWriter,
+			/journal root has neither its byte-exact current checkpoint nor one exact immediate successor/,
+		);
+		assert.equal(forgedRetryRootReads, 5, "the forged successor is rejected by the first classified scan after the valid final proof");
+		assert.equal(readFileSync(forgedDescendantPath).equals(forgedProjectionBefore), true);
+		const forgedOperationEntriesAfter = new Map(
+			readdirSync(forgedDescendantJournal.epoch)
+				.filter((name) => /^(?:claim(?:-index)?-|terminal-|transition-|applied-)/.test(name))
+				.sort()
+				.map((name) => [name, readFileSync(join(forgedDescendantJournal.epoch, name))]),
+		);
+		assert.deepEqual([...forgedOperationEntriesAfter.keys()], [...forgedOperationEntriesBefore.keys()]);
+		for (const [name, entryBytes] of forgedOperationEntriesBefore) {
+			assert.equal(forgedOperationEntriesAfter.get(name).equals(entryBytes), true, `${name} remains byte-exact`);
+		}
+
+		const startCheckpointReadRace = async (label, targetRole, runtime = {}) => {
+			const statePath = join(fixture, `${label}.json`);
+			await withConsumerStateLock(statePath, async (_path, transaction) => {
+				await transaction.commitState(bytes(`${label}-anchor`));
+			}, manualRuntime({ value: 1 }));
+			const journal = consumerJournal(statePath);
+			const earlyReached = deferred();
+			const releaseEarly = deferred();
+			const readReached = deferred();
+			const releaseRead = deferred();
+			let firstWalks = 0;
+			let armed = false;
+			let targetCheckpointPath = null;
+			const stale = rotateConsumerStateJournal(statePath, {
+				...manualRuntime({ value: 2 }, {
+					beforePathOperation: async ({ operation }) => {
+						if (operation !== "walk-transactions") return;
+						firstWalks += 1;
+						if (firstWalks !== 1) return;
+						earlyReached.resolve();
+						await releaseEarly.promise;
+					},
+					metadataRead: {
+						afterInitialStat: async (event) => {
+							await runtime.afterInitialStat?.(event, { armed, targetCheckpointPath });
+							if (!armed || event.path !== targetCheckpointPath) return;
+							readReached.resolve(event);
+							await releaseRead.promise;
+						},
+						beforeFinalStat: runtime.beforeFinalStat,
+					},
+				}),
+				...(runtime.readDirectory ? { readDirectory: runtime.readDirectory } : {}),
+			});
+			await earlyReached.promise;
+			let successorCheckpoint;
+			const capturedSuccessor = new Error(`capture ${label} successor`);
+			await assert.rejects(
+				() => rotateConsumerStateJournal(statePath, manualRuntime({ value: 3 }, {
+					beforeRotationDecision: async ({ claim }) => {
+						successorCheckpoint = claim.intent.checkpoint;
+						throw capturedSuccessor;
+					},
+				})),
+				(error) => error === capturedSuccessor,
+			);
+			const successorCheckpointName =
+				`checkpoint-${String(successorCheckpoint.epoch).padStart(16, "0")}-${successorCheckpoint.epochId}.json`;
+			const successorEpochName =
+				`epoch-${String(successorCheckpoint.epoch).padStart(16, "0")}-${successorCheckpoint.epochId}`;
+			const successorCheckpointPath = join(journal.journal, successorCheckpointName);
+			const successorEpochPath = join(journal.journal, successorEpochName);
+			mkdirSync(successorEpochPath, { mode: 0o700 });
+			writePrivate(successorCheckpointPath, metadata(successorCheckpoint));
+			targetCheckpointPath = targetRole === "current" ? journal.checkpoint : successorCheckpointPath;
+			armed = true;
+			releaseEarly.resolve();
+			const readEvent = await readReached.promise;
+			return {
+				statePath,
+				journal,
+				stale,
+				releaseRead,
+				readEvent,
+				targetCheckpointPath,
+				successorCheckpointPath,
+				successorEpochPath,
+			};
+		};
+
+		const mutatedCheckpointRace = await startCheckpointReadRace(
+			"canonical-mutated-checkpoint-read",
+			"current",
+		);
+		const mutatedCheckpointBytes = readFileSync(mutatedCheckpointRace.targetCheckpointPath);
+		const mutatedCheckpoint = JSON.parse(mutatedCheckpointBytes);
+		mutatedCheckpoint.historySha256 = `${mutatedCheckpoint.historySha256[0] === "a" ? "b" : "a"}` +
+			mutatedCheckpoint.historySha256.slice(1);
+		const mutatedCanonicalBytes = metadata(mutatedCheckpoint);
+		assert.equal(mutatedCanonicalBytes.length, mutatedCheckpointBytes.length);
+		const mutatedCheckpointStat = statSync(mutatedCheckpointRace.targetCheckpointPath);
+		writePrivate(mutatedCheckpointRace.targetCheckpointPath, mutatedCanonicalBytes);
+		utimesSync(
+			mutatedCheckpointRace.targetCheckpointPath,
+			mutatedCheckpointStat.atime,
+			mutatedCheckpointStat.mtime,
+		);
+		rmSync(mutatedCheckpointRace.targetCheckpointPath);
+		mutatedCheckpointRace.releaseRead.resolve();
+		await assert.rejects(mutatedCheckpointRace.stale, (error) => {
+			assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+			assert.match(error.message, /changed while it was read/);
+			return true;
+		});
+
+		for (const operation of ["unlink", "replace"]) {
+			const successorReadRace = await startCheckpointReadRace(
+				`unanchored-successor-${operation}`,
+				"successor",
+			);
+			if (operation === "unlink") {
+				rmSync(successorReadRace.targetCheckpointPath);
+			} else {
+				const original = readFileSync(successorReadRace.targetCheckpointPath);
+				renameSync(successorReadRace.targetCheckpointPath, `${successorReadRace.targetCheckpointPath}.replaced`);
+				writePrivate(successorReadRace.targetCheckpointPath, original);
+			}
+			successorReadRace.releaseRead.resolve();
+			await assert.rejects(successorReadRace.stale, (error) => {
+				assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+				assert.match(error.message, /changed while it was read/);
+				return true;
+			});
+		}
+
+		const replacedAnchoredRace = await startCheckpointReadRace("anchored-checkpoint-replace", "current");
+		const replacedAnchoredBytes = readFileSync(replacedAnchoredRace.targetCheckpointPath);
+		renameSync(replacedAnchoredRace.targetCheckpointPath, `${replacedAnchoredRace.targetCheckpointPath}.replaced`);
+		writePrivate(replacedAnchoredRace.targetCheckpointPath, replacedAnchoredBytes);
+		replacedAnchoredRace.releaseRead.resolve();
+		await assert.rejects(replacedAnchoredRace.stale, (error) => {
+			assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+			assert.match(error.message, /changed while it was read/);
+			return true;
+		});
+
+		const checkpointIoFailure = new Error("injected exact checkpoint read I/O failure");
+		let checkpointIoArmed = false;
+		const checkpointIoRace = await startCheckpointReadRace("checkpoint-read-io-identity", "current", {
+			beforeFinalStat: async ({ path }) => {
+				if (checkpointIoArmed && path === checkpointIoRace.targetCheckpointPath) throw checkpointIoFailure;
+			},
+		});
+		checkpointIoArmed = true;
+		checkpointIoRace.releaseRead.resolve();
+		await assert.rejects(checkpointIoRace.stale, (error) => error === checkpointIoFailure);
+
+		for (const rootMutation of ["competing-checkpoint", "malformed-entry"]) {
+			let proofRootReads = 0;
+			let proofArmed = false;
+			let rootPath;
+			const finalProofRace = await startCheckpointReadRace(
+				`checkpoint-final-proof-${rootMutation}`,
+				"current",
+				{
+					readDirectory: async (path) => {
+						if (proofArmed && path === rootPath) {
+							proofRootReads += 1;
+							if (proofRootReads === 2) {
+								if (rootMutation === "competing-checkpoint") {
+									writePrivate(
+										join(rootPath, `checkpoint-0000000000000002-${randomUUID()}.json`),
+										"{}\n",
+									);
+								} else {
+									writePrivate(join(rootPath, "malformed-root-entry"), "{}\n");
+								}
+							}
+						}
+						return readDirectoryEntries(path);
+					},
+				},
+			);
+			rootPath = finalProofRace.journal.journal;
+			const successorEntriesBefore = readdirSync(finalProofRace.successorEpochPath).sort();
+			rmSync(finalProofRace.journal.epoch, { recursive: true });
+			rmSync(finalProofRace.journal.checkpoint);
+			proofArmed = true;
+			finalProofRace.releaseRead.resolve();
+			await assert.rejects(
+				finalProofRace.stale,
+				/journal root changed without one exact current or immediate-successor authority/,
+			);
+			assert.equal(proofRootReads, 2, "the changed root receives one bounded proof and one final subset recheck");
+			assert.deepEqual(
+				readdirSync(finalProofRace.successorEpochPath).sort(),
+				successorEntriesBefore,
+				"a root inserted before the final proof cannot publish any journal operation",
+			);
+		}
+
 		const earlyFenceHandoffPath = join(fixture, "early-fence-completion-handoff.json");
 		await withConsumerStateLock(earlyFenceHandoffPath, async (_path, transaction) => {
 			await transaction.commitState(bytes("early-fence-handoff-anchor"));

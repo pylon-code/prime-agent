@@ -571,57 +571,160 @@ function isImmediateSuccessorCheckpoint(context, checkpoint) {
 		));
 }
 
-async function confirmAuthenticatedSuccessorRoot(scan, context, options, invalidRoot) {
-	const rootNames = new Set([
-		TEMPORARY_DIRECTORY_NAME,
-		...scan.checkpointEntries.map((entry) => entry.name),
-		...scan.epochEntries.map((entry) => entry.name),
-		...scan.temporaries
+function retainedCheckpointPath(context) {
+	if (context.checkpoint.retiredEpochDirectory === null) return null;
+	const match = epochPattern.exec(context.checkpoint.retiredEpochDirectory);
+	if (!match) throw new Error("Consumer high-water journal checkpoint context is malformed.");
+	return join(context.journalDirectory, `checkpoint-${match[1]}-${match[2]}.json`);
+}
+
+function contextCheckpointAnchors(context) {
+	const anchors = new Map([[context.checkpointPath, context.checkpointDigest]]);
+	const retainedPath = retainedCheckpointPath(context);
+	if (retainedPath !== null) anchors.set(retainedPath, context.checkpoint.previousCheckpointSha256);
+	return anchors;
+}
+
+function isContextAnchoredCheckpoint(context, path, checkpoint, expectedSha256) {
+	if (path === context.checkpointPath) {
+		return expectedSha256 === context.checkpointDigest &&
+			metadataBytes(checkpoint).equals(metadataBytes(context.checkpoint));
+	}
+	const retainedPath = retainedCheckpointPath(context);
+	return retainedPath !== null && path === retainedPath &&
+		expectedSha256 === context.checkpoint.previousCheckpointSha256 &&
+		checkpoint.epoch + 1 === context.checkpoint.epoch &&
+		epochName(checkpoint) === context.checkpoint.retiredEpochDirectory &&
+		checkpoint.sourceAuthoritySha256 === context.checkpoint.sourceAuthoritySha256 &&
+		checkpoint.sourceAuthorityTipDigest === context.checkpoint.sourceAuthorityTipDigest &&
+		checkpoint.sourceAuthorityTipBase64 === context.checkpoint.sourceAuthorityTipBase64 &&
+		context.checkpoint.historySha256 === digest(Buffer.from(
+			`${checkpoint.historySha256}:${expectedSha256}:${context.checkpoint.anchorDigest}`,
+		));
+}
+
+function isVanishedRetainedCheckpoint(path, context, anchors, rootNames) {
+	const retainedPath = retainedCheckpointPath(context);
+	if (
+		retainedPath === null || path !== retainedPath ||
+		anchors.get(path) !== context.checkpoint.previousCheckpointSha256
+	) return false;
+	const retainedMatch = checkpointPattern.exec(basename(path));
+	if (!retainedMatch || Number(retainedMatch[1]) + 1 !== context.checkpoint.epoch) return false;
+	return rootNames.some((candidate) => {
+		const candidateMatch = checkpointPattern.exec(candidate);
+		return candidateMatch && Number(candidateMatch[1]) > Number(retainedMatch[1]);
+	});
+}
+
+function authenticatedRemovedCheckpoint(error, context, options, anchors, rootNames) {
+	if (
+		!(error instanceof BoundedFileUnlinkedDuringReadError) ||
+		error.description !== "Consumer high-water journal checkpoint" || typeof error.path !== "string" ||
+		!Buffer.isBuffer(error.bytes) || error.bytes.length < 1 || error.bytes.length > options.metadataMaxBytes
+	) return null;
+	const expectedSha256 = anchors.get(error.path);
+	if (
+		expectedSha256 === undefined || error.expectedSha256 !== expectedSha256 ||
+		digest(error.bytes) !== expectedSha256 || dirname(error.path) !== context.journalDirectory
+	) return null;
+	const name = basename(error.path);
+	const match = checkpointPattern.exec(name);
+	if (!match || error.path !== join(context.journalDirectory, name)) return null;
+	let checkpoint;
+	try {
+		checkpoint = validateCheckpoint(JSON.parse(error.bytes.toString("utf8")), options.stateMaxBytes).value;
+	} catch {
+		return null;
+	}
+	if (
+		!metadataBytes(checkpoint).equals(error.bytes) || checkpointName(checkpoint) !== name ||
+		checkpoint.epoch !== Number(match[1]) ||
+		!isContextAnchoredCheckpoint(context, error.path, checkpoint, expectedSha256)
+	) return null;
+	const hasLaterCheckpoint = rootNames.some((candidate) => {
+		const candidateMatch = checkpointPattern.exec(candidate);
+		return candidateMatch && Number(candidateMatch[1]) > checkpoint.epoch;
+	});
+	return hasLaterCheckpoint ? checkpoint : null;
+}
+
+async function authenticateStableChangedRoot(scan, context, options, anchors, target, invalidRoot) {
+	const initialNames = new Set(scan.rootNames);
+	if (initialNames.size !== scan.rootNames.length) throw invalidRoot();
+	const targetCheckpointName = basename(target.path);
+	const targetEpochName = epochName(target.checkpoint);
+	const optionalCheckpointNames = new Set([
+		...scan.checkpointEntries
+			.filter((entry) => entry.path !== target.path && entry.checkpoint.epoch < target.checkpoint.epoch)
+			.map((entry) => entry.name),
+		...scan.vanishedRetainedCheckpointNames,
+	]);
+	const optionalEpochNames = new Set(
+		scan.epochEntries
+			.filter((entry) => entry.epoch < target.checkpoint.epoch)
+			.map((entry) => entry.name),
+	);
+	const optionalTemporaryNames = new Set(
+		scan.temporaries
 			.filter((temporary) => dirname(temporary.path) === context.journalDirectory)
 			.map((temporary) => basename(temporary.path)),
-	]);
-	const headEpoch = scan.head.checkpoint.epoch;
+	);
 	const optionalNames = new Set([
-		...scan.checkpointEntries.filter((entry) => entry.checkpoint.epoch < headEpoch).map((entry) => entry.name),
-		...scan.epochEntries.filter((entry) => entry.epoch < headEpoch).map((entry) => entry.name),
-		...scan.temporaries
-			.filter((temporary) => dirname(temporary.path) === context.journalDirectory)
-			.map((temporary) => basename(temporary.path)),
+		...optionalCheckpointNames,
+		...optionalEpochNames,
+		...optionalTemporaryNames,
 	]);
-	const sameRootAuthority = (names) => {
-		const actual = new Set(names);
-		return [...actual].every((name) => rootNames.has(name)) &&
-			[...rootNames].every((name) => optionalNames.has(name) || actual.has(name));
-	};
-	if (!sameRootAuthority(await options.readDirectory(context.journalDirectory))) throw invalidRoot();
+	const requiredNames = new Set([TEMPORARY_DIRECTORY_NAME, targetCheckpointName, targetEpochName]);
+	const proofNamesArray = await options.readDirectory(context.journalDirectory);
+	const proofNames = new Set(proofNamesArray);
+	if (
+		proofNamesArray.length > MAX_JOURNAL_ROOT_ENTRIES + MAX_TEMPORARY_ENTRIES ||
+		proofNames.size !== proofNamesArray.length ||
+		[...proofNames].some((name) => !initialNames.has(name)) ||
+		scan.vanishedRetainedCheckpointNames.some((name) => proofNames.has(name)) ||
+		[...initialNames].some((name) => !optionalNames.has(name) && !proofNames.has(name)) ||
+		[...requiredNames].some((name) => !proofNames.has(name))
+	) throw invalidRoot();
 	for (const entry of scan.checkpointEntries) {
-		let checkpoint;
-		try {
-			checkpoint = await readExactMetadata(
-				entry.path,
-				options.metadataMaxBytes,
-				(value) => validateCheckpoint(value, options.stateMaxBytes).value,
-				"Consumer high-water journal checkpoint",
-				options,
-				undefined,
-				entry.digest,
-			);
-		} catch (error) {
-			if (optionalNames.has(entry.name) && error instanceof BoundedFileUnlinkedDuringReadError) continue;
-			throw error;
-		}
-		if (checkpoint === null && optionalNames.has(entry.name)) continue;
-		if (checkpoint === null || digest(metadataBytes(checkpoint)) !== entry.digest) throw invalidRoot();
+		if (!proofNames.has(entry.name)) continue;
+		const expectedSha256 = anchors.get(entry.path) ?? null;
+		const checkpoint = await readExactMetadata(
+			entry.path,
+			options.metadataMaxBytes,
+			(value) => validateCheckpoint(value, options.stateMaxBytes).value,
+			"Consumer high-water journal checkpoint",
+			options,
+			undefined,
+			expectedSha256,
+		);
+		if (
+			checkpoint === null || !metadataBytes(checkpoint).equals(metadataBytes(entry.checkpoint)) ||
+			(expectedSha256 !== null && !isContextAnchoredCheckpoint(context, entry.path, checkpoint, expectedSha256))
+		) throw invalidRoot();
 	}
-	for (const entry of scan.epochEntries) {
-		try {
-			await secureDirectory(entry.path, "Consumer high-water epoch directory", options);
-		} catch (error) {
-			if (optionalNames.has(entry.name) && error?.code === "ENOENT") continue;
-			throw error;
+	await secureDirectory(
+		join(context.journalDirectory, TEMPORARY_DIRECTORY_NAME),
+		"Consumer high-water temporary directory",
+		options,
+	);
+	const targetEpoch = scan.epochEntries.find((entry) => entry.name === targetEpochName);
+	if (targetEpoch === undefined) throw invalidRoot();
+	await secureDirectory(targetEpoch.path, "Consumer high-water epoch directory", options);
+	for (const temporary of scan.temporaries) {
+		if (dirname(temporary.path) === context.journalDirectory && proofNames.has(basename(temporary.path))) {
+			if ((await inspectTemporary(temporary.path, options)) === null) throw invalidRoot();
 		}
 	}
-	if (!sameRootAuthority(await options.readDirectory(context.journalDirectory))) throw invalidRoot();
+	const finalNamesArray = await options.readDirectory(context.journalDirectory);
+	const finalNames = new Set(finalNamesArray);
+	if (
+		finalNamesArray.length > MAX_JOURNAL_ROOT_ENTRIES + MAX_TEMPORARY_ENTRIES ||
+		finalNames.size !== finalNamesArray.length ||
+		[...finalNames].some((name) => !proofNames.has(name)) ||
+		[...proofNames].some((name) => !optionalNames.has(name) && !finalNames.has(name)) ||
+		[...requiredNames].some((name) => !finalNames.has(name))
+	) throw invalidRoot();
 }
 
 async function authenticateChangedRoot(
@@ -630,7 +733,11 @@ async function authenticateChangedRoot(
 	inProgressCheckpoint = null,
 	allowInProgressDiscovery = false,
 ) {
-	const scan = await scanJournalRoot(context.statePath, context.journalDirectory, options, 0, true);
+	const anchors = contextCheckpointAnchors(context);
+	const scan = await scanJournalRoot(context.statePath, context.journalDirectory, options, {
+		checkpointAnchors: anchors,
+		checkpointContext: context,
+	});
 	const invalidRoot = () => new Error(
 		"Consumer high-water journal root changed without one exact current or immediate-successor authority.",
 	);
@@ -640,6 +747,8 @@ async function authenticateChangedRoot(
 	if (inProgressCheckpoint !== null && scan.checkpointEntries.length === 1) {
 		const checkpoint = validateCheckpoint(inProgressCheckpoint, options.stateMaxBytes).value;
 		const nextEpochPath = join(context.journalDirectory, epochName(checkpoint));
+		await secureDirectory(context.epochDirectory, "Consumer high-water epoch directory", options);
+		await secureDirectory(nextEpochPath, "Consumer high-water epoch directory", options);
 		if (
 			!isImmediateSuccessorCheckpoint(context, checkpoint) ||
 			scan.checkpointEntries.length !== 1 || scan.head?.path !== context.checkpointPath || scan.missingHeadEpoch ||
@@ -659,6 +768,8 @@ async function authenticateChangedRoot(
 		scan.epochEntries.length === 2 && discoveredNextEpoch?.epoch === context.checkpoint.epoch + 1 &&
 		(await options.readDirectory(discoveredNextEpoch.path)).length === 0
 	) {
+		await secureDirectory(context.epochDirectory, "Consumer high-water epoch directory", options);
+		await secureDirectory(discoveredNextEpoch.path, "Consumer high-water epoch directory", options);
 		if ((await options.readDirectory(discoveredNextEpoch.path)).length !== 0) throw invalidRoot();
 		return discoveredNextEpoch.path;
 	}
@@ -676,6 +787,11 @@ async function authenticateChangedRoot(
 		)) &&
 		scan.epochEntries.every((entry) => [context.epochDirectory, retiredEpochPath].includes(entry.path))
 	) {
+		if (scan.removedCheckpointEntries.length > 0 || scan.vanishedRetainedCheckpointNames.length > 0) {
+			await authenticateStableChangedRoot(scan, context, options, anchors, currentCheckpoint, invalidRoot);
+		} else {
+			await secureDirectory(context.epochDirectory, "Consumer high-water epoch directory", options);
+		}
 		return false;
 	}
 
@@ -695,7 +811,7 @@ async function authenticateChangedRoot(
 		scan.epochEntries.some((entry) => ![context.epochDirectory, expectedEpochPath].includes(entry.path)) ||
 		!scan.epochEntries.some((entry) => entry.path === expectedEpochPath)
 	) throw invalidRoot();
-	await confirmAuthenticatedSuccessorRoot(scan, context, options, invalidRoot);
+	await authenticateStableChangedRoot(scan, context, options, anchors, successor, invalidRoot);
 	return true;
 }
 
@@ -846,8 +962,7 @@ async function scanJournalRoot(
 	statePath,
 	journalDirectory,
 	options,
-	replacementRetries = PROJECTION_RETRY_LIMIT,
-	allowVanishedEarlierEntries = false,
+	{ checkpointAnchors = null, checkpointContext = null } = {},
 ) {
 	await secureDirectory(journalDirectory, "Consumer high-water journal directory", options);
 	await options.syncDirectory(journalDirectory);
@@ -856,6 +971,8 @@ async function scanJournalRoot(
 		throw new Error("Consumer high-water journal root exceeds its safe allocation bound.");
 	}
 	const checkpointEntries = [];
+	const removedCheckpointEntries = [];
+	const vanishedRetainedCheckpointNames = [];
 	const epochEntries = [];
 	const temporaries = [];
 	let temporaryDirectorySeen = false;
@@ -881,63 +998,45 @@ async function scanJournalRoot(
 		}
 		const checkpointMatch = checkpointPattern.exec(name);
 		if (checkpointMatch) {
-			const checkpoint = await readExactMetadata(
-				path,
-				options.metadataMaxBytes,
-				(value) => validateCheckpoint(value, options.stateMaxBytes).value,
-				"Consumer high-water journal checkpoint",
-				options,
-			);
+			const expectedSha256 = checkpointAnchors?.get(path) ?? null;
+			let checkpoint;
+			let removedDuringRead = false;
+			try {
+				checkpoint = await readExactMetadata(
+					path,
+					options.metadataMaxBytes,
+					(value) => validateCheckpoint(value, options.stateMaxBytes).value,
+					"Consumer high-water journal checkpoint",
+					options,
+					undefined,
+					expectedSha256,
+				);
+			} catch (error) {
+				const authenticated = checkpointContext === null || checkpointAnchors === null
+					? null
+					: authenticatedRemovedCheckpoint(error, checkpointContext, options, checkpointAnchors, names);
+				if (authenticated === null) throw error;
+				checkpoint = authenticated;
+				removedDuringRead = true;
+			}
 			if (checkpoint === null) {
-				const epoch = Number(checkpointMatch[1]);
-				const hasLaterCheckpoint = names.some((candidate) => {
-					const match = checkpointPattern.exec(candidate);
-					return match && Number(match[1]) > epoch;
-				});
-				if (hasLaterCheckpoint && replacementRetries > 0) {
-					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1, allowVanishedEarlierEntries);
-				}
-				if (hasLaterCheckpoint && allowVanishedEarlierEntries) continue;
-				throw new Error("Consumer high-water journal lost its current checkpoint during an authenticated scan.");
+				if (
+					checkpointContext === null || checkpointAnchors === null ||
+					!isVanishedRetainedCheckpoint(path, checkpointContext, checkpointAnchors, names)
+				) throw new Error("Consumer high-water journal lost its current checkpoint during an authenticated scan.");
+				vanishedRetainedCheckpointNames.push(name);
+				continue;
 			}
 			if (checkpointName(checkpoint) !== name || checkpoint.epoch !== Number(checkpointMatch[1])) {
 				throw new Error("Consumer high-water journal checkpoint name is malformed.");
 			}
-			checkpointEntries.push({ name, path, checkpoint, digest: digest(metadataBytes(checkpoint)) });
+			const entry = { name, path, checkpoint, digest: digest(metadataBytes(checkpoint)), removedDuringRead };
+			checkpointEntries.push(entry);
+			if (removedDuringRead) removedCheckpointEntries.push(entry);
 			continue;
 		}
 		const epochMatch = epochPattern.exec(name);
 		if (epochMatch) {
-			let entry;
-			try {
-				entry = await options.lstatEntry(path);
-			} catch (error) {
-				const epoch = Number(epochMatch[1]);
-				const hasLaterEpoch = names.some((candidate) => {
-					const match = epochPattern.exec(candidate);
-					return match && Number(match[1]) > epoch;
-				});
-				if (error?.code === "ENOENT" && hasLaterEpoch && replacementRetries > 0) {
-					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1, allowVanishedEarlierEntries);
-				}
-				if (error?.code === "ENOENT" && hasLaterEpoch && allowVanishedEarlierEntries) continue;
-				throw error;
-			}
-			if (!entry.isDirectory() || entry.isSymbolicLink?.()) throw new Error("Consumer high-water epoch entry must be one real directory.");
-			try {
-				await secureDirectory(path, "Consumer high-water epoch directory", options);
-			} catch (error) {
-				const epoch = Number(epochMatch[1]);
-				const hasLaterEpoch = names.some((candidate) => {
-					const match = epochPattern.exec(candidate);
-					return match && Number(match[1]) > epoch;
-				});
-				if (error?.code === "ENOENT" && hasLaterEpoch && replacementRetries > 0) {
-					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1, allowVanishedEarlierEntries);
-				}
-				if (error?.code === "ENOENT" && hasLaterEpoch && allowVanishedEarlierEntries) continue;
-				throw error;
-			}
 			epochEntries.push({ name, path, epoch: Number(epochMatch[1]), epochId: epochMatch[2] });
 			continue;
 		}
@@ -952,13 +1051,14 @@ async function scanJournalRoot(
 		throw new Error("Consumer high-water journal root contains an unexpected entry.");
 	}
 	if (!temporaryDirectorySeen) throw new Error("Consumer high-water journal lacks its exact temporary namespace.");
-	const authoritativeEntries = checkpointEntries.length + epochEntries.length + 1;
+	const checkpointNameCount = names.filter((name) => checkpointPattern.test(name)).length;
+	const authoritativeEntries = checkpointNameCount + epochEntries.length + 1;
 	if (authoritativeEntries > MAX_JOURNAL_ROOT_ENTRIES) {
 		throw new Error("Consumer high-water journal root exceeds its safe entry bound.");
 	}
 	checkpointEntries.sort((left, right) => left.checkpoint.epoch - right.checkpoint.epoch);
 	epochEntries.sort((left, right) => left.epoch - right.epoch);
-	if (checkpointEntries.length > 2 || epochEntries.length > 2) {
+	if (checkpointNameCount > 2 || epochEntries.length > 2) {
 		throw new Error("Consumer high-water journal root contains unbounded checkpoint metadata.");
 	}
 	for (let index = 1; index < checkpointEntries.length; index += 1) {
@@ -989,7 +1089,68 @@ async function scanJournalRoot(
 		)) throw new Error("Consumer high-water journal checkpoint does not anchor its exact predecessor.");
 	}
 	const missingHeadEpoch = head ? !epochEntries.some((entry) => entry.name === epochName(head.checkpoint)) : false;
-	return { checkpointEntries, epochEntries, temporaries, head, missingHeadEpoch };
+	if (checkpointContext === null) {
+		for (const entry of epochEntries) {
+			const pathEntry = await options.lstatEntry(entry.path);
+			if (!pathEntry.isDirectory() || pathEntry.isSymbolicLink?.()) {
+				throw new Error("Consumer high-water epoch entry must be one real directory.");
+			}
+			await secureDirectory(entry.path, "Consumer high-water epoch directory", options);
+		}
+	}
+	return {
+		checkpointEntries,
+		removedCheckpointEntries,
+		vanishedRetainedCheckpointNames,
+		epochEntries,
+		temporaries,
+		head,
+		missingHeadEpoch,
+		rootNames: names,
+	};
+}
+
+function classifyContextCheckpointAuthority(scan, context, anchors, invalidRoot) {
+	const current = scan.checkpointEntries.find((entry) => entry.path === context.checkpointPath);
+	if (current && !isContextAnchoredCheckpoint(context, current.path, current.checkpoint, current.digest)) {
+		throw invalidRoot();
+	}
+	const successors = scan.checkpointEntries.filter((entry) => entry.checkpoint.epoch > context.checkpoint.epoch);
+	if (successors.length === 0) {
+		if (
+			!current || scan.head?.path !== current.path ||
+			scan.checkpointEntries.some((entry) => {
+				const expectedSha256 = anchors.get(entry.path);
+				return expectedSha256 === undefined ||
+					!isContextAnchoredCheckpoint(context, entry.path, entry.checkpoint, expectedSha256);
+			})
+		) throw invalidRoot();
+		return { kind: "current", entry: current };
+	}
+	const successor = successors[0];
+	const successorEpochPath = join(context.journalDirectory, epochName(successor.checkpoint));
+	if (
+		successors.length !== 1 || scan.head?.path !== successor.path ||
+		!isImmediateSuccessorCheckpoint(context, successor.checkpoint) ||
+		scan.checkpointEntries.some((entry) => ![context.checkpointPath, successor.path].includes(entry.path)) ||
+		scan.epochEntries.some((entry) => ![context.epochDirectory, successorEpochPath].includes(entry.path)) ||
+		!scan.epochEntries.some((entry) => entry.path === successorEpochPath)
+	) throw invalidRoot();
+	return { kind: "successor", entry: successor };
+}
+
+async function scanAuthenticatedContextRoot(context, options) {
+	const anchors = contextCheckpointAnchors(context);
+	const scan = await scanJournalRoot(context.statePath, context.journalDirectory, options, {
+		checkpointAnchors: anchors,
+		checkpointContext: context,
+	});
+	const invalidRoot = () => new Error(
+		"Consumer high-water journal root has neither its byte-exact current checkpoint nor one exact immediate successor.",
+	);
+	const authority = classifyContextCheckpointAuthority(scan, context, anchors, invalidRoot);
+	await authenticateStableChangedRoot(scan, context, options, anchors, authority.entry, invalidRoot);
+	return { scan, authority };
 }
 
 async function initializeJournal(
@@ -1524,14 +1685,9 @@ async function authenticateAppliedCommit(context, claim, terminal, options) {
 }
 
 async function finishCommitAtAuthenticatedDescendant(context, options) {
-	const scan = await scanJournalRoot(context.statePath, context.journalDirectory, options);
-	const head = scan.head;
-	if (
-		!head || scan.missingHeadEpoch || head.checkpoint.epoch !== context.checkpoint.epoch + 1 ||
-		head.checkpoint.previousCheckpointSha256 !== context.checkpointDigest ||
-		head.checkpoint.retiredEpochDirectory !== basename(context.epochDirectory)
-	) return false;
-	const descendant = contextFromHead(context.statePath, context.guardPath, context.journalDirectory, head);
+	const { authority } = await scanAuthenticatedContextRoot(context, options);
+	if (authority.kind !== "successor") return false;
+	const descendant = contextFromHead(context.statePath, context.guardPath, context.journalDirectory, authority.entry);
 	const tip = await walkTransactions(descendant, options);
 	await repairProjection(descendant, tip, options, {
 		generation: 0,
@@ -1625,21 +1781,24 @@ async function effectiveTip(context, options) {
 }
 
 async function scanRotationPublicationSet(context, checkpoint, options, requirePublished) {
-	const scan = await scanJournalRoot(context.statePath, context.journalDirectory, options);
+	const { scan, authority } = await scanAuthenticatedContextRoot(context, options);
 	const nextCheckpointPath = join(context.journalDirectory, checkpointName(checkpoint));
 	const nextEpochPath = join(context.journalDirectory, epochName(checkpoint));
 	const allowedCheckpointPaths = new Set([context.checkpointPath, nextCheckpointPath]);
 	const allowedEpochPaths = new Set([context.epochDirectory, nextEpochPath]);
 	const currentCheckpoint = scan.checkpointEntries.find((entry) => entry.path === context.checkpointPath);
 	const currentEpoch = scan.epochEntries.find((entry) => entry.path === context.epochDirectory);
+	const published = scan.checkpointEntries.find((entry) => entry.path === nextCheckpointPath);
 	if (
 		scan.checkpointEntries.some((entry) => !allowedCheckpointPaths.has(entry.path)) ||
 		scan.epochEntries.some((entry) => !allowedEpochPaths.has(entry.path)) ||
 		(currentCheckpoint && currentCheckpoint.digest !== context.checkpointDigest) ||
 		!scan.epochEntries.some((entry) => entry.path === nextEpochPath) ||
-		(!requirePublished && (!currentCheckpoint || !currentEpoch))
+		(!requirePublished && (!currentCheckpoint || !currentEpoch)) ||
+		(published === undefined
+			? authority.kind !== "current"
+			: authority.kind !== "successor" || authority.entry.path !== published.path)
 	) throw new Error("Consumer high-water rotation found a competing root or epoch publication.");
-	const published = scan.checkpointEntries.find((entry) => entry.path === nextCheckpointPath);
 	if (published && !metadataBytes(published.checkpoint).equals(metadataBytes(checkpoint))) {
 		throw new Error("Consumer high-water rotation found a competing checkpoint for the same epoch.");
 	}
@@ -1961,7 +2120,7 @@ async function cleanupAuthority(
 		await options.removeFile(entry.path, { force: true });
 		await options.syncDirectory(context.journalDirectory);
 	}
-	const final = await scanJournalRoot(context.statePath, context.journalDirectory, options);
+	const { scan: final, authority: finalAuthority } = await scanAuthenticatedContextRoot(context, options);
 	const allowedCheckpoints = retiredEpochDeferred ? 2 : 1;
 	const expectedEpochs = new Set([context.epochDirectory]);
 	if (retiredEpochDeferred) {
@@ -1972,6 +2131,7 @@ async function cleanupAuthority(
 		final.epochEntries.some((entry) => entry.name === allowedNextEpoch)
 	) expectedEpochs.add(join(context.journalDirectory, allowedNextEpoch));
 	if (
+		finalAuthority.kind !== "current" ||
 		final.checkpointEntries.length !== allowedCheckpoints || final.epochEntries.length !== expectedEpochs.size ||
 		final.temporaries.some((temporary) => !temporaryProcessIsAlive(temporary, options)) ||
 		final.head?.path !== context.checkpointPath ||
@@ -1995,7 +2155,10 @@ async function helpRotationOperation(context, claim, options) {
 		if (tip.tipDigest !== intent.tipSha256) {
 			throw new Error("Consumer high-water rotation operation no longer matches its exact authoritative tip.");
 		}
-		const rootScan = await scanJournalRoot(context.statePath, context.journalDirectory, helperOptions);
+		const { scan: rootScan, authority: rootAuthority } = await scanAuthenticatedContextRoot(context, helperOptions);
+		if (rootAuthority.kind !== "current") {
+			throw new Error("Consumer high-water rotation helper lost its exact current checkpoint authority.");
+		}
 		const nextEpochName = epochName(intent.checkpoint);
 		await cleanupAuthority(
 			context,
@@ -3042,7 +3205,10 @@ async function runNormalLocked(statePath, action, rawOptions) {
 			}
 		};
 		try {
-			const rootScan = await scanJournalRoot(context.statePath, context.journalDirectory, options);
+			const { scan: rootScan, authority: rootAuthority } = await scanAuthenticatedContextRoot(context, options);
+			if (rootAuthority.kind !== "current") {
+				throw new Error("Consumer high-water operation lost its exact current checkpoint authority.");
+			}
 			await cleanupAuthority(context, claim, rootScan, temporaries, options, false);
 			await ensureLegacyGuard(context, claim, options);
 			let chain = await walkTransactions(context, options);
@@ -3143,12 +3309,13 @@ function isExpectedRemovedClaimRead(error, context, options) {
 }
 
 async function completedRotationResult(context, intent, options) {
-	const scan = await scanJournalRoot(context.statePath, context.journalDirectory, options);
-	if (scan.head && metadataBytes(scan.head.checkpoint).equals(metadataBytes(intent.checkpoint))) {
-		await scanRotationPublicationSet(context, intent.checkpoint, options, true);
-		return { epoch: intent.checkpoint.epoch, tipSha256: intent.checkpoint.anchorDigest };
-	}
-	return null;
+	const { authority } = await scanAuthenticatedContextRoot(context, options);
+	if (
+		authority.kind !== "successor" ||
+		!metadataBytes(authority.entry.checkpoint).equals(metadataBytes(intent.checkpoint))
+	) return null;
+	await scanRotationPublicationSet(context, intent.checkpoint, options, true);
+	return { epoch: intent.checkpoint.epoch, tipSha256: intent.checkpoint.anchorDigest };
 }
 
 async function recoverCompletedCurrentRotation(context, scan, options) {
@@ -3157,7 +3324,10 @@ async function recoverCompletedCurrentRotation(context, scan, options) {
 	if (tip.length !== 0 || tip.tipDigest !== context.checkpoint.anchorDigest) return null;
 	const writer = { generation: 0, token: context.checkpoint.epochId, type: "rotation" };
 	await repairProjection(context, tip, options, writer);
-	const rootScan = await scanJournalRoot(context.statePath, context.journalDirectory, options);
+	const { scan: rootScan, authority: rootAuthority } = await scanAuthenticatedContextRoot(context, options);
+	if (rootAuthority.kind !== "current") {
+		throw new Error("Consumer high-water recovery lost its exact current checkpoint authority.");
+	}
 	await cleanupAuthority(context, writer, rootScan, scan.temporaries, options, false, scan);
 	return { epoch: context.checkpoint.epoch, tipSha256: context.checkpoint.anchorDigest };
 }
