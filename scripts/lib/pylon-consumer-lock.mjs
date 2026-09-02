@@ -1185,6 +1185,42 @@ async function readApplied(context, claim, terminal, options) {
 	);
 }
 
+async function authenticateAppliedCommit(context, claim, terminal, options) {
+	for (const transaction of terminal.transactions) {
+		await revalidateAuthority(context, "read-applied-transition", options);
+		const existing = await readExactMetadata(
+			transitionPath(context, transaction.baseDigest),
+			options.metadataMaxBytes,
+			(value) => validateTransaction(value, transaction.baseDigest, options.stateMaxBytes).value,
+			"Consumer high-water applied transaction",
+			options,
+		);
+		if (existing === null || !metadataBytes(existing).equals(metadataBytes(transaction))) {
+			throw new Error("Consumer high-water applied marker does not authenticate its exact immutable transaction chain.");
+		}
+	}
+	const tip = await walkTransactions(context, options);
+	const terminalDigest = terminal.transactions.at(-1).candidateDigest;
+	if (tip.tipDigest !== terminalDigest) {
+		await revalidateAuthority(context, "read-applied-continuation", options);
+		const continuation = await readExactMetadata(
+			transitionPath(context, terminalDigest),
+			options.metadataMaxBytes,
+			(value) => validateTransaction(value, terminalDigest, options.stateMaxBytes).value,
+			"Consumer high-water applied transaction continuation",
+			options,
+		);
+		if (continuation === null) {
+			throw new Error("Consumer high-water applied marker does not authenticate its exact terminal digest.");
+		}
+	}
+	const repairedTip = await repairProjection(context, tip, options, claim);
+	const projection = await readProjection(context, "read-applied-projection", options);
+	if (projection.malformed || projection.sha256 !== repairedTip.tipDigest) {
+		throw new Error("Consumer high-water applied marker does not authenticate the current immutable tip and projection.");
+	}
+}
+
 async function finishCommitAtAuthenticatedDescendant(context, options) {
 	const scan = await scanJournalRoot(context.statePath, context.journalDirectory, options);
 	const head = scan.head;
@@ -1206,7 +1242,11 @@ async function finishCommitAtAuthenticatedDescendant(context, options) {
 async function finishCommit(context, claim, terminal, options) {
 	for (let attempt = 0; attempt < PROJECTION_RETRY_LIMIT; attempt += 1) {
 		try {
-			await readApplied(context, claim, terminal, options);
+			const applied = await readApplied(context, claim, terminal, options);
+			if (applied !== null) {
+				await authenticateAppliedCommit(context, claim, terminal, options);
+				return;
+			}
 			for (const transaction of terminal.transactions) await publishTransition(context, transaction, claim, options);
 			const tip = await walkTransactions(context, options);
 			await repairProjection(context, tip, options, claim);
@@ -2785,7 +2825,16 @@ async function runRotation(statePath, rawOptions) {
 		const initialScan = await scanEpoch(context, options);
 		const completed = await recoverCompletedCurrentRotation(context, initialScan, options);
 		if (completed) return completed;
-		const frontier = await resolveOperationFrontier(context, options);
+		const expectedIntent = rotationIntentFor(context, await effectiveTip(context, options));
+		let frontier;
+		try {
+			frontier = await resolveOperationFrontier(context, options);
+		} catch (error) {
+			if (error?.message !== "Consumer high-water journal epoch changed and fenced a paused writer.") throw error;
+			const completedResult = await completedRotationResult(context, expectedIntent, options);
+			if (completedResult) return completedResult;
+			throw error;
+		}
 		if (frontier.rotated) continue;
 		if (frontier.active) {
 			throw new Error("Consumer high-water state is actively locked; rotation will retry after the claim quiesces.");

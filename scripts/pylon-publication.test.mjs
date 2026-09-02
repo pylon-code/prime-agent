@@ -2348,6 +2348,24 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			);
 		}
 
+		const appliedReceiptPath = join(fixture, "already-applied-rotation.json");
+		await withConsumerStateLock(appliedReceiptPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("already-applied-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const redundantAppliedWrites = [];
+		const appliedReceiptRotation = await rotateConsumerStateJournal(appliedReceiptPath, manualRuntime({ value: 2 }, {
+			afterFileSync: async ({ kind }) => {
+				if (!["transition", "applied"].includes(kind)) return;
+				redundantAppliedWrites.push(kind);
+				throw new Error(`already-applied claim attempted a redundant ${kind} publication`);
+			},
+		}));
+		assert.deepEqual(redundantAppliedWrites, []);
+		assert.deepEqual(appliedReceiptRotation, {
+			epoch: 2,
+			tipSha256: sha256Bytes(bytes("already-applied-anchor")),
+		});
+
 		const legacyRotationPath = join(fixture, "legacy-rotation.json");
 		writeFileSync(legacyRotationPath, bytes("legacy-anchor"), { mode: 0o600 });
 		assert.equal((await rotateConsumerStateJournal(legacyRotationPath, manualRuntime({ value: 1 }))).epoch, 2);
@@ -2598,6 +2616,41 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		);
 		rmSync(join(liveTemporaryDirectory, liveTemporaryName));
 		assert.equal((await rotateConsumerStateJournal(liveTemporaryPath, manualRuntime({ value: 4 }))).epoch, 2);
+
+		const frontierHandoffPath = join(fixture, "frontier-completion-handoff.json");
+		await withConsumerStateLock(frontierHandoffPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("frontier-handoff-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const firstSecondScanReached = deferred();
+		const secondSecondScanReached = deferred();
+		const releaseFirstSecondScan = deferred();
+		const releaseSecondSecondScan = deferred();
+		const rotationAtSecondScanBarrier = (reached, release) => {
+			let claimScans = 0;
+			return rotateConsumerStateJournal(frontierHandoffPath, manualRuntime({ value: 2 }, {
+				beforePathOperation: async ({ operation }) => {
+					if (operation !== "scan-claims") return;
+					claimScans += 1;
+					if (claimScans !== 2) return;
+					reached.resolve();
+					await release.promise;
+				},
+			}));
+		};
+		const frontierWinner = rotationAtSecondScanBarrier(firstSecondScanReached, releaseFirstSecondScan);
+		const frontierResumed = rotationAtSecondScanBarrier(secondSecondScanReached, releaseSecondSecondScan);
+		await Promise.all([firstSecondScanReached.promise, secondSecondScanReached.promise]);
+		releaseFirstSecondScan.resolve();
+		const frontierWinnerResult = await frontierWinner;
+		releaseSecondSecondScan.resolve();
+		const frontierResumedResult = await frontierResumed;
+		assert.equal(Buffer.from(JSON.stringify(frontierResumedResult)).equals(
+			Buffer.from(JSON.stringify(frontierWinnerResult)),
+		), true, "the stale rotator returns the winner's byte-identical completion receipt");
+		assert.deepEqual(frontierWinnerResult, {
+			epoch: 2,
+			tipSha256: sha256Bytes(bytes("frontier-handoff-anchor")),
+		});
 
 		const concurrentRotationPath = join(fixture, "concurrent-rotation.json");
 		await withConsumerStateLock(concurrentRotationPath, async (_path, transaction) => {
