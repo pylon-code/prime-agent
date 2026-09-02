@@ -6,6 +6,8 @@ import {
 	closeSync,
 	existsSync,
 	fsyncSync,
+	fstatSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	openSync,
@@ -17,13 +19,15 @@ import {
 	statSync,
 	symlinkSync,
 	truncateSync,
+	utimesSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
+import { lstat as lstatFile, open as openFileHandle, readdir as readDirectoryEntries } from "node:fs/promises";
 import { test } from "node:test";
 
 import {
@@ -87,9 +91,11 @@ import {
 	withConsumerStateLock,
 } from "./lib/pylon-consumer-lock.mjs";
 import {
+	BoundedFileUnlinkedDuringReadError,
 	PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
 	PYLON_STABLE_HISTORY_MAX_MANIFESTS,
 	readBoundedRegularFile,
+	readBoundedRegularFileSync,
 } from "./lib/pylon-bounded-file.mjs";
 import { isExactWithdrawalReplay, selectStableHistoryReleases } from "./prepare-pylon-stable-manifest.mjs";
 import { recoverStableDraft } from "./recover-pylon-stable-manifest.mjs";
@@ -733,9 +739,184 @@ test("consumer stable high-water pins and bounds every manifest before parsing",
 					},
 				},
 			}),
-			/changed while it was read/,
+			(error) => {
+				assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+				assert.match(error.message, /changed while it was read/);
+				return true;
+			},
 		);
 		assert.equal(swapped, true, "the descriptor re-stat detects a pathname swap without reading the replacement");
+
+		const replacedBeforeOpen = join(fixture, "replaced-before-open.json");
+		const replacedBeforeOpenMoved = join(fixture, "replaced-before-open-original.json");
+		writeFileSync(replacedBeforeOpen, "original");
+		let replacedOnOpen = false;
+		await assert.rejects(
+			() => readBoundedRegularFile(replacedBeforeOpen, {
+				maxBytes: 1024,
+				description: "Replaced bounded input",
+				openFile: async (path, flags) => {
+					if (!replacedOnOpen) {
+						replacedOnOpen = true;
+						renameSync(path, replacedBeforeOpenMoved);
+						writeFileSync(path, "replacement");
+					}
+					return openFileHandle(path, flags);
+				},
+			}),
+			(error) => {
+				assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+				assert.match(error.message, /changed while it was read/);
+				return true;
+			},
+		);
+		assert.equal(replacedOnOpen, true, "an inode replaced between lstat and open is terminal, not convergence");
+
+		const overwrittenAsync = join(fixture, "overwritten-unlinked-async.bin");
+		const originalAsyncBytes = Buffer.from("original-async");
+		const replacementAsyncBytes = Buffer.from("replaced-async");
+		assert.equal(originalAsyncBytes.length, replacementAsyncBytes.length);
+		writeFileSync(overwrittenAsync, originalAsyncBytes);
+		const originalAsyncStat = statSync(overwrittenAsync);
+		await assert.rejects(
+			() => readBoundedRegularFile(overwrittenAsync, {
+				maxBytes: 1024,
+				description: "Overwritten async bounded input",
+				expectedSha256: sha256Bytes(originalAsyncBytes),
+				hooks: {
+					afterInitialStat: () => {
+						writeFileSync(overwrittenAsync, replacementAsyncBytes);
+						utimesSync(overwrittenAsync, originalAsyncStat.atime, originalAsyncStat.mtime);
+						rmSync(overwrittenAsync);
+					},
+				},
+			}),
+			(error) => {
+				assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+				assert.match(error.message, /changed while it was read/);
+				return true;
+			},
+		);
+
+		const unanchoredRemovalPath = join(fixture, "unanchored-removal.bin");
+		writeFileSync(unanchoredRemovalPath, "legacy");
+		await assert.rejects(
+			() => readBoundedRegularFile(unanchoredRemovalPath, {
+				maxBytes: 1024,
+				description: "Unanchored bounded input",
+				hooks: { afterInitialStat: () => rmSync(unanchoredRemovalPath) },
+			}),
+			(error) => {
+				assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+				assert.match(error.message, /changed while it was read/);
+				return true;
+			},
+		);
+
+		const overwrittenSync = join(fixture, "overwritten-unlinked-sync.bin");
+		const originalSyncBytes = Buffer.from("original-sync");
+		const replacementSyncBytes = Buffer.from("replaced-sync");
+		assert.equal(originalSyncBytes.length, replacementSyncBytes.length);
+		writeFileSync(overwrittenSync, originalSyncBytes);
+		const originalSyncStat = statSync(overwrittenSync);
+		assert.throws(
+			() => readBoundedRegularFileSync(overwrittenSync, {
+				maxBytes: 1024,
+				description: "Overwritten sync bounded input",
+				expectedSha256: sha256Bytes(originalSyncBytes),
+				hooks: {
+					afterInitialStat: () => {
+						writeFileSync(overwrittenSync, replacementSyncBytes);
+						utimesSync(overwrittenSync, originalSyncStat.atime, originalSyncStat.mtime);
+						rmSync(overwrittenSync);
+					},
+				},
+			}),
+			(error) => {
+				assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+				assert.match(error.message, /changed while it was read/);
+				return true;
+			},
+		);
+
+		const asyncFstatFailurePath = join(fixture, "async-fstat-failure.bin");
+		writeFileSync(asyncFstatFailurePath, "fstat");
+		const asyncFstatFailure = new Error("injected async final fstat failure");
+		await assert.rejects(
+			() => readBoundedRegularFile(asyncFstatFailurePath, {
+				maxBytes: 1024,
+				description: "Async fstat failure input",
+				expectedSha256: sha256Bytes(Buffer.from("fstat")),
+				openFile: async (path, flags) => {
+					const handle = await openFileHandle(path, flags);
+					let statCalls = 0;
+					return {
+						close: handle.close.bind(handle),
+						read: handle.read.bind(handle),
+						stat: async () => {
+							statCalls += 1;
+							if (statCalls === 2) throw asyncFstatFailure;
+							return handle.stat();
+						},
+					};
+				},
+			}),
+			(error) => error === asyncFstatFailure,
+		);
+
+		const asyncFinalLstatFailurePath = join(fixture, "async-final-lstat-failure.bin");
+		writeFileSync(asyncFinalLstatFailurePath, "lstat");
+		const asyncFinalLstatFailure = new Error("injected async final lstat failure");
+		let asyncLstatCalls = 0;
+		await assert.rejects(
+			() => readBoundedRegularFile(asyncFinalLstatFailurePath, {
+				maxBytes: 1024,
+				description: "Async lstat failure input",
+				expectedSha256: sha256Bytes(Buffer.from("lstat")),
+				lstatEntry: async (path) => {
+					asyncLstatCalls += 1;
+					if (asyncLstatCalls === 2) throw asyncFinalLstatFailure;
+					return lstatFile(path);
+				},
+			}),
+			(error) => error === asyncFinalLstatFailure,
+		);
+
+		const syncFstatFailurePath = join(fixture, "sync-fstat-failure.bin");
+		writeFileSync(syncFstatFailurePath, "fstat");
+		const syncFstatFailure = new Error("injected sync final fstat failure");
+		let syncFstatCalls = 0;
+		assert.throws(
+			() => readBoundedRegularFileSync(syncFstatFailurePath, {
+				maxBytes: 1024,
+				description: "Sync fstat failure input",
+				expectedSha256: sha256Bytes(Buffer.from("fstat")),
+				statFile: (descriptor) => {
+					syncFstatCalls += 1;
+					if (syncFstatCalls === 2) throw syncFstatFailure;
+					return fstatSync(descriptor);
+				},
+			}),
+			(error) => error === syncFstatFailure,
+		);
+
+		const syncFinalLstatFailurePath = join(fixture, "sync-final-lstat-failure.bin");
+		writeFileSync(syncFinalLstatFailurePath, "lstat");
+		const syncFinalLstatFailure = new Error("injected sync final lstat failure");
+		let syncLstatCalls = 0;
+		assert.throws(
+			() => readBoundedRegularFileSync(syncFinalLstatFailurePath, {
+				maxBytes: 1024,
+				description: "Sync lstat failure input",
+				expectedSha256: sha256Bytes(Buffer.from("lstat")),
+				lstatEntry: (path) => {
+					syncLstatCalls += 1;
+					if (syncLstatCalls === 2) throw syncFinalLstatFailure;
+					return lstatSync(path);
+				},
+			}),
+			(error) => error === syncFinalLstatFailure,
+		);
 
 		const maximum = join(fixture, "maximum.bin");
 		writeFileSync(maximum, Buffer.alloc(PYLON_PUBLICATION_MANIFEST_MAX_BYTES, 0x61));
@@ -2167,7 +2348,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		assert.match(recoveries.find((result) => result.status === "rejected").reason.message, /actively locked/);
 		oldRelease.resolve();
 		await oldOwnerRejected;
-		const raceClaims = readdirSync(consumerJournal(racePath).epoch).filter((name) => name.startsWith("claim-"));
+		const raceClaims = readdirSync(consumerJournal(racePath).epoch).filter((name) => name.startsWith("claim-index-"));
 		assert.equal(raceClaims.length, 2);
 
 		const fencedPath = join(fixture, "fenced.json");
@@ -2303,6 +2484,9 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			["afterFileSync", "claim"],
 			["afterMetadataLink", "claim"],
 			["afterMetadataDirectorySync", "claim"],
+			["afterFileSync", "claim-index"],
+			["afterMetadataLink", "claim-index"],
+			["afterMetadataDirectorySync", "claim-index"],
 			["afterFileSync", "terminal-commit"],
 			["afterMetadataLink", "terminal-commit"],
 			["afterMetadataDirectorySync", "terminal-commit"],
@@ -2434,7 +2618,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			await transaction.commitState(bytes("normal-winner"));
 		}, manualRuntime({ value: 2 }, {
 			afterMetadataLink: async ({ kind }) => {
-				if (kind !== "claim") return;
+				if (kind !== "claim-index") return;
 				normalClaimLinked.resolve();
 				await releaseNormalClaim.promise;
 			},
@@ -2462,7 +2646,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		const releaseRotationClaim = deferred();
 		const rotationWinner = rotateConsumerStateJournal(rotationWinsPath, manualRuntime({ value: 2 }, {
 			afterMetadataLink: async ({ kind }) => {
-				if (kind !== "claim") return;
+				if (kind !== "claim-index") return;
 				rotationClaimLinked.resolve();
 				await releaseRotationClaim.promise;
 			},
@@ -2470,7 +2654,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		await rotationClaimLinked.promise;
 		const pendingRotationJournal = consumerJournal(rotationWinsPath);
 		const pendingRotationClaim = readdirSync(pendingRotationJournal.epoch)
-			.filter((name) => name.startsWith("claim-"))
+			.filter((name) => /^claim-[0-9]{16}-[0-9a-f]{64}\.json$/.test(name))
 			.map((name) => JSON.parse(readFileSync(join(pendingRotationJournal.epoch, name))))
 			.at(-1);
 		assert.equal(pendingRotationClaim.type, "rotation");
@@ -2530,7 +2714,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		const finalCrashCheckpoint = JSON.parse(readFileSync(finalCrashJournal.checkpoint));
 		const finalCrashClaim = JSON.parse(readFileSync(join(
 			finalCrashJournal.epoch,
-			readdirSync(finalCrashJournal.epoch).find((name) => name === "claim-0000000000000002.json"),
+			readdirSync(finalCrashJournal.epoch).find((name) => /^claim-0000000000000002-[0-9a-f]{64}\.json$/.test(name)),
 		)));
 		const finalCrashTemporaryDirectory = join(finalCrashJournal.journal, ".owned-temporaries-v2");
 		for (let index = 0; index < 17; index += 1) {
@@ -2557,7 +2741,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		});
 		const floodJournal = consumerJournal(temporaryFloodPath);
 		const floodCheckpoint = JSON.parse(readFileSync(floodJournal.checkpoint));
-		const floodClaimName = readdirSync(floodJournal.epoch).find((name) => name.startsWith("claim-"));
+		const floodClaimName = readdirSync(floodJournal.epoch).find((name) => /^claim-[0-9]{16}-[0-9a-f]{64}\.json$/.test(name));
 		const floodClaim = JSON.parse(readFileSync(join(floodJournal.epoch, floodClaimName)));
 		const floodTemporaryDirectory = join(floodJournal.journal, ".owned-temporaries-v2");
 		const temporaryFileName = ({ pid, generation, token, attempt, kind }) =>
@@ -2607,7 +2791,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			() => rotateConsumerStateJournal(liveTemporaryPath, manualRuntime({ value: 2 })),
 			/rotation operation is pending.*temporary writer quiesces/,
 		);
-		assert.equal(readdirSync(liveJournal.epoch).filter((name) => name.startsWith("claim-")).some(
+		assert.equal(readdirSync(liveJournal.epoch).filter((name) => /^claim-[0-9]{16}-[0-9a-f]{64}\.json$/.test(name)).some(
 			(name) => JSON.parse(readFileSync(join(liveJournal.epoch, name))).type === "rotation",
 		), true);
 		await assert.rejects(
@@ -2651,6 +2835,473 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			epoch: 2,
 			tipSha256: sha256Bytes(bytes("frontier-handoff-anchor")),
 		});
+
+		const removedClaimHandoffPath = join(fixture, "removed-claim-completion-handoff.json");
+		await withConsumerStateLock(removedClaimHandoffPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("removed-claim-handoff-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const removedClaimJournal = consumerJournal(removedClaimHandoffPath);
+		const removedClaimIndexName = readdirSync(removedClaimJournal.epoch).find((name) => name.startsWith("claim-index-"));
+		const removedClaimIndex = JSON.parse(readFileSync(join(removedClaimJournal.epoch, removedClaimIndexName)));
+		const removedClaimContentName = readdirSync(removedClaimJournal.epoch)
+			.find((name) => /^claim-[0-9]{16}-[0-9a-f]{64}\.json$/.test(name));
+		const removedClaimContentBytes = readFileSync(join(removedClaimJournal.epoch, removedClaimContentName));
+		assert.equal(removedClaimIndex.claimSha256, sha256Bytes(removedClaimContentBytes));
+		assert.match(removedClaimContentName, new RegExp(`${removedClaimIndex.claimSha256}\\.json$`));
+		const removedClaimReadReached = deferred();
+		const releaseRemovedClaimRead = deferred();
+		let claimReads = 0;
+		let openedClaimPath;
+		const removedClaimStale = rotateConsumerStateJournal(removedClaimHandoffPath, manualRuntime({ value: 2 }, {
+			metadataRead: {
+				afterInitialStat: async ({ path }) => {
+					if (!/^claim-[0-9]{16}-[0-9a-f]{64}\.json$/.test(basename(path))) return;
+					claimReads += 1;
+					if (claimReads !== 2) return;
+					openedClaimPath = path;
+					removedClaimReadReached.resolve();
+					await releaseRemovedClaimRead.promise;
+				},
+			},
+		}));
+		await removedClaimReadReached.promise;
+		const removedClaimWinner = await rotateConsumerStateJournal(removedClaimHandoffPath, manualRuntime({ value: 3 }));
+		const removedClaimCleanup = await rotateConsumerStateJournal(removedClaimHandoffPath, manualRuntime({ value: 4 }));
+		assert.deepEqual(removedClaimCleanup, removedClaimWinner);
+		assert.equal(existsSync(openedClaimPath), false, "the authenticated old claim inode is removed while its read handle is pinned");
+		releaseRemovedClaimRead.resolve();
+		const removedClaimResumed = await removedClaimStale;
+		assert.equal(Buffer.from(JSON.stringify(removedClaimResumed)).equals(
+			Buffer.from(JSON.stringify(removedClaimWinner)),
+		), true, "a same-inode old-claim removal converges only to the byte-identical winner receipt");
+		assert.deepEqual(removedClaimWinner, {
+			epoch: 2,
+			tipSha256: sha256Bytes(bytes("removed-claim-handoff-anchor")),
+		});
+
+		const earlyFenceHandoffPath = join(fixture, "early-fence-completion-handoff.json");
+		await withConsumerStateLock(earlyFenceHandoffPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("early-fence-handoff-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const earlyFenceReached = deferred();
+		const releaseEarlyFence = deferred();
+		let preIntentWalks = 0;
+		const earlyFenceStale = rotateConsumerStateJournal(earlyFenceHandoffPath, manualRuntime({ value: 2 }, {
+			beforePathOperation: async ({ operation }) => {
+				if (operation !== "walk-transactions") return;
+				preIntentWalks += 1;
+				if (preIntentWalks !== 1) return;
+				earlyFenceReached.resolve();
+				await releaseEarlyFence.promise;
+			},
+		}));
+		await earlyFenceReached.promise;
+		const earlyFenceWinner = await rotateConsumerStateJournal(earlyFenceHandoffPath, manualRuntime({ value: 3 }));
+		releaseEarlyFence.resolve();
+		const earlyFenceResumed = await earlyFenceStale;
+		assert.equal(Buffer.from(JSON.stringify(earlyFenceResumed)).equals(
+			Buffer.from(JSON.stringify(earlyFenceWinner)),
+		), true, "a pre-intent epoch fence reauthenticates and returns the byte-identical winner receipt");
+		assert.deepEqual(earlyFenceWinner, {
+			epoch: 2,
+			tipSha256: sha256Bytes(bytes("early-fence-handoff-anchor")),
+		});
+
+		const malformedSuccessorPath = join(fixture, "malformed-successor-fence.json");
+		await withConsumerStateLock(malformedSuccessorPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("malformed-successor-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const malformedSuccessorReached = deferred();
+		const releaseMalformedSuccessor = deferred();
+		let malformedSuccessorWalks = 0;
+		const malformedSuccessorStale = rotateConsumerStateJournal(malformedSuccessorPath, manualRuntime({ value: 2 }, {
+			beforePathOperation: async ({ operation }) => {
+				if (operation !== "walk-transactions") return;
+				malformedSuccessorWalks += 1;
+				if (malformedSuccessorWalks !== 1) return;
+				malformedSuccessorReached.resolve();
+				await releaseMalformedSuccessor.promise;
+			},
+		}));
+		await malformedSuccessorReached.promise;
+		const malformedSuccessorJournal = consumerJournal(malformedSuccessorPath);
+		writePrivate(
+			join(malformedSuccessorJournal.journal, `checkpoint-0000000000000002-${randomUUID()}.json`),
+			"{}\n",
+		);
+		releaseMalformedSuccessor.resolve();
+		await assert.rejects(malformedSuccessorStale, /journal checkpoint is malformed/);
+
+		const skippedSuccessorPath = join(fixture, "skipped-successor-fence.json");
+		await withConsumerStateLock(skippedSuccessorPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("skipped-successor-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const skippedSuccessorReached = deferred();
+		const releaseSkippedSuccessor = deferred();
+		let skippedSuccessorWalks = 0;
+		const skippedSuccessorStale = rotateConsumerStateJournal(skippedSuccessorPath, manualRuntime({ value: 2 }, {
+			beforePathOperation: async ({ operation }) => {
+				if (operation !== "walk-transactions") return;
+				skippedSuccessorWalks += 1;
+				if (skippedSuccessorWalks !== 1) return;
+				skippedSuccessorReached.resolve();
+				await releaseSkippedSuccessor.promise;
+			},
+		}));
+		await skippedSuccessorReached.promise;
+		let skippedCheckpoint;
+		const captureSkippedCheckpoint = new Error("capture skipped successor checkpoint");
+		await assert.rejects(
+			() => rotateConsumerStateJournal(skippedSuccessorPath, manualRuntime({ value: 3 }, {
+				beforeRotationDecision: async ({ claim }) => {
+					skippedCheckpoint = { ...claim.intent.checkpoint, epoch: claim.intent.checkpoint.epoch + 1 };
+					throw captureSkippedCheckpoint;
+				},
+			})),
+			(error) => error === captureSkippedCheckpoint,
+		);
+		const skippedSuccessorJournal = consumerJournal(skippedSuccessorPath);
+		writePrivate(
+			join(
+				skippedSuccessorJournal.journal,
+				`checkpoint-${String(skippedCheckpoint.epoch).padStart(16, "0")}-${skippedCheckpoint.epochId}.json`,
+			),
+			metadata(skippedCheckpoint),
+		);
+		releaseSkippedSuccessor.resolve();
+		await assert.rejects(skippedSuccessorStale, /journal checkpoints are not contiguous/);
+
+		const competingSuccessorPath = join(fixture, "competing-successor-fence.json");
+		await withConsumerStateLock(competingSuccessorPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("competing-successor-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const competingSuccessorReached = deferred();
+		const releaseCompetingSuccessor = deferred();
+		let competingSuccessorWalks = 0;
+		const competingSuccessorStale = rotateConsumerStateJournal(competingSuccessorPath, manualRuntime({ value: 2 }, {
+			beforePathOperation: async ({ operation }) => {
+				if (operation !== "walk-transactions") return;
+				competingSuccessorWalks += 1;
+				if (competingSuccessorWalks !== 1) return;
+				competingSuccessorReached.resolve();
+				await releaseCompetingSuccessor.promise;
+			},
+		}));
+		await competingSuccessorReached.promise;
+		let competingCheckpoint;
+		const captureCompetingCheckpoint = new Error("capture competing successor checkpoint");
+		await assert.rejects(
+			() => rotateConsumerStateJournal(competingSuccessorPath, manualRuntime({ value: 3 }, {
+				beforeRotationDecision: async ({ claim }) => {
+					competingCheckpoint = claim.intent.checkpoint;
+					throw captureCompetingCheckpoint;
+				},
+			})),
+			(error) => error === captureCompetingCheckpoint,
+		);
+		const competingSuccessorJournal = consumerJournal(competingSuccessorPath);
+		const alternateCompetingCheckpoint = { ...competingCheckpoint, epochId: randomUUID() };
+		for (const checkpoint of [competingCheckpoint, alternateCompetingCheckpoint]) {
+			writePrivate(
+				join(
+					competingSuccessorJournal.journal,
+					`checkpoint-${String(checkpoint.epoch).padStart(16, "0")}-${checkpoint.epochId}.json`,
+				),
+				metadata(checkpoint),
+			);
+		}
+		releaseCompetingSuccessor.resolve();
+		await assert.rejects(
+			competingSuccessorStale,
+			/journal (?:checkpoint set is malformed|root contains unbounded checkpoint metadata)/,
+		);
+
+		const publicationEntries = (journal) => readdirSync(journal.epoch)
+			.filter((name) => /^(?:claim(?:-index)?-|terminal-|transition-)/.test(name))
+			.sort();
+		const sameEpochCheckpointPath = join(fixture, "same-epoch-checkpoint-root-competitor.json");
+		await withConsumerStateLock(sameEpochCheckpointPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("same-epoch-checkpoint-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const sameEpochCheckpointJournal = consumerJournal(sameEpochCheckpointPath);
+		const sameEpochCheckpointBaseline = publicationEntries(sameEpochCheckpointJournal);
+		const maliciousCheckpointName = `checkpoint-0000000000000001-${randomUUID()}.json`;
+		const sameEpochCheckpointReached = deferred();
+		const releaseSameEpochCheckpoint = deferred();
+		let sameEpochCheckpointInjected = false;
+		const sameEpochCheckpointWriter = withConsumerStateLock(sameEpochCheckpointPath, async () => {}, {
+			...manualRuntime({ value: 2 }, {
+				beforePathOperation: async ({ operation }) => {
+					if (operation !== "claim") return;
+					sameEpochCheckpointReached.resolve();
+					await releaseSameEpochCheckpoint.promise;
+				},
+			}),
+			readDirectory: async (path) => {
+				const names = await readDirectoryEntries(path);
+				if (!sameEpochCheckpointInjected || path !== sameEpochCheckpointJournal.journal) return names;
+				return [maliciousCheckpointName, ...names.filter((name) => name !== maliciousCheckpointName)];
+			},
+		});
+		await sameEpochCheckpointReached.promise;
+		writePrivate(join(sameEpochCheckpointJournal.journal, maliciousCheckpointName), "{}\n");
+		sameEpochCheckpointInjected = true;
+		releaseSameEpochCheckpoint.resolve();
+		await assert.rejects(sameEpochCheckpointWriter, /journal checkpoint is malformed/);
+		assert.deepEqual(
+			publicationEntries(sameEpochCheckpointJournal),
+			sameEpochCheckpointBaseline,
+			"a malicious same-epoch checkpoint cannot publish a claim, terminal, or transition",
+		);
+
+		const sameEpochDirectoryPath = join(fixture, "same-epoch-directory-root-competitor.json");
+		await withConsumerStateLock(sameEpochDirectoryPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("same-epoch-directory-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const sameEpochDirectoryJournal = consumerJournal(sameEpochDirectoryPath);
+		const sameEpochDirectoryBaseline = publicationEntries(sameEpochDirectoryJournal);
+		const sameEpochDirectoryReached = deferred();
+		const releaseSameEpochDirectory = deferred();
+		const sameEpochDirectoryWriter = withConsumerStateLock(sameEpochDirectoryPath, async () => {}, manualRuntime(
+			{ value: 2 },
+			{
+				beforePathOperation: async ({ operation }) => {
+					if (operation !== "claim") return;
+					sameEpochDirectoryReached.resolve();
+					await releaseSameEpochDirectory.promise;
+				},
+			},
+		));
+		await sameEpochDirectoryReached.promise;
+		mkdirSync(
+			join(sameEpochDirectoryJournal.journal, `epoch-0000000000000001-${randomUUID()}`),
+			{ mode: 0o700 },
+		);
+		releaseSameEpochDirectory.resolve();
+		await assert.rejects(sameEpochDirectoryWriter, /competing epoch directories for one parent epoch/);
+		assert.deepEqual(
+			publicationEntries(sameEpochDirectoryJournal),
+			sameEpochDirectoryBaseline,
+			"a sibling same-epoch directory cannot publish a claim, terminal, or transition",
+		);
+
+		const unindexedOrderPath = join(fixture, "unindexed-claim-validation-order.json");
+		await withConsumerStateLock(unindexedOrderPath, async () => {}, manualRuntime({ value: 1 }));
+		const unindexedOrderJournal = consumerJournal(unindexedOrderPath);
+		const indexedClaimName = readdirSync(unindexedOrderJournal.epoch)
+			.find((name) => /^claim-[0-9]{16}-[0-9a-f]{64}\.json$/.test(name));
+		const indexedClaimBytes = readFileSync(join(unindexedOrderJournal.epoch, indexedClaimName));
+		const unorderedClaims = [
+			`claim-0000000000000003-${"0".repeat(64)}.json`,
+			`claim-0000000000000002-${"f".repeat(64)}.json`,
+			`claim-0000000000000002-${"0".repeat(64)}.json`,
+		];
+		for (const name of unorderedClaims) writePrivate(join(unindexedOrderJournal.epoch, name), indexedClaimBytes);
+		const unindexedReads = [];
+		await assert.rejects(
+			() => rotateConsumerStateJournal(unindexedOrderPath, {
+				...manualRuntime({ value: 2 }, {
+					metadataRead: {
+						afterInitialStat: ({ path }) => {
+							if (unorderedClaims.includes(basename(path))) unindexedReads.push(basename(path));
+						},
+					},
+				}),
+				readDirectory: async (path) => {
+					const names = await readDirectoryEntries(path);
+					if (path !== unindexedOrderJournal.epoch) return names;
+					return [...unorderedClaims, ...names.filter((name) => !unorderedClaims.includes(name))];
+				},
+			}),
+			/unindexed claim content differs from its exact canonical bytes/,
+		);
+		assert.deepEqual(
+			unindexedReads,
+			[`claim-0000000000000002-${"0".repeat(64)}.json`],
+			"unindexed claims validate by numeric generation and then lexical content digest",
+		);
+
+		const missingSuccessorEpochPath = join(fixture, "missing-successor-epoch-fence.json");
+		await withConsumerStateLock(missingSuccessorEpochPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("missing-successor-epoch-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const missingSuccessorEpochReached = deferred();
+		const releaseMissingSuccessorEpoch = deferred();
+		let missingSuccessorEpochWalks = 0;
+		const missingSuccessorEpochStale = rotateConsumerStateJournal(missingSuccessorEpochPath, manualRuntime({ value: 2 }, {
+			beforePathOperation: async ({ operation }) => {
+				if (operation !== "walk-transactions") return;
+				missingSuccessorEpochWalks += 1;
+				if (missingSuccessorEpochWalks !== 1) return;
+				missingSuccessorEpochReached.resolve();
+				await releaseMissingSuccessorEpoch.promise;
+			},
+		}));
+		await missingSuccessorEpochReached.promise;
+		let missingEpochCheckpoint;
+		const captureMissingEpoch = new Error("capture successor without publishing it");
+		await assert.rejects(
+			() => rotateConsumerStateJournal(missingSuccessorEpochPath, manualRuntime({ value: 3 }, {
+				beforeRotationDecision: async ({ claim }) => {
+					missingEpochCheckpoint = claim.intent.checkpoint;
+					throw captureMissingEpoch;
+				},
+			})),
+			(error) => error === captureMissingEpoch,
+		);
+		const missingSuccessorJournal = consumerJournal(missingSuccessorEpochPath);
+		writePrivate(
+			join(
+				missingSuccessorJournal.journal,
+				`checkpoint-${String(missingEpochCheckpoint.epoch).padStart(16, "0")}-${missingEpochCheckpoint.epochId}.json`,
+			),
+			metadata(missingEpochCheckpoint),
+		);
+		releaseMissingSuccessorEpoch.resolve();
+		await assert.rejects(
+			missingSuccessorEpochStale,
+			/journal root changed without one exact current or immediate-successor authority/,
+		);
+
+		const successorIoPath = join(fixture, "successor-scan-io-fence.json");
+		await withConsumerStateLock(successorIoPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("successor-io-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const successorIoJournal = consumerJournal(successorIoPath);
+		const successorIoReached = deferred();
+		const releaseSuccessorIo = deferred();
+		const successorIoFailure = new Error("injected successor scan I/O failure");
+		let successorIoWalks = 0;
+		let injectSuccessorIo = false;
+		let successorIoRootReads = 0;
+		const successorIoStale = rotateConsumerStateJournal(successorIoPath, {
+			...manualRuntime({ value: 2 }, {
+				beforePathOperation: async ({ operation }) => {
+					if (operation !== "walk-transactions") return;
+					successorIoWalks += 1;
+					if (successorIoWalks !== 1) return;
+					successorIoReached.resolve();
+					await releaseSuccessorIo.promise;
+				},
+			}),
+			readDirectory: async (path) => {
+				if (injectSuccessorIo && path === successorIoJournal.journal) {
+					successorIoRootReads += 1;
+					if (successorIoRootReads === 2) throw successorIoFailure;
+				}
+				return readDirectoryEntries(path);
+			},
+		});
+		await successorIoReached.promise;
+		await rotateConsumerStateJournal(successorIoPath, manualRuntime({ value: 3 }));
+		injectSuccessorIo = true;
+		releaseSuccessorIo.resolve();
+		await assert.rejects(successorIoStale, (error) => error === successorIoFailure);
+
+		const falseFencePath = join(fixture, "false-typed-fence.json");
+		await withConsumerStateLock(falseFencePath, async (_path, transaction) => {
+			await transaction.commitState(bytes("false-fence-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const falseFenceReached = deferred();
+		const releaseFalseFence = deferred();
+		const falseFence = new Error("Consumer high-water journal epoch changed and fenced a paused writer.");
+		let falseFenceScans = 0;
+		const falseFenceStale = rotateConsumerStateJournal(falseFencePath, manualRuntime({ value: 2 }, {
+			beforePathOperation: async ({ operation }) => {
+				if (operation !== "scan-claims") return;
+				falseFenceScans += 1;
+				if (falseFenceScans !== 2) return;
+				falseFenceReached.resolve();
+				await releaseFalseFence.promise;
+				throw falseFence;
+			},
+		}));
+		await falseFenceReached.promise;
+		await rotateConsumerStateJournal(falseFencePath, manualRuntime({ value: 3 }));
+		releaseFalseFence.resolve();
+		await assert.rejects(falseFenceStale, (error) => {
+			assert.equal(error, falseFence);
+			assert.equal(error.name, "Error");
+			return true;
+		});
+
+		const escapedRemovalPath = join(fixture, "escaped-removal-signal.json");
+		await withConsumerStateLock(escapedRemovalPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("escaped-removal-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const escapedRemovalJournal = consumerJournal(escapedRemovalPath);
+		const escapedClaimName = readdirSync(escapedRemovalJournal.epoch)
+			.find((name) => /^claim-[0-9]{16}-[0-9a-f]{64}\.json$/.test(name));
+		const escapedClaimBytes = readFileSync(join(escapedRemovalJournal.epoch, escapedClaimName));
+		const escapedClaimSha256 = /-([0-9a-f]{64})\.json$/.exec(escapedClaimName)[1];
+		const escapedRemovalReached = deferred();
+		const releaseEscapedRemoval = deferred();
+		let escapedRemovalScans = 0;
+		let escapedRemoval;
+		const escapedRemovalStale = rotateConsumerStateJournal(escapedRemovalPath, manualRuntime({ value: 2 }, {
+			beforePathOperation: async ({ operation, transactionDirectory }) => {
+				if (operation !== "scan-claims") return;
+				escapedRemovalScans += 1;
+				if (escapedRemovalScans !== 2) return;
+				escapedRemoval = new BoundedFileUnlinkedDuringReadError(
+					join(transactionDirectory, "..", escapedClaimName),
+					"Consumer high-water operation claim",
+					escapedClaimBytes,
+					escapedClaimSha256,
+				);
+				escapedRemovalReached.resolve();
+				await releaseEscapedRemoval.promise;
+				throw escapedRemoval;
+			},
+		}));
+		await escapedRemovalReached.promise;
+		await rotateConsumerStateJournal(escapedRemovalPath, manualRuntime({ value: 3 }));
+		releaseEscapedRemoval.resolve();
+		await assert.rejects(escapedRemovalStale, (error) => {
+			assert.equal(error, escapedRemoval);
+			return true;
+		});
+
+		const changedClaimPath = join(fixture, "changed-claim-is-terminal.json");
+		await withConsumerStateLock(changedClaimPath, async (_path, transaction) => {
+			await transaction.commitState(bytes("changed-claim-anchor"));
+		}, manualRuntime({ value: 1 }));
+		const changedClaimReadReached = deferred();
+		const releaseChangedClaimRead = deferred();
+		let changedClaimReads = 0;
+		let openedChangedClaimPath;
+		const changedClaimStale = rotateConsumerStateJournal(changedClaimPath, manualRuntime({ value: 2 }, {
+			metadataRead: {
+				afterInitialStat: async ({ path }) => {
+					if (!/^claim-[0-9]{16}-[0-9a-f]{64}\.json$/.test(basename(path))) return;
+					changedClaimReads += 1;
+					if (changedClaimReads !== 2) return;
+					openedChangedClaimPath = path;
+					changedClaimReadReached.resolve();
+					await releaseChangedClaimRead.promise;
+				},
+			},
+		}));
+		await changedClaimReadReached.promise;
+		await rotateConsumerStateJournal(changedClaimPath, manualRuntime({ value: 3 }));
+		writePrivate(openedChangedClaimPath, '{"malformed":true}\n');
+		releaseChangedClaimRead.resolve();
+		await assert.rejects(changedClaimStale, (error) => {
+			assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+			assert.match(error.message, /changed while it was read/);
+			return true;
+		});
+
+		const malformedClaimPath = join(fixture, "malformed-claim-is-terminal.json");
+		await withConsumerStateLock(malformedClaimPath, async () => {}, manualRuntime({ value: 1 }));
+		const malformedClaimJournal = consumerJournal(malformedClaimPath);
+		const malformedClaimName = readdirSync(malformedClaimJournal.epoch)
+			.find((name) => /^claim-[0-9]{16}-[0-9a-f]{64}\.json$/.test(name));
+		writePrivate(join(malformedClaimJournal.epoch, malformedClaimName), "{}\n");
+		await assert.rejects(
+			() => rotateConsumerStateJournal(malformedClaimPath, manualRuntime({ value: 2 })),
+			/operation claim is malformed/,
+		);
 
 		const concurrentRotationPath = join(fixture, "concurrent-rotation.json");
 		await withConsumerStateLock(concurrentRotationPath, async (_path, transaction) => {
@@ -2766,9 +3417,12 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			["afterFileSync", "claim"],
 			["afterMetadataLink", "claim"],
 			["afterMetadataDirectorySync", "claim"],
+			["afterFileSync", "claim-index"],
+			["afterMetadataLink", "claim-index"],
+			["afterMetadataDirectorySync", "claim-index"],
 			["afterRotationIntent", null],
 		]) {
-			const intentCrashPath = join(fixture, `rotation-operation-crash-${hookName}.json`);
+			const intentCrashPath = join(fixture, `rotation-operation-crash-${hookName}-${wantedKind ?? "rotation-decision"}.json`);
 			await withConsumerStateLock(intentCrashPath, async (_path, transaction) => {
 				await transaction.commitState(bytes("intent-anchor"));
 			}, manualRuntime({ value: 1 }));
@@ -2783,7 +3437,11 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 				})),
 				/simulated rotation operation crash/,
 			);
-			assert.equal((await rotateConsumerStateJournal(intentCrashPath, manualRuntime({ value: 3 }))).epoch, 2);
+			assert.equal(
+				(await rotateConsumerStateJournal(intentCrashPath, manualRuntime({ value: 3 }))).epoch,
+				2,
+				`${hookName}/${wantedKind ?? "rotation-decision"} must recover the same rotation epoch`,
+			);
 		}
 
 		for (const [hookName, wantedKind] of [

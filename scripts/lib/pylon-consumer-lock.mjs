@@ -3,13 +3,24 @@ import { constants } from "node:fs";
 import { link, lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 
-import { readBoundedRegularFile } from "./pylon-bounded-file.mjs";
+import {
+	BoundedFileUnlinkedDuringReadError,
+	readBoundedRegularFile,
+} from "./pylon-bounded-file.mjs";
+
+class ConsumerEpochAdvancedError extends Error {
+	constructor() {
+		super("Consumer high-water journal epoch changed and fenced a paused writer.");
+		this.name = "ConsumerEpochAdvancedError";
+	}
+}
 
 export const PYLON_CONSUMER_LOCK_STALE_MS = 30_000;
 export const PYLON_CONSUMER_LOCK_UPDATE_MS = 10_000;
 export const PYLON_CONSUMER_ROTATE_CLAIM_TRIGGER = 60_000;
 export const PYLON_CONSUMER_ROTATE_TRANSITION_TRIGGER = 3_800;
 const LOCK_SCHEMA_VERSION = 2;
+const CLAIM_INDEX_SCHEMA_VERSION = 1;
 const LEGACY_LOCK_SCHEMA_VERSION = 1;
 const TRANSACTION_SCHEMA_VERSION = 1;
 const CHECKPOINT_SCHEMA_VERSION = 2;
@@ -31,7 +42,9 @@ const TEMPORARY_DIRECTORY_NAME = ".owned-temporaries-v2";
 const LEGACY_RETIREMENT_MARKER_NAME = ".pylon-consumer-v1-retired.json";
 const uuidSource = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 const uuidPattern = new RegExp(`^${uuidSource}$`);
-const claimPattern = /^claim-([0-9]{16})\.json$/;
+const claimPattern = /^claim-([0-9]{16})-([0-9a-f]{64})\.json$/;
+const claimIndexPattern = /^claim-index-([0-9]{16})\.json$/;
+const undigestedClaimPattern = /^claim-([0-9]{16})\.json$/;
 const transitionPattern = /^transition-([0-9a-f]{64})\.json$/;
 const legacyTransitionPattern = /^([0-9a-f]{64})\.json$/;
 const checkpointPattern = new RegExp(`^checkpoint-([0-9]{16})-(${uuidSource})\\.json$`);
@@ -76,8 +89,12 @@ function epochName(checkpoint) {
 	return `epoch-${generationName(checkpoint.epoch)}-${checkpoint.epochId}`;
 }
 
-function claimPath(context, generation) {
-	return join(context.epochDirectory, `claim-${generationName(generation)}.json`);
+function claimPath(context, claim) {
+	return join(context.epochDirectory, `claim-${generationName(claim.generation)}-${digest(metadataBytes(claim))}.json`);
+}
+
+function claimIndexPath(context, generation) {
+	return join(context.epochDirectory, `claim-index-${generationName(generation)}.json`);
 }
 
 function heartbeatPath(context, claim) {
@@ -117,6 +134,23 @@ function validateClaim(value, context, stateMaxBytes) {
 	if (value.token !== intent.checkpoint.epochId) {
 		throw new Error("Consumer high-water rotation operation claim differs from its deterministic intent.");
 	}
+	return value;
+}
+
+function claimIndexFor(claim) {
+	return {
+		schemaVersion: CLAIM_INDEX_SCHEMA_VERSION,
+		generation: claim.generation,
+		claimSha256: digest(metadataBytes(claim)),
+	};
+}
+
+function validateClaimIndex(value, generation) {
+	if (
+		!exactKeys(value, ["schemaVersion", "generation", "claimSha256"]) ||
+		value.schemaVersion !== CLAIM_INDEX_SCHEMA_VERSION || value.generation !== generation ||
+		!/^[0-9a-f]{64}$/.test(value.claimSha256 ?? "")
+	) throw new Error("Consumer high-water claim index is malformed.");
 	return value;
 }
 
@@ -431,7 +465,7 @@ async function ensureDirectory(path, description, options) {
 	await options.syncDirectory(dirname(path));
 }
 
-async function readSecureFile(path, maxBytes, description, options, minBytes = 1, hooks) {
+async function readSecureFile(path, maxBytes, description, options, minBytes = 1, hooks, expectedSha256 = null) {
 	return readBoundedRegularFile(path, {
 		maxBytes,
 		minBytes,
@@ -439,12 +473,21 @@ async function readSecureFile(path, maxBytes, description, options, minBytes = 1
 		openFile: options.openFile,
 		lstatEntry: options.lstatEntry,
 		hooks,
+		expectedSha256,
 		validateHandle: (handle, stat) => secureHandle(handle, stat, description, "file", options),
 	});
 }
 
-async function readExactMetadata(path, maxBytes, validate, description, options, budget) {
-	const bytes = await readSecureFile(path, maxBytes, description, options);
+async function readExactMetadata(path, maxBytes, validate, description, options, budget, expectedSha256 = null) {
+	const bytes = await readSecureFile(
+		path,
+		maxBytes,
+		description,
+		options,
+		1,
+		options.hooks?.metadataRead,
+		expectedSha256,
+	);
 	if (bytes === null) return null;
 	if (budget) {
 		budget.bytes += bytes.length;
@@ -495,7 +538,7 @@ async function inspectTemporary(path, options) {
 	}
 	const kind = match[6];
 	const allowedKinds = new Set([
-		"checkpoint", "projection", "transition", "claim", "initial-heartbeat", "heartbeat",
+		"checkpoint", "projection", "transition", "claim", "claim-index", "initial-heartbeat", "heartbeat",
 		"terminal-released", "terminal-retired", "terminal-commit", "applied", "legacy-guard",
 		"legacy-retirement",
 	]);
@@ -512,7 +555,157 @@ async function inspectTemporary(path, options) {
 	};
 }
 
-async function revalidateAuthority(context, operation, options) {
+function isImmediateSuccessorCheckpoint(context, checkpoint) {
+	return checkpoint.epoch === context.checkpoint.epoch + 1 &&
+		checkpoint.epochId === deterministicUuid(
+			`pylon-consumer-rotation-v2:${context.checkpointDigest}:${checkpoint.anchorDigest}`,
+		) &&
+		checkpoint.previousCheckpointSha256 === context.checkpointDigest &&
+		checkpoint.previousTipSha256 === checkpoint.anchorDigest &&
+		checkpoint.retiredEpochDirectory === basename(context.epochDirectory) &&
+		checkpoint.sourceAuthoritySha256 === context.checkpoint.sourceAuthoritySha256 &&
+		checkpoint.sourceAuthorityTipDigest === context.checkpoint.sourceAuthorityTipDigest &&
+		checkpoint.sourceAuthorityTipBase64 === context.checkpoint.sourceAuthorityTipBase64 &&
+		checkpoint.historySha256 === digest(Buffer.from(
+			`${context.checkpoint.historySha256}:${context.checkpointDigest}:${checkpoint.anchorDigest}`,
+		));
+}
+
+async function confirmAuthenticatedSuccessorRoot(scan, context, options, invalidRoot) {
+	const rootNames = new Set([
+		TEMPORARY_DIRECTORY_NAME,
+		...scan.checkpointEntries.map((entry) => entry.name),
+		...scan.epochEntries.map((entry) => entry.name),
+		...scan.temporaries
+			.filter((temporary) => dirname(temporary.path) === context.journalDirectory)
+			.map((temporary) => basename(temporary.path)),
+	]);
+	const headEpoch = scan.head.checkpoint.epoch;
+	const optionalNames = new Set([
+		...scan.checkpointEntries.filter((entry) => entry.checkpoint.epoch < headEpoch).map((entry) => entry.name),
+		...scan.epochEntries.filter((entry) => entry.epoch < headEpoch).map((entry) => entry.name),
+		...scan.temporaries
+			.filter((temporary) => dirname(temporary.path) === context.journalDirectory)
+			.map((temporary) => basename(temporary.path)),
+	]);
+	const sameRootAuthority = (names) => {
+		const actual = new Set(names);
+		return [...actual].every((name) => rootNames.has(name)) &&
+			[...rootNames].every((name) => optionalNames.has(name) || actual.has(name));
+	};
+	if (!sameRootAuthority(await options.readDirectory(context.journalDirectory))) throw invalidRoot();
+	for (const entry of scan.checkpointEntries) {
+		let checkpoint;
+		try {
+			checkpoint = await readExactMetadata(
+				entry.path,
+				options.metadataMaxBytes,
+				(value) => validateCheckpoint(value, options.stateMaxBytes).value,
+				"Consumer high-water journal checkpoint",
+				options,
+				undefined,
+				entry.digest,
+			);
+		} catch (error) {
+			if (optionalNames.has(entry.name) && error instanceof BoundedFileUnlinkedDuringReadError) continue;
+			throw error;
+		}
+		if (checkpoint === null && optionalNames.has(entry.name)) continue;
+		if (checkpoint === null || digest(metadataBytes(checkpoint)) !== entry.digest) throw invalidRoot();
+	}
+	for (const entry of scan.epochEntries) {
+		try {
+			await secureDirectory(entry.path, "Consumer high-water epoch directory", options);
+		} catch (error) {
+			if (optionalNames.has(entry.name) && error?.code === "ENOENT") continue;
+			throw error;
+		}
+	}
+	if (!sameRootAuthority(await options.readDirectory(context.journalDirectory))) throw invalidRoot();
+}
+
+async function authenticateChangedRoot(
+	context,
+	options,
+	inProgressCheckpoint = null,
+	allowInProgressDiscovery = false,
+) {
+	const scan = await scanJournalRoot(context.statePath, context.journalDirectory, options, 0, true);
+	const invalidRoot = () => new Error(
+		"Consumer high-water journal root changed without one exact current or immediate-successor authority.",
+	);
+	const currentCheckpoint = scan.checkpointEntries.find((entry) => entry.path === context.checkpointPath);
+	if (currentCheckpoint && currentCheckpoint.digest !== context.checkpointDigest) throw invalidRoot();
+
+	if (inProgressCheckpoint !== null && scan.checkpointEntries.length === 1) {
+		const checkpoint = validateCheckpoint(inProgressCheckpoint, options.stateMaxBytes).value;
+		const nextEpochPath = join(context.journalDirectory, epochName(checkpoint));
+		if (
+			!isImmediateSuccessorCheckpoint(context, checkpoint) ||
+			scan.checkpointEntries.length !== 1 || scan.head?.path !== context.checkpointPath || scan.missingHeadEpoch ||
+			scan.epochEntries.length !== 2 ||
+			scan.epochEntries.some((entry) => ![context.epochDirectory, nextEpochPath].includes(entry.path)) ||
+			!scan.epochEntries.some((entry) => entry.path === nextEpochPath) ||
+			(await options.readDirectory(nextEpochPath)).length !== 0
+		) throw invalidRoot();
+		if ((await options.readDirectory(nextEpochPath)).length !== 0) throw invalidRoot();
+		return false;
+	}
+
+	const discoveredNextEpoch = scan.epochEntries.find((entry) => entry.path !== context.epochDirectory);
+	if (
+		allowInProgressDiscovery && inProgressCheckpoint === null &&
+		scan.checkpointEntries.length === 1 && scan.head?.path === context.checkpointPath && !scan.missingHeadEpoch &&
+		scan.epochEntries.length === 2 && discoveredNextEpoch?.epoch === context.checkpoint.epoch + 1 &&
+		(await options.readDirectory(discoveredNextEpoch.path)).length === 0
+	) {
+		if ((await options.readDirectory(discoveredNextEpoch.path)).length !== 0) throw invalidRoot();
+		return discoveredNextEpoch.path;
+	}
+
+	const retainedCheckpoint = scan.checkpointEntries.find((entry) => entry.path !== context.checkpointPath);
+	const retiredEpochPath = context.checkpoint.retiredEpochDirectory === null
+		? null
+		: join(context.journalDirectory, context.checkpoint.retiredEpochDirectory);
+	if (
+		currentCheckpoint && scan.head?.path === context.checkpointPath && !scan.missingHeadEpoch &&
+		scan.checkpointEntries.length <= 2 && scan.epochEntries.length <= 2 &&
+		(!retainedCheckpoint || (
+			retainedCheckpoint.digest === context.checkpoint.previousCheckpointSha256 &&
+			epochName(retainedCheckpoint.checkpoint) === context.checkpoint.retiredEpochDirectory
+		)) &&
+		scan.epochEntries.every((entry) => [context.epochDirectory, retiredEpochPath].includes(entry.path))
+	) {
+		return false;
+	}
+
+	const successor = scan.head;
+	const expectedCheckpointPath = successor
+		? join(context.journalDirectory, checkpointName(successor.checkpoint))
+		: null;
+	const expectedEpochPath = successor
+		? join(context.journalDirectory, epochName(successor.checkpoint))
+		: null;
+	if (
+		!successor || scan.missingHeadEpoch || successor.path !== expectedCheckpointPath ||
+		!isImmediateSuccessorCheckpoint(context, successor.checkpoint) ||
+		scan.checkpointEntries.length < 1 || scan.checkpointEntries.length > 2 ||
+		scan.epochEntries.length < 1 || scan.epochEntries.length > 2 ||
+		scan.checkpointEntries.some((entry) => ![context.checkpointPath, expectedCheckpointPath].includes(entry.path)) ||
+		scan.epochEntries.some((entry) => ![context.epochDirectory, expectedEpochPath].includes(entry.path)) ||
+		!scan.epochEntries.some((entry) => entry.path === expectedEpochPath)
+	) throw invalidRoot();
+	await confirmAuthenticatedSuccessorRoot(scan, context, options, invalidRoot);
+	return true;
+}
+
+async function revalidateAuthority(
+	context,
+	operation,
+	options,
+	inProgressCheckpoint = options.inProgressCheckpoint ?? null,
+	allowInProgressDiscovery = false,
+) {
 	await options.hooks?.beforePathOperation?.({
 		operation,
 		statePath: context.statePath,
@@ -526,17 +719,33 @@ async function revalidateAuthority(context, operation, options) {
 	await secureDirectory(dirname(context.statePath), "Consumer high-water state directory", options);
 	await secureDirectory(context.journalDirectory, "Consumer high-water journal directory", options);
 	await secureDirectory(context.temporaryDirectory, "Consumer high-water temporary directory", options);
-	await secureDirectory(context.epochDirectory, "Consumer high-water epoch directory", options);
+	let oldEpochError = null;
+	try {
+		await secureDirectory(context.epochDirectory, "Consumer high-water epoch directory", options);
+	} catch (error) {
+		if (error?.code !== "ENOENT") throw error;
+		oldEpochError = error;
+	}
 	const entries = await options.readDirectory(context.journalDirectory);
 	if (entries.length > MAX_JOURNAL_ROOT_ENTRIES + MAX_TEMPORARY_ENTRIES) {
 		throw new Error("Consumer high-water journal root exceeds its safe allocation bound.");
 	}
-	const checkpoints = entries.map((name) => ({ name, match: checkpointPattern.exec(name) })).filter((entry) => entry.match);
-	if (checkpoints.length < 1 || checkpoints.length > 2) throw new Error("Consumer high-water journal checkpoint set is malformed.");
-	checkpoints.sort((left, right) => Number(left.match[1]) - Number(right.match[1]));
-	if (checkpoints.at(-1).name !== basename(context.checkpointPath)) {
-		throw new Error("Consumer high-water journal epoch changed and fenced a paused writer.");
+	const expectedRootNames = new Set([
+		TEMPORARY_DIRECTORY_NAME,
+		basename(context.checkpointPath),
+		basename(context.epochDirectory),
+	]);
+	let changedRoot = false;
+	if (entries.some((name) => !expectedRootNames.has(name))) {
+		changedRoot = await authenticateChangedRoot(
+			context,
+			options,
+			inProgressCheckpoint,
+			allowInProgressDiscovery,
+		);
+		if (changedRoot === true) throw new ConsumerEpochAdvancedError();
 	}
+	if (oldEpochError) throw oldEpochError;
 	const current = await readExactMetadata(
 		context.checkpointPath,
 		options.metadataMaxBytes,
@@ -547,6 +756,7 @@ async function revalidateAuthority(context, operation, options) {
 	if (digest(metadataBytes(current)) !== context.checkpointDigest) {
 		throw new Error("Consumer high-water journal checkpoint changed and fenced a paused writer.");
 	}
+	return typeof changedRoot === "string" ? changedRoot : null;
 }
 
 async function publishImmutable({
@@ -559,8 +769,9 @@ async function publishImmutable({
 	options,
 	revalidate = true,
 	beforeLink,
+	inProgressCheckpoint = null,
 }) {
-	if (revalidate) await revalidateAuthority(context, kind, options);
+	if (revalidate) await revalidateAuthority(context, kind, options, inProgressCheckpoint);
 	const temporary = join(context.temporaryDirectory, temporaryName(path, kind, writer, context));
 	let handle;
 	let linked = false;
@@ -573,7 +784,7 @@ async function publishImmutable({
 		handle = undefined;
 		await options.hooks?.afterFileSync?.({ kind, path, temporary });
 		await beforeLink?.();
-		if (revalidate) await revalidateAuthority(context, `${kind}-link`, options);
+		if (revalidate) await revalidateAuthority(context, `${kind}-link`, options, inProgressCheckpoint);
 		try {
 			await options.linkFile(temporary, path);
 			linked = true;
@@ -631,7 +842,13 @@ function genesisCheckpoint(statePath) {
 	};
 }
 
-async function scanJournalRoot(statePath, journalDirectory, options, replacementRetries = PROJECTION_RETRY_LIMIT) {
+async function scanJournalRoot(
+	statePath,
+	journalDirectory,
+	options,
+	replacementRetries = PROJECTION_RETRY_LIMIT,
+	allowVanishedEarlierEntries = false,
+) {
 	await secureDirectory(journalDirectory, "Consumer high-water journal directory", options);
 	await options.syncDirectory(journalDirectory);
 	const names = await options.readDirectory(journalDirectory);
@@ -678,8 +895,9 @@ async function scanJournalRoot(statePath, journalDirectory, options, replacement
 					return match && Number(match[1]) > epoch;
 				});
 				if (hasLaterCheckpoint && replacementRetries > 0) {
-					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1);
+					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1, allowVanishedEarlierEntries);
 				}
+				if (hasLaterCheckpoint && allowVanishedEarlierEntries) continue;
 				throw new Error("Consumer high-water journal lost its current checkpoint during an authenticated scan.");
 			}
 			if (checkpointName(checkpoint) !== name || checkpoint.epoch !== Number(checkpointMatch[1])) {
@@ -700,8 +918,9 @@ async function scanJournalRoot(statePath, journalDirectory, options, replacement
 					return match && Number(match[1]) > epoch;
 				});
 				if (error?.code === "ENOENT" && hasLaterEpoch && replacementRetries > 0) {
-					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1);
+					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1, allowVanishedEarlierEntries);
 				}
+				if (error?.code === "ENOENT" && hasLaterEpoch && allowVanishedEarlierEntries) continue;
 				throw error;
 			}
 			if (!entry.isDirectory() || entry.isSymbolicLink?.()) throw new Error("Consumer high-water epoch entry must be one real directory.");
@@ -714,8 +933,9 @@ async function scanJournalRoot(statePath, journalDirectory, options, replacement
 					return match && Number(match[1]) > epoch;
 				});
 				if (error?.code === "ENOENT" && hasLaterEpoch && replacementRetries > 0) {
-					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1);
+					return scanJournalRoot(statePath, journalDirectory, options, replacementRetries - 1, allowVanishedEarlierEntries);
 				}
+				if (error?.code === "ENOENT" && hasLaterEpoch && allowVanishedEarlierEntries) continue;
 				throw error;
 			}
 			epochEntries.push({ name, path, epoch: Number(epochMatch[1]), epochId: epochMatch[2] });
@@ -900,10 +1120,7 @@ function isProjectionReplacementTransient(error) {
 }
 
 function isCommitHelperReplacementTransient(error) {
-	return isProjectionReplacementTransient(error) || [
-		"Consumer high-water journal epoch changed and fenced a paused writer.",
-		"Consumer high-water journal checkpoint changed and fenced a paused writer.",
-	].includes(error?.message);
+	return isProjectionReplacementTransient(error) || error instanceof ConsumerEpochAdvancedError;
 }
 
 async function repairProjection(context, initialTip, options, writer = options.activeWriter) {
@@ -961,13 +1178,21 @@ async function publishTransition(context, transaction, claim, options) {
 }
 
 async function scanEpoch(context, options) {
-	await revalidateAuthority(context, "scan-claims", options);
+	const discoveredNextEpoch = await revalidateAuthority(
+		context,
+		"scan-claims",
+		options,
+		options.inProgressCheckpoint ?? null,
+		true,
+	);
 	await options.syncDirectory(context.epochDirectory);
 	const names = await options.readDirectory(context.epochDirectory);
 	if (names.length > options.maxJournalEntries + MAX_TEMPORARY_ENTRIES) {
 		throw new Error("Consumer high-water epoch exceeds its safe allocation bound.");
 	}
-	const claimNames = new Map();
+	const claimContentNames = new Map();
+	const claimIndexNames = new Map();
+	const legacyClaimNames = new Map();
 	const heartbeatNames = new Map();
 	const terminalNames = new Map();
 	const appliedNames = new Map();
@@ -976,8 +1201,20 @@ async function scanEpoch(context, options) {
 	for (const name of names) {
 		let match;
 		if ((match = claimPattern.exec(name))) {
-			if (claimNames.has(Number(match[1]))) throw new Error("Consumer high-water lock contains a duplicate claim.");
-			claimNames.set(Number(match[1]), name);
+			const generation = Number(match[1]);
+			const contents = claimContentNames.get(generation) ?? new Map();
+			contents.set(match[2], name);
+			claimContentNames.set(generation, contents);
+			authoritativeEntryCount += 1;
+		} else if ((match = claimIndexPattern.exec(name))) {
+			const generation = Number(match[1]);
+			if (claimIndexNames.has(generation)) throw new Error("Consumer high-water lock contains a duplicate claim index.");
+			claimIndexNames.set(generation, name);
+			authoritativeEntryCount += 1;
+		} else if ((match = undigestedClaimPattern.exec(name))) {
+			const generation = Number(match[1]);
+			if (legacyClaimNames.has(generation)) throw new Error("Consumer high-water lock contains a duplicate legacy claim.");
+			legacyClaimNames.set(generation, name);
 			authoritativeEntryCount += 1;
 		} else if ((match = heartbeatPattern.exec(name))) {
 			heartbeatNames.set(`${Number(match[1])}:${match[2]}`, name);
@@ -1007,20 +1244,71 @@ async function scanEpoch(context, options) {
 	const budget = { bytes: 0 };
 	const claims = [];
 	const byKey = new Map();
-	for (const [generation, name] of [...claimNames].sort((left, right) => left[0] - right[0])) {
-		const claim = await readExactMetadata(
-			join(context.epochDirectory, name),
-			options.metadataMaxBytes,
-			(value) => validateClaim(value, context, options.stateMaxBytes),
-			"Consumer high-water operation claim",
-			options,
-			budget,
-		);
-		if (claim.generation !== generation || name !== `claim-${generationName(generation)}.json`) {
-			throw new Error("Consumer high-water lock claim name differs from its exact generation.");
+	const referencedClaimContents = new Set();
+	const generations = new Set([...claimIndexNames.keys(), ...legacyClaimNames.keys()]);
+	for (const generation of [...generations].sort((left, right) => left - right)) {
+		if (claimIndexNames.has(generation) && legacyClaimNames.has(generation)) {
+			throw new Error("Consumer high-water lock contains competing indexed and legacy claims.");
+		}
+		let claim;
+		if (claimIndexNames.has(generation)) {
+			const index = await readExactMetadata(
+				join(context.epochDirectory, claimIndexNames.get(generation)),
+				options.metadataMaxBytes,
+				(value) => validateClaimIndex(value, generation),
+				"Consumer high-water claim index",
+				options,
+				budget,
+			);
+			const name = claimContentNames.get(generation)?.get(index.claimSha256);
+			if (!name) throw new Error("Consumer high-water claim index lacks its exact digest-bound claim bytes.");
+			referencedClaimContents.add(name);
+			claim = await readExactMetadata(
+				join(context.epochDirectory, name),
+				options.metadataMaxBytes,
+				(value) => validateClaim(value, context, options.stateMaxBytes),
+				"Consumer high-water operation claim",
+				options,
+				budget,
+				index.claimSha256,
+			);
+			if (
+				claim.generation !== generation || digest(metadataBytes(claim)) !== index.claimSha256 ||
+				name !== basename(claimPath(context, claim))
+			) throw new Error("Consumer high-water claim index differs from its exact canonical claim bytes.");
+		} else {
+			const name = legacyClaimNames.get(generation);
+			claim = await readExactMetadata(
+				join(context.epochDirectory, name),
+				options.metadataMaxBytes,
+				(value) => validateClaim(value, context, options.stateMaxBytes),
+				"Consumer high-water legacy operation claim",
+				options,
+				budget,
+			);
+			if (claim.generation !== generation || name !== `claim-${generationName(generation)}.json`) {
+				throw new Error("Consumer high-water legacy claim name differs from its exact generation.");
+			}
 		}
 		claims.push(claim);
 		byKey.set(`${generation}:${claim.token}`, claim);
+	}
+	for (const [generation, contents] of [...claimContentNames].sort((left, right) => left[0] - right[0])) {
+		for (const [claimSha256, name] of [...contents].sort((left, right) => left[0].localeCompare(right[0]))) {
+			if (referencedClaimContents.has(name)) continue;
+			const claim = await readExactMetadata(
+				join(context.epochDirectory, name),
+				options.metadataMaxBytes,
+				(value) => validateClaim(value, context, options.stateMaxBytes),
+				"Consumer high-water unindexed claim content",
+				options,
+				budget,
+			);
+			if (
+				claim.generation !== generation || digest(metadataBytes(claim)) !== claimSha256 ||
+				name !== basename(claimPath(context, claim))
+			) throw new Error("Consumer high-water unindexed claim content differs from its exact canonical bytes.");
+		}
 	}
 	if (claims.length > MAX_OPERATION_GENERATIONS) throw new Error("Consumer high-water operation generation bound is exhausted.");
 	for (let index = 0; index < claims.length; index += 1) {
@@ -1071,6 +1359,20 @@ async function scanEpoch(context, options) {
 		const terminal = terminals.get(key);
 		if (claim.type === "rotation" || !terminal || (terminal.outcome === "commit" && !appliedClaims.has(key))) {
 			throw new Error("Consumer high-water operation generations crossed an unresolved earlier slot.");
+		}
+	}
+	if (discoveredNextEpoch !== null) {
+		const latest = claims.at(-1);
+		if (latest?.type !== "rotation") {
+			throw new Error("Consumer high-water in-progress next epoch lacks its exact published rotation intent.");
+		}
+		const intent = validateRotationIntent(latest.intent, context, options.stateMaxBytes);
+		if (
+			!isImmediateSuccessorCheckpoint(context, intent.checkpoint) ||
+			discoveredNextEpoch !== join(context.journalDirectory, epochName(intent.checkpoint))
+		) throw new Error("Consumer high-water in-progress next epoch differs from its exact published rotation intent.");
+		if (await authenticateChangedRoot(context, options, intent.checkpoint)) {
+			throw new ConsumerEpochAdvancedError();
 		}
 	}
 	return { claims, terminals, temporaries };
@@ -1383,6 +1685,7 @@ async function finishRotationCheckpoint(context, checkpoint, writer, options) {
 		context,
 		writer,
 		options,
+		inProgressCheckpoint: checkpoint,
 		beforeLink: () => scanRotationPublicationSet(context, checkpoint, options, false),
 	});
 	await options.hooks?.afterRotationCheckpoint?.({ checkpoint: structuredClone(checkpoint), nextPath });
@@ -1438,6 +1741,27 @@ async function resolveOperationFrontier(context, options) {
 	return { scan, frontier: latest, rotated: false, active: false };
 }
 
+async function tryPublishClaim(context, claim, options) {
+	const contentPath = claimPath(context, claim);
+	const contentResult = await publishMetadata(contentPath, claim, "claim", context, claim, options);
+	const existingClaim = validateClaim(contentResult.value, context, options.stateMaxBytes);
+	if (!metadataBytes(existingClaim).equals(metadataBytes(claim))) {
+		throw new Error("Consumer high-water claim content lost its exact digest-bound publication.");
+	}
+	const index = claimIndexFor(claim);
+	const indexResult = await publishMetadata(
+		claimIndexPath(context, claim.generation),
+		index,
+		"claim-index",
+		context,
+		claim,
+		options,
+	);
+	const existingIndex = validateClaimIndex(indexResult.value, claim.generation);
+	if (!metadataBytes(existingIndex).equals(metadataBytes(index))) return false;
+	return indexResult.created;
+}
+
 async function tryCreateNormalClaim(context, generation, options) {
 	const claim = {
 		schemaVersion: LOCK_SCHEMA_VERSION,
@@ -1447,9 +1771,7 @@ async function tryCreateNormalClaim(context, generation, options) {
 		ownerPid: process.pid,
 		createdAtMs: options.now(),
 	};
-	const result = await publishMetadata(claimPath(context, generation), claim, "claim", context, claim, options);
-	if (!result.created) return null;
-	validateClaim(result.value, context, options.stateMaxBytes);
+	if (!(await tryPublishClaim(context, claim, options))) return null;
 	const heartbeat = {
 		schemaVersion: LOCK_SCHEMA_VERSION,
 		generation,
@@ -1464,9 +1786,7 @@ async function tryCreateNormalClaim(context, generation, options) {
 async function tryCreateRotationClaim(context, generation, tip, options) {
 	const claim = rotationClaimFor(context, generation, tip);
 	await options.hooks?.beforeRotationDecision?.({ intent: structuredClone(claim.intent), claim: structuredClone(claim) });
-	const result = await publishMetadata(claimPath(context, generation), claim, "claim", context, claim, options);
-	if (!result.created) return null;
-	validateClaim(result.value, context, options.stateMaxBytes);
+	if (!(await tryPublishClaim(context, claim, options))) return null;
 	await options.hooks?.afterRotationIntent?.({ intent: structuredClone(claim.intent), claim: structuredClone(claim) });
 	return claim;
 }
@@ -1611,7 +1931,9 @@ async function cleanupAuthority(
 				const temporary = await inspectTemporary(path, options);
 				if (temporary) retiredTemporaries.push(temporary);
 			} else if (
-				!claimPattern.test(name) && !heartbeatPattern.test(name) && !terminalPattern.test(name) &&
+				!claimPattern.test(name) && !claimIndexPattern.test(name) && !undigestedClaimPattern.test(name) &&
+				!heartbeatPattern.test(name) &&
+				!terminalPattern.test(name) &&
 				!appliedPattern.test(name) && !transitionPattern.test(name)
 			) {
 				throw new Error("Consumer high-water retired epoch contains an unexpected entry.");
@@ -1660,34 +1982,35 @@ async function cleanupAuthority(
 async function helpRotationOperation(context, claim, options) {
 	if (claim.type !== "rotation") throw new Error("Consumer high-water rotation helper requires one rotation operation slot.");
 	const intent = validateRotationIntent(claim.intent, context, options.stateMaxBytes);
-	const completedBeforeHelp = await completedRotationResult(context, intent, options).catch(() => null);
+	const helperOptions = { ...options, inProgressCheckpoint: intent.checkpoint };
+	const completedBeforeHelp = await completedRotationResult(context, intent, helperOptions).catch(() => null);
 	if (completedBeforeHelp) return true;
 	try {
-		const scan = await scanEpoch(context, options);
+		const scan = await scanEpoch(context, helperOptions);
 		const latest = scan.claims.at(-1);
 		if (operationIdentity(latest) !== operationIdentity(claim) || !metadataBytes(latest).equals(metadataBytes(claim))) {
 			throw new Error("Consumer high-water rotation operation is not the unique latest slot.");
 		}
-		const tip = await effectiveTip(context, options);
+		const tip = await effectiveTip(context, helperOptions);
 		if (tip.tipDigest !== intent.tipSha256) {
 			throw new Error("Consumer high-water rotation operation no longer matches its exact authoritative tip.");
 		}
-		const rootScan = await scanJournalRoot(context.statePath, context.journalDirectory, options);
+		const rootScan = await scanJournalRoot(context.statePath, context.journalDirectory, helperOptions);
 		const nextEpochName = epochName(intent.checkpoint);
 		await cleanupAuthority(
 			context,
 			claim,
 			rootScan,
 			scan.temporaries,
-			options,
+			helperOptions,
 			true,
 			scan,
 			nextEpochName,
 		);
-		await finishRotationCheckpoint(context, intent.checkpoint, claim, options);
+		await finishRotationCheckpoint(context, intent.checkpoint, claim, helperOptions);
 		return true;
 	} catch (error) {
-		const completed = await completedRotationResult(context, intent, options).catch(() => null);
+		const completed = await completedRotationResult(context, intent, helperOptions).catch(() => null);
 		if (completed) return true;
 		throw error;
 	}
@@ -1792,7 +2115,7 @@ function normalizeOptions({
 		maxTransactionDepth,
 		maxLockGenerations,
 		maxJournalBytes,
-		maxJournalEntries: MAX_OPERATION_GENERATIONS * 4 + MAX_TRANSACTION_DEPTH + 32,
+		maxJournalEntries: MAX_OPERATION_GENERATIONS * 5 + MAX_TRANSACTION_DEPTH + 32,
 		metadataMaxBytes: stateMaxBytes * 3 + 8192,
 		now,
 		startHeartbeat,
@@ -1818,7 +2141,7 @@ function normalizeRotationOptions(rawOptions) {
 	options.maxTransactionDepth = MAX_TRANSACTION_DEPTH;
 	options.maxLockGenerations = MAX_LOCK_GENERATIONS;
 	options.maxJournalBytes = MAX_JOURNAL_BYTES;
-	options.maxJournalEntries = MAX_OPERATION_GENERATIONS * 4 + MAX_TRANSACTION_DEPTH + 32;
+	options.maxJournalEntries = MAX_OPERATION_GENERATIONS * 5 + MAX_TRANSACTION_DEPTH + 32;
 	options.metadataMaxBytes = MAX_STATE_BYTES * 3 + 8192;
 	return options;
 }
@@ -1917,7 +2240,7 @@ async function readLegacyAuthority(statePath, lockDirectory, transactionDirector
 			);
 			continue;
 		}
-		if ((match = claimPattern.exec(name))) claimNames.set(Number(match[1]), name);
+		if ((match = undigestedClaimPattern.exec(name))) claimNames.set(Number(match[1]), name);
 		else if ((match = heartbeatPattern.exec(name))) heartbeatNames.set(`${Number(match[1])}:${match[2]}`, name);
 		else if ((match = terminalPattern.exec(name))) terminalNames.set(`${Number(match[1])}:${match[2]}`, name);
 		else if ((match = appliedPattern.exec(name))) appliedNames.set(`${Number(match[1])}:${match[2]}`, name);
@@ -2797,6 +3120,28 @@ async function runNormalLocked(statePath, action, rawOptions) {
 	}
 }
 
+function isExpectedRemovedClaimRead(error, context, options) {
+	if (
+		!(error instanceof BoundedFileUnlinkedDuringReadError) ||
+		error.description !== "Consumer high-water operation claim" || typeof error.path !== "string" ||
+		!Buffer.isBuffer(error.bytes) || error.bytes.length < 1 || error.bytes.length > options.metadataMaxBytes
+	) return false;
+	const name = basename(error.path);
+	const match = claimPattern.exec(name);
+	if (
+		!match || error.expectedSha256 !== match[2] || digest(error.bytes) !== match[2] ||
+		error.path !== join(context.epochDirectory, name) || dirname(error.path) !== context.epochDirectory
+	) return false;
+	let claim;
+	try {
+		claim = validateClaim(JSON.parse(error.bytes), context, options.stateMaxBytes);
+	} catch {
+		return false;
+	}
+	return claim.generation === Number(match[1]) && metadataBytes(claim).equals(error.bytes) &&
+		error.path === claimPath(context, claim);
+}
+
 async function completedRotationResult(context, intent, options) {
 	const scan = await scanJournalRoot(context.statePath, context.journalDirectory, options);
 	if (scan.head && metadataBytes(scan.head.checkpoint).equals(metadataBytes(intent.checkpoint))) {
@@ -2820,17 +3165,28 @@ async function recoverCompletedCurrentRotation(context, scan, options) {
 async function runRotation(statePath, rawOptions) {
 	const options = normalizeRotationOptions(rawOptions);
 	for (;;) {
-		const { context } = await prepareContext(statePath, options);
-		await ensureLegacyGuard(context, { generation: 0, token: context.checkpoint.epochId, type: "rotation" }, options);
-		const initialScan = await scanEpoch(context, options);
-		const completed = await recoverCompletedCurrentRotation(context, initialScan, options);
-		if (completed) return completed;
-		const expectedIntent = rotationIntentFor(context, await effectiveTip(context, options));
+		let context;
+		let expectedIntent;
+		try {
+			({ context } = await prepareContext(statePath, options));
+			await ensureLegacyGuard(context, { generation: 0, token: context.checkpoint.epochId, type: "rotation" }, options);
+			const initialScan = await scanEpoch(context, options);
+			const latest = initialScan.claims.at(-1);
+			const preparationOptions = latest?.type === "rotation"
+				? { ...options, inProgressCheckpoint: validateRotationIntent(latest.intent, context, options.stateMaxBytes).checkpoint }
+				: options;
+			const completed = await recoverCompletedCurrentRotation(context, initialScan, preparationOptions);
+			if (completed) return completed;
+			expectedIntent = rotationIntentFor(context, await effectiveTip(context, preparationOptions));
+		} catch (error) {
+			if (error instanceof ConsumerEpochAdvancedError) continue;
+			throw error;
+		}
 		let frontier;
 		try {
 			frontier = await resolveOperationFrontier(context, options);
 		} catch (error) {
-			if (error?.message !== "Consumer high-water journal epoch changed and fenced a paused writer.") throw error;
+			if (!(error instanceof ConsumerEpochAdvancedError) && !isExpectedRemovedClaimRead(error, context, options)) throw error;
 			const completedResult = await completedRotationResult(context, expectedIntent, options);
 			if (completedResult) return completedResult;
 			throw error;
