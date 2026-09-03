@@ -23,6 +23,33 @@ export class BoundedFileUnlinkedDuringReadError extends Error {
 	}
 }
 
+function statEvidence(stat) {
+	return Object.freeze({
+		dev: stat.dev,
+		ino: stat.ino,
+		size: stat.size,
+		mtimeMs: stat.mtimeMs,
+		ctimeMs: stat.ctimeMs,
+		nlink: stat.nlink,
+	});
+}
+
+export class BoundedFileLinkRetiredBeforeReadError extends Error {
+	constructor(path, description, bytes, expectedSha256, pathEntry, openedHandle) {
+		super(`${description} changed while it was read because one publication hardlink was retired before the file was opened.`);
+		this.name = "BoundedFileLinkRetiredBeforeReadError";
+		this.path = path;
+		this.description = description;
+		this.bytes = Buffer.from(bytes);
+		this.expectedSha256 = expectedSha256;
+		this.sha256 = createHash("sha256").update(this.bytes).digest("hex");
+		this.statTransition = Object.freeze({
+			pathEntry: statEvidence(pathEntry),
+			openedHandle: statEvidence(openedHandle),
+		});
+	}
+}
+
 function sameInodeReadBounds(left, right) {
 	return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
 		left.mtimeMs === right.mtimeMs;
@@ -35,6 +62,25 @@ function sameStat(left, right) {
 function isPinnedHandleRemoval(pathEntry, before, after, extraBytes, finalPathMissing) {
 	return finalPathMissing && extraBytes === 0 && sameStat(pathEntry, before) &&
 		sameInodeReadBounds(before, after) && before.nlink > 0 && after.nlink === 0;
+}
+
+function initialRetirementKind(pathEntry, openedHandle, expectedSha256) {
+	if (
+		expectedSha256 === null || !sameInodeReadBounds(pathEntry, openedHandle) ||
+		pathEntry.ctimeMs === openedHandle.ctimeMs
+	) return null;
+	if (pathEntry.nlink === 2 && openedHandle.nlink === 1) return "link-retired";
+	if (pathEntry.nlink === 1 && openedHandle.nlink === 0) return "unlinked";
+	return null;
+}
+
+function isStableLinkRetirementBeforeRead(before, after, extraBytes, finalPathEntry, finalPathMissing) {
+	return !finalPathMissing && extraBytes === 0 && !finalPathEntry.isSymbolicLink?.() && finalPathEntry.isFile() &&
+		sameStat(before, after) && sameStat(after, finalPathEntry);
+}
+
+function isStableHandleRemovalBeforeRead(before, after, extraBytes, finalPathMissing) {
+	return finalPathMissing && extraBytes === 0 && sameStat(before, after);
 }
 
 function exactSha256(bytes, expectedSha256) {
@@ -84,7 +130,11 @@ export async function readBoundedRegularFile(
 		let before = await handle.stat();
 		if (!before.isFile()) throw new Error(`${description} is not one regular non-symlink file.`);
 		if (validateHandle) before = await validateHandle(handle, before, description);
-		if (!sameStat(pathEntry, before)) throw new Error(`${description} changed while it was read.`);
+		let retirementBeforeRead = null;
+		if (!sameStat(pathEntry, before)) {
+			retirementBeforeRead = initialRetirementKind(pathEntry, before, expectedSha256);
+			if (retirementBeforeRead === null) throw new Error(`${description} changed while it was read.`);
+		}
 		if (before.size < minBytes || before.size > maxBytes) throw new Error(`${description} exceeds its format byte limit or is malformed.`);
 		await hooks?.afterInitialStat?.({ path, handle, stat: before });
 		const bytes = Buffer.alloc(before.size);
@@ -106,14 +156,36 @@ export async function readBoundedRegularFile(
 			if (error?.code !== "ENOENT") throw error;
 			finalPathMissing = true;
 		}
-		if (
-			isPinnedHandleRemoval(pathEntry, before, after, extraBytes, finalPathMissing) &&
-			exactSha256(bytes, expectedSha256)
-		) {
-			throw new BoundedFileUnlinkedDuringReadError(path, description, bytes, expectedSha256);
+		if (exactSha256(bytes, expectedSha256)) {
+			if (
+				retirementBeforeRead === "link-retired" &&
+				isStableLinkRetirementBeforeRead(before, after, extraBytes, finalPathEntry, finalPathMissing)
+			) {
+				throw new BoundedFileLinkRetiredBeforeReadError(
+					path,
+					description,
+					bytes,
+					expectedSha256,
+					pathEntry,
+					before,
+				);
+			}
+			if (
+				retirementBeforeRead === "unlinked" &&
+				isStableHandleRemovalBeforeRead(before, after, extraBytes, finalPathMissing)
+			) {
+				throw new BoundedFileUnlinkedDuringReadError(path, description, bytes, expectedSha256);
+			}
+			if (
+				retirementBeforeRead === null &&
+				isPinnedHandleRemoval(pathEntry, before, after, extraBytes, finalPathMissing)
+			) {
+				throw new BoundedFileUnlinkedDuringReadError(path, description, bytes, expectedSha256);
+			}
 		}
 		if (
-			extraBytes !== 0 || finalPathMissing || finalPathEntry.isSymbolicLink?.() || !finalPathEntry.isFile() ||
+			retirementBeforeRead !== null || extraBytes !== 0 || finalPathMissing ||
+			finalPathEntry.isSymbolicLink?.() || !finalPathEntry.isFile() ||
 			!sameStat(before, after) || !sameStat(after, finalPathEntry)
 		) throw new Error(`${description} changed while it was read.`);
 		return bytes;
@@ -165,7 +237,11 @@ export function readBoundedRegularFileSync(
 	try {
 		const before = statFile(descriptor);
 		if (!before.isFile()) throw new Error(`${description} is not one regular non-symlink file.`);
-		if (!sameStat(pathEntry, before)) throw new Error(`${description} changed while it was read.`);
+		let retirementBeforeRead = null;
+		if (!sameStat(pathEntry, before)) {
+			retirementBeforeRead = initialRetirementKind(pathEntry, before, expectedSha256);
+			if (retirementBeforeRead === null) throw new Error(`${description} changed while it was read.`);
+		}
 		if (before.size < minBytes || before.size > maxBytes) throw new Error(`${description} exceeds its format byte limit or is malformed.`);
 		hooks?.afterInitialStat?.({ path, descriptor, stat: before });
 		const bytes = Buffer.alloc(before.size);
@@ -187,14 +263,36 @@ export function readBoundedRegularFileSync(
 			if (error?.code !== "ENOENT") throw error;
 			finalPathMissing = true;
 		}
-		if (
-			isPinnedHandleRemoval(pathEntry, before, after, extraBytes, finalPathMissing) &&
-			exactSha256(bytes, expectedSha256)
-		) {
-			throw new BoundedFileUnlinkedDuringReadError(path, description, bytes, expectedSha256);
+		if (exactSha256(bytes, expectedSha256)) {
+			if (
+				retirementBeforeRead === "link-retired" &&
+				isStableLinkRetirementBeforeRead(before, after, extraBytes, finalPathEntry, finalPathMissing)
+			) {
+				throw new BoundedFileLinkRetiredBeforeReadError(
+					path,
+					description,
+					bytes,
+					expectedSha256,
+					pathEntry,
+					before,
+				);
+			}
+			if (
+				retirementBeforeRead === "unlinked" &&
+				isStableHandleRemovalBeforeRead(before, after, extraBytes, finalPathMissing)
+			) {
+				throw new BoundedFileUnlinkedDuringReadError(path, description, bytes, expectedSha256);
+			}
+			if (
+				retirementBeforeRead === null &&
+				isPinnedHandleRemoval(pathEntry, before, after, extraBytes, finalPathMissing)
+			) {
+				throw new BoundedFileUnlinkedDuringReadError(path, description, bytes, expectedSha256);
+			}
 		}
 		if (
-			extraBytes !== 0 || finalPathMissing || finalPathEntry.isSymbolicLink?.() || !finalPathEntry.isFile() ||
+			retirementBeforeRead !== null || extraBytes !== 0 || finalPathMissing ||
+			finalPathEntry.isSymbolicLink?.() || !finalPathEntry.isFile() ||
 			!sameStat(before, after) || !sameStat(after, finalPathEntry)
 		) throw new Error(`${description} changed while it was read.`);
 		return bytes;
