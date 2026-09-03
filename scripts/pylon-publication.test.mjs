@@ -13,6 +13,7 @@ import {
 	mkdtempSync,
 	openSync,
 	readFileSync,
+	readSync,
 	readdirSync,
 	realpathSync,
 	renameSync,
@@ -93,6 +94,7 @@ import {
 } from "./lib/pylon-consumer-lock.mjs";
 import {
 	BoundedFileLinkRetiredBeforeReadError,
+	BoundedFileLinkRetiredDuringReadError,
 	BoundedFileUnlinkedDuringReadError,
 	PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
 	PYLON_STABLE_HISTORY_MAX_MANIFESTS,
@@ -969,21 +971,35 @@ test("bounded reads authenticate only exact pre-read link retirement transitions
 				},
 			}),
 			(error) => {
-				assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, true);
+				assert.equal(error.constructor, BoundedFileLinkRetiredBeforeReadError);
+				assert.equal(error.name, "BoundedFileLinkRetiredBeforeReadError");
 				assert.equal(error.path, asyncPublic);
 				assert.equal(error.description, "Async linked input");
 				assert.equal(error.bytes.equals(exactBytes), true);
 				assert.equal(error.expectedSha256, exactDigest);
 				assert.equal(error.sha256, exactDigest);
+				assert.equal(Object.isFrozen(error.statTransition), true);
 				assert.deepEqual(Object.keys(error.statTransition).sort(), ["openedHandle", "pathEntry"]);
 				const { pathEntry, openedHandle } = error.statTransition;
+				assert.equal(Object.isFrozen(pathEntry), true);
+				assert.equal(Object.isFrozen(openedHandle), true);
+				assert.deepEqual(
+					[pathEntry, openedHandle].map((stat) => Object.keys(stat).sort()),
+					Array(2).fill(["ctimeMs", "dev", "ino", "mtimeMs", "nlink", "size"]),
+				);
 				assert.deepEqual(
 					[pathEntry.dev, pathEntry.ino, pathEntry.size, pathEntry.mtimeMs],
 					[openedHandle.dev, openedHandle.ino, openedHandle.size, openedHandle.mtimeMs],
 				);
 				assert.equal(pathEntry.ctimeMs === openedHandle.ctimeMs, false);
 				assert.deepEqual([pathEntry.nlink, openedHandle.nlink], [2, 1]);
-				assert.equal(lstatSync(asyncPublic).nlink, 1);
+				const finalPath = lstatSync(asyncPublic);
+				assert.equal(finalPath.isFile(), true);
+				assert.equal(finalPath.isSymbolicLink(), false);
+				assert.deepEqual(
+					[finalPath.dev, finalPath.ino, finalPath.size, finalPath.mtimeMs, finalPath.ctimeMs, finalPath.nlink],
+					[openedHandle.dev, openedHandle.ino, openedHandle.size, openedHandle.mtimeMs, openedHandle.ctimeMs, 1],
+				);
 				return true;
 			},
 		);
@@ -1003,12 +1019,33 @@ test("bounded reads authenticate only exact pre-read link retirement transitions
 				},
 			}),
 			(error) => {
-				assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, true);
+				assert.equal(error.constructor, BoundedFileLinkRetiredBeforeReadError);
+				assert.equal(error.name, "BoundedFileLinkRetiredBeforeReadError");
+				assert.equal(error.path, syncPublic);
+				assert.equal(error.description, "Sync linked input");
 				assert.equal(error.bytes.equals(exactBytes), true);
+				assert.equal(error.expectedSha256, exactDigest);
 				assert.equal(error.sha256, exactDigest);
+				assert.equal(Object.isFrozen(error.statTransition), true);
+				const { pathEntry, openedHandle } = error.statTransition;
+				assert.equal(Object.isFrozen(pathEntry), true);
+				assert.equal(Object.isFrozen(openedHandle), true);
 				assert.deepEqual(
-					[error.statTransition.pathEntry.nlink, error.statTransition.openedHandle.nlink],
-					[2, 1],
+					[pathEntry, openedHandle].map((stat) => Object.keys(stat).sort()),
+					Array(2).fill(["ctimeMs", "dev", "ino", "mtimeMs", "nlink", "size"]),
+				);
+				assert.deepEqual([pathEntry.nlink, openedHandle.nlink], [2, 1]);
+				assert.deepEqual(
+					[pathEntry.dev, pathEntry.ino, pathEntry.size, pathEntry.mtimeMs],
+					[openedHandle.dev, openedHandle.ino, openedHandle.size, openedHandle.mtimeMs],
+				);
+				assert.notEqual(pathEntry.ctimeMs, openedHandle.ctimeMs);
+				const finalPath = lstatSync(syncPublic);
+				assert.equal(finalPath.isFile(), true);
+				assert.equal(finalPath.isSymbolicLink(), false);
+				assert.deepEqual(
+					[finalPath.dev, finalPath.ino, finalPath.size, finalPath.mtimeMs, finalPath.ctimeMs, finalPath.nlink],
+					[openedHandle.dev, openedHandle.ino, openedHandle.size, openedHandle.mtimeMs, openedHandle.ctimeMs, 1],
 				);
 				return true;
 			},
@@ -1028,10 +1065,30 @@ test("bounded reads authenticate only exact pre-read link retirement transitions
 				},
 			}),
 			(error) => {
-				assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, true);
+				assert.equal(error.constructor, BoundedFileUnlinkedDuringReadError);
+				assert.equal(error.name, "BoundedFileUnlinkedDuringReadError");
 				assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, false);
+				assert.equal(error.path, asyncUnlinked);
+				assert.equal(error.description, "Async unlinked input");
 				assert.equal(error.bytes.equals(exactBytes), true);
 				assert.equal(error.expectedSha256, exactDigest);
+				assert.equal(error.sha256, exactDigest);
+				assert.equal(Object.isFrozen(error.statTransition), true);
+				const { pathEntry, before, after, confirmedHandle } = error.statTransition;
+				assert.equal(confirmedHandle, null);
+				assert.equal([pathEntry, before, after].every((stat) => Object.isFrozen(stat)), true);
+				assert.deepEqual(
+					[pathEntry, before, after].map((stat) => Object.keys(stat).sort()),
+					Array(3).fill(["ctimeMs", "dev", "ino", "mtimeMs", "nlink", "size"]),
+				);
+				assert.deepEqual([pathEntry.nlink, before.nlink, after.nlink], [1, 0, 0]);
+				assert.equal(before.ctimeMs, after.ctimeMs);
+				assert.notEqual(pathEntry.ctimeMs, before.ctimeMs);
+				assert.equal(
+					new Set([pathEntry, before, after].map((stat) => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`)).size,
+					1,
+				);
+				assert.equal(existsSync(error.path), false);
 				return true;
 			},
 		);
@@ -1050,8 +1107,29 @@ test("bounded reads authenticate only exact pre-read link retirement transitions
 				},
 			}),
 			(error) => {
-				assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, true);
+				assert.equal(error.constructor, BoundedFileUnlinkedDuringReadError);
+				assert.equal(error.name, "BoundedFileUnlinkedDuringReadError");
+				assert.equal(error.path, syncUnlinked);
+				assert.equal(error.description, "Sync unlinked input");
 				assert.equal(error.bytes.equals(exactBytes), true);
+				assert.equal(error.expectedSha256, exactDigest);
+				assert.equal(error.sha256, exactDigest);
+				assert.equal(Object.isFrozen(error.statTransition), true);
+				const { pathEntry, before, after, confirmedHandle } = error.statTransition;
+				assert.equal(confirmedHandle, null);
+				assert.equal([pathEntry, before, after].every((stat) => Object.isFrozen(stat)), true);
+				assert.deepEqual(
+					[pathEntry, before, after].map((stat) => Object.keys(stat).sort()),
+					Array(3).fill(["ctimeMs", "dev", "ino", "mtimeMs", "nlink", "size"]),
+				);
+				assert.deepEqual([pathEntry.nlink, before.nlink, after.nlink], [1, 0, 0]);
+				assert.equal(before.ctimeMs, after.ctimeMs);
+				assert.notEqual(pathEntry.ctimeMs, before.ctimeMs);
+				assert.equal(
+					new Set([pathEntry, before, after].map((stat) => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`)).size,
+					1,
+				);
+				assert.equal(existsSync(error.path), false);
 				return true;
 			},
 		);
@@ -1207,6 +1285,520 @@ test("bounded reads authenticate only exact pre-read link retirement transitions
 			);
 			assert.equal(readFileSync(path).equals(exactBytes), true, `${label} failure cannot write the input`);
 		}
+	} finally {
+		rmSync(fixture, { recursive: true, force: true });
+	}
+});
+
+test("bounded reads authenticate every exact monotone retirement cut and confirmed unlink", async () => {
+	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-bounded-monotone-retirement-")));
+	const exactBytes = Buffer.from("monotone-retirement-bytes");
+	const exactDigest = sha256Bytes(exactBytes);
+	let fixtureNumber = 0;
+	const nextPath = (label) => join(fixture, `${String(++fixtureNumber).padStart(3, "0")}-${label}`);
+	const linkedPaths = (label, links = 2) => {
+		const publicPath = nextPath(`${label}-public`);
+		const privatePaths = [];
+		writeFileSync(publicPath, exactBytes);
+		for (let index = 1; index < links; index += 1) {
+			const privatePath = nextPath(`${label}-private-${index}`);
+			linkSync(publicPath, privatePath);
+			privatePaths.push(privatePath);
+		}
+		return { publicPath, privatePaths };
+	};
+	const assertExactStatTransition = (stats, expectedLinks) => {
+		assert.deepEqual(stats.map((stat) => stat.nlink), expectedLinks);
+		assert.equal(stats.every((stat) => Object.isFrozen(stat)), true);
+		assert.deepEqual(
+			stats.map((stat) => Object.keys(stat).sort()),
+			Array(stats.length).fill(["ctimeMs", "dev", "ino", "mtimeMs", "nlink", "size"]),
+		);
+		assert.equal(stats.every((stat) => stat.size === exactBytes.length), true);
+		assert.equal(new Set(stats.map((stat) => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`)).size, 1);
+		let cuts = 0;
+		for (let index = 1; index < stats.length; index += 1) {
+			if (stats[index - 1].nlink === stats[index].nlink) {
+				assert.equal(stats[index - 1].ctimeMs, stats[index].ctimeMs);
+			} else {
+				cuts += 1;
+				assert.notEqual(stats[index - 1].ctimeMs, stats[index].ctimeMs);
+			}
+		}
+		assert.equal(cuts, 1);
+	};
+	const assertLaterLinkEvidence = (error, expectedCut) => {
+		assert.equal(error.constructor, BoundedFileLinkRetiredDuringReadError);
+		assert.equal(error.name, "BoundedFileLinkRetiredDuringReadError");
+		assert.equal(error.bytes.equals(exactBytes), true);
+		assert.equal(error.expectedSha256, exactDigest);
+		assert.equal(error.sha256, exactDigest);
+		assert.equal(Object.isFrozen(error.statTransition), true);
+		assert.deepEqual(Object.keys(error.statTransition).sort(), ["after", "before", "finalPathEntry", "pathEntry"]);
+		const stats = [
+			error.statTransition.pathEntry,
+			error.statTransition.before,
+			error.statTransition.after,
+			error.statTransition.finalPathEntry,
+		];
+		assertExactStatTransition(stats, expectedCut === 2 ? [2, 2, 1, 1] : [2, 2, 2, 1]);
+		const finalPath = lstatSync(error.path);
+		assert.equal(finalPath.isFile(), true);
+		assert.equal(finalPath.isSymbolicLink(), false);
+		assert.deepEqual(
+			[finalPath.dev, finalPath.ino, finalPath.size, finalPath.mtimeMs, finalPath.ctimeMs, finalPath.nlink],
+			[
+				stats.at(-1).dev,
+				stats.at(-1).ino,
+				stats.at(-1).size,
+				stats.at(-1).mtimeMs,
+				stats.at(-1).ctimeMs,
+				stats.at(-1).nlink,
+			],
+		);
+		return true;
+	};
+	const assertUnlinkedEvidence = (error, expectedLinks, confirmed) => {
+		assert.equal(error.constructor, BoundedFileUnlinkedDuringReadError);
+		assert.equal(error.name, "BoundedFileUnlinkedDuringReadError");
+		assert.equal(error.bytes.equals(exactBytes), true);
+		assert.equal(error.expectedSha256, exactDigest);
+		assert.equal(error.sha256, exactDigest);
+		assert.equal(Object.isFrozen(error.statTransition), true);
+		assert.deepEqual(
+			Object.keys(error.statTransition).sort(),
+			["after", "before", "confirmedHandle", "pathEntry"],
+		);
+		const { pathEntry, before, after, confirmedHandle } = error.statTransition;
+		assert.deepEqual([pathEntry.nlink, before.nlink, after.nlink], expectedLinks);
+		assert.equal(confirmedHandle === null, !confirmed);
+		if (confirmed) assert.equal(confirmedHandle.nlink, 0);
+		const stats = [pathEntry, before, after, ...(confirmedHandle === null ? [] : [confirmedHandle])];
+		assertExactStatTransition(stats, [...expectedLinks, ...(confirmed ? [0] : [])]);
+		assert.equal(existsSync(error.path), false);
+		return true;
+	};
+	const rejectGenericAsync = async (operation) => {
+		await assert.rejects(operation, (error) => {
+			assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, false);
+			assert.equal(error instanceof BoundedFileLinkRetiredDuringReadError, false);
+			assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+			assert.match(error.message, /changed while it was read|regular non-symlink file/);
+			return true;
+		});
+	};
+	const rejectGenericSync = (operation) => {
+		assert.throws(operation, (error) => {
+			assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, false);
+			assert.equal(error instanceof BoundedFileLinkRetiredDuringReadError, false);
+			assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+			assert.match(error.message, /changed while it was read|regular non-symlink file/);
+			return true;
+		});
+	};
+	try {
+		for (const [phase, expectedCut] of [["afterInitialStat", 2], ["afterFinalStat", 3]]) {
+			const asyncPaths = linkedPaths(`async-link-${phase}`);
+			await assert.rejects(
+				() => readBoundedRegularFile(asyncPaths.publicPath, {
+					maxBytes: 1024,
+					expectedSha256: exactDigest,
+					hooks: { [phase]: () => rmSync(asyncPaths.privatePaths[0]) },
+				}),
+				(error) => assertLaterLinkEvidence(error, expectedCut),
+			);
+			const syncPaths = linkedPaths(`sync-link-${phase}`);
+			assert.throws(
+				() => readBoundedRegularFileSync(syncPaths.publicPath, {
+					maxBytes: 1024,
+					expectedSha256: exactDigest,
+					hooks: { [phase]: () => rmSync(syncPaths.privatePaths[0]) },
+				}),
+				(error) => assertLaterLinkEvidence(error, expectedCut),
+			);
+		}
+
+		for (const phase of ["before-open", "after-initial", "after-final"]) {
+			const asyncPath = nextPath(`async-unlink-${phase}`);
+			writeFileSync(asyncPath, exactBytes);
+			let asyncStatCalls = 0;
+			const asyncOptions = {
+				maxBytes: 1024,
+				expectedSha256: exactDigest,
+				openFile: async (path, flags) => {
+					const handle = await openFileHandle(path, flags);
+					if (phase === "before-open") rmSync(path);
+					return {
+						close: handle.close.bind(handle),
+						read: handle.read.bind(handle),
+						stat: async () => {
+							asyncStatCalls += 1;
+							return handle.stat();
+						},
+					};
+				},
+				hooks: phase === "after-initial"
+					? { afterInitialStat: () => rmSync(asyncPath) }
+					: phase === "after-final" ? { afterFinalStat: () => rmSync(asyncPath) } : {},
+			};
+			await assert.rejects(
+				() => readBoundedRegularFile(asyncPath, asyncOptions),
+				(error) => assertUnlinkedEvidence(
+					error,
+					phase === "before-open" ? [1, 0, 0] : phase === "after-initial" ? [1, 1, 0] : [1, 1, 1],
+					phase === "after-final",
+				),
+			);
+			assert.equal(asyncStatCalls, phase === "after-final" ? 3 : 2);
+
+			const syncPath = nextPath(`sync-unlink-${phase}`);
+			writeFileSync(syncPath, exactBytes);
+			let syncStatCalls = 0;
+			assert.throws(
+				() => readBoundedRegularFileSync(syncPath, {
+					maxBytes: 1024,
+					expectedSha256: exactDigest,
+					openFile: (path, flags) => {
+						const descriptor = openSync(path, flags);
+						if (phase === "before-open") rmSync(path);
+						return descriptor;
+					},
+					statFile: (descriptor) => {
+						syncStatCalls += 1;
+						return fstatSync(descriptor);
+					},
+					hooks: phase === "after-initial"
+						? { afterInitialStat: () => rmSync(syncPath) }
+						: phase === "after-final" ? { afterFinalStat: () => rmSync(syncPath) } : {},
+				}),
+				(error) => assertUnlinkedEvidence(
+					error,
+					phase === "before-open" ? [1, 0, 0] : phase === "after-initial" ? [1, 1, 0] : [1, 1, 1],
+					phase === "after-final",
+				),
+			);
+			assert.equal(syncStatCalls, phase === "after-final" ? 3 : 2);
+		}
+
+		const preciseStat = (base, nlink, ctimeMs) => ({
+			dev: base.dev,
+			ino: base.ino,
+			size: base.size,
+			mtimeMs: base.mtimeMs,
+			ctimeMs,
+			nlink,
+			isFile: () => true,
+			isSymbolicLink: () => false,
+		});
+		const multipleTransitionPath = nextPath("multiple-observed-transitions");
+		writeFileSync(multipleTransitionPath, exactBytes);
+		const multipleBase = lstatSync(multipleTransitionPath);
+		const multipleStats = [
+			preciseStat(multipleBase, 2, 10),
+			preciseStat(multipleBase, 1, 20),
+			preciseStat(multipleBase, 2, 30),
+			preciseStat(multipleBase, 1, 40),
+		];
+		let multipleLstats = 0;
+		await rejectGenericAsync(() => readBoundedRegularFile(multipleTransitionPath, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			lstatEntry: async () => multipleStats[multipleLstats++ === 0 ? 0 : 3],
+			openFile: async (path, flags) => {
+				const handle = await openFileHandle(path, flags);
+				let stats = 0;
+				return {
+					close: handle.close.bind(handle),
+					read: handle.read.bind(handle),
+					stat: async () => multipleStats[++stats],
+				};
+			},
+		}));
+		assert.equal(multipleLstats, 2);
+
+		const asyncExtraTransition = async (label, transition) => {
+			const path = nextPath(`extra-${label}`);
+			writeFileSync(path, exactBytes);
+			const base = lstatSync(path);
+			const pathEntry = preciseStat(base, transition === "link" ? 2 : 1, 10);
+			const before = preciseStat(base, transition === "link" ? 2 : 1, 10);
+			const after = preciseStat(base, transition === "link" ? 1 : 0, 20);
+			const finalPathEntry = preciseStat(base, 1, 20);
+			let lstats = 0;
+			await rejectGenericAsync(() => readBoundedRegularFile(path, {
+				maxBytes: 1024,
+				expectedSha256: exactDigest,
+				lstatEntry: async () => {
+					lstats += 1;
+					if (lstats === 1) return pathEntry;
+					if (transition === "unlink") {
+						const missing = new Error("precise final path is absent");
+						missing.code = "ENOENT";
+						throw missing;
+					}
+					return finalPathEntry;
+				},
+				openFile: async (openedPath, flags) => {
+					const handle = await openFileHandle(openedPath, flags);
+					let stats = 0;
+					return {
+						close: handle.close.bind(handle),
+						stat: async () => (++stats === 1 ? before : after),
+						read: async (buffer, offset, length, position) => {
+							if (position === exactBytes.length) return { bytesRead: 1, buffer };
+							return handle.read(buffer, offset, length, position);
+						},
+					};
+				},
+			}));
+			assert.equal(lstats, 2);
+		};
+		await asyncExtraTransition("eligible-link", "link");
+		await asyncExtraTransition("eligible-unlink", "unlink");
+
+		for (const phase of ["afterInitialStat", "afterFinalStat"]) {
+			const { publicPath, privatePaths } = linkedPaths(`new-inode-${phase}`);
+			const movedPath = nextPath(`new-inode-${phase}-moved`);
+			await rejectGenericAsync(() => readBoundedRegularFile(publicPath, {
+				maxBytes: 1024,
+				expectedSha256: exactDigest,
+				hooks: { [phase]: () => {
+					renameSync(publicPath, movedPath);
+					writeFileSync(publicPath, exactBytes);
+					rmSync(privatePaths[0]);
+				} },
+			}));
+		}
+
+		for (const phase of ["afterInitialStat", "afterFinalStat"]) {
+			const path = nextPath(`same-size-mtime-${phase}`);
+			const replacement = Buffer.from(exactBytes);
+			replacement[0] ^= 1;
+			writeFileSync(path, exactBytes);
+			const initial = statSync(path);
+			await rejectGenericAsync(() => readBoundedRegularFile(path, {
+				maxBytes: 1024,
+				expectedSha256: exactDigest,
+				hooks: { [phase]: () => {
+					writeFileSync(path, replacement);
+					utimesSync(path, initial.atime, initial.mtime);
+				} },
+			}));
+		}
+
+		const appendPath = nextPath("append");
+		writeFileSync(appendPath, exactBytes);
+		await rejectGenericAsync(() => readBoundedRegularFile(appendPath, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			hooks: { afterInitialStat: () => writeFileSync(appendPath, "x", { flag: "a" }) },
+		}));
+		const truncatePath = nextPath("truncate");
+		writeFileSync(truncatePath, exactBytes);
+		await rejectGenericAsync(() => readBoundedRegularFile(truncatePath, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			hooks: { afterInitialStat: () => truncateSync(truncatePath, 1) },
+		}));
+
+		for (const expectedSha256 of [null, "f".repeat(64)]) {
+			const { publicPath, privatePaths } = linkedPaths(`digest-${expectedSha256 ?? "absent"}`);
+			await rejectGenericAsync(() => readBoundedRegularFile(publicPath, {
+				maxBytes: 1024,
+				expectedSha256,
+				hooks: { afterInitialStat: () => rmSync(privatePaths[0]) },
+			}));
+		}
+
+		const threeLinks = linkedPaths("three-to-two", 3);
+		await rejectGenericAsync(() => readBoundedRegularFile(threeLinks.publicPath, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			hooks: { afterInitialStat: () => rmSync(threeLinks.privatePaths[0]) },
+		}));
+		const twoToZero = linkedPaths("two-to-zero");
+		await rejectGenericAsync(() => readBoundedRegularFile(twoToZero.publicPath, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			hooks: { afterInitialStat: () => {
+				rmSync(twoToZero.privatePaths[0]);
+				rmSync(twoToZero.publicPath);
+			} },
+		}));
+
+		for (const replacementKind of ["symlink", "directory"]) {
+			const path = nextPath(`final-${replacementKind}`);
+			const moved = nextPath(`final-${replacementKind}-moved`);
+			writeFileSync(path, exactBytes);
+			await rejectGenericAsync(() => readBoundedRegularFile(path, {
+				maxBytes: 1024,
+				expectedSha256: exactDigest,
+				hooks: { afterFinalStat: () => {
+					renameSync(path, moved);
+					if (replacementKind === "symlink") symlinkSync(moved, path);
+					else mkdirSync(path);
+				} },
+			}));
+		}
+
+		const asyncIoCases = [
+			["initial-lstat", (_path, failure) => ({ lstatEntry: async () => { throw failure; } })],
+			["open", (_path, failure) => ({ openFile: async () => { throw failure; } })],
+			["initial-fstat", (_path, failure) => ({
+				openFile: async (path, flags) => {
+					const handle = await openFileHandle(path, flags);
+					return { close: handle.close.bind(handle), read: handle.read.bind(handle), stat: async () => { throw failure; } };
+				},
+			})],
+			["read", (_path, failure) => ({
+				openFile: async (path, flags) => {
+					const handle = await openFileHandle(path, flags);
+					return { close: handle.close.bind(handle), read: async () => { throw failure; }, stat: handle.stat.bind(handle) };
+				},
+			})],
+			["final-fstat", (_path, failure) => ({
+				openFile: async (path, flags) => {
+					const handle = await openFileHandle(path, flags);
+					let calls = 0;
+					return {
+						close: handle.close.bind(handle),
+						read: handle.read.bind(handle),
+						stat: async () => { if (++calls === 2) throw failure; return handle.stat(); },
+					};
+				},
+			})],
+			["confirm-fstat", (path, failure) => ({
+				openFile: async (openedPath, flags) => {
+					const handle = await openFileHandle(openedPath, flags);
+					let calls = 0;
+					return {
+						close: handle.close.bind(handle),
+						read: handle.read.bind(handle),
+						stat: async () => { if (++calls === 3) throw failure; return handle.stat(); },
+					};
+				},
+				hooks: { afterFinalStat: () => rmSync(path) },
+			})],
+			["final-lstat", (_path, failure) => {
+				let calls = 0;
+				return { lstatEntry: async (path) => { if (++calls === 2) throw failure; return lstatFile(path); } };
+			}],
+		];
+		for (const [label, options] of asyncIoCases) {
+			const path = nextPath(`async-io-${label}`);
+			const failure = new Error(`async ${label} identity`);
+			writeFileSync(path, exactBytes);
+			await assert.rejects(
+				() => readBoundedRegularFile(path, { maxBytes: 1024, expectedSha256: exactDigest, ...options(path, failure) }),
+				(error) => error === failure,
+			);
+		}
+
+		const syncIoCases = [
+			["initial-lstat", (_path, failure) => ({ lstatEntry: () => { throw failure; } })],
+			["open", (_path, failure) => ({ openFile: () => { throw failure; } })],
+			["initial-fstat", (_path, failure) => ({ statFile: () => { throw failure; } })],
+			["read", (_path, failure) => ({ readFile: () => { throw failure; } })],
+			["final-fstat", (_path, failure) => {
+				let calls = 0;
+				return { statFile: (descriptor) => { if (++calls === 2) throw failure; return fstatSync(descriptor); } };
+			}],
+			["confirm-fstat", (path, failure) => {
+				let calls = 0;
+				return {
+					statFile: (descriptor) => { if (++calls === 3) throw failure; return fstatSync(descriptor); },
+					hooks: { afterFinalStat: () => rmSync(path) },
+				};
+			}],
+			["final-lstat", (_path, failure) => {
+				let calls = 0;
+				return { lstatEntry: (path) => { if (++calls === 2) throw failure; return lstatSync(path); } };
+			}],
+		];
+		for (const [label, options] of syncIoCases) {
+			const path = nextPath(`sync-io-${label}`);
+			const failure = new Error(`sync ${label} identity`);
+			writeFileSync(path, exactBytes);
+			assert.throws(
+				() => readBoundedRegularFileSync(path, { maxBytes: 1024, expectedSha256: exactDigest, ...options(path, failure) }),
+				(error) => error === failure,
+			);
+		}
+
+		const syncNewInode = nextPath("sync-new-inode");
+		const syncNewInodeMoved = nextPath("sync-new-inode-moved");
+		writeFileSync(syncNewInode, exactBytes);
+		rejectGenericSync(() => readBoundedRegularFileSync(syncNewInode, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			hooks: { afterInitialStat: () => {
+				renameSync(syncNewInode, syncNewInodeMoved);
+				writeFileSync(syncNewInode, exactBytes);
+			} },
+		}));
+
+		const syncTwoToZero = linkedPaths("sync-two-to-zero");
+		rejectGenericSync(() => readBoundedRegularFileSync(syncTwoToZero.publicPath, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			hooks: { afterInitialStat: () => {
+				rmSync(syncTwoToZero.privatePaths[0]);
+				rmSync(syncTwoToZero.publicPath);
+			} },
+		}));
+
+		for (const replacementKind of ["symlink", "directory"]) {
+			const path = nextPath(`sync-final-${replacementKind}`);
+			const moved = nextPath(`sync-final-${replacementKind}-moved`);
+			writeFileSync(path, exactBytes);
+			rejectGenericSync(() => readBoundedRegularFileSync(path, {
+				maxBytes: 1024,
+				expectedSha256: exactDigest,
+				hooks: { afterFinalStat: () => {
+					renameSync(path, moved);
+					if (replacementKind === "symlink") symlinkSync(moved, path);
+					else mkdirSync(path);
+				} },
+			}));
+		}
+
+		for (const expectedSha256 of [null, "f".repeat(64)]) {
+			const syncDigest = linkedPaths(`sync-digest-${expectedSha256 ?? "absent"}`);
+			rejectGenericSync(() => readBoundedRegularFileSync(syncDigest.publicPath, {
+				maxBytes: 1024,
+				expectedSha256,
+				hooks: { afterInitialStat: () => rmSync(syncDigest.privatePaths[0]) },
+			}));
+		}
+
+		const syncExtraPath = nextPath("sync-extra-eligible-link");
+		writeFileSync(syncExtraPath, exactBytes);
+		const syncExtraBase = lstatSync(syncExtraPath);
+		const syncExtraPathEntry = preciseStat(syncExtraBase, 2, 10);
+		const syncExtraBefore = preciseStat(syncExtraBase, 2, 10);
+		const syncExtraAfter = preciseStat(syncExtraBase, 1, 20);
+		const syncExtraFinal = preciseStat(syncExtraBase, 1, 20);
+		let syncExtraLstats = 0;
+		let syncExtraStats = 0;
+		rejectGenericSync(() => readBoundedRegularFileSync(syncExtraPath, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			lstatEntry: () => (++syncExtraLstats === 1 ? syncExtraPathEntry : syncExtraFinal),
+			statFile: () => (++syncExtraStats === 1 ? syncExtraBefore : syncExtraAfter),
+			readFile: (descriptor, buffer, offset, length, position) => {
+				if (position === exactBytes.length) return 1;
+				return readSync(descriptor, buffer, offset, length, position);
+			},
+		}));
+		assert.equal(syncExtraLstats, 2);
+		assert.equal(syncExtraStats, 2);
+
+		const syncGeneric = linkedPaths("sync-nonunit", 3);
+		rejectGenericSync(() => readBoundedRegularFileSync(syncGeneric.publicPath, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			hooks: { afterInitialStat: () => rmSync(syncGeneric.privatePaths[0]) },
+		}));
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
@@ -1934,6 +2526,603 @@ test("checkpoint readers converge across exact publication-link and retained-lin
 		for (const mutation of [null, "checkpoint", "historySha256", "sourceAuthoritySha256", "anchorDigest"]) {
 			await runDiscoveredSuccessor(mutation);
 		}
+	} finally {
+		rmSync(fixture, { recursive: true, force: true });
+	}
+});
+
+test("stable checkpoint proof consumes exact retirements and fences namespace changes", async () => {
+	const deferred = () => {
+		let resolvePromise;
+		const promise = new Promise((resolvePromiseValue) => { resolvePromise = resolvePromiseValue; });
+		return { promise, resolve: resolvePromise };
+	};
+	const runtime = (hooks = {}, operations = {}) => ({
+		stale: 20,
+		update: 10,
+		stateMaxBytes: 1024,
+		now: () => 2,
+		hooks,
+		processKill: process.kill.bind(process),
+		startHeartbeat: () => async () => {},
+		...operations,
+	});
+	const stateBytes = (value) => Buffer.from(`${JSON.stringify({ value })}\n`);
+	const directoryBytes = (directory) => new Map(
+		readdirSync(directory).sort().map((name) => [name, readFileSync(join(directory, name))]),
+	);
+	const assertDirectoryBytes = (directory, expected) => {
+		const actual = directoryBytes(directory);
+		assert.deepEqual([...actual.keys()], [...expected.keys()]);
+		for (const [name, value] of expected) assert.equal(actual.get(name).equals(value), true);
+	};
+	const assertFinalEpoch = (statePath, expectedTip) => {
+		const journalDirectory = `${statePath}.journal`;
+		const names = readdirSync(journalDirectory).sort();
+		const checkpointName = names.find((name) => name.startsWith("checkpoint-"));
+		assert.ok(checkpointName);
+		const checkpoint = JSON.parse(readFileSync(join(journalDirectory, checkpointName)));
+		const epochName = `epoch-${String(checkpoint.epoch).padStart(16, "0")}-${checkpoint.epochId}`;
+		assert.deepEqual(names, [".owned-temporaries-v2", checkpointName, epochName].sort());
+		assert.equal(checkpoint.epoch, 2);
+		assert.equal(checkpoint.anchorDigest, expectedTip);
+		assert.deepEqual(readdirSync(join(journalDirectory, ".owned-temporaries-v2")), []);
+	};
+	const outcome = (promise) => promise.then(
+		(value) => ({ value, error: null }),
+		(error) => ({ value: null, error }),
+	);
+	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-stable-checkpoint-proof-")));
+	let scenarioNumber = 0;
+	try {
+		const runSuccessorProof = async ({ label, proofEntry, phase = null, scanRemoval = false, mutate, succeeds }) => {
+			scenarioNumber += 1;
+			const statePath = join(fixture, `${String(scenarioNumber).padStart(2, "0")}-${label}.json`);
+			const anchor = stateBytes(`${label}-anchor`);
+			await withConsumerStateLock(statePath, async (_path, transaction) => {
+				await transaction.commitState(anchor);
+			}, runtime());
+			const original = consumerJournal(statePath);
+			const originalCheckpointBytes = readFileSync(original.checkpoint);
+			const readerPrepared = deferred();
+			const releaseReader = deferred();
+			const proofReady = deferred();
+			const releaseProof = deferred();
+			let walkTransactions = 0;
+			let phaseArmed = false;
+			let removeBeforeScanOpen = false;
+			let scanRootCaptured = false;
+			let newCheckpointPath;
+			let proofPath;
+			let retirementTemporary = null;
+			const proofHooks = {
+				beforePathOperation: async ({ operation }) => {
+					if (operation !== "walk-transactions") return;
+					walkTransactions += 1;
+					if (walkTransactions !== 1) return;
+					readerPrepared.resolve();
+					await releaseReader.promise;
+				},
+				beforeStableCheckpointProofRead: async ({ path, target }) => {
+					const wanted = proofEntry === "target" ? target : path === original.checkpoint;
+					if (!wanted || (proofEntry === "target" && path !== newCheckpointPath)) return;
+					proofPath = path;
+					proofReady.resolve();
+					await releaseProof.promise;
+				},
+				metadataRead: {
+					afterInitialStat: async ({ path }) => {
+						if (!phaseArmed || phase !== "afterInitialStat" || path !== proofPath) return;
+						phaseArmed = false;
+						mutate({ path, retirementTemporary, original, originalCheckpointBytes, newCheckpointPath });
+					},
+					afterFinalStat: async ({ path }) => {
+						if (!phaseArmed || phase !== "afterFinalStat" || path !== proofPath) return;
+						phaseArmed = false;
+						mutate({ path, retirementTemporary, original, originalCheckpointBytes, newCheckpointPath });
+					},
+				},
+			};
+			const reader = rotateConsumerStateJournal(statePath, runtime(proofHooks, {
+				readDirectory: async (path) => {
+					const names = await readDirectoryEntries(path);
+					if (removeBeforeScanOpen && path === original.journal) {
+						assert.equal(names.includes(basename(original.checkpoint)), true);
+						assert.equal(names.includes(basename(newCheckpointPath)), true);
+						scanRootCaptured = true;
+					}
+					return names;
+				},
+				openFile: async (path, flags, mode) => {
+					if (removeBeforeScanOpen && path === original.checkpoint) {
+						assert.equal(scanRootCaptured, true);
+						removeBeforeScanOpen = false;
+						rmSync(path);
+					}
+					return openFileHandle(path, flags, mode);
+				},
+			}));
+			const readerOutcome = outcome(reader);
+			await readerPrepared.promise;
+			const checkpointPublished = deferred();
+			const releasePublisher = deferred();
+			const publisher = rotateConsumerStateJournal(statePath, runtime({
+				afterRotationCheckpoint: async ({ nextPath }) => {
+					newCheckpointPath = nextPath;
+					checkpointPublished.resolve();
+					await releasePublisher.promise;
+				},
+			}));
+			const publisherOutcome = outcome(publisher);
+			await checkpointPublished.promise;
+			const newCheckpoint = JSON.parse(readFileSync(newCheckpointPath));
+			const newEpochPath = join(
+				original.journal,
+				`epoch-${String(newCheckpoint.epoch).padStart(16, "0")}-${newCheckpoint.epochId}`,
+			);
+			if (label.startsWith("link-")) {
+				retirementTemporary = join(
+					original.journal,
+					".owned-temporaries-v2",
+					`.pylon-consumer-tmp-v1-p${process.pid}-e${newCheckpoint.epochId}-g0000000000000000` +
+						`-w${newCheckpoint.epochId}-n${String(scenarioNumber).padStart(12, "0")}-kcheckpoint-t${"a".repeat(64)}.tmp`,
+				);
+				linkSync(newCheckpointPath, retirementTemporary);
+				assert.equal(lstatSync(newCheckpointPath).nlink, 2);
+			}
+			const oldEpochBefore = directoryBytes(original.epoch);
+			const newEpochBefore = directoryBytes(newEpochPath);
+			removeBeforeScanOpen = scanRemoval;
+			releaseReader.resolve();
+			await proofReady.promise;
+			if (phase === null) {
+				mutate({ path: proofPath, retirementTemporary, original, originalCheckpointBytes, newCheckpointPath });
+			}
+			else phaseArmed = true;
+			releaseProof.resolve();
+			const readerResult = await readerOutcome;
+			if (succeeds) {
+				assert.equal(readerResult.error, null);
+				releasePublisher.resolve();
+				const publisherResult = await publisherOutcome;
+				assert.equal(publisherResult.error, null);
+				assert.deepEqual(readerResult.value, publisherResult.value);
+				assert.deepEqual(readerResult.value, { epoch: 2, tipSha256: sha256Bytes(anchor) });
+				const cleanupReceipt = await rotateConsumerStateJournal(statePath, runtime());
+				assert.deepEqual(cleanupReceipt, readerResult.value);
+				assertFinalEpoch(statePath, sha256Bytes(anchor));
+			} else {
+				assert.notEqual(readerResult.error, null);
+				assertDirectoryBytes(original.epoch, oldEpochBefore);
+				assertDirectoryBytes(newEpochPath, newEpochBefore);
+				releasePublisher.resolve();
+				await publisherOutcome;
+			}
+			return { readerResult, original, newCheckpointPath, newEpochPath };
+		};
+
+		for (const phase of ["afterInitialStat", "afterFinalStat"]) {
+			await runSuccessorProof({
+				label: `link-${phase}`,
+				proofEntry: "target",
+				phase,
+				mutate: ({ retirementTemporary }) => rmSync(retirementTemporary),
+				succeeds: true,
+			});
+		}
+		await runSuccessorProof({
+			label: "optional-unlink-after-final",
+			proofEntry: "optional",
+			phase: "afterFinalStat",
+			mutate: ({ path }) => rmSync(path),
+			succeeds: true,
+		});
+		await runSuccessorProof({
+			label: "optional-disappears-before-open",
+			proofEntry: "optional",
+			mutate: ({ path }) => rmSync(path),
+			succeeds: true,
+		});
+
+		await runSuccessorProof({
+			label: "current-disappears-before-scan-open",
+			proofEntry: "target",
+			scanRemoval: true,
+			mutate: () => {},
+			succeeds: true,
+		});
+
+		const reappearedCurrent = await runSuccessorProof({
+			label: "removed-current-reappears-before-final",
+			proofEntry: "target",
+			scanRemoval: true,
+			mutate: ({ original, originalCheckpointBytes }) => {
+				writeFileSync(original.checkpoint, originalCheckpointBytes, { mode: 0o600 });
+			},
+			succeeds: false,
+		});
+		assert.match(reappearedCurrent.readerResult.error.message, /journal root changed/);
+
+		const identityStatePath = join(fixture, "post-read-identity-removal.json");
+		const identityAnchor = stateBytes("post-read-identity-removal-anchor");
+		await withConsumerStateLock(identityStatePath, async (_path, transaction) => {
+			await transaction.commitState(identityAnchor);
+		}, runtime());
+		const identityJournal = consumerJournal(identityStatePath);
+		const identityReaderPrepared = deferred();
+		const releaseIdentityReader = deferred();
+		const identityStatReady = deferred();
+		const releaseIdentityStat = deferred();
+		let identityWalks = 0;
+		let identityStatArmed = false;
+		const identityReader = rotateConsumerStateJournal(identityStatePath, runtime({
+			beforePathOperation: async ({ operation }) => {
+				if (operation !== "walk-transactions") return;
+				identityWalks += 1;
+				if (identityWalks !== 1) return;
+				identityReaderPrepared.resolve();
+				await releaseIdentityReader.promise;
+			},
+			beforeCheckpointIdentityStat: async ({ path }) => {
+				if (!identityStatArmed || path !== identityJournal.checkpoint) return;
+				identityStatArmed = false;
+				identityStatReady.resolve();
+				await releaseIdentityStat.promise;
+			},
+		}));
+		const identityReaderOutcome = outcome(identityReader);
+		await identityReaderPrepared.promise;
+		const identityCheckpointReady = deferred();
+		const releaseIdentityPublisher = deferred();
+		const identityPublisher = rotateConsumerStateJournal(identityStatePath, runtime({
+			afterRotationCheckpoint: async () => {
+				identityCheckpointReady.resolve();
+				await releaseIdentityPublisher.promise;
+			},
+		}));
+		await identityCheckpointReady.promise;
+		identityStatArmed = true;
+		releaseIdentityReader.resolve();
+		await identityStatReady.promise;
+		releaseIdentityPublisher.resolve();
+		const identityPublisherReceipt = await identityPublisher;
+		const identityCurrentRemoved = deferred();
+		const identityCleaner = rotateConsumerStateJournal(identityStatePath, runtime({}, {
+			removeFile: async (path, options) => {
+				rmSync(path, options);
+				if (path === identityJournal.checkpoint) identityCurrentRemoved.resolve();
+			},
+		}));
+		await identityCurrentRemoved.promise;
+		const identityCleanerReceipt = await identityCleaner;
+		assert.equal(existsSync(identityJournal.checkpoint), false);
+		releaseIdentityStat.resolve();
+		const identityReaderResult = await identityReaderOutcome;
+		assert.equal(identityReaderResult.error, null);
+		assert.deepEqual(identityReaderResult.value, identityPublisherReceipt);
+		assert.deepEqual(identityCleanerReceipt, identityPublisherReceipt);
+		assert.deepEqual(identityReaderResult.value, { epoch: 2, tipSha256: sha256Bytes(identityAnchor) });
+		assertFinalEpoch(identityStatePath, sha256Bytes(identityAnchor));
+
+		const recreated = await runSuccessorProof({
+			label: "optional-remove-recreate",
+			proofEntry: "optional",
+			mutate: ({ path }) => {
+				const bytes = readFileSync(path);
+				renameSync(path, join(fixture, `removed-${scenarioNumber}`));
+				writeFileSync(path, bytes, { mode: 0o600 });
+			},
+			succeeds: false,
+		});
+		assert.match(recreated.readerResult.error.message, /journal root changed/);
+
+		const requiredUnlink = await runSuccessorProof({
+			label: "required-target-unlink",
+			proofEntry: "target",
+			phase: "afterFinalStat",
+			mutate: ({ path }) => rmSync(path),
+			succeeds: false,
+		});
+		assert.equal(requiredUnlink.readerResult.error.constructor, BoundedFileUnlinkedDuringReadError);
+
+		for (const phase of ["afterInitialStat", "afterFinalStat"]) {
+			const replaced = await runSuccessorProof({
+				label: `target-new-inode-${phase}`,
+				proofEntry: "target",
+				phase,
+				mutate: ({ path }) => {
+					const bytes = readFileSync(path);
+					renameSync(path, join(fixture, `same-bytes-old-${scenarioNumber}`));
+					writeFileSync(path, bytes, { mode: 0o600 });
+				},
+				succeeds: false,
+			});
+			assert.match(replaced.readerResult.error.message, /changed while it was read/);
+		}
+
+		for (const phase of ["afterInitialStat", "afterFinalStat"]) {
+			const mutated = await runSuccessorProof({
+				label: `target-mutated-${phase}`,
+				proofEntry: "target",
+				phase,
+				mutate: ({ path }) => {
+					const initial = statSync(path);
+					const bytes = readFileSync(path);
+					bytes[0] ^= 1;
+					writeFileSync(path, bytes);
+					utimesSync(path, initial.atime, initial.mtime);
+				},
+				succeeds: false,
+			});
+			assert.match(mutated.readerResult.error.message, /changed while it was read/);
+		}
+
+		for (const mutation of ["append", "truncate"]) {
+			const changedSize = await runSuccessorProof({
+				label: `target-${mutation}`,
+				proofEntry: "target",
+				phase: "afterInitialStat",
+				mutate: ({ path }) => {
+					if (mutation === "append") writeFileSync(path, "x", { flag: "a" });
+					else truncateSync(path, 1);
+				},
+				succeeds: false,
+			});
+			assert.match(changedSize.readerResult.error.message, /changed while it was read/);
+		}
+
+		for (const rootMutation of ["added", "competing"]) {
+			const rootChanged = await runSuccessorProof({
+				label: `root-${rootMutation}`,
+				proofEntry: "target",
+				mutate: ({ original, newCheckpointPath }) => {
+					if (rootMutation === "added") {
+						writeFileSync(join(original.journal, "unexpected-proof-entry"), "unexpected\n");
+					} else {
+						const checkpoint = JSON.parse(readFileSync(newCheckpointPath));
+						checkpoint.epochId = randomUUID();
+						writeFileSync(
+							join(
+								original.journal,
+								`checkpoint-${String(checkpoint.epoch).padStart(16, "0")}-${checkpoint.epochId}.json`,
+							),
+							`${JSON.stringify(checkpoint)}\n`,
+							{ mode: 0o600 },
+						);
+					}
+				},
+				succeeds: false,
+			});
+			assert.match(rootChanged.readerResult.error.message, /journal root changed/);
+		}
+
+		const runRemovedCurrentInvalid = async (label, mutateRoot, { recreateCurrent = false } = {}) => {
+			scenarioNumber += 1;
+			const statePath = join(fixture, `${String(scenarioNumber).padStart(2, "0")}-removed-current-${label}.json`);
+			const anchor = stateBytes(`removed-current-${label}-anchor`);
+			await withConsumerStateLock(statePath, async (_path, transaction) => {
+				await transaction.commitState(anchor);
+			}, runtime());
+			const journal = consumerJournal(statePath);
+			const readerPrepared = deferred();
+			const releaseReader = deferred();
+			let walks = 0;
+			let removeOnOpen = false;
+			const reader = rotateConsumerStateJournal(statePath, runtime({
+				beforePathOperation: async ({ operation }) => {
+					if (operation !== "walk-transactions") return;
+					walks += 1;
+					if (walks !== 1) return;
+					readerPrepared.resolve();
+					await releaseReader.promise;
+				},
+			}, {
+				readDirectory: async (path) => {
+					const names = await readDirectoryEntries(path);
+					if (path !== journal.journal) return names;
+					return names.sort((left, right) => {
+						if (left === basename(journal.checkpoint)) return -1;
+						if (right === basename(journal.checkpoint)) return 1;
+						return left.localeCompare(right);
+					});
+				},
+				openFile: async (path, flags, mode) => {
+					if (removeOnOpen && path === journal.checkpoint) {
+						removeOnOpen = false;
+						const checkpointBytes = recreateCurrent ? readFileSync(path) : null;
+						rmSync(path);
+						if (checkpointBytes !== null) writeFileSync(path, checkpointBytes, { mode: 0o600 });
+					}
+					return openFileHandle(path, flags, mode);
+				},
+			}));
+			const readerOutcome = outcome(reader);
+			await readerPrepared.promise;
+			const checkpointReady = deferred();
+			const releasePublisher = deferred();
+			let nextCheckpointPath;
+			const publisher = rotateConsumerStateJournal(statePath, runtime({
+				afterRotationCheckpoint: async ({ nextPath }) => {
+					nextCheckpointPath = nextPath;
+					checkpointReady.resolve();
+					await releasePublisher.promise;
+				},
+			}));
+			const publisherOutcome = outcome(publisher);
+			await checkpointReady.promise;
+			const checkpoint = JSON.parse(readFileSync(nextCheckpointPath));
+			const nextEpochPath = join(
+				journal.journal,
+				`epoch-${String(checkpoint.epoch).padStart(16, "0")}-${checkpoint.epochId}`,
+			);
+			mutateRoot({ checkpoint, journal, nextCheckpointPath });
+			const oldEpochBefore = directoryBytes(journal.epoch);
+			const nextEpochBefore = directoryBytes(nextEpochPath);
+			removeOnOpen = true;
+			releaseReader.resolve();
+			const readerResult = await readerOutcome;
+			assert.equal(readerResult.value, null);
+			assert.notEqual(readerResult.error, null);
+			assert.equal(existsSync(journal.checkpoint), recreateCurrent);
+			assertDirectoryBytes(journal.epoch, oldEpochBefore);
+			assertDirectoryBytes(nextEpochPath, nextEpochBefore);
+			releasePublisher.resolve();
+			await publisherOutcome;
+			return readerResult.error;
+		};
+		for (const invalidSuccessor of [
+			"fake",
+			"malformed",
+			"unanchored",
+			"wrong-digest",
+			"historical",
+			"source",
+			"competing",
+		]) {
+			const error = await runRemovedCurrentInvalid(invalidSuccessor, ({ checkpoint, journal, nextCheckpointPath }) => {
+				if (invalidSuccessor === "fake") {
+					writeFileSync(nextCheckpointPath, readFileSync(journal.checkpoint));
+					return;
+				}
+				if (invalidSuccessor === "malformed") {
+					writeFileSync(nextCheckpointPath, "{}\n");
+					return;
+				}
+				if (invalidSuccessor === "competing") {
+					const competitor = { ...checkpoint, epochId: randomUUID() };
+					writeFileSync(
+						join(
+							journal.journal,
+							`checkpoint-${String(competitor.epoch).padStart(16, "0")}-${competitor.epochId}.json`,
+						),
+						`${JSON.stringify(competitor)}\n`,
+						{ mode: 0o600 },
+					);
+					return;
+				}
+				const field = invalidSuccessor === "unanchored"
+					? "previousCheckpointSha256"
+					: invalidSuccessor === "historical" ? "historySha256"
+						: invalidSuccessor === "source" ? "sourceAuthoritySha256" : "anchorDigest";
+				checkpoint[field] = "f".repeat(64);
+				writeFileSync(nextCheckpointPath, `${JSON.stringify(checkpoint)}\n`);
+			});
+			assert.match(error.message, /checkpoint|journal root|unbounded/);
+		}
+
+		const recreatedCurrentError = await runRemovedCurrentInvalid(
+			"recreated-current",
+			() => {},
+			{ recreateCurrent: true },
+		);
+		assert.match(recreatedCurrentError.message, /changed while it was read/);
+
+		const noHigherPath = join(fixture, "current-null-without-higher.json");
+		await withConsumerStateLock(noHigherPath, async (_path, transaction) => {
+			await transaction.commitState(stateBytes("current-null-without-higher-anchor"));
+		}, runtime());
+		const noHigherJournal = consumerJournal(noHigherPath);
+		const noHigherEpochBefore = directoryBytes(noHigherJournal.epoch);
+		let removeNoHigher = true;
+		await assert.rejects(
+			() => rotateConsumerStateJournal(noHigherPath, runtime({}, {
+				openFile: async (path, flags, mode) => {
+					if (removeNoHigher && path === noHigherJournal.checkpoint) {
+						removeNoHigher = false;
+						rmSync(path);
+					}
+					return openFileHandle(path, flags, mode);
+				},
+			})),
+			/lost its current checkpoint/,
+		);
+		assertDirectoryBytes(noHigherJournal.epoch, noHigherEpochBefore);
+
+		for (const code of ["ENOENT", "EIO"]) {
+			const statePath = join(fixture, `identity-stat-${code.toLowerCase()}.json`);
+			await withConsumerStateLock(statePath, async (_path, transaction) => {
+				await transaction.commitState(stateBytes(`identity-stat-${code.toLowerCase()}-anchor`));
+			}, runtime());
+			const journal = consumerJournal(statePath);
+			const epochBefore = directoryBytes(journal.epoch);
+			const identityFailure = new Error(`injected checkpoint identity ${code}`);
+			identityFailure.code = code;
+			let failIdentityStat = false;
+			await assert.rejects(
+				() => rotateConsumerStateJournal(statePath, runtime({
+					beforeCheckpointIdentityStat: async ({ path }) => {
+						if (path === journal.checkpoint) failIdentityStat = true;
+					},
+				}, {
+					lstatEntry: async (path) => {
+						if (failIdentityStat && path === journal.checkpoint) {
+							failIdentityStat = false;
+							throw identityFailure;
+						}
+						return lstatFile(path);
+					},
+				})),
+				(error) => error === identityFailure,
+			);
+			assertDirectoryBytes(journal.epoch, epochBefore);
+		}
+
+		const currentStatePath = join(fixture, "required-current-unlink.json");
+		const currentAnchor = stateBytes("required-current-unlink-anchor");
+		await withConsumerStateLock(currentStatePath, async (_path, transaction) => {
+			await transaction.commitState(currentAnchor);
+		}, runtime());
+		const currentJournal = consumerJournal(currentStatePath);
+		const currentProofReady = deferred();
+		const releaseCurrentProof = deferred();
+		let retirementTemporary;
+		let retireBeforeOpen = false;
+		let unlinkAfterFinal = false;
+		let nextEpochPath;
+		const currentRotation = rotateConsumerStateJournal(currentStatePath, runtime({
+			afterRotationEpochSync: async ({ checkpoint, nextEpoch }) => {
+				nextEpochPath = nextEpoch;
+				retirementTemporary = join(
+					currentJournal.journal,
+					".owned-temporaries-v2",
+					`.pylon-consumer-tmp-v1-p${process.pid}-e${checkpoint.epochId}-g0000000000000000` +
+						`-w${checkpoint.epochId}-n${"f".repeat(12)}-kcheckpoint-t${"a".repeat(64)}.tmp`,
+				);
+				linkSync(currentJournal.checkpoint, retirementTemporary);
+				retireBeforeOpen = true;
+			},
+			beforeStableCheckpointProofRead: async ({ path, target }) => {
+				if (nextEpochPath === undefined || !target || path !== currentJournal.checkpoint) return;
+				currentProofReady.resolve();
+				await releaseCurrentProof.promise;
+				unlinkAfterFinal = true;
+			},
+			metadataRead: {
+				afterFinalStat: async ({ path }) => {
+					if (!unlinkAfterFinal || path !== currentJournal.checkpoint) return;
+					unlinkAfterFinal = false;
+					rmSync(path);
+				},
+			},
+		}, {
+			openFile: async (path, flags, mode) => {
+				if (retireBeforeOpen && path === currentJournal.checkpoint) {
+					retireBeforeOpen = false;
+					rmSync(retirementTemporary);
+				}
+				return openFileHandle(path, flags, mode);
+			},
+		}));
+		const currentOutcome = outcome(currentRotation);
+		await currentProofReady.promise;
+		const currentEpochBefore = directoryBytes(currentJournal.epoch);
+		const nextEpochBefore = directoryBytes(nextEpochPath);
+		releaseCurrentProof.resolve();
+		const currentResult = await currentOutcome;
+		assert.equal(currentResult.value, null);
+		assert.equal(currentResult.error.constructor, BoundedFileUnlinkedDuringReadError);
+		assertDirectoryBytes(currentJournal.epoch, currentEpochBefore);
+		assertDirectoryBytes(nextEpochPath, nextEpochBefore);
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
@@ -4674,11 +5863,16 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 				if (operation !== "scan-claims") return;
 				escapedRemovalScans += 1;
 				if (escapedRemovalScans !== 2) return;
+				const linkedStat = lstatSync(join(escapedRemovalJournal.epoch, escapedClaimName));
+				const unlinkedStat = { ...linkedStat, ctimeMs: linkedStat.ctimeMs + 1, nlink: 0 };
 				escapedRemoval = new BoundedFileUnlinkedDuringReadError(
 					join(transactionDirectory, "..", escapedClaimName),
 					"Consumer high-water operation claim",
 					escapedClaimBytes,
 					escapedClaimSha256,
+					linkedStat,
+					linkedStat,
+					unlinkedStat,
 				);
 				escapedRemovalReached.resolve();
 				await releaseEscapedRemoval.promise;

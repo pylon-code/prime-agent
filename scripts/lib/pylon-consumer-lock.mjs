@@ -5,6 +5,7 @@ import { basename, dirname, join, parse, relative, resolve, sep } from "node:pat
 
 import {
 	BoundedFileLinkRetiredBeforeReadError,
+	BoundedFileLinkRetiredDuringReadError,
 	BoundedFileUnlinkedDuringReadError,
 	readBoundedRegularFile,
 } from "./pylon-bounded-file.mjs";
@@ -604,6 +605,34 @@ function isContextAnchoredCheckpoint(context, path, checkpoint, expectedSha256) 
 		));
 }
 
+function isAuthenticatedCheckpointAnchor(context, path, checkpoint, expectedSha256, additionalAnchor = null) {
+	return isContextAnchoredCheckpoint(context, path, checkpoint, expectedSha256) || (
+		additionalAnchor !== null && path === additionalAnchor.path && expectedSha256 === additionalAnchor.digest &&
+		metadataBytes(checkpoint).equals(metadataBytes(additionalAnchor.checkpoint)) &&
+		isImmediateSuccessorCheckpoint(context, checkpoint)
+	);
+}
+
+function canonicalCheckpointNameEpoch(name) {
+	const match = checkpointPattern.exec(name);
+	if (!match) return null;
+	const epoch = Number(match[1]);
+	return Number.isSafeInteger(epoch) && generationName(epoch) === match[1] ? epoch : null;
+}
+
+function isProvisionallyRemovedContextCurrentCheckpoint(path, context, anchors, rootNames) {
+	const name = basename(path);
+	if (
+		path !== context.checkpointPath || path !== join(context.journalDirectory, name) ||
+		name !== checkpointName(context.checkpoint) || anchors.get(path) !== context.checkpointDigest ||
+		canonicalCheckpointNameEpoch(name) !== context.checkpoint.epoch
+	) return false;
+	return rootNames.some((candidate) => {
+		const candidateEpoch = canonicalCheckpointNameEpoch(candidate);
+		return candidateEpoch !== null && candidateEpoch > context.checkpoint.epoch;
+	});
+}
+
 function isVanishedRetainedCheckpoint(path, context, anchors, rootNames) {
 	const retainedPath = retainedCheckpointPath(context);
 	if (
@@ -613,42 +642,107 @@ function isVanishedRetainedCheckpoint(path, context, anchors, rootNames) {
 	const retainedMatch = checkpointPattern.exec(basename(path));
 	if (!retainedMatch || Number(retainedMatch[1]) + 1 !== context.checkpoint.epoch) return false;
 	return rootNames.some((candidate) => {
-		const candidateMatch = checkpointPattern.exec(candidate);
-		return candidateMatch && Number(candidateMatch[1]) > Number(retainedMatch[1]);
+		const candidateEpoch = canonicalCheckpointNameEpoch(candidate);
+		return candidateEpoch !== null && candidateEpoch > Number(retainedMatch[1]);
 	});
+}
+
+const checkpointStatEvidenceKeys = ["dev", "ino", "size", "mtimeMs", "ctimeMs", "nlink"];
+
+function isFrozenRecord(value) {
+	return value !== null && typeof value === "object" && Object.isFrozen(value);
+}
+
+function isExactCheckpointStatEvidence(value) {
+	return isFrozenRecord(value) && exactKeys(value, checkpointStatEvidenceKeys) &&
+		checkpointStatEvidenceKeys.every((key) => Number.isFinite(value[key])) &&
+		Number.isSafeInteger(value.size) && value.size >= 0 && Number.isSafeInteger(value.nlink) && value.nlink >= 0;
+}
+
+function exactEvidenceMonotoneCut(observations, fromLinks, toLinks, byteLength) {
+	if (
+		observations.length < 2 || observations.some((stat) => !isExactCheckpointStatEvidence(stat)) ||
+		observations[0].size !== byteLength || observations[0].nlink !== fromLinks ||
+		observations.at(-1).nlink !== toLinks ||
+		observations.some((stat) => (
+			stat.dev !== observations[0].dev || stat.ino !== observations[0].ino ||
+			stat.size !== observations[0].size || stat.mtimeMs !== observations[0].mtimeMs
+		))
+	) return null;
+	let cut = null;
+	for (let index = 1; index < observations.length; index += 1) {
+		const previous = observations[index - 1];
+		const current = observations[index];
+		if (previous.nlink === current.nlink) {
+			if (previous.ctimeMs !== current.ctimeMs) return null;
+			continue;
+		}
+		if (
+			cut !== null || previous.nlink !== fromLinks || current.nlink !== toLinks ||
+			previous.ctimeMs === current.ctimeMs
+		) return null;
+		cut = index;
+	}
+	return cut;
 }
 
 function isExactLinkRetiredBeforeReadEvidence(error) {
 	const transition = error.statTransition;
-	if (!exactKeys(transition, ["pathEntry", "openedHandle"])) return false;
-	const pathEntry = transition.pathEntry;
-	const openedHandle = transition.openedHandle;
-	const statKeys = ["dev", "ino", "size", "mtimeMs", "ctimeMs", "nlink"];
-	return exactKeys(pathEntry, statKeys) && exactKeys(openedHandle, statKeys) &&
-		pathEntry.dev === openedHandle.dev && pathEntry.ino === openedHandle.ino &&
-		pathEntry.size === openedHandle.size && pathEntry.size === error.bytes.length &&
-		pathEntry.mtimeMs === openedHandle.mtimeMs && pathEntry.ctimeMs !== openedHandle.ctimeMs &&
-		pathEntry.nlink === 2 && openedHandle.nlink === 1;
+	return isFrozenRecord(transition) && exactKeys(transition, ["pathEntry", "openedHandle"]) &&
+		exactEvidenceMonotoneCut(
+			[transition.pathEntry, transition.openedHandle],
+			2,
+			1,
+			error.bytes.length,
+		) === 1;
 }
 
-function authenticatedChangedCheckpointRead(error, context, options, anchors, rootNames) {
-	const linkRetiredBeforeRead = error instanceof BoundedFileLinkRetiredBeforeReadError;
-	const unlinkedDuringRead = error instanceof BoundedFileUnlinkedDuringReadError;
+function isExactLinkRetiredDuringReadEvidence(error) {
+	const transition = error.statTransition;
+	return isFrozenRecord(transition) && exactKeys(transition, ["pathEntry", "before", "after", "finalPathEntry"]) &&
+		[2, 3].includes(exactEvidenceMonotoneCut(
+			[transition.pathEntry, transition.before, transition.after, transition.finalPathEntry],
+			2,
+			1,
+			error.bytes.length,
+		));
+}
+
+function isExactUnlinkedDuringReadEvidence(error) {
+	const transition = error.statTransition;
 	if (
-		(!linkRetiredBeforeRead && !unlinkedDuringRead) ||
-		(linkRetiredBeforeRead && (
-			error.constructor !== BoundedFileLinkRetiredBeforeReadError ||
-			error.name !== "BoundedFileLinkRetiredBeforeReadError"
-		)) ||
+		!isFrozenRecord(transition) ||
+		!exactKeys(transition, ["pathEntry", "before", "after", "confirmedHandle"]) ||
+		!(transition.confirmedHandle === null || isExactCheckpointStatEvidence(transition.confirmedHandle))
+	) return false;
+	const observations = [transition.pathEntry, transition.before, transition.after];
+	if (transition.confirmedHandle !== null) observations.push(transition.confirmedHandle);
+	return exactEvidenceMonotoneCut(observations, 1, 0, error.bytes.length) !== null;
+}
+
+function authenticatedChangedCheckpointRead(error, context, options, anchors, rootNames, additionalAnchor = null) {
+	const linkRetiredBeforeRead = error instanceof BoundedFileLinkRetiredBeforeReadError &&
+		error.constructor === BoundedFileLinkRetiredBeforeReadError &&
+		error.name === "BoundedFileLinkRetiredBeforeReadError";
+	const linkRetiredDuringRead = error instanceof BoundedFileLinkRetiredDuringReadError &&
+		error.constructor === BoundedFileLinkRetiredDuringReadError &&
+		error.name === "BoundedFileLinkRetiredDuringReadError";
+	const unlinkedDuringRead = error instanceof BoundedFileUnlinkedDuringReadError &&
+		error.constructor === BoundedFileUnlinkedDuringReadError &&
+		error.name === "BoundedFileUnlinkedDuringReadError";
+	const linkRetiredDuringOrBeforeRead = linkRetiredBeforeRead || linkRetiredDuringRead;
+	if (
+		(!linkRetiredDuringOrBeforeRead && !unlinkedDuringRead) ||
 		error.description !== "Consumer high-water journal checkpoint" || typeof error.path !== "string" ||
 		!Buffer.isBuffer(error.bytes) || error.bytes.length < 1 || error.bytes.length > options.metadataMaxBytes ||
-		(linkRetiredBeforeRead && !isExactLinkRetiredBeforeReadEvidence(error))
+		(linkRetiredBeforeRead && !isExactLinkRetiredBeforeReadEvidence(error)) ||
+		(linkRetiredDuringRead && !isExactLinkRetiredDuringReadEvidence(error)) ||
+		(unlinkedDuringRead && !isExactUnlinkedDuringReadEvidence(error))
 	) return null;
 	const expectedSha256 = anchors.get(error.path);
 	if (
 		expectedSha256 === undefined || error.expectedSha256 !== expectedSha256 ||
-		digest(error.bytes) !== expectedSha256 ||
-		(linkRetiredBeforeRead && error.sha256 !== expectedSha256) ||
+		digest(error.bytes) !== expectedSha256 || error.sha256 !== expectedSha256 ||
 		dirname(error.path) !== context.journalDirectory
 	) return null;
 	const name = basename(error.path);
@@ -663,19 +757,23 @@ function authenticatedChangedCheckpointRead(error, context, options, anchors, ro
 	if (
 		!metadataBytes(checkpoint).equals(error.bytes) || checkpointName(checkpoint) !== name ||
 		checkpoint.epoch !== Number(match[1]) ||
-		!isContextAnchoredCheckpoint(context, error.path, checkpoint, expectedSha256)
+		!isAuthenticatedCheckpointAnchor(context, error.path, checkpoint, expectedSha256, additionalAnchor)
 	) return null;
 	if (unlinkedDuringRead) {
 		const hasLaterCheckpoint = rootNames.some((candidate) => {
-			const candidateMatch = checkpointPattern.exec(candidate);
-			return candidateMatch && Number(candidateMatch[1]) > checkpoint.epoch;
+			const candidateEpoch = canonicalCheckpointNameEpoch(candidate);
+			return candidateEpoch !== null && candidateEpoch > checkpoint.epoch;
 		});
 		if (!hasLaterCheckpoint) return null;
 	}
+	const linkRetirementStat = linkRetiredBeforeRead
+		? error.statTransition.openedHandle
+		: linkRetiredDuringRead ? error.statTransition.finalPathEntry : null;
 	return {
 		checkpoint,
-		linkRetiredBeforeRead,
-		linkRetirementStat: linkRetiredBeforeRead ? error.statTransition.openedHandle : null,
+		linkRetiredBeforeRead: linkRetiredDuringOrBeforeRead,
+		linkRetirementStat,
+		unlinkedDuringRead,
 	};
 }
 
@@ -686,12 +784,16 @@ function sameRetiredLinkStat(left, right) {
 }
 
 function checkpointProofOptions(entry, options, invalidRoot) {
-	if (entry.linkRetirementStat === null) return options;
+	if (entry.checkpointStat === null) return options;
+	let initialPathStat = true;
 	return {
 		...options,
 		lstatEntry: async (path) => {
 			const stat = await options.lstatEntry(path);
-			if (path === entry.path && !sameRetiredLinkStat(stat, entry.linkRetirementStat)) throw invalidRoot();
+			if (path === entry.path && initialPathStat) {
+				initialPathStat = false;
+				if (!sameRetiredLinkStat(stat, entry.checkpointStat)) throw invalidRoot();
+			}
 			return stat;
 		},
 	};
@@ -702,6 +804,8 @@ async function authenticateStableChangedRoot(scan, context, options, anchors, ta
 	if (initialNames.size !== scan.rootNames.length) throw invalidRoot();
 	const targetCheckpointName = basename(target.path);
 	const targetEpochName = epochName(target.checkpoint);
+	const proofAnchors = new Map(anchors);
+	proofAnchors.set(target.path, target.digest);
 	const optionalCheckpointNames = new Set([
 		...scan.checkpointEntries
 			.filter((entry) => entry.path !== target.path && entry.checkpoint.epoch < target.checkpoint.epoch)
@@ -724,33 +828,76 @@ async function authenticateStableChangedRoot(scan, context, options, anchors, ta
 		...optionalTemporaryNames,
 	]);
 	const requiredNames = new Set([TEMPORARY_DIRECTORY_NAME, targetCheckpointName, targetEpochName]);
+	const removedBeforeProof = new Set(scan.removedCheckpointEntries.map((entry) => entry.name));
 	const proofNamesArray = await options.readDirectory(context.journalDirectory);
 	const proofNames = new Set(proofNamesArray);
 	if (
 		proofNamesArray.length > MAX_JOURNAL_ROOT_ENTRIES + MAX_TEMPORARY_ENTRIES ||
 		proofNames.size !== proofNamesArray.length ||
 		[...proofNames].some((name) => !initialNames.has(name)) ||
+		[...removedBeforeProof].some((name) => proofNames.has(name)) ||
 		scan.vanishedRetainedCheckpointNames.some((name) => proofNames.has(name)) ||
 		[...initialNames].some((name) => !optionalNames.has(name) && !proofNames.has(name)) ||
 		[...requiredNames].some((name) => !proofNames.has(name))
 	) throw invalidRoot();
+	const removedDuringProof = new Set();
+	let targetAuthenticated = false;
 	for (const entry of scan.checkpointEntries) {
 		if (!proofNames.has(entry.name)) continue;
-		const expectedSha256 = anchors.get(entry.path) ?? null;
-		const checkpoint = await readExactMetadata(
-			entry.path,
-			options.metadataMaxBytes,
-			(value) => validateCheckpoint(value, options.stateMaxBytes).value,
-			"Consumer high-water journal checkpoint",
-			checkpointProofOptions(entry, options, invalidRoot),
-			undefined,
-			expectedSha256,
-		);
+		const optional = optionalCheckpointNames.has(entry.name);
+		await options.hooks?.beforeStableCheckpointProofRead?.({
+			name: entry.name,
+			path: entry.path,
+			target: entry.path === target.path,
+		});
+		const expectedSha256 = proofAnchors.get(entry.path) ?? null;
+		let checkpoint;
+		let changedRead = null;
+		try {
+			checkpoint = await readExactMetadata(
+				entry.path,
+				options.metadataMaxBytes,
+				(value) => validateCheckpoint(value, options.stateMaxBytes).value,
+				"Consumer high-water journal checkpoint",
+				checkpointProofOptions(entry, options, invalidRoot),
+				undefined,
+				expectedSha256,
+			);
+		} catch (error) {
+			changedRead = authenticatedChangedCheckpointRead(
+				error,
+				context,
+				options,
+				proofAnchors,
+				proofNamesArray,
+				target,
+			);
+			if (changedRead === null) throw error;
+			checkpoint = changedRead.checkpoint;
+		}
+		if (checkpoint === null) {
+			if (!optional) throw invalidRoot();
+			removedDuringProof.add(entry.name);
+			continue;
+		}
 		if (
-			checkpoint === null || !metadataBytes(checkpoint).equals(metadataBytes(entry.checkpoint)) ||
-			(expectedSha256 !== null && !isContextAnchoredCheckpoint(context, entry.path, checkpoint, expectedSha256))
+			!metadataBytes(checkpoint).equals(metadataBytes(entry.checkpoint)) ||
+			(expectedSha256 !== null && !isAuthenticatedCheckpointAnchor(
+				context,
+				entry.path,
+				checkpoint,
+				expectedSha256,
+				target,
+			))
 		) throw invalidRoot();
+		if (changedRead?.unlinkedDuringRead) {
+			if (!optional) throw invalidRoot();
+			removedDuringProof.add(entry.name);
+			continue;
+		}
+		if (entry.path === target.path) targetAuthenticated = true;
 	}
+	if (!targetAuthenticated) throw invalidRoot();
 	await secureDirectory(
 		join(context.journalDirectory, TEMPORARY_DIRECTORY_NAME),
 		"Consumer high-water temporary directory",
@@ -771,6 +918,8 @@ async function authenticateStableChangedRoot(scan, context, options, anchors, ta
 		finalNames.size !== finalNamesArray.length ||
 		[...finalNames].some((name) => !proofNames.has(name)) ||
 		[...proofNames].some((name) => !optionalNames.has(name) && !finalNames.has(name)) ||
+		[...removedBeforeProof].some((name) => finalNames.has(name)) ||
+		[...removedDuringProof].some((name) => finalNames.has(name)) ||
 		[...requiredNames].some((name) => !finalNames.has(name))
 	) throw invalidRoot();
 }
@@ -1150,12 +1299,37 @@ async function scanJournalRoot(
 				removedDuringRead = !linkRetiredBeforeRead;
 			}
 			if (checkpoint === null) {
+				if (checkpointContext === null || checkpointAnchors === null) {
+					throw new Error("Consumer high-water journal lost its current checkpoint during an authenticated scan.");
+				}
+				if (isProvisionallyRemovedContextCurrentCheckpoint(path, checkpointContext, checkpointAnchors, names)) {
+					checkpoint = checkpointContext.checkpoint;
+					removedDuringRead = true;
+				} else {
+					if (!isVanishedRetainedCheckpoint(path, checkpointContext, checkpointAnchors, names)) {
+						throw new Error("Consumer high-water journal lost its current checkpoint during an authenticated scan.");
+					}
+					vanishedRetainedCheckpointNames.push(name);
+					continue;
+				}
+			}
+			let checkpointStat = linkRetirementStat;
+			if (!removedDuringRead && checkpointStat === null) {
+				await options.hooks?.beforeCheckpointIdentityStat?.({ name, path });
+				try {
+					checkpointStat = await options.lstatEntry(path);
+				} catch (error) {
+					const allowedRemoval = checkpointContext !== null && checkpointAnchors !== null && (
+						isProvisionallyRemovedContextCurrentCheckpoint(path, checkpointContext, checkpointAnchors, names) ||
+						isVanishedRetainedCheckpoint(path, checkpointContext, checkpointAnchors, names)
+					);
+					if (error?.code !== "ENOENT" || !allowedRemoval) throw error;
+					removedDuringRead = true;
+				}
 				if (
-					checkpointContext === null || checkpointAnchors === null ||
-					!isVanishedRetainedCheckpoint(path, checkpointContext, checkpointAnchors, names)
-				) throw new Error("Consumer high-water journal lost its current checkpoint during an authenticated scan.");
-				vanishedRetainedCheckpointNames.push(name);
-				continue;
+					checkpointStat !== null &&
+					(checkpointStat.isSymbolicLink?.() || !checkpointStat.isFile())
+				) throw new Error("Consumer high-water journal checkpoint must remain one regular non-symlink file.");
 			}
 			if (checkpointName(checkpoint) !== name || checkpoint.epoch !== Number(checkpointMatch[1])) {
 				throw new Error("Consumer high-water journal checkpoint name is malformed.");
@@ -1168,6 +1342,7 @@ async function scanJournalRoot(
 				removedDuringRead,
 				linkRetiredBeforeRead,
 				linkRetirementStat,
+				checkpointStat,
 			};
 			checkpointEntries.push(entry);
 			if (removedDuringRead) removedCheckpointEntries.push(entry);
@@ -3454,13 +3629,15 @@ async function runNormalLocked(statePath, action, rawOptions) {
 function isExpectedRemovedClaimRead(error, context, options) {
 	if (
 		!(error instanceof BoundedFileUnlinkedDuringReadError) ||
+		error.constructor !== BoundedFileUnlinkedDuringReadError || error.name !== "BoundedFileUnlinkedDuringReadError" ||
 		error.description !== "Consumer high-water operation claim" || typeof error.path !== "string" ||
-		!Buffer.isBuffer(error.bytes) || error.bytes.length < 1 || error.bytes.length > options.metadataMaxBytes
+		!Buffer.isBuffer(error.bytes) || error.bytes.length < 1 || error.bytes.length > options.metadataMaxBytes ||
+		!isExactUnlinkedDuringReadEvidence(error)
 	) return false;
 	const name = basename(error.path);
 	const match = claimPattern.exec(name);
 	if (
-		!match || error.expectedSha256 !== match[2] || digest(error.bytes) !== match[2] ||
+		!match || error.expectedSha256 !== match[2] || error.sha256 !== match[2] || digest(error.bytes) !== match[2] ||
 		error.path !== join(context.epochDirectory, name) || dirname(error.path) !== context.epochDirectory
 	) return false;
 	let claim;
