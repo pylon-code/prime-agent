@@ -332,6 +332,8 @@ jobs:
     needs: [admission, verify-preview]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    env:
+      PYLON_RELEASE_MODE: historical
     permissions:
       actions: read
       contents: read
@@ -340,7 +342,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-15]
     steps:
-      - name: Checkout current protected install policy
+      - name: Checkout exact source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.sha }}
@@ -351,9 +353,6 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.PYLON_RELEASE_NODE }}
-
-      - name: Install pinned npm
-        run: npm install --global "npm@${{ env.PYLON_RELEASE_NPM }}"
 
       - name: Verify workflow artifact provenance
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
@@ -382,10 +381,22 @@ jobs:
           name: verified-stable-preview
           path: .npm/pylon-release/artifacts
 
-      - name: Install the same exact preview bytes
+      - name: Run isolated artifact smoke
+        shell: /usr/bin/bash --noprofile --norc -euo pipefail {0}
         run: |
-          npm run release:pylon:verify-preview -- --historical
-          npm run release:pylon:smoke -- --historical
+          node_path="$(node -e 'process.stdout.write(require("node:fs").realpathSync.native(process.execPath))')"
+          /usr/bin/env -i \
+            "HOME=/tmp" \
+            "PATH=${node_path%/*}:/usr/bin:/bin" \
+            "$node_path" "$GITHUB_WORKSPACE/scripts/run-pylon-release-sandbox.mjs" \
+            --task smoke \
+            --mode "$PYLON_RELEASE_MODE" \
+            --host-os "${{ runner.os }}" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --artifact-dir "$GITHUB_WORKSPACE/.npm/pylon-release/artifacts" \
+            --run-id "${{ github.run_id }}" \
+            --run-number "${{ github.run_number }}" \
+            --publication-policy-revision 3
 
   prepare:
     name: Resolve exact stable transaction
@@ -473,7 +484,7 @@ jobs:
               --operation "$OPERATION"
               --policy-sha "${{ github.sha }}"
               --policy-tree "$policy_tree"
-              --publication-policy-revision 2
+              --publication-policy-revision 3
             )
             if [ "$OPERATION" = withdraw ]; then
               args+=(--revoke-tag "$REVOKE_STABLE_TAG" --reason "$REASON")
@@ -557,7 +568,7 @@ jobs:
           if (
             manifest.schemaVersion !== 1 || manifest.channel !== "stable" ||
             manifest.repository !== "https://github.com/pylon-code/prime-agent" ||
-            manifest.promotion?.publicationPolicyRevision !== 2 ||
+            manifest.promotion?.publicationPolicyRevision !== 3 ||
             !/^pylon-stable-[0-9]{6}-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(manifest.tag)
           ) throw new Error("Stable manifest identity is malformed.");
           NODE
@@ -663,8 +674,8 @@ jobs:
             if (
               !parsed || !preview || Number(parsed[1]) !== manifest.sequence || parsed[2] !== manifest.build.source?.commit?.slice(0, 12) ||
               Number(parsed[3]) !== manifest.build.recipeRevision || preview[1] !== parsed[2] || Number(preview[2]) !== manifest.build.recipeRevision ||
-              manifest.build.previewTag !== manifest.build.id || ![1, 2].includes(manifest.build.publicationPolicyRevision) ||
-              manifest.promotion?.policyCommit !== context.sha || manifest.promotion?.publicationPolicyRevision !== 2
+              manifest.build.previewTag !== manifest.build.id || ![1, 2, 3].includes(manifest.build.publicationPolicyRevision) ||
+              manifest.promotion?.policyCommit !== context.sha || manifest.promotion?.publicationPolicyRevision !== 3
             ) throw new Error("Stable draft identity is malformed or not signed by this policy commit.");
             const name = `Pylon Prime stable ${tag}`;
             const encoded = bytes.toString("base64");
@@ -840,10 +851,10 @@ jobs:
               Number(previewMatch[2]) !== manifest.build?.recipeRevision || manifest.build.previewTag !== manifest.build.id ||
               manifest.build.previewSequence?.sequenceEpoch !== 1 || !Number.isSafeInteger(manifest.build.previewSequence?.sequence) ||
               manifest.build.previewSequence.sequence < 1 || !/^[1-9][0-9]*$/.test(manifest.build.previewSequence?.workflowRunId ?? "") ||
-              manifest.build.previewTag !== process.env.PREVIEW_TAG || ![1, 2].includes(manifest.build.publicationPolicyRevision) ||
+              manifest.build.previewTag !== process.env.PREVIEW_TAG || ![1, 2, 3].includes(manifest.build.publicationPolicyRevision) ||
               manifest.promotion?.kind !== operation ||
-              (mode === "normal" ? manifest.promotion?.publicationPolicyRevision !== 2 :
-                ![1, 2].includes(manifest.promotion?.publicationPolicyRevision)) ||
+              (mode === "normal" ? manifest.promotion?.publicationPolicyRevision !== 3 :
+                ![1, 2, 3].includes(manifest.promotion?.publicationPolicyRevision)) ||
               manifest.promotion?.policyCommit !== process.env.POLICY_SHA || manifest.promotion?.policyTree !== process.env.POLICY_TREE
             ) throw new Error("Stable manifest, preview recipe, operator request, or policy identity differs.");
             if (operation === "withdraw") {

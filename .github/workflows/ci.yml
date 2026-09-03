@@ -226,6 +226,7 @@ jobs:
         copy: [a, b]
     env:
       PYLON_RELEASE_NODE: 22.23.2
+      PYLON_RELEASE_MODE: ci
       PYLON_RELEASE_NPM: 11.10.1
     steps:
       - name: Checkout exact source
@@ -240,36 +241,29 @@ jobs:
         with:
           node-version: ${{ env.PYLON_RELEASE_NODE }}
 
-      - name: Install pinned build inputs
+      - name: Run isolated release sandbox
+        id: sandbox
+        shell: /usr/bin/bash --noprofile --norc -euo pipefail {0}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev
-          npm install --global "npm@${PYLON_RELEASE_NPM}"
-          test "$(node --version)" = "v${PYLON_RELEASE_NODE}"
-          test "$(npm --version)" = "${PYLON_RELEASE_NPM}"
-          npm ci
+          node_path="$(node -e 'process.stdout.write(require("node:fs").realpathSync.native(process.execPath))')"
+          /usr/bin/env -i \
+            "HOME=/tmp" \
+            "PATH=${node_path%/*}:/usr/bin:/bin" \
+            "$node_path" "$GITHUB_WORKSPACE/scripts/run-pylon-release-sandbox.mjs" \
+            --task pack \
+            --mode "$PYLON_RELEASE_MODE" \
+            --host-os "${{ runner.os }}" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --github-output "$GITHUB_OUTPUT" \
+            --run-id "${{ github.run_id }}" \
+            --run-number "${{ github.run_number }}" \
+            --publication-policy-revision 3
 
-      - name: Test release contract
-        run: npm run test:pylon-release
-
-      - name: Build offline and pack without network
-        run: |
-          sudo env \
-            "PATH=$PATH" \
-            "HOME=$HOME" \
-            "GIT_CONFIG_COUNT=1" \
-            "GIT_CONFIG_KEY_0=safe.directory" \
-            "GIT_CONFIG_VALUE_0=$GITHUB_WORKSPACE" \
-            unshare --net -- npm run release:pylon:pack
-
-      - name: Verify artifact contract
-        run: npm run release:pylon:verify
-
-      - name: Upload candidate
+      - name: Upload isolated subjects
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pylon-prime-pack-${{ matrix.copy }}
-          path: .npm/pylon-release/artifacts
+          path: ${{ steps.sandbox.outputs.artifact_dir }}
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 3
@@ -301,12 +295,16 @@ jobs:
     if: needs.trust.outputs.allowed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
     env:
       PYLON_RELEASE_NODE: 22.23.2
+      PYLON_RELEASE_MODE: ci
       PYLON_RELEASE_NPM: 11.10.1
     steps:
       - name: Checkout exact source
@@ -321,17 +319,28 @@ jobs:
         with:
           node-version: ${{ env.PYLON_RELEASE_NODE }}
 
-      - name: Install pinned npm
-        run: npm install --global "npm@${{ env.PYLON_RELEASE_NPM }}"
-
       - name: Download reproducible pack
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: pylon-prime-pack-a
           path: .npm/pylon-release/artifacts
 
-      - name: Verify temporary-prefix runtime
-        run: npm run release:pylon:smoke
+      - name: Run isolated artifact smoke
+        shell: /usr/bin/bash --noprofile --norc -euo pipefail {0}
+        run: |
+          node_path="$(node -e 'process.stdout.write(require("node:fs").realpathSync.native(process.execPath))')"
+          /usr/bin/env -i \
+            "HOME=/tmp" \
+            "PATH=${node_path%/*}:/usr/bin:/bin" \
+            "$node_path" "$GITHUB_WORKSPACE/scripts/run-pylon-release-sandbox.mjs" \
+            --task smoke \
+            --mode "$PYLON_RELEASE_MODE" \
+            --host-os "${{ runner.os }}" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --artifact-dir "$GITHUB_WORKSPACE/.npm/pylon-release/artifacts" \
+            --run-id "${{ github.run_id }}" \
+            --run-number "${{ github.run_number }}" \
+            --publication-policy-revision 3
 
   build-check-test:
     name: build-check-test
