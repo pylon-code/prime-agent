@@ -4,6 +4,7 @@ import { link, lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises"
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 
 import {
+	BoundedFileLinkRetiredBeforeReadError,
 	BoundedFileUnlinkedDuringReadError,
 	readBoundedRegularFile,
 } from "./pylon-bounded-file.mjs";
@@ -617,16 +618,38 @@ function isVanishedRetainedCheckpoint(path, context, anchors, rootNames) {
 	});
 }
 
-function authenticatedRemovedCheckpoint(error, context, options, anchors, rootNames) {
+function isExactLinkRetiredBeforeReadEvidence(error) {
+	const transition = error.statTransition;
+	if (!exactKeys(transition, ["pathEntry", "openedHandle"])) return false;
+	const pathEntry = transition.pathEntry;
+	const openedHandle = transition.openedHandle;
+	const statKeys = ["dev", "ino", "size", "mtimeMs", "ctimeMs", "nlink"];
+	return exactKeys(pathEntry, statKeys) && exactKeys(openedHandle, statKeys) &&
+		pathEntry.dev === openedHandle.dev && pathEntry.ino === openedHandle.ino &&
+		pathEntry.size === openedHandle.size && pathEntry.size === error.bytes.length &&
+		pathEntry.mtimeMs === openedHandle.mtimeMs && pathEntry.ctimeMs !== openedHandle.ctimeMs &&
+		pathEntry.nlink === 2 && openedHandle.nlink === 1;
+}
+
+function authenticatedChangedCheckpointRead(error, context, options, anchors, rootNames) {
+	const linkRetiredBeforeRead = error instanceof BoundedFileLinkRetiredBeforeReadError;
+	const unlinkedDuringRead = error instanceof BoundedFileUnlinkedDuringReadError;
 	if (
-		!(error instanceof BoundedFileUnlinkedDuringReadError) ||
+		(!linkRetiredBeforeRead && !unlinkedDuringRead) ||
+		(linkRetiredBeforeRead && (
+			error.constructor !== BoundedFileLinkRetiredBeforeReadError ||
+			error.name !== "BoundedFileLinkRetiredBeforeReadError"
+		)) ||
 		error.description !== "Consumer high-water journal checkpoint" || typeof error.path !== "string" ||
-		!Buffer.isBuffer(error.bytes) || error.bytes.length < 1 || error.bytes.length > options.metadataMaxBytes
+		!Buffer.isBuffer(error.bytes) || error.bytes.length < 1 || error.bytes.length > options.metadataMaxBytes ||
+		(linkRetiredBeforeRead && !isExactLinkRetiredBeforeReadEvidence(error))
 	) return null;
 	const expectedSha256 = anchors.get(error.path);
 	if (
 		expectedSha256 === undefined || error.expectedSha256 !== expectedSha256 ||
-		digest(error.bytes) !== expectedSha256 || dirname(error.path) !== context.journalDirectory
+		digest(error.bytes) !== expectedSha256 ||
+		(linkRetiredBeforeRead && error.sha256 !== expectedSha256) ||
+		dirname(error.path) !== context.journalDirectory
 	) return null;
 	const name = basename(error.path);
 	const match = checkpointPattern.exec(name);
@@ -642,11 +665,36 @@ function authenticatedRemovedCheckpoint(error, context, options, anchors, rootNa
 		checkpoint.epoch !== Number(match[1]) ||
 		!isContextAnchoredCheckpoint(context, error.path, checkpoint, expectedSha256)
 	) return null;
-	const hasLaterCheckpoint = rootNames.some((candidate) => {
-		const candidateMatch = checkpointPattern.exec(candidate);
-		return candidateMatch && Number(candidateMatch[1]) > checkpoint.epoch;
-	});
-	return hasLaterCheckpoint ? checkpoint : null;
+	if (unlinkedDuringRead) {
+		const hasLaterCheckpoint = rootNames.some((candidate) => {
+			const candidateMatch = checkpointPattern.exec(candidate);
+			return candidateMatch && Number(candidateMatch[1]) > checkpoint.epoch;
+		});
+		if (!hasLaterCheckpoint) return null;
+	}
+	return {
+		checkpoint,
+		linkRetiredBeforeRead,
+		linkRetirementStat: linkRetiredBeforeRead ? error.statTransition.openedHandle : null,
+	};
+}
+
+function sameRetiredLinkStat(left, right) {
+	return left !== null && right !== null &&
+		left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
+		left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs && left.nlink === right.nlink;
+}
+
+function checkpointProofOptions(entry, options, invalidRoot) {
+	if (entry.linkRetirementStat === null) return options;
+	return {
+		...options,
+		lstatEntry: async (path) => {
+			const stat = await options.lstatEntry(path);
+			if (path === entry.path && !sameRetiredLinkStat(stat, entry.linkRetirementStat)) throw invalidRoot();
+			return stat;
+		},
+	};
 }
 
 async function authenticateStableChangedRoot(scan, context, options, anchors, target, invalidRoot) {
@@ -694,7 +742,7 @@ async function authenticateStableChangedRoot(scan, context, options, anchors, ta
 			options.metadataMaxBytes,
 			(value) => validateCheckpoint(value, options.stateMaxBytes).value,
 			"Consumer high-water journal checkpoint",
-			options,
+			checkpointProofOptions(entry, options, invalidRoot),
 			undefined,
 			expectedSha256,
 		);
@@ -724,6 +772,58 @@ async function authenticateStableChangedRoot(scan, context, options, anchors, ta
 		[...finalNames].some((name) => !proofNames.has(name)) ||
 		[...proofNames].some((name) => !optionalNames.has(name) && !finalNames.has(name)) ||
 		[...requiredNames].some((name) => !finalNames.has(name))
+	) throw invalidRoot();
+}
+
+async function inProgressDirectoryStats(context, nextEpochPath, options, invalidRoot) {
+	const [temporaryDirectory, currentEpoch, nextEpoch] = await Promise.all([
+		options.lstatEntry(context.temporaryDirectory),
+		options.lstatEntry(context.epochDirectory),
+		options.lstatEntry(nextEpochPath),
+	]);
+	if (
+		!temporaryDirectory.isDirectory() || temporaryDirectory.isSymbolicLink?.() ||
+		!currentEpoch.isDirectory() || currentEpoch.isSymbolicLink?.() ||
+		!nextEpoch.isDirectory() || nextEpoch.isSymbolicLink?.()
+	) throw invalidRoot();
+	return { temporaryDirectory, currentEpoch, nextEpoch };
+}
+
+async function authenticateLinkRetiredInProgressRoot(
+	scan,
+	context,
+	options,
+	anchors,
+	currentCheckpoint,
+	nextEpochPath,
+	kind,
+	invalidRoot,
+) {
+	if (scan.linkRetiredCheckpointEntries.length === 0) return;
+	if (
+		currentCheckpoint === undefined || scan.linkRetiredCheckpointEntries.length !== 1 ||
+		scan.linkRetiredCheckpointEntries[0] !== currentCheckpoint || currentCheckpoint.path !== context.checkpointPath ||
+		currentCheckpoint.linkRetirementStat === null
+	) throw invalidRoot();
+	const permittedNames = new Set([
+		TEMPORARY_DIRECTORY_NAME,
+		basename(context.checkpointPath),
+		basename(context.epochDirectory),
+		basename(nextEpochPath),
+	]);
+	if (
+		scan.rootNames.length !== permittedNames.size ||
+		scan.rootNames.some((name) => !permittedNames.has(name))
+	) throw invalidRoot();
+	const beforeDirectories = await inProgressDirectoryStats(context, nextEpochPath, options, invalidRoot);
+	await options.hooks?.beforeInProgressStableRootProof?.({ kind });
+	await authenticateStableChangedRoot(scan, context, options, anchors, currentCheckpoint, invalidRoot);
+	const afterDirectories = await inProgressDirectoryStats(context, nextEpochPath, options, invalidRoot);
+	if (
+		!sameRetiredLinkStat(beforeDirectories.temporaryDirectory, afterDirectories.temporaryDirectory) ||
+		!sameRetiredLinkStat(beforeDirectories.currentEpoch, afterDirectories.currentEpoch) ||
+		!sameRetiredLinkStat(beforeDirectories.nextEpoch, afterDirectories.nextEpoch) ||
+		(await options.readDirectory(nextEpochPath)).length !== 0
 	) throw invalidRoot();
 }
 
@@ -758,6 +858,16 @@ async function authenticateChangedRoot(
 			(await options.readDirectory(nextEpochPath)).length !== 0
 		) throw invalidRoot();
 		if ((await options.readDirectory(nextEpochPath)).length !== 0) throw invalidRoot();
+		await authenticateLinkRetiredInProgressRoot(
+			scan,
+			context,
+			options,
+			anchors,
+			currentCheckpoint,
+			nextEpochPath,
+			"known",
+			invalidRoot,
+		);
 		return false;
 	}
 
@@ -771,6 +881,16 @@ async function authenticateChangedRoot(
 		await secureDirectory(context.epochDirectory, "Consumer high-water epoch directory", options);
 		await secureDirectory(discoveredNextEpoch.path, "Consumer high-water epoch directory", options);
 		if ((await options.readDirectory(discoveredNextEpoch.path)).length !== 0) throw invalidRoot();
+		await authenticateLinkRetiredInProgressRoot(
+			scan,
+			context,
+			options,
+			anchors,
+			currentCheckpoint,
+			discoveredNextEpoch.path,
+			"discovered",
+			invalidRoot,
+		);
 		return discoveredNextEpoch.path;
 	}
 
@@ -787,7 +907,10 @@ async function authenticateChangedRoot(
 		)) &&
 		scan.epochEntries.every((entry) => [context.epochDirectory, retiredEpochPath].includes(entry.path))
 	) {
-		if (scan.removedCheckpointEntries.length > 0 || scan.vanishedRetainedCheckpointNames.length > 0) {
+		if (
+			scan.removedCheckpointEntries.length > 0 || scan.linkRetiredCheckpointEntries.length > 0 ||
+			scan.vanishedRetainedCheckpointNames.length > 0
+		) {
 			await authenticateStableChangedRoot(scan, context, options, anchors, currentCheckpoint, invalidRoot);
 		} else {
 			await secureDirectory(context.epochDirectory, "Consumer high-water epoch directory", options);
@@ -827,6 +950,7 @@ async function revalidateAuthority(
 		statePath: context.statePath,
 		lockDirectory: context.journalDirectory,
 		transactionDirectory: context.epochDirectory,
+		inProgressCheckpoint: inProgressCheckpoint === null ? null : structuredClone(inProgressCheckpoint),
 	});
 	await ensureDurableConsumerStateDirectory(dirname(context.statePath), {
 		...options.directoryOperations,
@@ -918,7 +1042,7 @@ async function publishImmutable({
 	}
 }
 
-async function publishMetadata(path, value, kind, context, writer, options) {
+async function publishMetadata(path, value, kind, context, writer, options, inProgressCheckpoint = null) {
 	const created = await publishImmutable({
 		path,
 		bytes: metadataBytes(value),
@@ -927,9 +1051,10 @@ async function publishMetadata(path, value, kind, context, writer, options) {
 		context,
 		writer,
 		options,
+		inProgressCheckpoint,
 	});
 	if (created) return { value, created: true };
-	await revalidateAuthority(context, `${kind}-existing`, options);
+	await revalidateAuthority(context, `${kind}-existing`, options, inProgressCheckpoint);
 	const existing = await readExactMetadata(
 		path,
 		options.metadataMaxBytes,
@@ -972,6 +1097,7 @@ async function scanJournalRoot(
 	}
 	const checkpointEntries = [];
 	const removedCheckpointEntries = [];
+	const linkRetiredCheckpointEntries = [];
 	const vanishedRetainedCheckpointNames = [];
 	const epochEntries = [];
 	const temporaries = [];
@@ -1001,6 +1127,8 @@ async function scanJournalRoot(
 			const expectedSha256 = checkpointAnchors?.get(path) ?? null;
 			let checkpoint;
 			let removedDuringRead = false;
+			let linkRetiredBeforeRead = false;
+			let linkRetirementStat = null;
 			try {
 				checkpoint = await readExactMetadata(
 					path,
@@ -1014,10 +1142,12 @@ async function scanJournalRoot(
 			} catch (error) {
 				const authenticated = checkpointContext === null || checkpointAnchors === null
 					? null
-					: authenticatedRemovedCheckpoint(error, checkpointContext, options, checkpointAnchors, names);
+					: authenticatedChangedCheckpointRead(error, checkpointContext, options, checkpointAnchors, names);
 				if (authenticated === null) throw error;
-				checkpoint = authenticated;
-				removedDuringRead = true;
+				checkpoint = authenticated.checkpoint;
+				linkRetiredBeforeRead = authenticated.linkRetiredBeforeRead;
+				linkRetirementStat = authenticated.linkRetirementStat;
+				removedDuringRead = !linkRetiredBeforeRead;
 			}
 			if (checkpoint === null) {
 				if (
@@ -1030,9 +1160,18 @@ async function scanJournalRoot(
 			if (checkpointName(checkpoint) !== name || checkpoint.epoch !== Number(checkpointMatch[1])) {
 				throw new Error("Consumer high-water journal checkpoint name is malformed.");
 			}
-			const entry = { name, path, checkpoint, digest: digest(metadataBytes(checkpoint)), removedDuringRead };
+			const entry = {
+				name,
+				path,
+				checkpoint,
+				digest: digest(metadataBytes(checkpoint)),
+				removedDuringRead,
+				linkRetiredBeforeRead,
+				linkRetirementStat,
+			};
 			checkpointEntries.push(entry);
 			if (removedDuringRead) removedCheckpointEntries.push(entry);
+			if (linkRetiredBeforeRead) linkRetiredCheckpointEntries.push(entry);
 			continue;
 		}
 		const epochMatch = epochPattern.exec(name);
@@ -1101,6 +1240,7 @@ async function scanJournalRoot(
 	return {
 		checkpointEntries,
 		removedCheckpointEntries,
+		linkRetiredCheckpointEntries,
 		vanishedRetainedCheckpointNames,
 		epochEntries,
 		temporaries,
@@ -1900,9 +2040,33 @@ async function resolveOperationFrontier(context, options) {
 	return { scan, frontier: latest, rotated: false, active: false };
 }
 
+function inProgressCheckpointForClaim(context, claim, options) {
+	if (claim.type !== "rotation") return null;
+	const validatedClaim = validateClaim(claim, context, options.stateMaxBytes);
+	const intent = validateRotationIntent(validatedClaim.intent, context, options.stateMaxBytes);
+	const { anchorBytes } = validateCheckpoint(intent.checkpoint, options.stateMaxBytes);
+	const expectedClaim = rotationClaimFor(context, validatedClaim.generation, {
+		tipDigest: intent.tipSha256,
+		tipBytes: anchorBytes,
+	});
+	if (!metadataBytes(validatedClaim).equals(metadataBytes(expectedClaim))) {
+		throw new Error("Consumer high-water rotation claim does not match its exact authenticated intent.");
+	}
+	return intent.checkpoint;
+}
+
 async function tryPublishClaim(context, claim, options) {
+	const inProgressCheckpoint = inProgressCheckpointForClaim(context, claim, options);
 	const contentPath = claimPath(context, claim);
-	const contentResult = await publishMetadata(contentPath, claim, "claim", context, claim, options);
+	const contentResult = await publishMetadata(
+		contentPath,
+		claim,
+		"claim",
+		context,
+		claim,
+		options,
+		inProgressCheckpoint,
+	);
 	const existingClaim = validateClaim(contentResult.value, context, options.stateMaxBytes);
 	if (!metadataBytes(existingClaim).equals(metadataBytes(claim))) {
 		throw new Error("Consumer high-water claim content lost its exact digest-bound publication.");
@@ -1915,6 +2079,7 @@ async function tryPublishClaim(context, claim, options) {
 		context,
 		claim,
 		options,
+		inProgressCheckpoint,
 	);
 	const existingIndex = validateClaimIndex(indexResult.value, claim.generation);
 	if (!metadataBytes(existingIndex).equals(metadataBytes(index))) return false;

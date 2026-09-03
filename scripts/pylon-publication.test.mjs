@@ -7,6 +7,7 @@ import {
 	existsSync,
 	fsyncSync,
 	fstatSync,
+	linkSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -24,7 +25,7 @@ import {
 	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
 import { lstat as lstatFile, open as openFileHandle, readdir as readDirectoryEntries } from "node:fs/promises";
@@ -91,6 +92,7 @@ import {
 	withConsumerStateLock,
 } from "./lib/pylon-consumer-lock.mjs";
 import {
+	BoundedFileLinkRetiredBeforeReadError,
 	BoundedFileUnlinkedDuringReadError,
 	PYLON_PUBLICATION_MANIFEST_MAX_BYTES,
 	PYLON_STABLE_HISTORY_MAX_MANIFESTS,
@@ -934,6 +936,1004 @@ test("consumer stable high-water pins and bounds every manifest before parsing",
 			),
 			/manifest work bound/,
 		);
+	} finally {
+		rmSync(fixture, { recursive: true, force: true });
+	}
+});
+
+test("bounded reads authenticate only exact pre-read link retirement transitions", async () => {
+	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-bounded-link-retirement-")));
+	const exactBytes = Buffer.from("exact-retirement-bytes");
+	const exactDigest = sha256Bytes(exactBytes);
+	const rejectGenericChange = async (operation) => {
+		await assert.rejects(operation, (error) => {
+			assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, false);
+			assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+			assert.match(error.message, /changed while it was read|regular non-symlink file/);
+			return true;
+		});
+	};
+	try {
+		const asyncPrivate = join(fixture, "async-private");
+		const asyncPublic = join(fixture, "async-public");
+		writeFileSync(asyncPrivate, exactBytes);
+		linkSync(asyncPrivate, asyncPublic);
+		await assert.rejects(
+			() => readBoundedRegularFile(asyncPublic, {
+				maxBytes: 1024,
+				description: "Async linked input",
+				expectedSha256: exactDigest,
+				openFile: async (path, flags) => {
+					rmSync(asyncPrivate);
+					return openFileHandle(path, flags);
+				},
+			}),
+			(error) => {
+				assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, true);
+				assert.equal(error.path, asyncPublic);
+				assert.equal(error.description, "Async linked input");
+				assert.equal(error.bytes.equals(exactBytes), true);
+				assert.equal(error.expectedSha256, exactDigest);
+				assert.equal(error.sha256, exactDigest);
+				assert.deepEqual(Object.keys(error.statTransition).sort(), ["openedHandle", "pathEntry"]);
+				const { pathEntry, openedHandle } = error.statTransition;
+				assert.deepEqual(
+					[pathEntry.dev, pathEntry.ino, pathEntry.size, pathEntry.mtimeMs],
+					[openedHandle.dev, openedHandle.ino, openedHandle.size, openedHandle.mtimeMs],
+				);
+				assert.equal(pathEntry.ctimeMs === openedHandle.ctimeMs, false);
+				assert.deepEqual([pathEntry.nlink, openedHandle.nlink], [2, 1]);
+				assert.equal(lstatSync(asyncPublic).nlink, 1);
+				return true;
+			},
+		);
+
+		const syncPrivate = join(fixture, "sync-private");
+		const syncPublic = join(fixture, "sync-public");
+		writeFileSync(syncPrivate, exactBytes);
+		linkSync(syncPrivate, syncPublic);
+		assert.throws(
+			() => readBoundedRegularFileSync(syncPublic, {
+				maxBytes: 1024,
+				description: "Sync linked input",
+				expectedSha256: exactDigest,
+				openFile: (path, flags) => {
+					rmSync(syncPrivate);
+					return openSync(path, flags);
+				},
+			}),
+			(error) => {
+				assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, true);
+				assert.equal(error.bytes.equals(exactBytes), true);
+				assert.equal(error.sha256, exactDigest);
+				assert.deepEqual(
+					[error.statTransition.pathEntry.nlink, error.statTransition.openedHandle.nlink],
+					[2, 1],
+				);
+				return true;
+			},
+		);
+
+		const asyncUnlinked = join(fixture, "async-unlinked");
+		writeFileSync(asyncUnlinked, exactBytes);
+		await assert.rejects(
+			() => readBoundedRegularFile(asyncUnlinked, {
+				maxBytes: 1024,
+				description: "Async unlinked input",
+				expectedSha256: exactDigest,
+				openFile: async (path, flags) => {
+					const handle = await openFileHandle(path, flags);
+					rmSync(path);
+					return handle;
+				},
+			}),
+			(error) => {
+				assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, true);
+				assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, false);
+				assert.equal(error.bytes.equals(exactBytes), true);
+				assert.equal(error.expectedSha256, exactDigest);
+				return true;
+			},
+		);
+
+		const syncUnlinked = join(fixture, "sync-unlinked");
+		writeFileSync(syncUnlinked, exactBytes);
+		assert.throws(
+			() => readBoundedRegularFileSync(syncUnlinked, {
+				maxBytes: 1024,
+				description: "Sync unlinked input",
+				expectedSha256: exactDigest,
+				openFile: (path, flags) => {
+					const descriptor = openSync(path, flags);
+					rmSync(path);
+					return descriptor;
+				},
+			}),
+			(error) => {
+				assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, true);
+				assert.equal(error.bytes.equals(exactBytes), true);
+				return true;
+			},
+		);
+
+		const replaced = join(fixture, "same-bytes-new-inode");
+		const replacedOriginal = join(fixture, "same-bytes-old-inode");
+		writeFileSync(replaced, exactBytes);
+		await rejectGenericChange(() => readBoundedRegularFile(replaced, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			openFile: async (path, flags) => {
+				renameSync(path, replacedOriginal);
+				writeFileSync(path, exactBytes);
+				return openFileHandle(path, flags);
+			},
+		}));
+
+		const differentPrivate = join(fixture, "different-private");
+		const differentPublic = join(fixture, "different-public");
+		const differentBytes = Buffer.from("other-retirement-bytes");
+		assert.equal(differentBytes.length, exactBytes.length);
+		writeFileSync(differentPrivate, exactBytes);
+		linkSync(differentPrivate, differentPublic);
+		const differentInitial = statSync(differentPublic);
+		await rejectGenericChange(() => readBoundedRegularFile(differentPublic, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			openFile: async (path, flags) => {
+				rmSync(differentPrivate);
+				writeFileSync(path, differentBytes);
+				utimesSync(path, differentInitial.atime, differentInitial.mtime);
+				return openFileHandle(path, flags);
+			},
+		}));
+
+		const unanchoredPrivate = join(fixture, "unanchored-private");
+		const unanchoredPublic = join(fixture, "unanchored-public");
+		writeFileSync(unanchoredPrivate, exactBytes);
+		linkSync(unanchoredPrivate, unanchoredPublic);
+		await rejectGenericChange(() => readBoundedRegularFile(unanchoredPublic, {
+			maxBytes: 1024,
+			openFile: async (path, flags) => {
+				rmSync(unanchoredPrivate);
+				return openFileHandle(path, flags);
+			},
+		}));
+
+		const threeLinkPrivate = join(fixture, "three-link-private");
+		const threeLinkPublic = join(fixture, "three-link-public");
+		const threeLinkOther = join(fixture, "three-link-other");
+		writeFileSync(threeLinkPrivate, exactBytes);
+		linkSync(threeLinkPrivate, threeLinkPublic);
+		linkSync(threeLinkPrivate, threeLinkOther);
+		await rejectGenericChange(() => readBoundedRegularFile(threeLinkPublic, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			openFile: async (path, flags) => {
+				rmSync(threeLinkPrivate);
+				return openFileHandle(path, flags);
+			},
+		}));
+
+		const nonunitPrivate = join(fixture, "nonunit-private");
+		const nonunitPublic = join(fixture, "nonunit-public");
+		writeFileSync(nonunitPrivate, exactBytes);
+		linkSync(nonunitPrivate, nonunitPublic);
+		await rejectGenericChange(() => readBoundedRegularFile(nonunitPublic, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			openFile: async (path, flags) => {
+				const handle = await openFileHandle(path, flags);
+				rmSync(nonunitPrivate);
+				rmSync(nonunitPublic);
+				return handle;
+			},
+		}));
+
+		const symlinkSource = join(fixture, "symlink-source");
+		const symlinkTarget = join(fixture, "symlink-target");
+		const symlinkMoved = join(fixture, "symlink-moved");
+		writeFileSync(symlinkSource, exactBytes);
+		writeFileSync(symlinkTarget, exactBytes);
+		await rejectGenericChange(() => readBoundedRegularFile(symlinkSource, {
+			maxBytes: 1024,
+			expectedSha256: exactDigest,
+			openFile: async (path, flags) => {
+				renameSync(path, symlinkMoved);
+				symlinkSync(symlinkTarget, path);
+				return openFileHandle(path, flags);
+			},
+		}));
+
+		const ioCases = [
+			["initial lstat", (_path, failure) => ({ lstatEntry: async () => { throw failure; } })],
+			["open", (_path, failure) => ({ openFile: async () => { throw failure; } })],
+			["initial fstat", (_path, failure) => ({
+				openFile: async (path, flags) => {
+					const handle = await openFileHandle(path, flags);
+					return {
+						close: handle.close.bind(handle),
+						read: handle.read.bind(handle),
+						stat: async () => { throw failure; },
+					};
+				},
+			})],
+			["read", (_path, failure) => ({
+				openFile: async (path, flags) => {
+					const handle = await openFileHandle(path, flags);
+					return {
+						close: handle.close.bind(handle),
+						read: async () => { throw failure; },
+						stat: handle.stat.bind(handle),
+					};
+				},
+			})],
+			["final fstat", (_path, failure) => ({
+				openFile: async (path, flags) => {
+					const handle = await openFileHandle(path, flags);
+					let statCalls = 0;
+					return {
+						close: handle.close.bind(handle),
+						read: handle.read.bind(handle),
+						stat: async () => {
+							statCalls += 1;
+							if (statCalls === 2) throw failure;
+							return handle.stat();
+						},
+					};
+				},
+			})],
+			["final lstat", (_path, failure) => {
+				let lstatCalls = 0;
+				return {
+					lstatEntry: async (path) => {
+						lstatCalls += 1;
+						if (lstatCalls === 2) throw failure;
+						return lstatFile(path);
+					},
+				};
+			}],
+		];
+		for (const [label, options] of ioCases) {
+			const path = join(fixture, `io-${label.replace(" ", "-")}`);
+			const failure = new Error(`injected ${label} failure`);
+			writeFileSync(path, exactBytes);
+			await assert.rejects(
+				() => readBoundedRegularFile(path, {
+					maxBytes: 1024,
+					expectedSha256: exactDigest,
+					...options(path, failure),
+				}),
+				(error) => error === failure,
+			);
+			assert.equal(readFileSync(path).equals(exactBytes), true, `${label} failure cannot write the input`);
+		}
+	} finally {
+		rmSync(fixture, { recursive: true, force: true });
+	}
+});
+
+test("checkpoint readers converge across exact publication-link and retained-link retirement", async () => {
+	const deferred = () => {
+		let resolvePromise;
+		const promise = new Promise((resolvePromiseValue) => { resolvePromise = resolvePromiseValue; });
+		return { promise, resolve: resolvePromise };
+	};
+	const stateBytes = (value) => Buffer.from(`${JSON.stringify({ value })}\n`);
+	const runtime = (hooks = {}, operations = {}) => ({
+		stale: 20,
+		update: 10,
+		stateMaxBytes: 1024,
+		now: () => 2,
+		hooks,
+		processKill: process.kill.bind(process),
+		startHeartbeat: () => async () => {},
+		...operations,
+	});
+	const assertFinalEpoch = (statePath, expectedTip) => {
+		const journalDirectory = `${statePath}.journal`;
+		const names = readdirSync(journalDirectory).sort();
+		const checkpointName = names.find((name) => name.startsWith("checkpoint-"));
+		assert.ok(checkpointName);
+		const checkpointBytes = readFileSync(join(journalDirectory, checkpointName));
+		const checkpoint = JSON.parse(checkpointBytes);
+		const epochName = `epoch-${String(checkpoint.epoch).padStart(16, "0")}-${checkpoint.epochId}`;
+		assert.deepEqual(names, [".owned-temporaries-v2", checkpointName, epochName].sort());
+		assert.equal(checkpointBytes.equals(Buffer.from(`${JSON.stringify(checkpoint)}\n`)), true);
+		assert.equal(checkpoint.epoch, 2);
+		assert.equal(checkpoint.anchorDigest, expectedTip);
+		assert.deepEqual(readdirSync(join(journalDirectory, ".owned-temporaries-v2")), []);
+	};
+	const directoryBytes = (directory) => new Map(
+		readdirSync(directory).sort().map((name) => [name, readFileSync(join(directory, name))]),
+	);
+	const assertDirectoryBytes = (directory, expected) => {
+		const actual = directoryBytes(directory);
+		assert.deepEqual([...actual.keys()], [...expected.keys()]);
+		for (const [name, value] of expected) assert.equal(actual.get(name).equals(value), true);
+	};
+	const linkCheckpointTemporary = (journal, checkpointPath, attempt) => {
+		const checkpoint = JSON.parse(readFileSync(checkpointPath));
+		const path = join(
+			journal,
+			".owned-temporaries-v2",
+			`.pylon-consumer-tmp-v1-p${process.pid}-e${checkpoint.epochId}-g0000000000000000` +
+				`-w${checkpoint.epochId}-n${attempt}-kcheckpoint-t${"a".repeat(64)}.tmp`,
+		);
+		linkSync(checkpointPath, path);
+		assert.equal(lstatSync(checkpointPath).nlink, 2);
+		return path;
+	};
+	const fixture = realpathSync(mkdtempSync(join(tmpdir(), "pylon-checkpoint-link-retirement-")));
+	try {
+		const linkedStatePath = join(fixture, "linked-current.json");
+		const linkedAnchor = stateBytes("linked-current-anchor");
+		await withConsumerStateLock(linkedStatePath, async (_path, transaction) => {
+			await transaction.commitState(linkedAnchor);
+		}, runtime());
+		const linkedJournalDirectory = `${linkedStatePath}.journal`;
+		const publicLinkSynced = deferred();
+		const releasePublisher = deferred();
+		const privateLinkRemoved = deferred();
+		let publishedCheckpointPath;
+		let publicPathStat;
+		const publisher = rotateConsumerStateJournal(linkedStatePath, runtime({
+			afterMetadataDirectorySync: async ({ kind, path, linked }) => {
+				if (kind !== "checkpoint" || !linked) return;
+				publishedCheckpointPath = path;
+				publicPathStat = lstatSync(path);
+				assert.equal(publicPathStat.nlink, 2);
+				publicLinkSynced.resolve();
+				await releasePublisher.promise;
+			},
+		}, {
+			removeFile: async (path, options) => {
+				rmSync(path, options);
+				if (
+					publishedCheckpointPath && path !== publishedCheckpointPath &&
+					basename(path).includes("-kcheckpoint-")
+				) privateLinkRemoved.resolve();
+			},
+		}));
+		await publicLinkSynced.promise;
+
+		const readerBeforeOpen = deferred();
+		const releaseReaderOpen = deferred();
+		let checkpointOpens = 0;
+		let readerPathStat;
+		let latestPathStat;
+		const linkedReader = rotateConsumerStateJournal(linkedStatePath, runtime({}, {
+			lstatEntry: async (path) => {
+				const entry = await lstatFile(path);
+				if (path === publishedCheckpointPath) latestPathStat = entry;
+				return entry;
+			},
+			openFile: async (path, flags, mode) => {
+				if (path === publishedCheckpointPath) {
+					checkpointOpens += 1;
+					if (checkpointOpens === 2) {
+						readerPathStat = latestPathStat;
+						readerBeforeOpen.resolve();
+						await releaseReaderOpen.promise;
+					}
+				}
+				return openFileHandle(path, flags, mode);
+			},
+		}));
+		await readerBeforeOpen.promise;
+		assert.equal(readerPathStat.nlink, 2);
+		releasePublisher.resolve();
+		await privateLinkRemoved.promise;
+		const retiredLinkStat = lstatSync(publishedCheckpointPath);
+		assert.deepEqual(
+			[retiredLinkStat.dev, retiredLinkStat.ino, retiredLinkStat.size, retiredLinkStat.mtimeMs],
+			[publicPathStat.dev, publicPathStat.ino, publicPathStat.size, publicPathStat.mtimeMs],
+		);
+		assert.deepEqual([publicPathStat.nlink, retiredLinkStat.nlink], [2, 1]);
+		assert.equal(publicPathStat.ctimeMs === retiredLinkStat.ctimeMs, false);
+		releaseReaderOpen.resolve();
+		const [linkedReaderReceipt, publisherReceipt] = await Promise.all([linkedReader, publisher]);
+		assert.equal(
+			Buffer.from(JSON.stringify(linkedReaderReceipt)).equals(Buffer.from(JSON.stringify(publisherReceipt))),
+			true,
+		);
+		assert.deepEqual(publisherReceipt, { epoch: 2, tipSha256: sha256Bytes(linkedAnchor) });
+		assertFinalEpoch(linkedStatePath, sha256Bytes(linkedAnchor));
+		assert.equal(dirname(publishedCheckpointPath), linkedJournalDirectory);
+
+		const unlinkedStatePath = join(fixture, "unlinked-retained.json");
+		const unlinkedAnchor = stateBytes("unlinked-retained-anchor");
+		await withConsumerStateLock(unlinkedStatePath, async (_path, transaction) => {
+			await transaction.commitState(unlinkedAnchor);
+		}, runtime());
+		const retainedJournal = consumerJournal(unlinkedStatePath);
+		const checkpointPublished = deferred();
+		const releaseCheckpointPublisher = deferred();
+		const checkpointPublisher = rotateConsumerStateJournal(unlinkedStatePath, runtime({
+			afterRotationCheckpoint: async () => {
+				checkpointPublished.resolve();
+				await releaseCheckpointPublisher.promise;
+			},
+		}));
+		await checkpointPublished.promise;
+		assert.equal(lstatSync(retainedJournal.checkpoint).nlink, 1);
+
+		const readerBeforeInitialFstat = deferred();
+		const releaseInitialFstat = deferred();
+		let retainedCheckpointOpens = 0;
+		let pinnedHandle;
+		const retainedReader = rotateConsumerStateJournal(unlinkedStatePath, runtime({}, {
+			openFile: async (path, flags, mode) => {
+				const handle = await openFileHandle(path, flags, mode);
+				if (path !== retainedJournal.checkpoint) return handle;
+				retainedCheckpointOpens += 1;
+				if (retainedCheckpointOpens !== 2) return handle;
+				pinnedHandle = handle;
+				let statCalls = 0;
+				return {
+					close: handle.close.bind(handle),
+					read: handle.read.bind(handle),
+					stat: async (...arguments_) => {
+						statCalls += 1;
+						if (statCalls === 1) {
+							readerBeforeInitialFstat.resolve();
+							await releaseInitialFstat.promise;
+						}
+						return handle.stat(...arguments_);
+					},
+				};
+			},
+		}));
+		await readerBeforeInitialFstat.promise;
+		assert.equal((await pinnedHandle.stat()).nlink, 1);
+		releaseCheckpointPublisher.resolve();
+		const checkpointPublisherReceipt = await checkpointPublisher;
+
+		const retainedPathRemoved = deferred();
+		const cleanup = rotateConsumerStateJournal(unlinkedStatePath, runtime({}, {
+			removeFile: async (path, options) => {
+				rmSync(path, options);
+				if (path === retainedJournal.checkpoint) retainedPathRemoved.resolve();
+			},
+		}));
+		await retainedPathRemoved.promise;
+		assert.equal(existsSync(retainedJournal.checkpoint), false);
+		assert.equal((await pinnedHandle.stat()).nlink, 0);
+		releaseInitialFstat.resolve();
+		const [retainedReaderReceipt, cleanupReceipt] = await Promise.all([retainedReader, cleanup]);
+		const publisherReceiptBytes = Buffer.from(JSON.stringify(checkpointPublisherReceipt));
+		assert.equal(Buffer.from(JSON.stringify(retainedReaderReceipt)).equals(publisherReceiptBytes), true);
+		assert.equal(Buffer.from(JSON.stringify(cleanupReceipt)).equals(publisherReceiptBytes), true);
+		assert.deepEqual(checkpointPublisherReceipt, { epoch: 2, tipSha256: sha256Bytes(unlinkedAnchor) });
+		assertFinalEpoch(unlinkedStatePath, sha256Bytes(unlinkedAnchor));
+
+		let earlyExitFixture = 0;
+		const mutateInProgressRoot = (mutation, statePath, checkpointPath, nextEpochPath) => {
+			const journalDirectory = `${statePath}.journal`;
+			if (mutation === "mutate") {
+				const original = readFileSync(checkpointPath);
+				writeFileSync(checkpointPath, Buffer.alloc(original.length, 0x61));
+			} else if (mutation === "add") {
+				writeFileSync(join(journalDirectory, "unexpected-root-entry"), "unexpected\n");
+			} else if (mutation === "remove") {
+				rmSync(nextEpochPath, { recursive: true });
+			} else if (mutation === "replace") {
+				const original = readFileSync(checkpointPath);
+				renameSync(checkpointPath, join(fixture, `replaced-checkpoint-${earlyExitFixture}`));
+				writeFileSync(checkpointPath, original, { mode: 0o600 });
+			} else if (mutation !== null) {
+				throw new Error(`unknown in-progress root mutation ${mutation}`);
+			}
+		};
+		const runKnownInProgressProof = async (mutation) => {
+			earlyExitFixture += 1;
+			const label = `known-in-progress-${mutation ?? "stable"}-${earlyExitFixture}`;
+			const statePath = join(fixture, `${label}.json`);
+			const anchor = stateBytes(`${label}-anchor`);
+			await withConsumerStateLock(statePath, async (_path, transaction) => {
+				await transaction.commitState(anchor);
+			}, runtime());
+			const journal = consumerJournal(statePath);
+			const proofReached = deferred();
+			const releaseProof = deferred();
+			let linkedTemporary;
+			let retireLink = false;
+			let nextCheckpointPath;
+			let nextEpochPath;
+			const rotation = rotateConsumerStateJournal(statePath, runtime({
+				afterRotationEpochSync: async ({ checkpoint, nextEpoch }) => {
+					nextEpochPath = nextEpoch;
+					nextCheckpointPath = join(
+						journal.journal,
+						`checkpoint-${String(checkpoint.epoch).padStart(16, "0")}-${checkpoint.epochId}.json`,
+					);
+					linkedTemporary = linkCheckpointTemporary(
+						journal.journal,
+						journal.checkpoint,
+						String(earlyExitFixture).padStart(12, "0"),
+					);
+					retireLink = true;
+				},
+				beforeInProgressStableRootProof: async ({ kind }) => {
+					assert.equal(kind, "known");
+					proofReached.resolve();
+					await releaseProof.promise;
+				},
+			}, {
+				openFile: async (path, flags, mode) => {
+					if (retireLink && path === journal.checkpoint) {
+						rmSync(linkedTemporary);
+						retireLink = false;
+						assert.equal(lstatSync(journal.checkpoint).nlink, 1);
+					}
+					return openFileHandle(path, flags, mode);
+				},
+			}));
+			await proofReached.promise;
+			assert.deepEqual(readdirSync(journal.journal).sort(), [
+				".owned-temporaries-v2",
+				basename(journal.checkpoint),
+				basename(journal.epoch),
+				basename(nextEpochPath),
+			].sort());
+			assert.deepEqual(readdirSync(nextEpochPath), []);
+			assert.equal(existsSync(nextCheckpointPath), false, "the proof cannot require a later checkpoint");
+			const epochBefore = directoryBytes(journal.epoch);
+			mutateInProgressRoot(mutation, statePath, journal.checkpoint, nextEpochPath);
+			releaseProof.resolve();
+			if (mutation === null) {
+				const receipt = await rotation;
+				assert.deepEqual(receipt, { epoch: 2, tipSha256: sha256Bytes(anchor) });
+				const cleanupReceipt = await rotateConsumerStateJournal(statePath, runtime());
+				assert.deepEqual(cleanupReceipt, receipt);
+				assertFinalEpoch(statePath, sha256Bytes(anchor));
+			} else {
+				await assert.rejects(
+					rotation,
+					/journal root changed without one exact current or immediate-successor authority/,
+				);
+				assertDirectoryBytes(journal.epoch, epochBefore);
+				assert.equal(existsSync(nextCheckpointPath), false);
+			}
+		};
+		const runDiscoveredInProgressProof = async (mutation) => {
+			earlyExitFixture += 1;
+			const label = `discovered-in-progress-${mutation ?? "stable"}-${earlyExitFixture}`;
+			const statePath = join(fixture, `${label}.json`);
+			const anchor = stateBytes(`${label}-anchor`);
+			await withConsumerStateLock(statePath, async (_path, transaction) => {
+				await transaction.commitState(anchor);
+			}, runtime());
+			const journal = consumerJournal(statePath);
+			const epochPublished = deferred();
+			const releasePublisherEpoch = deferred();
+			let nextCheckpointPath;
+			let nextEpochPath;
+			const publisher = rotateConsumerStateJournal(statePath, runtime({
+				afterRotationEpochSync: async ({ checkpoint, nextEpoch }) => {
+					nextEpochPath = nextEpoch;
+					nextCheckpointPath = join(
+						journal.journal,
+						`checkpoint-${String(checkpoint.epoch).padStart(16, "0")}-${checkpoint.epochId}.json`,
+					);
+					epochPublished.resolve();
+					await releasePublisherEpoch.promise;
+				},
+			}));
+			const publisherOutcome = publisher.then(
+				(value) => ({ value, error: null }),
+				(error) => ({ value: null, error }),
+			);
+			await epochPublished.promise;
+			const proofReached = deferred();
+			const releaseProof = deferred();
+			let linkedTemporary;
+			let retireLink = false;
+			let claimScans = 0;
+			const reader = rotateConsumerStateJournal(statePath, runtime({
+				beforePathOperation: async ({ operation }) => {
+					if (operation !== "scan-claims") return;
+					claimScans += 1;
+					if (claimScans !== 1) return;
+					linkedTemporary = linkCheckpointTemporary(
+						journal.journal,
+						journal.checkpoint,
+						String(earlyExitFixture).padStart(12, "0"),
+					);
+					retireLink = true;
+				},
+				beforeInProgressStableRootProof: async ({ kind }) => {
+					assert.equal(kind, "discovered");
+					proofReached.resolve();
+					await releaseProof.promise;
+				},
+			}, {
+				openFile: async (path, flags, mode) => {
+					if (retireLink && path === journal.checkpoint) {
+						rmSync(linkedTemporary);
+						retireLink = false;
+						assert.equal(lstatSync(journal.checkpoint).nlink, 1);
+					}
+					return openFileHandle(path, flags, mode);
+				},
+			}));
+			await proofReached.promise;
+			assert.deepEqual(readdirSync(journal.journal).sort(), [
+				".owned-temporaries-v2",
+				basename(journal.checkpoint),
+				basename(journal.epoch),
+				basename(nextEpochPath),
+			].sort());
+			assert.deepEqual(readdirSync(nextEpochPath), []);
+			assert.equal(existsSync(nextCheckpointPath), false, "discovery authenticates before checkpoint publication");
+			const epochBefore = directoryBytes(journal.epoch);
+			mutateInProgressRoot(mutation, statePath, journal.checkpoint, nextEpochPath);
+			releaseProof.resolve();
+			if (mutation === null) {
+				releasePublisherEpoch.resolve();
+				const [readerReceipt, publisherResult] = await Promise.all([reader, publisherOutcome]);
+				assert.equal(publisherResult.error, null);
+				assert.deepEqual(readerReceipt, publisherResult.value);
+				assert.deepEqual(readerReceipt, { epoch: 2, tipSha256: sha256Bytes(anchor) });
+				const cleanupReceipt = await rotateConsumerStateJournal(statePath, runtime());
+				assert.deepEqual(cleanupReceipt, readerReceipt);
+				assertFinalEpoch(statePath, sha256Bytes(anchor));
+			} else {
+				await assert.rejects(
+					reader,
+					/journal root changed without one exact current or immediate-successor authority/,
+				);
+				assertDirectoryBytes(journal.epoch, epochBefore);
+				assert.equal(existsSync(nextCheckpointPath), false);
+				releasePublisherEpoch.resolve();
+				const publisherResult = await publisherOutcome;
+				if (publisherResult.error === null) {
+					assert.deepEqual(publisherResult.value, { epoch: 2, tipSha256: sha256Bytes(anchor) });
+				} else {
+					assert.match(publisherResult.error.message, /journal root|checkpoint|epoch/);
+				}
+			}
+		};
+		for (const mutation of [null, "mutate", "add", "remove", "replace"]) {
+			await runKnownInProgressProof(mutation);
+			await runDiscoveredInProgressProof(mutation);
+		}
+
+		for (const intentCase of ["nonrotation", "incomplete", "wrong-intent", "competitor"]) {
+			earlyExitFixture += 1;
+			const statePath = join(fixture, `in-progress-intent-${intentCase}-${earlyExitFixture}.json`);
+			const anchor = stateBytes(`in-progress-intent-${intentCase}-anchor`);
+			await withConsumerStateLock(statePath, async (_path, transaction) => {
+				await transaction.commitState(anchor);
+			}, runtime());
+			let validClaim;
+			const capturedClaim = new Error(`capture ${intentCase} rotation claim`);
+			await assert.rejects(
+				() => rotateConsumerStateJournal(statePath, runtime({
+					beforeRotationDecision: async ({ claim }) => {
+						validClaim = claim;
+						throw capturedClaim;
+					},
+				})),
+				(error) => error === capturedClaim,
+			);
+			const journal = consumerJournal(statePath);
+			const validNextEpochPath = join(
+				journal.journal,
+				`epoch-${String(validClaim.intent.checkpoint.epoch).padStart(16, "0")}-${validClaim.intent.checkpoint.epochId}`,
+			);
+			mkdirSync(validNextEpochPath, { mode: 0o700 });
+			let forgedClaim;
+			if (intentCase === "nonrotation") {
+				forgedClaim = {
+					schemaVersion: 2,
+					generation: validClaim.generation,
+					token: randomUUID(),
+					type: "normal",
+					ownerPid: process.pid,
+					createdAtMs: 2,
+				};
+			} else {
+				forgedClaim = structuredClone(validClaim);
+				if (intentCase === "incomplete") {
+					delete forgedClaim.intent.checkpoint;
+				} else if (intentCase === "wrong-intent") {
+					forgedClaim.intent.checkpoint.historySha256 = "f".repeat(64);
+				} else {
+					const competitorId = randomUUID();
+					forgedClaim.token = competitorId;
+					forgedClaim.intent.checkpoint.epochId = competitorId;
+				}
+			}
+			const claimBytes = Buffer.from(`${JSON.stringify(forgedClaim)}\n`);
+			const claimSha256 = sha256Bytes(claimBytes);
+			writeFileSync(
+				join(
+					journal.epoch,
+					`claim-${String(forgedClaim.generation).padStart(16, "0")}-${claimSha256}.json`,
+				),
+				claimBytes,
+				{ mode: 0o600 },
+			);
+			writeFileSync(
+				join(journal.epoch, `claim-index-${String(forgedClaim.generation).padStart(16, "0")}.json`),
+				`${JSON.stringify({ schemaVersion: 1, generation: forgedClaim.generation, claimSha256 })}\n`,
+				{ mode: 0o600 },
+			);
+			const epochBefore = directoryBytes(journal.epoch);
+			await assert.rejects(
+				() => rotateConsumerStateJournal(statePath, runtime()),
+				/rotation intent|in-progress next epoch|operation claim/,
+			);
+			assertDirectoryBytes(journal.epoch, epochBefore);
+			assert.equal(
+				readdirSync(journal.journal).some((name) => name.startsWith("checkpoint-0000000000000002-")),
+				false,
+			);
+		}
+
+		const wrongEvidenceNameStatePath = join(fixture, "wrong-link-retirement-evidence-name.json");
+		const wrongEvidenceAnchor = stateBytes("wrong-link-retirement-evidence-name-anchor");
+		await withConsumerStateLock(wrongEvidenceNameStatePath, async (_path, transaction) => {
+			await transaction.commitState(wrongEvidenceAnchor);
+		}, runtime());
+		const wrongEvidenceJournal = consumerJournal(wrongEvidenceNameStatePath);
+		let wrongEvidenceArmed = false;
+		let wrongEvidence;
+		await assert.rejects(
+			() => rotateConsumerStateJournal(wrongEvidenceNameStatePath, runtime({
+				afterRotationEpochSync: async () => { wrongEvidenceArmed = true; },
+				metadataRead: {
+					afterInitialStat: async ({ path, stat }) => {
+						if (!wrongEvidenceArmed || path !== wrongEvidenceJournal.checkpoint) return;
+						wrongEvidenceArmed = false;
+						const checkpointBytes = readFileSync(path);
+						const openedHandle = {
+							dev: stat.dev,
+							ino: stat.ino,
+							size: stat.size,
+							mtimeMs: stat.mtimeMs,
+							ctimeMs: stat.ctimeMs,
+							nlink: 1,
+						};
+						const pathEntry = { ...openedHandle, ctimeMs: openedHandle.ctimeMs - 1, nlink: 2 };
+						wrongEvidence = new BoundedFileLinkRetiredBeforeReadError(
+							path,
+							"Consumer high-water journal checkpoint",
+							checkpointBytes,
+							sha256Bytes(checkpointBytes),
+							pathEntry,
+							openedHandle,
+						);
+						wrongEvidence.name = "Error";
+						throw wrongEvidence;
+					},
+				},
+			})),
+			(error) => error === wrongEvidence,
+		);
+
+		const normalClaimStatePath = join(fixture, "normal-claim-has-no-in-progress-checkpoint.json");
+		let normalClaimRevalidations = 0;
+		await withConsumerStateLock(normalClaimStatePath, async () => {}, runtime({
+			beforePathOperation: async ({ operation, inProgressCheckpoint }) => {
+				if (!operation.startsWith("claim")) return;
+				normalClaimRevalidations += 1;
+				assert.equal(inProgressCheckpoint, null);
+			},
+		}));
+		assert.equal(normalClaimRevalidations >= 2, true);
+
+		const transientStatePath = join(fixture, "claim-index-in-progress-checkpoint.json");
+		const transientAnchor = stateBytes("claim-index-in-progress-checkpoint-anchor");
+		await withConsumerStateLock(transientStatePath, async (_path, transaction) => {
+			await transaction.commitState(transientAnchor);
+		}, runtime());
+		const transientJournal = consumerJournal(transientStatePath);
+		const claimPublicationBarriers = () => {
+			const claimFileReady = deferred();
+			const releaseClaimFile = deferred();
+			const claimDirectoryReady = deferred();
+			const releaseClaimDirectory = deferred();
+			const indexFileReady = deferred();
+			const releaseIndexFile = deferred();
+			const indexDirectoryReady = deferred();
+			const releaseIndexDirectory = deferred();
+			return {
+				claimFileReady,
+				releaseClaimFile,
+				claimDirectoryReady,
+				releaseClaimDirectory,
+				indexFileReady,
+				releaseIndexFile,
+				indexDirectoryReady,
+				releaseIndexDirectory,
+				hooks: {
+					afterFileSync: async ({ kind }) => {
+						if (kind === "claim") {
+							claimFileReady.resolve();
+							await releaseClaimFile.promise;
+						} else if (kind === "claim-index") {
+							indexFileReady.resolve();
+							await releaseIndexFile.promise;
+						}
+					},
+					afterMetadataDirectorySync: async ({ kind, path, linked }) => {
+						if (kind === "claim") {
+							claimDirectoryReady.resolve({ path, linked });
+							await releaseClaimDirectory.promise;
+						} else if (kind === "claim-index") {
+							indexDirectoryReady.resolve({ path, linked });
+							await releaseIndexDirectory.promise;
+						}
+					},
+				},
+			};
+		};
+		const firstClaimPublisher = claimPublicationBarriers();
+		const secondClaimPublisher = claimPublicationBarriers();
+		const firstEpochReady = deferred();
+		const releaseFirstEpoch = deferred();
+		const secondExistingReadReady = deferred();
+		const releaseSecondExistingRead = deferred();
+		let inProgressCheckpoint;
+		let inProgressEpochPath;
+		let inProgressCheckpointPath;
+		firstClaimPublisher.hooks.afterRotationEpochSync = async ({ checkpoint, nextEpoch }) => {
+			inProgressCheckpoint = checkpoint;
+			inProgressEpochPath = nextEpoch;
+			inProgressCheckpointPath = join(
+				transientJournal.journal,
+				`checkpoint-${String(checkpoint.epoch).padStart(16, "0")}-${checkpoint.epochId}.json`,
+			);
+			firstEpochReady.resolve();
+			await releaseFirstEpoch.promise;
+		};
+		secondClaimPublisher.hooks.beforePathOperation = async ({ operation, inProgressCheckpoint: candidate }) => {
+			if (operation !== "claim-index-existing") return;
+			secondExistingReadReady.resolve(candidate);
+			await releaseSecondExistingRead.promise;
+		};
+		const firstRotation = rotateConsumerStateJournal(
+			transientStatePath,
+			runtime(firstClaimPublisher.hooks),
+		);
+		await firstClaimPublisher.claimFileReady.promise;
+		const secondRotation = rotateConsumerStateJournal(
+			transientStatePath,
+			runtime(secondClaimPublisher.hooks),
+		);
+		await secondClaimPublisher.claimFileReady.promise;
+		firstClaimPublisher.releaseClaimFile.resolve();
+		const firstClaimLink = await firstClaimPublisher.claimDirectoryReady.promise;
+		assert.equal(firstClaimLink.linked, true);
+		secondClaimPublisher.releaseClaimFile.resolve();
+		const secondClaimLink = await secondClaimPublisher.claimDirectoryReady.promise;
+		assert.equal(secondClaimLink.linked, false);
+		assert.equal(secondClaimLink.path, firstClaimLink.path);
+		firstClaimPublisher.releaseClaimDirectory.resolve();
+		await firstClaimPublisher.indexFileReady.promise;
+		secondClaimPublisher.releaseClaimDirectory.resolve();
+		await secondClaimPublisher.indexFileReady.promise;
+		firstClaimPublisher.releaseIndexFile.resolve();
+		const firstIndexLink = await firstClaimPublisher.indexDirectoryReady.promise;
+		assert.equal(firstIndexLink.linked, true);
+		secondClaimPublisher.releaseIndexFile.resolve();
+		const secondIndexLink = await secondClaimPublisher.indexDirectoryReady.promise;
+		assert.equal(secondIndexLink.linked, false);
+		assert.equal(secondIndexLink.path, firstIndexLink.path);
+		firstClaimPublisher.releaseIndexDirectory.resolve();
+		await firstEpochReady.promise;
+		assert.deepEqual(readdirSync(transientJournal.journal).sort(), [
+			".owned-temporaries-v2",
+			basename(transientJournal.checkpoint),
+			basename(transientJournal.epoch),
+			basename(inProgressEpochPath),
+		].sort());
+		assert.deepEqual(readdirSync(inProgressEpochPath), []);
+		assert.equal(existsSync(inProgressCheckpointPath), false);
+		secondClaimPublisher.releaseIndexDirectory.resolve();
+		const secondAuthenticatedCheckpoint = await secondExistingReadReady.promise;
+		assert.deepEqual(secondAuthenticatedCheckpoint, inProgressCheckpoint);
+		assert.deepEqual(readdirSync(transientJournal.journal).sort(), [
+			".owned-temporaries-v2",
+			basename(transientJournal.checkpoint),
+			basename(transientJournal.epoch),
+			basename(inProgressEpochPath),
+		].sort());
+		assert.deepEqual(readdirSync(inProgressEpochPath), []);
+		assert.equal(existsSync(inProgressCheckpointPath), false);
+		releaseSecondExistingRead.resolve();
+		releaseFirstEpoch.resolve();
+		const [firstTransientReceipt, secondTransientReceipt] = await Promise.all([
+			firstRotation,
+			secondRotation,
+		]);
+		assert.equal(
+			Buffer.from(JSON.stringify(firstTransientReceipt)).equals(
+				Buffer.from(JSON.stringify(secondTransientReceipt)),
+			),
+			true,
+		);
+		assert.deepEqual(firstTransientReceipt, { epoch: 2, tipSha256: sha256Bytes(transientAnchor) });
+		const transientCleanupReceipt = await rotateConsumerStateJournal(transientStatePath, runtime());
+		assert.deepEqual(transientCleanupReceipt, firstTransientReceipt);
+		assertFinalEpoch(transientStatePath, sha256Bytes(transientAnchor));
+
+		const runDiscoveredSuccessor = async (mutation) => {
+			earlyExitFixture += 1;
+			const label = `discovered-successor-${mutation ?? "exact"}-${earlyExitFixture}`;
+			const statePath = join(fixture, `${label}.json`);
+			const anchor = stateBytes(`${label}-anchor`);
+			await withConsumerStateLock(statePath, async (_path, transaction) => {
+				await transaction.commitState(anchor);
+			}, runtime());
+			const journal = consumerJournal(statePath);
+			const epochReady = deferred();
+			const releasePublisher = deferred();
+			let checkpoint;
+			let checkpointPath;
+			const publisher = rotateConsumerStateJournal(statePath, runtime({
+				afterRotationEpochSync: async ({ checkpoint: candidate }) => {
+					checkpoint = candidate;
+					checkpointPath = join(
+						journal.journal,
+						`checkpoint-${String(candidate.epoch).padStart(16, "0")}-${candidate.epochId}.json`,
+					);
+					epochReady.resolve();
+					await releasePublisher.promise;
+				},
+			}));
+			const publisherOutcome = publisher.then(
+				(value) => ({ value, error: null }),
+				(error) => ({ value: null, error }),
+			);
+			await epochReady.promise;
+			const discoveryReady = deferred();
+			const releaseDiscovery = deferred();
+			let scanClaims = 0;
+			const reader = rotateConsumerStateJournal(statePath, runtime({
+				beforePathOperation: async ({ operation }) => {
+					if (operation !== "scan-claims") return;
+					scanClaims += 1;
+					if (scanClaims !== 1) return;
+					discoveryReady.resolve();
+					await releaseDiscovery.promise;
+				},
+			}));
+			await discoveryReady.promise;
+			const epochBefore = directoryBytes(journal.epoch);
+			let publishedCheckpoint = checkpoint;
+			if (mutation === "checkpoint") {
+				publishedCheckpoint = { ...checkpoint, epochId: randomUUID() };
+			} else if (["historySha256", "sourceAuthoritySha256", "anchorDigest"].includes(mutation)) {
+				publishedCheckpoint = { ...checkpoint, [mutation]: "f".repeat(64) };
+			} else if (mutation !== null) {
+				throw new Error(`unknown successor mutation ${mutation}`);
+			}
+			writeFileSync(checkpointPath, `${JSON.stringify(publishedCheckpoint)}\n`, { mode: 0o600 });
+			releaseDiscovery.resolve();
+			if (mutation === null) {
+				const readerReceipt = await reader;
+				releasePublisher.resolve();
+				const publisherResult = await publisherOutcome;
+				assert.equal(publisherResult.error, null);
+				assert.deepEqual(publisherResult.value, readerReceipt);
+				assert.deepEqual(readerReceipt, { epoch: 2, tipSha256: sha256Bytes(anchor) });
+				const cleanupReceipt = await rotateConsumerStateJournal(statePath, runtime());
+				assert.deepEqual(cleanupReceipt, readerReceipt);
+				assertFinalEpoch(statePath, sha256Bytes(anchor));
+			} else {
+				await assert.rejects(reader, /checkpoint|journal root|immediate successor/);
+				assertDirectoryBytes(journal.epoch, epochBefore);
+				releasePublisher.resolve();
+				const publisherResult = await publisherOutcome;
+				assert.equal(publisherResult.value, null);
+				assert.match(publisherResult.error.message, /checkpoint|journal root|competing/);
+			}
+		};
+		for (const mutation of [null, "checkpoint", "historySha256", "sourceAuthoritySha256", "anchorDigest"]) {
+			await runDiscoveredSuccessor(mutation);
+		}
 	} finally {
 		rmSync(fixture, { recursive: true, force: true });
 	}
