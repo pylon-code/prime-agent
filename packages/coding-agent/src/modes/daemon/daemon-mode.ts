@@ -1822,16 +1822,17 @@ export class AgentDaemon {
 					},
 				}),
 			);
-			const autonomousStatus = runtime.session.getAutonomousStatus();
-			if (
-				this.workerRecoveryMode === "disabled" &&
-				(runtime.session.getActiveToolNames().length > 0 ||
+			if (this.workerRecoveryMode === "disabled") {
+				const autonomousStatus = runtime.session.getAutonomousStatus();
+				if (
+					runtime.session.getActiveToolNames().length > 0 ||
 					runtime.session.hasLoadedExtensions() ||
 					autonomousStatus.enabled ||
-					autonomousStatus.gates.commands.length > 0)
-			) {
-				await runtime.dispose().catch(() => undefined);
-				throw new Error("Nonpersistent daemon command was invalid");
+					autonomousStatus.gates.commands.length > 0
+				) {
+					await runtime.dispose().catch(() => undefined);
+					throw new Error("Nonpersistent daemon command was invalid");
+				}
 			}
 			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
 				await runtime.dispose().catch(() => undefined);
