@@ -1368,6 +1368,50 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("preserves ordinary wire JSON semantics while snapshotting public commands", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connecting = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connecting;
+		emitHello(socket);
+		const response = client.request({
+			type: "append_custom_message",
+			activeSessionId: "active-1",
+			message: {
+				customType: "ordinary-details",
+				content: "details",
+				display: true,
+				details: {
+					buffer: Buffer.from([1, 2, 3]),
+					custom: {
+						toJSON: () => ({ serialized: "by-json" }),
+					},
+				},
+			},
+		});
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!) as {
+			id: string;
+			command: { message: { details: unknown } };
+		};
+		expect(envelope.command.message.details).toEqual({
+			buffer: { type: "Buffer", data: [1, 2, 3] },
+			custom: { serialized: "by-json" },
+		});
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "append_custom_message",
+				success: true,
+			})}\n`,
+		);
+		await expect(response).resolves.toMatchObject({ success: true });
+		client.close();
+	});
+
 	it("snapshots disabled create classification and payload before waiting for hello", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		client.enableRequestRecovery();

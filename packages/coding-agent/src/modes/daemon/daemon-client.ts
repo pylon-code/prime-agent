@@ -377,7 +377,9 @@ export class DaemonClient {
 		timeoutMs = 30000,
 		options: DaemonClientRequestOptions = {},
 	): Promise<DaemonResponse> {
-		const requestCommand = structuredClone(command);
+		const serializedCommand = JSON.stringify({ ...command });
+		if (serializedCommand === undefined) throw new TypeError("Daemon command is not JSON serializable");
+		const requestCommand = JSON.parse(serializedCommand) as DaemonCommandBody;
 		const isNonpersistentCreate = requestCommand.type === "create" && requestCommand.workerRecovery === "disabled";
 		const nonpersistentCreateTransportGeneration = isNonpersistentCreate ? this.transportGeneration : undefined;
 		if (!this.socket || this.socket.destroyed) {
