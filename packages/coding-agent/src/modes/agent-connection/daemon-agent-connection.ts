@@ -777,6 +777,9 @@ export class DaemonAgentConnection implements AgentConnection {
 			const proof = options.nonpersistentWorkerCreateProof;
 			if (
 				options.ownedSession !== true ||
+				options.recoverDaemon !== undefined ||
+				options.ownedSessionRecoveryConfig !== undefined ||
+				ownedSessionLaunchEnv !== undefined ||
 				typeof proof.id !== "string" ||
 				proof.id.length === 0 ||
 				(proof.activeSessionId !== undefined && typeof proof.activeSessionId !== "string") ||
@@ -824,6 +827,12 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.transportCloseRetirementInProgress = false;
 			}
 			if (this.disposed || this.terminalCloseEmitted) {
+				return;
+			}
+			if (this.options.nonpersistentWorkerCreateProof) {
+				this.correlatedPromptRoutes.clear();
+				this.terminalCloseEmitted = true;
+				void this.emit({ type: "closed", error: this.formatDaemonConnectionClosedError(error) });
 				return;
 			}
 			if (this.client.isClosed) {

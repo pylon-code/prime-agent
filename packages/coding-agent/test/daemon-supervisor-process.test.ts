@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	lstatSync,
@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../src/config.js";
 import { AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { readActiveOrphanProcesses } from "../src/core/orphan-process-journal.js";
+import { createPromptRequestFingerprint } from "../src/core/prompt-lifecycle.js";
 import {
 	acquireSessionLease,
 	getProcessStartId,
@@ -24,6 +25,7 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "../src/core/session-lease.js";
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
+import type { DaemonNonpersistentWorkerCreateProof } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import {
 	adoptRecoverableOwnedSession,
@@ -3371,12 +3373,33 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 			error: expect.stringContaining("unavailable for a nonpersistent daemon worker"),
 		});
 
+		const nonpersistentWorkerCreateProof = created.data as DaemonNonpersistentWorkerCreateProof;
 		const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 			supportsExtensionUi: false,
+			ownedSession: true,
+			nonpersistentWorkerCreateProof,
 		});
 		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
 		const correlationId = `PRIVATE-CORRELATION-CANARY-${randomUUID()}`;
 		const promptCanary = `PRIVATE-PROMPT-CANARY-${randomUUID()}`;
+		const promptFingerprint = createPromptRequestFingerprint({ message: promptCanary, queueIfBusy: false });
+		const legacyRequestIdentity = JSON.stringify([
+			"submit_correlated_prompt",
+			summary.sessionId,
+			correlationId,
+			promptFingerprint,
+		]);
+		const forbiddenPrivateDigests = [
+			promptFingerprint,
+			createHash("sha256").update(promptCanary).digest("hex"),
+			createHash("sha256").update(correlationId).digest("hex"),
+			createHash("sha256").update(legacyRequestIdentity).digest("hex"),
+		];
+		const expectPrivateCanariesAbsent = () => {
+			for (const canary of [correlationId, promptCanary, ...forbiddenPrivateDigests]) {
+				expect(treeContains(agentDir, canary)).toBe(false);
+			}
+		};
 		await connection.submitCorrelatedPrompt(promptCanary, {
 			correlationId,
 			queueIfBusy: false,
@@ -3407,15 +3430,13 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 		).resolves.toMatchObject({ success: true });
 		await connection.cancelPromptLifecycle(correlationId);
 		expect(existsSync(unexpectedRecoveryPath)).toBe(false);
-		expect(treeContains(agentDir, correlationId)).toBe(false);
-		expect(treeContains(agentDir, promptCanary)).toBe(false);
+		expectPrivateCanariesAbsent();
 		const updateRestart = await client.request({ type: "prepare_update_restart" });
 		expect(updateRestart).toMatchObject({
 			success: false,
 			error: expect.stringContaining("unavailable while a nonpersistent daemon worker exists"),
 		});
-		expect(treeContains(agentDir, correlationId)).toBe(false);
-		expect(treeContains(agentDir, promptCanary)).toBe(false);
+		expectPrivateCanariesAbsent();
 
 		const promote = await client.request({
 			type: "promote_owned_session",
@@ -3440,8 +3461,7 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 		});
 		expect(lateRetry).toMatchObject({ success: false, error: "Nonpersistent correlated command failed" });
 		expect(JSON.stringify(lateRetry)).not.toContain(correlationId);
-		expect(treeContains(agentDir, correlationId)).toBe(false);
-		expect(treeContains(agentDir, promptCanary)).toBe(false);
+		expectPrivateCanariesAbsent();
 		await expect(
 			client.request({
 				type: "get_owned_session_cleanup",
@@ -3454,7 +3474,7 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 
-	it("retires a nonpersistent worker after replacement even when its descriptor marker was stripped", async () => {
+	it("retires a live nonpersistent worker after replacement even when its descriptor marker was stripped", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");
 		const projectDir = join(root, "project");
@@ -3497,13 +3517,16 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 		if (!ownerRecordPath) throw new Error("Supervisor owner record was not persisted");
 		const ownerRecord = JSON.parse(readFileSync(ownerRecordPath, "utf8")) as { pid?: unknown };
 		if (!Number.isInteger(ownerRecord.pid)) throw new Error("Supervisor owner record omitted its pid");
+		// Freeze the worker before removing its supervisor. It cannot observe the
+		// loss and self-retire, so the replacement must contain a provably live
+		// process from the version-3 sidecar provenance.
+		process.kill(summary.workerPid, "SIGSTOP");
+		process.kill(summary.workerPid, 0);
 		process.kill(ownerRecord.pid as number, "SIGKILL");
 		firstSupervisor.kill("SIGKILL");
 		await waitForExit(firstSupervisor);
 		firstClient.close();
-		process.kill(summary.workerPid, "SIGKILL");
-		await waitForProcessGone(summary.workerPid);
-		workerPids.delete(summary.workerPid);
+		process.kill(summary.workerPid, 0);
 
 		const replacement = spawnSupervisor(agentDir, socketPath, projectDir, [], supervisorEnvironment);
 		const replacementClient = await connectEventually(socketPath, replacement);

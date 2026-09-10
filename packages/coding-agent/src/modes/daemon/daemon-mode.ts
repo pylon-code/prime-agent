@@ -123,7 +123,7 @@ import {
 import { createAgentConnectionToolDefinition } from "../agent-connection/tool-definition.js";
 import type { AgentConnectionHeartbeat, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import { waitForHeadlessCompletion } from "../headless-completion.js";
-import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
+import { attachBoundedJsonlByteReader, serializeJsonLine } from "../rpc/jsonl.js";
 import { encodePrivateFrameParts, PrivateFrameDecoder } from "../session-worker/private-framing.js";
 import {
 	type ActiveSessionState,
@@ -256,6 +256,7 @@ const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const WORKER_SNAPSHOT_PREPARATION_TIMEOUT_MS = 30_000;
 const WORKER_PRIVATE_FRAME_WRITE_BYTES = 64 * 1024;
+const MAX_DAEMON_INGRESS_BYTES = 64 * 1024 * 1024;
 const NONPERSISTENT_CORRELATED_PROMPT_BYTES = 8 * 1024;
 const MAX_NONPERSISTENT_CORRELATED_PROMPT_REQUESTS = 256;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
@@ -1596,6 +1597,13 @@ export class AgentDaemon {
 		command: Extract<DaemonCommand, { type: "create" }>,
 		runtimeOpenGuard?: RuntimeOpenGuard,
 	): Promise<ActiveSessionState> {
+		if (
+			this.workerRecoveryMode === "disabled" &&
+			(command.config?.autonomous?.enabled === true ||
+				(command.config?.autonomous?.gates?.commands?.length ?? 0) !== 0)
+		) {
+			throw new Error("Nonpersistent daemon command was invalid");
+		}
 		const mergedConfig = mergeAgentSessionRuntimeConfig(this.options.defaultSessionConfig, command.config);
 		const config =
 			this.workerRecoveryMode === "disabled"
@@ -1605,6 +1613,7 @@ export class AgentDaemon {
 						noExtensions: true,
 						tools: [],
 						extensions: [],
+						autonomous: { enabled: false, gates: { commands: [] } },
 					}
 				: mergedConfig;
 		if (!config.cwd) {
@@ -1813,9 +1822,13 @@ export class AgentDaemon {
 					},
 				}),
 			);
+			const autonomousStatus = runtime.session.getAutonomousStatus();
 			if (
 				this.workerRecoveryMode === "disabled" &&
-				(runtime.session.getActiveToolNames().length > 0 || runtime.session.hasLoadedExtensions())
+				(runtime.session.getActiveToolNames().length > 0 ||
+					runtime.session.hasLoadedExtensions() ||
+					autonomousStatus.enabled ||
+					autonomousStatus.gates.commands.length > 0)
 			) {
 				await runtime.dispose().catch(() => undefined);
 				throw new Error("Nonpersistent daemon command was invalid");
@@ -3313,9 +3326,16 @@ export class AgentDaemon {
 				socket.off("end", onEnd);
 			};
 		} else {
-			client.detachInput = attachJsonlLineReader(socket, (line) => {
-				void this.handleLine(client, line);
-			});
+			client.detachInput = attachBoundedJsonlByteReader(
+				socket,
+				(line) => {
+					void this.handleLine(client, line);
+				},
+				{
+					maxFrameBytes: MAX_DAEMON_INGRESS_BYTES,
+					onFrameTooLarge: () => socket.destroy(new Error("Daemon inbound frame exceeded the configured limit")),
+				},
+			);
 		}
 
 		let cleanedUp = false;

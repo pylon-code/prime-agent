@@ -53,7 +53,11 @@ function sliceWireSource(source: string, start: string, end: string): string {
 	return source.slice(startIndex, endIndex);
 }
 
-function daemonSchemaDigest(daemonSource: string, workerSource: string): string {
+function daemonSchemaDigest(
+	daemonSource: string,
+	workerSource: string,
+	nonpersistentWorkerFeature: string = NONPERSISTENT_DAEMON_WORKER_FEATURE,
+): string {
 	const sections = [
 		sliceWireSource(daemonSource, "export type DaemonClientCapability", "export type DaemonReplayStatus"),
 		sliceWireSource(
@@ -67,6 +71,8 @@ function daemonSchemaDigest(daemonSource: string, workerSource: string): string 
 			"const RECOVERABLE_OWNED_SESSION_ADOPTION_COMMAND",
 			"const AUTHORITATIVE_OWNED_SESSION_CLEANUP_COMMAND",
 		),
+		sliceWireSource(daemonSource, "const NONPERSISTENT_DAEMON_WORKER_COMMAND", "const DELETE_RLM_SUBAGENT_COMMAND"),
+		nonpersistentWorkerFeature,
 		sliceWireSource(
 			daemonSource,
 			"export interface DaemonSavedSessionInfo",
@@ -85,6 +91,11 @@ function daemonSchemaDigest(daemonSource: string, workerSource: string): string 
 			workerSource,
 			"export interface DaemonWorkerAuthenticationResult",
 			"export interface DaemonWorkerDescriptor",
+		),
+		sliceWireSource(
+			workerSource,
+			"export interface DaemonWorkerDescriptor",
+			"export function durableDaemonWorkerDescriptor",
 		),
 	];
 	return createHash("sha256").update(sections.join("\n")).digest("hex").slice(0, 12);
@@ -422,6 +433,34 @@ describe("daemon protocol helpers", () => {
 		for (const [before, after] of workerMutations) {
 			expect(daemonSchemaDigest(daemonSource, replaceWireSentinel(workerSource, before, after))).not.toBe(baseline);
 		}
+	});
+
+	it("changes the schema digest for every nonpersistent worker wire family", () => {
+		const daemonSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
+		const workerSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-worker-protocol.ts"), "utf8");
+		const baseline = daemonSchemaDigest(daemonSource, workerSource);
+		const nonpersistentCompatibility = `const NONPERSISTENT_DAEMON_WORKER_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 31,
+	capability: NONPERSISTENT_DAEMON_WORKER_FEATURE,
+} as const;`;
+		expect(
+			daemonSchemaDigest(
+				replaceWireSentinel(
+					daemonSource,
+					nonpersistentCompatibility,
+					nonpersistentCompatibility.replace("minSchemaRevision: 31", "minSchemaRevision: 32"),
+				),
+				workerSource,
+			),
+		).not.toBe(baseline);
+		for (const [before, after] of [
+			["version: 1 | 2 | 3;", "version: 1 | 2 | 3 | 4;"],
+			['workerRecovery?: "disabled";', 'workerRecovery?: "disabled" | "ephemeral";'],
+		] as const) {
+			expect(daemonSchemaDigest(daemonSource, replaceWireSentinel(workerSource, before, after))).not.toBe(baseline);
+		}
+		expect(daemonSchemaDigest(daemonSource, workerSource, "nonpersistent_daemon_worker_v2")).not.toBe(baseline);
 	});
 
 	it("requires compatibility metadata for the heartbeat protocol surface", () => {

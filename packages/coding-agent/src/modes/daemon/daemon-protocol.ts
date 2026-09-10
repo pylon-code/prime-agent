@@ -88,7 +88,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 30 adds capability-gated same-supervisor recoverable owned-session adoption.
 // Revision 31 adds capability-proved nonpersistent fresh daemon workers.
 export const DAEMON_SCHEMA_REVISION = 31;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-241186b40713";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-8a52a7010c1f";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

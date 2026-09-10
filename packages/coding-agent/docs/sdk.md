@@ -79,25 +79,39 @@ if (!connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")) 
 
 ### Nonpersistent daemon workers
 
-Hosts that need a private one-turn worker must require the package-root `nonpersistent_daemon_worker_v1` token and the same server hello capability before create. Then send one fresh create with `lifecycle: "client_owned"`, `workerRecovery: "disabled"`, `noSession: true`, and explicit `config.noTools: true` plus `config.noExtensions: true`. `sessionPath` and `continueRecent: true` are invalid. An optional client and command ID gives bounded same-supervisor retry convergence; an unkeyed create is one-shot.
+Hosts that need a private one-turn worker must require the package-root `nonpersistent_daemon_worker_v1` token and the same server hello capability before create. Then send one fresh create with `lifecycle: "client_owned"`, `workerRecovery: "disabled"`, `noSession: true`, and explicit `config.noTools: true` plus `config.noExtensions: true`. `sessionPath` and `continueRecent: true` are invalid. The raw protocol supports bounded same-supervisor convergence for a keyed client/command envelope; an unkeyed raw create is one-shot. Public `DaemonClient.request()` allocates and owns that command ID for the lifetime of its request. Callers cannot supply `id`, and must not start a second create after an uncertain return.
 
 ```typescript
-const sdk = await import("@earendil-works/pi-coding-agent");
-if (
-  !Array.isArray(sdk.PRIME_AGENT_SDK_FEATURES) ||
-  !sdk.PRIME_AGENT_SDK_FEATURES.includes("nonpersistent_daemon_worker_v1")
-) {
+import {
+  DaemonAgentConnection,
+  DaemonClient,
+  PRIME_AGENT_SDK_FEATURES,
+  type DaemonNonpersistentWorkerCreateProof,
+} from "@earendil-works/pi-coding-agent";
+
+function isNonpersistentWorkerCreateProof(value: unknown): value is DaemonNonpersistentWorkerCreateProof {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.id === "string" &&
+    (candidate.activeSessionId === undefined || typeof candidate.activeSessionId === "string") &&
+    typeof candidate.sessionId === "string" &&
+    candidate.workerRecovery === "disabled" &&
+    candidate.sessionFile === undefined
+  );
+}
+
+if (!PRIME_AGENT_SDK_FEATURES.includes("nonpersistent_daemon_worker_v1")) {
   throw new Error("The local SDK does not support private daemon workers");
 }
 
-const client = new sdk.DaemonClient(socketPath, { maxInboundFrameBytes: 64 * 1024 * 1024 });
+const client = new DaemonClient(socketPath, { maxInboundFrameBytes: 64 * 1024 * 1024 });
 await client.connect();
 if (!client.supportsServerCapability("nonpersistent_daemon_worker_v1")) {
   throw new Error("The daemon does not support private daemon workers");
 }
 
 const response = await client.request({
-  id: crypto.randomUUID(),
   type: "create",
   lifecycle: "client_owned",
   workerRecovery: "disabled",
@@ -108,11 +122,11 @@ const response = await client.request({
     noExtensions: true,
   },
 });
-if (!response.success || response.data?.workerRecovery !== "disabled" || response.data.sessionFile) {
+if (!response.success || !isNonpersistentWorkerCreateProof(response.data)) {
   throw new Error("Private worker proof is unavailable");
 }
-const proof = response.data as sdk.DaemonNonpersistentWorkerCreateProof;
-const connection = new sdk.DaemonAgentConnection(client, proof.activeSessionId ?? proof.id, {
+const proof = response.data;
+const connection = new DaemonAgentConnection(client, proof.activeSessionId ?? proof.id, {
   ownedSession: true,
   nonpersistentWorkerCreateProof: proof,
 });
@@ -120,9 +134,9 @@ const connection = new sdk.DaemonAgentConnection(client, proof.activeSessionId ?
 
 The `workerRecovery: "disabled"` field is an exact create-only receipt. List and attach summaries omit it. The receipt is returned only for the same ready, authenticated worker incarnation with a valid version 3 descriptor and `.nonpersistent` marker, the exact owner and root session, no session file, and no recovery or adoption state. A hello offer, schema number, create success without the receipt, attach success, or package version is not proof.
 
-A disabled worker never creates a session JSONL or worker recovery journal. Create retry requests are cloned and compared only in bounded supervisor memory. Pass the exact create receipt as `nonpersistentWorkerCreateProof` when constructing the owned `DaemonAgentConnection`; the adapter clones and revalidates it against the attached active/session generation before retaining private prompt retry requests as exact bounded in-memory clones. Ordinary connections continue to retain constant-size SHA-256 retry fingerprints. Disabled payloads are not fingerprinted. Worker and supervisor snapshot caches remain memory-only and reject a transcript above 16 MiB instead of spilling it to disk. Correlated submissions accept only nonempty, non-slash text up to 8 KiB UTF-8 with no images. The fixed privacy-safe failures do not echo prompts, identifiers, paths, credentials, receipts, or digests.
+A disabled worker never creates a session JSONL or worker recovery journal. A disabled create is limited to 1 MiB, and keyed retry requests are cloned and compared only in supervisor memory with both a 32-entry cap and an 8 MiB cumulative input-byte cap. Pass the exact create receipt as `nonpersistentWorkerCreateProof` when constructing the owned `DaemonAgentConnection`; the adapter clones and revalidates it against the attached active/session generation before retaining private prompt retry requests as exact bounded in-memory clones. Ordinary connections continue to retain constant-size SHA-256 retry fingerprints. Disabled payloads are not fingerprinted. Supervisor and worker JSONL ingress reject a line above 64 MiB. Worker and supervisor snapshot caches remain memory-only and reject a transcript above 16 MiB instead of spilling it to disk. Correlated submissions accept only nonempty, non-slash text up to 8 KiB UTF-8 with no images. The fixed privacy-safe failures do not echo prompts, identifiers, paths, credentials, receipts, or digests.
 
-The mode is deliberately narrower than an ordinary client-owned session. Effective tool and extension sets must be empty; inherited daemon defaults are cleared and runtime proof fails closed if either becomes active. A positive command allowlist admits only creation, live attachment controls, correlated submit/cancel/reconciliation, abort, and shutdown/owned cleanup. It rejects legacy prompt paths and transcript-transforming or durable commands such as Bash, cron, `compact`, `export_jsonl`, and `refine`. A disabled worker cannot change its root session, attach after disconnect, recover uncertain operations, retry, relaunch, become resident, enter recoverable-owned adoption, transfer MCP adoption authority, or participate in update-restart snapshots. Supervisor replacement, worker loss, owner cleanup, normal shutdown, and `daemon stop --force` retire it with process-incarnation checks. Ordinary recoverable workers keep their existing journal, hashed retry identity, replay, adoption, and update behavior.
+The mode is deliberately narrower than an ordinary client-owned session. Effective tool and extension sets must be empty. Autonomous continuation and shell gates must also be disabled and empty. Inherited daemon defaults are cleared, contradictory explicit creates are rejected, and runtime proof fails closed if any tool, extension, autonomous continuation, or gate becomes active. A positive command allowlist admits only creation, live attachment controls, correlated submit/cancel/reconciliation, abort, and shutdown/owned cleanup. It rejects legacy prompt paths and transcript-transforming or durable commands such as Bash, cron, `compact`, `export_jsonl`, and `refine`. A disabled worker cannot change its root session, attach after disconnect, recover uncertain operations, retry, relaunch, become resident, enter recoverable-owned adoption, transfer MCP adoption authority, or participate in update-restart snapshots. Owner transport loss starts immediate identity-safe retirement; a connection carrying the create proof rejects daemon-recovery options and treats every transport loss as terminal. Supervisor replacement, worker loss, normal shutdown, and `daemon stop --force` also retire the worker with process-incarnation checks. Ordinary recoverable workers keep their existing grace period, journal, hashed retry identity, replay, adoption, and update behavior.
 
 After create, attach and separately require current-generation `correlated_prompt_lifecycle_v1` proof before using correlated prompt APIs. Do not resubmit across a transport or supervisor generation. Treat an unavailable create receipt, failed attachment proof, oversized snapshot, disconnect, or uncertain cleanup as terminal for that worker.
 

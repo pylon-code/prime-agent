@@ -1,4 +1,5 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
@@ -2610,6 +2611,31 @@ describe("daemon worker supervisor monitoring", () => {
 			killSpy.mockRestore();
 			startIdSpy.mockRestore();
 		}
+	});
+
+	it("retires a nonpersistent worker immediately after its owner transport disconnects", () => {
+		const worker = {
+			descriptor: {
+				workerId: "private-owner-disconnect",
+				ownerClientId: "private-owner",
+				workerRecovery: "disabled" as const,
+			},
+			ownerCleanupTimer: undefined,
+		};
+		const retireNonpersistentWorker = vi.fn(async () => undefined);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients: new Set<DaemonSocketClient>(),
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			protocolClientIds: new WeakMap(),
+			retireNonpersistentWorker,
+		}) as {
+			scheduleOwnedWorkerCleanup(target: typeof worker): void;
+		};
+
+		supervisor.scheduleOwnedWorkerCleanup(worker);
+
+		expect(retireNonpersistentWorker).toHaveBeenCalledExactlyOnceWith(worker);
+		expect(worker.ownerCleanupTimer).toBeUndefined();
 	});
 
 	it("arms owner cleanup after a client-owned create registers without its disconnected client", async () => {
@@ -5735,6 +5761,24 @@ describe("daemon worker supervisor monitoring", () => {
 				noSession: true,
 				config: { noTools: true, noExtensions: true, extensions: ["/tmp/private-extension.ts"] },
 			},
+			{
+				type: "create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: true,
+				config: { noTools: true, noExtensions: true, autonomous: { enabled: true } },
+			},
+			{
+				type: "create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: true,
+				config: {
+					noTools: true,
+					noExtensions: true,
+					autonomous: { gates: { commands: ["private-shell-gate"] } },
+				},
+			},
 			{ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", sessionPath: "/saved.jsonl" },
 			{ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", continueRecent: true },
 			{ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", continueRecent: "false" },
@@ -6037,6 +6081,68 @@ describe("daemon worker supervisor monitoring", () => {
 
 		expect(supervisor.isWorkerRecoveryEligible(worker)).toBe(false);
 		await expect(supervisor.recoverWorker(worker)).rejects.toThrow("cannot be recovered");
+	});
+
+	it("keeps nonpersistent provenance after a partial descriptor unlink so finalization can persist and retry", () => {
+		const descriptorDir = mkdtempSync(join(tmpdir(), "prime-supervisor-partial-descriptor-unlink-"));
+		try {
+			const descriptorPath = join(descriptorDir, "worker-partial.json");
+			const markerPath = `${descriptorPath}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`;
+			const descriptor: DaemonWorkerDescriptor = {
+				version: 3,
+				workerId: "worker-partial",
+				pid: process.pid,
+				processStartId: getProcessStartId(process.pid),
+				socketPath: "/tmp/worker-partial.sock",
+				supervisorSocketPath: "/tmp/supervisor.sock",
+				authenticationToken: "worker-token",
+				rootActiveSessionId: "active-partial",
+				ownerClientId: "owner-partial",
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: "2026-01-01T00:00:00.000Z",
+				lifecycle: "stopping",
+				createCommand: { type: "create", noSession: true },
+				consecutiveFailures: 0,
+				stopRequestedAt: "2026-01-01T00:00:00.000Z",
+				workerRecovery: "disabled",
+			};
+			writeFileSync(
+				descriptorPath,
+				`${JSON.stringify(descriptor)}
+`,
+			);
+			writeFileSync(markerPath, DAEMON_NONPERSISTENT_WORKER_MARKER);
+			const worker = { descriptor, descriptorPath };
+			let failDescriptorRemoval = true;
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				descriptorDir,
+				shuttingDown: false,
+				nonpersistentCreateRuns: new Map(),
+				log: vi.fn(),
+				removeWorkerCleanupFile(path: string) {
+					if (path === descriptorPath && failDescriptorRemoval) {
+						failDescriptorRemoval = false;
+						throw new Error("descriptor unlink temporarily unavailable");
+					}
+					rmSync(path, { force: true });
+				},
+			}) as {
+				deleteWorkerDescriptor(target: typeof worker): void;
+				persistWorker(target: typeof worker): void;
+			};
+
+			expect(() => supervisor.deleteWorkerDescriptor(worker)).toThrow(
+				"Worker cleanup could not verify durable registration removal",
+			);
+			expect(existsSync(descriptorPath)).toBe(true);
+			expect(existsSync(markerPath)).toBe(true);
+			expect(() => supervisor.persistWorker(worker)).not.toThrow();
+			expect(() => supervisor.deleteWorkerDescriptor(worker)).not.toThrow();
+			expect(existsSync(descriptorPath)).toBe(false);
+			expect(existsSync(markerPath)).toBe(false);
+		} finally {
+			rmSync(descriptorDir, { recursive: true, force: true });
+		}
 	});
 
 	it("contains sidecar-marked downgrade-ambiguous descriptors while ignoring unrelated malformed records", () => {
@@ -6438,6 +6544,23 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 
 		try {
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(
+					createDaemonCommandEnvelope(
+						{
+							...baseCommand,
+							config: { ...baseCommand.config, apiKey: "x".repeat(1024 * 1024) },
+						},
+						"oversized-create",
+						"client-1",
+					),
+				),
+			);
+			expect(nonpersistentCreateRuns.size).toBe(0);
+			expect(handleCommand).not.toHaveBeenCalled();
+			expect(writes.join(" ")).toContain("Nonpersistent daemon command was invalid");
+
 			await supervisor.handleLine(client, JSON.stringify(createDaemonCommandEnvelope(baseCommand, "", "client-1")));
 			expect(nonpersistentCreateRuns.size).toBe(0);
 			await supervisor.handleLine(
@@ -6448,6 +6571,20 @@ describe("daemon worker supervisor monitoring", () => {
 				client,
 				JSON.stringify(createDaemonCommandEnvelope(baseCommand, "stable-create", "client-1")),
 			);
+			const retainedCreate = nonpersistentCreateRuns.get(JSON.stringify(["client-1", "stable-create"]));
+			if (!retainedCreate) throw new Error("Expected a retained create run");
+			nonpersistentCreateRuns.set("synthetic-byte-saturation", {
+				...retainedCreate,
+				requestBytes: 8 * 1024 * 1024,
+			});
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope(baseCommand, "byte-saturated-create", "client-1")),
+			);
+			expect(nonpersistentCreateRuns.has(JSON.stringify(["client-1", "byte-saturated-create"]))).toBe(false);
+			nonpersistentCreateRuns.delete("synthetic-byte-saturation");
+			expect(writes.join(" ")).toContain("Too many unacknowledged nonpersistent daemon worker creates");
+
 			await supervisor.handleLine(
 				client,
 				JSON.stringify(
@@ -6498,6 +6635,14 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(durableJournal).not.toContain("stable-create");
 			expect(durableJournal).not.toContain("PRIVATE-CREATE-SECRET");
 			expect(durableJournal).not.toContain("PRIVATE-LAUNCH-SECRET");
+			for (const privateValue of ["PRIVATE-CREATE-SECRET", "PRIVATE-LAUNCH-SECRET"]) {
+				expect(durableJournal).not.toContain(createHash("sha256").update(privateValue).digest("hex"));
+			}
+			expect(durableJournal).not.toContain(
+				createHash("sha256")
+					.update(JSON.stringify(createDaemonCommandEnvelope(baseCommand, "stable-create", "client-1")))
+					.digest("hex"),
+			);
 
 			await Reflect.apply(Reflect.get(DaemonSupervisor.prototype, "handleCommand"), supervisor, [
 				client,

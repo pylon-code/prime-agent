@@ -4131,6 +4131,62 @@ describe("DaemonAgentConnection", () => {
 		expect([...privateRoutes.values()].every((route) => typeof route.request === "object")).toBe(true);
 	});
 
+	it("rejects daemon recovery options for a nonpersistent create receipt", () => {
+		const fakeClient = new FakeDaemonClient();
+		const proof = {
+			id: "active-1",
+			activeSessionId: "active-1",
+			sessionId: "session-current",
+			workerRecovery: "disabled" as const,
+		};
+		for (const incompatible of [
+			{ recoverDaemon: async () => undefined },
+			{ ownedSessionRecoveryConfig: { cwd: "/tmp", agentDir: "/tmp" } },
+			{
+				ownedSessionRecoveryConfig: { cwd: "/tmp", agentDir: "/tmp" },
+				ownedSessionLaunchEnv: { PRIVATE_TOKEN: "private" },
+			},
+		]) {
+			expect(
+				() =>
+					new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+						ownedSession: true,
+						nonpersistentWorkerCreateProof: proof,
+						...incompatible,
+					}),
+			).toThrow("Nonpersistent daemon worker create proof is unavailable");
+		}
+	});
+
+	it("treats transport loss as terminal and retires exact private retry state", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			ownedSession: true,
+			nonpersistentWorkerCreateProof: {
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionId: "session-current",
+				workerRecovery: "disabled",
+			},
+		});
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		await connection.submitCorrelatedPrompt("private input", { correlationId: "private-transport-loss" });
+		const privateRoutes = (connection as unknown as { correlatedPromptRoutes: Map<string, unknown> })
+			.correlatedPromptRoutes;
+		expect(privateRoutes.size).toBe(1);
+
+		fakeClient.emitClose(new Error("transport lost"));
+
+		await vi.waitFor(() => expect(events.some((event) => event.type === "closed")).toBe(true));
+		expect(privateRoutes.size).toBe(0);
+		expect(events.some((event) => event.type === "connection_status" && event.status === "reconnecting")).toBe(false);
+	});
+
 	it("rejects an unbound nonpersistent create receipt", () => {
 		const fakeClient = new FakeDaemonClient();
 		const proof = {

@@ -70,7 +70,7 @@ import { SettingsManager } from "../../core/settings-manager.js";
 import { CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE } from "../../sdk-features.js";
 import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
-import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
+import { attachBoundedJsonlByteReader, attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
 import { createActiveSessionId, type DaemonSocketClient } from "./active-session-state.js";
 import {
@@ -201,6 +201,9 @@ const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const SNAPSHOT_ATTEMPT_TIMEOUT_MS = 30_000;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
+const MAX_DAEMON_INGRESS_BYTES = 64 * 1024 * 1024;
+const MAX_NONPERSISTENT_CREATE_REQUEST_BYTES = 1024 * 1024;
+const MAX_NONPERSISTENT_CREATE_RETAINED_BYTES = 8 * 1024 * 1024;
 const MAX_NONPERSISTENT_CREATE_RUNS = 32;
 
 function createPublicSnapshotTransferId(): string {
@@ -601,6 +604,7 @@ interface SupervisorCorrelatedJournalRun {
 
 interface SupervisorNonpersistentCreateRun {
 	request: DaemonCreateCommand;
+	requestBytes: number;
 	activeSessionId?: string;
 	promise: Promise<DaemonResponse>;
 	resolve: (response: DaemonResponse) => void;
@@ -771,6 +775,8 @@ function assertWorkerRecoveryRequest(command: DaemonCreateCommand): void {
 		command.config.noExtensions !== true ||
 		(command.config.tools?.length ?? 0) !== 0 ||
 		(command.config.extensions?.length ?? 0) !== 0 ||
+		command.config.autonomous?.enabled === true ||
+		(command.config.autonomous?.gates?.commands?.length ?? 0) !== 0 ||
 		command.sessionPath !== undefined ||
 		(command.continueRecent !== undefined && typeof command.continueRecent !== "boolean") ||
 		command.continueRecent === true
@@ -1588,8 +1594,12 @@ export class DaemonSupervisor {
 					}
 				}
 			}
-			this.removeWorkerCleanupFile(nonpersistentWorkerMarkerPath(worker.descriptorPath));
+			// Remove the authoritative descriptor before its provenance marker. If
+			// descriptor removal fails, the marker must remain so a finalizer can
+			// persist the stop tombstone and retry. If the process dies after the
+			// descriptor is gone, replacement startup removes the orphan marker.
 			this.removeWorkerCleanupFile(worker.descriptorPath);
+			this.removeWorkerCleanupFile(nonpersistentWorkerMarkerPath(worker.descriptorPath));
 			for (const [key, run] of this.nonpersistentCreateRuns ?? []) {
 				if (run.activeSessionId === worker.descriptor.rootActiveSessionId) {
 					this.nonpersistentCreateRuns.delete(key);
@@ -1682,7 +1692,10 @@ export class DaemonSupervisor {
 			() => client.socket.destroy(),
 		);
 
-		client.detachInput = attachJsonlLineReader(socket, (line) => void this.handleLine(client, line));
+		client.detachInput = attachBoundedJsonlByteReader(socket, (line) => void this.handleLine(client, line), {
+			maxFrameBytes: MAX_DAEMON_INGRESS_BYTES,
+			onFrameTooLarge: () => socket.destroy(new Error("Daemon inbound frame exceeded the configured limit")),
+		});
 		let cleaned = false;
 		const cleanup = () => {
 			if (cleaned) {
@@ -1909,6 +1922,10 @@ export class DaemonSupervisor {
 			worker.ownerCleanupTimer ||
 			[...this.clients].some((client) => this.protocolClientId(client) === ownerClientId)
 		) {
+			return;
+		}
+		if (worker.descriptor.workerRecovery === "disabled") {
+			void this.retireNonpersistentWorker(worker);
 			return;
 		}
 		worker.ownerCleanupTimer = setTimeout(() => {
@@ -2293,10 +2310,15 @@ export class DaemonSupervisor {
 		}
 
 		let nonpersistentCreateRequest: DaemonCreateCommand | undefined;
+		let nonpersistentCreateRequestBytes: number | undefined;
 		if (command.type === "create") {
 			try {
 				assertWorkerRecoveryRequest(command);
 				if (command.workerRecovery === "disabled") {
+					nonpersistentCreateRequestBytes = Buffer.byteLength(line, "utf8");
+					if (nonpersistentCreateRequestBytes > MAX_NONPERSISTENT_CREATE_REQUEST_BYTES) {
+						throw new Error("Nonpersistent daemon command was invalid");
+					}
 					nonpersistentCreateRequest = structuredClone(command) as DaemonCreateCommand;
 				}
 			} catch (error) {
@@ -2422,8 +2444,15 @@ export class DaemonSupervisor {
 			);
 			return;
 		}
-		if (nonpersistentCreateKey && nonpersistentCreateRequest) {
-			if (this.nonpersistentCreateRuns.size >= MAX_NONPERSISTENT_CREATE_RUNS) {
+		if (nonpersistentCreateKey && nonpersistentCreateRequest && nonpersistentCreateRequestBytes !== undefined) {
+			const retainedBytes = [...this.nonpersistentCreateRuns.values()].reduce(
+				(total, run) => total + run.requestBytes,
+				0,
+			);
+			if (
+				this.nonpersistentCreateRuns.size >= MAX_NONPERSISTENT_CREATE_RUNS ||
+				retainedBytes > MAX_NONPERSISTENT_CREATE_RETAINED_BYTES - nonpersistentCreateRequestBytes
+			) {
 				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 				correlatedOrder?.release();
 				this.write(
@@ -2439,6 +2468,7 @@ export class DaemonSupervisor {
 			nonpersistentCreateRun = {
 				key: nonpersistentCreateKey,
 				request: nonpersistentCreateRequest,
+				requestBytes: nonpersistentCreateRequestBytes,
 				promise,
 				resolve: resolveRun,
 				settled: false,

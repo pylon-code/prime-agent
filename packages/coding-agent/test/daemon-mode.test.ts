@@ -322,6 +322,22 @@ describe("daemon mode helpers", () => {
 				noSession: true,
 				config: { noTools: true, noExtensions: true, extensions: ["/tmp/private-extension.ts"] },
 			},
+			{
+				type: "create" as const,
+				lifecycle: "client_owned" as const,
+				noSession: true,
+				config: { noTools: true, noExtensions: true, autonomous: { enabled: true } },
+			},
+			{
+				type: "create" as const,
+				lifecycle: "client_owned" as const,
+				noSession: true,
+				config: {
+					noTools: true,
+					noExtensions: true,
+					autonomous: { enabled: false, gates: { commands: ["private-shell-gate"] } },
+				},
+			},
 		]) {
 			await expect(internals.handleCommand(makeClient("supervisor", "active"), command)).rejects.toThrow(
 				"Nonpersistent daemon command was invalid",
@@ -330,16 +346,25 @@ describe("daemon mode helpers", () => {
 		expect(createRuntime).not.toHaveBeenCalled();
 	});
 
-	it("clears inherited tools and extensions before constructing a nonpersistent runtime", async () => {
-		const createRuntime = vi.fn(async (options: { sessionConfig?: { tools?: string[]; extensions?: string[] } }) => {
-			throw new Error(`captured:${JSON.stringify(options.sessionConfig)}`);
-		});
+	it("clears inherited tools, extensions, and autonomous gates before constructing a nonpersistent runtime", async () => {
+		const createRuntime = vi.fn(
+			async (options: {
+				sessionConfig?: {
+					tools?: string[];
+					extensions?: string[];
+					autonomous?: { enabled?: boolean; gates?: { commands?: string[] } };
+				};
+			}) => {
+				throw new Error(`captured:${JSON.stringify(options.sessionConfig)}`);
+			},
+		);
 		const daemon = new AgentDaemon("/tmp/nonpersistent-worker-config.sock", {
 			defaultSessionConfig: {
 				agentDir: "/tmp",
 				cwd: "/tmp",
 				tools: ["ipython"],
 				extensions: ["/tmp/private-extension.ts"],
+				autonomous: { enabled: true, gates: { commands: ["private-shell-gate"] } },
 			},
 			createRuntime: createRuntime as never,
 			worker: { authenticationToken: "token", recoveryMode: "disabled" },
@@ -360,14 +385,17 @@ describe("daemon mode helpers", () => {
 			noExtensions: true,
 			tools: [],
 			extensions: [],
+			autonomous: { enabled: false, gates: { commands: [] } },
 		});
 	});
 
 	it.each([
-		{ activeTools: ["ipython"], loadedExtensions: false },
-		{ activeTools: [], loadedExtensions: true },
+		{ activeTools: ["ipython"], loadedExtensions: false, autonomousEnabled: false, gateCommands: [] },
+		{ activeTools: [], loadedExtensions: true, autonomousEnabled: false, gateCommands: [] },
+		{ activeTools: [], loadedExtensions: false, autonomousEnabled: true, gateCommands: [] },
+		{ activeTools: [], loadedExtensions: false, autonomousEnabled: false, gateCommands: ["private-shell-gate"] },
 	])(
-		"rejects a nonpersistent runtime with effective tools or extensions: $activeTools/$loadedExtensions",
+		"rejects a nonpersistent runtime with active tools, extensions, or autonomous execution: $activeTools/$loadedExtensions/$autonomousEnabled/$gateCommands",
 		async (fixture) => {
 			const disposeAsync = vi.fn(async () => undefined);
 			const daemon = new AgentDaemon("/tmp/nonpersistent-worker-runtime-proof.sock", {
@@ -376,6 +404,10 @@ describe("daemon mode helpers", () => {
 					session: {
 						getActiveToolNames: () => fixture.activeTools,
 						hasLoadedExtensions: () => fixture.loadedExtensions,
+						getAutonomousStatus: () => ({
+							enabled: fixture.autonomousEnabled,
+							gates: { commands: fixture.gateCommands },
+						}),
 						setSubagentRuntimeHost: vi.fn(),
 						setSessionReplacementAdmissionGuard: vi.fn(),
 						extensionRunner: { hasHandlers: () => false },
@@ -9858,6 +9890,8 @@ function makeRuntimeSession(
 		getAvailableThinkingLevels: vi.fn(() => []),
 		scopedModels: [],
 		getActiveToolNames: vi.fn(() => []),
+		hasLoadedExtensions: vi.fn(() => false),
+		getAutonomousStatus: vi.fn(() => ({ enabled: false, gates: { commands: [] } })),
 		getContextUsage: vi.fn(() => undefined),
 		setSessionName: vi.fn((name: string) => sessionManager.appendSessionInfo(name)),
 		dispose: vi.fn(),
