@@ -2632,6 +2632,36 @@ describe("DaemonAgentConnection", () => {
 		},
 	);
 
+	it("rechecks the private transport after awaiting snapshot recovery", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			ownedSession: true,
+			nonpersistentWorkerCreateProof: {
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionId: "session-current",
+				workerRecovery: "disabled",
+			},
+		});
+		await connection.attach();
+		let releaseRecovery!: () => void;
+		const recovery = new Promise<void>((resolve) => {
+			releaseRecovery = resolve;
+		});
+		(connection as unknown as { runtimeSnapshotAttempt: { recovery: Promise<void> } }).runtimeSnapshotAttempt = {
+			recovery,
+		};
+
+		const snapshot = connection.getInitialSnapshot();
+		await Promise.resolve();
+		fakeClient.resetTransportForReconnect();
+		releaseRecovery();
+
+		await expect(snapshot).rejects.toThrow(
+			"A nonpersistent daemon worker cannot be recovered or reattached after disconnect",
+		);
+	});
+
 	it("fences an in-flight attach when its session closes before the response", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");

@@ -1392,7 +1392,10 @@ export class DaemonAgentConnection implements AgentConnection {
 	async getInitialSnapshot(): Promise<AgentConnectionSnapshot> {
 		this.assertNonpersistentTransportAvailable();
 		const snapshotRecovery = this.runtimeSnapshotAttempt?.recovery;
-		if (snapshotRecovery) await snapshotRecovery;
+		if (snapshotRecovery) {
+			await snapshotRecovery;
+			this.assertNonpersistentTransportAvailable();
+		}
 		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
 			return this.latestSnapshot;
 		}
