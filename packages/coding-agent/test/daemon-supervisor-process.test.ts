@@ -136,6 +136,23 @@ function tempDir(): string {
 	return directory;
 }
 
+async function reserveClosedTcpBaseUrl(): Promise<string> {
+	const server = createServer();
+	await new Promise<void>((resolveListen, reject) => {
+		server.once("error", reject);
+		server.listen(0, "127.0.0.1", () => resolveListen());
+	});
+	const address = server.address();
+	if (!address || typeof address === "string") {
+		server.close();
+		throw new Error("Test model server did not expose a TCP port");
+	}
+	await new Promise<void>((resolveClose, reject) => {
+		server.close((error) => (error ? reject(error) : resolveClose()));
+	});
+	return `http://127.0.0.1:${address.port}/v1`;
+}
+
 function spawnSupervisor(
 	agentDir: string,
 	socketPath: string,
@@ -3297,7 +3314,23 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 			tmpdir(),
 			`prime-supervisor-nonpersistent-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
 		);
+		mkdirSync(agentDir, { recursive: true });
 		mkdirSync(projectDir, { recursive: true });
+		const unavailableModelBaseUrl = await reserveClosedTcpBaseUrl();
+		writeFileSync(
+			join(agentDir, "models.json"),
+			JSON.stringify({
+				providers: {
+					intercept: {
+						baseUrl: unavailableModelBaseUrl,
+						api: "openai-completions",
+						apiKey: "test-key",
+						models: [{ id: "nonpersistent-test-model", reasoning: false, input: ["text"] }],
+					},
+				},
+			}),
+			"utf8",
+		);
 
 		const inheritedRecoveryPath = join(root, "inherited-recovery.jsonl");
 		const injectedRecoveryPath = join(root, "injected-recovery.jsonl");
@@ -3335,7 +3368,15 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 				[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: injectedRecoveryPath,
 				PRIVATE_LAUNCH_CANARY: launchCanary,
 			},
-			config: { cwd: projectDir, agentDir, noTools: true, noExtensions: true, apiKey: configCanary },
+			config: {
+				cwd: projectDir,
+				agentDir,
+				noTools: true,
+				noExtensions: true,
+				provider: "intercept",
+				model: "nonpersistent-test-model",
+				apiKey: configCanary,
+			},
 		});
 		if (!created.success) throw new Error(created.error);
 		const summary = requireSummary(created.data);
