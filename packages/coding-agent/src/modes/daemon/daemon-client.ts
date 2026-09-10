@@ -377,14 +377,15 @@ export class DaemonClient {
 		timeoutMs = 30000,
 		options: DaemonClientRequestOptions = {},
 	): Promise<DaemonResponse> {
-		const nonpersistentCreateTransportGeneration =
-			command.type === "create" && command.workerRecovery === "disabled" ? this.transportGeneration : undefined;
+		const requestCommand = structuredClone(command);
+		const isNonpersistentCreate = requestCommand.type === "create" && requestCommand.workerRecovery === "disabled";
+		const nonpersistentCreateTransportGeneration = isNonpersistentCreate ? this.transportGeneration : undefined;
 		if (!this.socket || this.socket.destroyed) {
 			if (this.terminalTransportError) {
 				throw this.terminalTransportError;
 			}
 			throw new Error(
-				`Cannot send daemon command "${command.type}" because the Prime Agent daemon is not connected. ${daemonEndpointDetails(this.socketPath)}`,
+				`Cannot send daemon command "${requestCommand.type}" because the Prime Agent daemon is not connected. ${daemonEndpointDetails(this.socketPath)}`,
 			);
 		}
 		const hello = this.helloMessage ?? (await this.waitForHello());
@@ -395,26 +396,24 @@ export class DaemonClient {
 			throw new Error("Nonpersistent daemon worker create result is uncertain");
 		}
 		const expectedSupervisorGeneration =
-			"expectedSupervisorGeneration" in command && typeof command.expectedSupervisorGeneration === "string"
-				? command.expectedSupervisorGeneration
+			"expectedSupervisorGeneration" in requestCommand &&
+			typeof requestCommand.expectedSupervisorGeneration === "string"
+				? requestCommand.expectedSupervisorGeneration
 				: undefined;
 		if (expectedSupervisorGeneration !== undefined && hello.supervisorGeneration !== expectedSupervisorGeneration) {
 			throw new Error("Recoverable owned session adoption is unavailable");
 		}
-		const compatibilities = getDaemonCommandCompatibilities(command);
+		const compatibilities = getDaemonCommandCompatibilities(requestCommand);
 		const missingCompatibility = compatibilities.find(
 			(compatibility) => !this.meetsCommandCompatibility(hello, compatibility),
 		);
 		if (missingCompatibility) {
-			throw new DaemonCapabilityUnavailableError(command.type, missingCompatibility.capability);
+			throw new DaemonCapabilityUnavailableError(requestCommand.type, missingCompatibility.capability);
 		}
 		const envelopeProtocolVersion = Math.min(hello.protocol.version, DAEMON_PROTOCOL_VERSION);
-		const requestOptions =
-			command.type === "create" && command.workerRecovery === "disabled"
-				? { ...options, recoverAcrossReconnect: false }
-				: options;
+		const requestOptions = isNonpersistentCreate ? { ...options, recoverAcrossReconnect: false } : options;
 		const response = await this.requestWire(
-			command,
+			requestCommand,
 			timeoutMs,
 			requestOptions,
 			envelopeProtocolVersion >= DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION ? envelopeProtocolVersion : undefined,

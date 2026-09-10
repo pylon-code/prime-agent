@@ -1368,6 +1368,90 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("snapshots disabled create classification and payload before waiting for hello", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const connecting = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connecting;
+		const command = {
+			type: "create" as const,
+			lifecycle: "client_owned" as const,
+			workerRecovery: "disabled" as const,
+			noSession: true,
+			config: { noTools: true, noExtensions: true, apiKey: "entry-private-value" },
+		};
+		const response = client.request(command);
+		Object.assign(command as unknown as Record<string, unknown>, {
+			workerRecovery: undefined,
+			noSession: false,
+			config: { noTools: false, noExtensions: false, apiKey: "mutated-private-value" },
+		});
+
+		emitHello(
+			socket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+			DAEMON_SCHEMA_REVISION,
+		);
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!) as {
+			id: string;
+			command: Record<string, unknown> & { config?: Record<string, unknown> };
+		};
+		expect(envelope.command).toMatchObject({
+			workerRecovery: "disabled",
+			noSession: true,
+			config: { noTools: true, noExtensions: true, apiKey: "entry-private-value" },
+		});
+		expect(JSON.stringify(envelope)).not.toContain("mutated-private-value");
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id: envelope.id, type: "response", command: "create", success: true })}
+`,
+		);
+		await expect(response).resolves.toMatchObject({ success: true });
+		client.close();
+	});
+
+	it("does not acquire disabled-create behavior from caller mutation while waiting for hello", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const connecting = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connecting;
+		const command = { type: "create" as const, lifecycle: "client_owned" as const };
+		const response = client.request(command);
+		Object.assign(command as unknown as Record<string, unknown>, {
+			workerRecovery: "disabled",
+			noSession: true,
+			config: { noTools: true, noExtensions: true, apiKey: "late-private-value" },
+		});
+
+		emitHello(
+			socket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "client_owned_sessions"],
+			DAEMON_SCHEMA_REVISION,
+		);
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!) as { id: string; command: Record<string, unknown> };
+		expect(envelope.command).toMatchObject({ type: "create", lifecycle: "client_owned" });
+		expect(envelope.command).not.toHaveProperty("workerRecovery");
+		expect(envelope.command).not.toHaveProperty("noSession");
+		expect(envelope.command).not.toHaveProperty("config");
+		expect(JSON.stringify(envelope)).not.toContain("late-private-value");
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id: envelope.id, type: "response", command: "create", success: true })}
+`,
+		);
+		await expect(response).resolves.toMatchObject({ success: true });
+		client.close();
+	});
+
 	it("rejects a disabled create response that resolves before a silent transport reset", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connecting = client.connect();
