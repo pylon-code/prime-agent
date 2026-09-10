@@ -54,7 +54,10 @@ import {
 	failure,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+	type DaemonWorkerCommand,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 
 describe("daemon mode helpers", () => {
@@ -198,7 +201,7 @@ describe("daemon mode helpers", () => {
 		const daemon = new AgentDaemon("/tmp/unused-worker.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: vi.fn(),
-			worker: { authenticationToken: "token" },
+			worker: { authenticationToken: "token", recoveryMode: "disabled" },
 		});
 		const setSessionName = vi.fn();
 		const state = makeState("active");
@@ -226,6 +229,291 @@ describe("daemon mode helpers", () => {
 		).resolves.toMatchObject({ success: true });
 		expect(assertStateSessionNameAvailable).not.toHaveBeenCalled();
 		expect(setSessionName).toHaveBeenCalledWith("approved");
+	});
+
+	it("keeps nonpersistent correlated retry identity as an exact in-memory request", () => {
+		const daemon = new AgentDaemon("/tmp/nonpersistent-worker-correlation.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+			worker: { authenticationToken: "token", recoveryMode: "disabled" },
+		});
+		const internals = daemon as unknown as {
+			registerCorrelatedPromptSubmission(command: {
+				id: string;
+				type: "submit_correlated_prompt";
+				activeSessionId: string;
+				sessionId: string;
+				correlationId: string;
+				message: string;
+				queueIfBusy?: boolean;
+			}): void;
+			correlatedPromptSubmissions: Map<string, { requestIdentity: unknown; ownerCommandId: string }>;
+			nonpersistentCorrelatedPromptRequests: Map<string, unknown>;
+		};
+		const request = {
+			id: "submit-1",
+			type: "submit_correlated_prompt" as const,
+			activeSessionId: "active",
+			sessionId: "session",
+			correlationId: "correlation",
+			message: "private prompt",
+			queueIfBusy: false,
+		};
+
+		internals.registerCorrelatedPromptSubmission(request);
+		const [submission] = internals.correlatedPromptSubmissions.values();
+		expect(submission?.requestIdentity).toEqual({
+			message: "private prompt",
+			images: undefined,
+			queueIfBusy: false,
+		});
+		expect(typeof submission?.requestIdentity).not.toBe("string");
+		expect(internals.nonpersistentCorrelatedPromptRequests.size).toBe(1);
+		expect(() => internals.registerCorrelatedPromptSubmission({ ...request, id: "submit-2" })).not.toThrow();
+		expect(internals.correlatedPromptSubmissions.size).toBe(1);
+		expect(() =>
+			internals.registerCorrelatedPromptSubmission({
+				...request,
+				id: "submit-3",
+				message: "changed private prompt",
+			}),
+		).toThrow();
+	});
+
+	it("rejects a persistent session create inside a nonpersistent worker", async () => {
+		const createRuntime = vi.fn();
+		const daemon = new AgentDaemon("/tmp/nonpersistent-worker-create.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime,
+			worker: { authenticationToken: "token", recoveryMode: "disabled" },
+		});
+		const internals = daemon as unknown as {
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+
+		for (const command of [
+			{
+				type: "create" as const,
+				lifecycle: "client_owned" as const,
+				noSession: false,
+				config: { noTools: true, noExtensions: true },
+			},
+			{
+				type: "create" as const,
+				lifecycle: "client_owned" as const,
+				noSession: true,
+				config: { noTools: false, noExtensions: true },
+			},
+			{
+				type: "create" as const,
+				lifecycle: "client_owned" as const,
+				noSession: true,
+				config: { noTools: true, noExtensions: false },
+			},
+			{
+				type: "create" as const,
+				lifecycle: "client_owned" as const,
+				noSession: true,
+				config: { noTools: true, noExtensions: true, tools: ["ipython"] },
+			},
+			{
+				type: "create" as const,
+				lifecycle: "client_owned" as const,
+				noSession: true,
+				config: { noTools: true, noExtensions: true, extensions: ["/tmp/private-extension.ts"] },
+			},
+			{
+				type: "create" as const,
+				lifecycle: "client_owned" as const,
+				noSession: true,
+				config: { noTools: true, noExtensions: true, autonomous: { enabled: true } },
+			},
+			{
+				type: "create" as const,
+				lifecycle: "client_owned" as const,
+				noSession: true,
+				config: {
+					noTools: true,
+					noExtensions: true,
+					autonomous: { enabled: false, gates: { commands: ["private-shell-gate"] } },
+				},
+			},
+		]) {
+			await expect(internals.handleCommand(makeClient("supervisor", "active"), command)).rejects.toThrow(
+				"Nonpersistent daemon command was invalid",
+			);
+		}
+		expect(createRuntime).not.toHaveBeenCalled();
+	});
+
+	it("clears inherited tools, extensions, and autonomous gates before constructing a nonpersistent runtime", async () => {
+		const createRuntime = vi.fn(
+			async (options: {
+				sessionConfig?: {
+					tools?: string[];
+					extensions?: string[];
+					autonomous?: { enabled?: boolean; gates?: { commands?: string[] } };
+				};
+			}) => {
+				throw new Error(`captured:${JSON.stringify(options.sessionConfig)}`);
+			},
+		);
+		const daemon = new AgentDaemon("/tmp/nonpersistent-worker-config.sock", {
+			defaultSessionConfig: {
+				agentDir: "/tmp",
+				cwd: "/tmp",
+				tools: ["ipython"],
+				extensions: ["/tmp/private-extension.ts"],
+				autonomous: { enabled: true, gates: { commands: ["private-shell-gate"] } },
+			},
+			createRuntime: createRuntime as never,
+			worker: { authenticationToken: "token", recoveryMode: "disabled" },
+		});
+		const internals = daemon as unknown as {
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		await expect(
+			internals.handleCommand(makeClient("supervisor", "active"), {
+				type: "create",
+				lifecycle: "client_owned",
+				noSession: true,
+				config: { noTools: true, noExtensions: true },
+			}),
+		).rejects.toThrow("captured:");
+		expect(createRuntime.mock.calls[0]?.[0].sessionConfig).toMatchObject({
+			noTools: true,
+			noExtensions: true,
+			tools: [],
+			extensions: [],
+			autonomous: { enabled: false, gates: { commands: [] } },
+		});
+	});
+
+	it.each([
+		{ activeTools: ["ipython"], loadedExtensions: false, autonomousEnabled: false, gateCommands: [] },
+		{ activeTools: [], loadedExtensions: true, autonomousEnabled: false, gateCommands: [] },
+		{ activeTools: [], loadedExtensions: false, autonomousEnabled: true, gateCommands: [] },
+		{ activeTools: [], loadedExtensions: false, autonomousEnabled: false, gateCommands: ["private-shell-gate"] },
+	])(
+		"rejects a nonpersistent runtime with active tools, extensions, or autonomous execution: $activeTools/$loadedExtensions/$autonomousEnabled/$gateCommands",
+		async (fixture) => {
+			const disposeAsync = vi.fn(async () => undefined);
+			const daemon = new AgentDaemon("/tmp/nonpersistent-worker-runtime-proof.sock", {
+				defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+				createRuntime: vi.fn(async (options: { sessionManager: SessionManager }) => ({
+					session: {
+						getActiveToolNames: () => fixture.activeTools,
+						hasLoadedExtensions: () => fixture.loadedExtensions,
+						getAutonomousStatus: () => ({
+							enabled: fixture.autonomousEnabled,
+							gates: { commands: fixture.gateCommands },
+						}),
+						setSubagentRuntimeHost: vi.fn(),
+						setSessionReplacementAdmissionGuard: vi.fn(),
+						extensionRunner: { hasHandlers: () => false },
+						sessionManager: options.sessionManager,
+						disposeAsync,
+					},
+					services: {},
+				})) as never,
+				worker: { authenticationToken: "token", recoveryMode: "disabled" },
+			});
+			const internals = daemon as unknown as {
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			await expect(
+				internals.handleCommand(makeClient("supervisor", "active"), {
+					type: "create",
+					lifecycle: "client_owned",
+					noSession: true,
+					config: { noTools: true, noExtensions: true },
+				}),
+			).rejects.toThrow("Nonpersistent daemon command was invalid");
+			expect(disposeAsync).toHaveBeenCalledOnce();
+		},
+	);
+
+	it("rejects transcript and persistence commands inside a nonpersistent worker", async () => {
+		const daemon = new AgentDaemon("/tmp/nonpersistent-worker-allowlist.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+			worker: { authenticationToken: "token", recoveryMode: "disabled" },
+		});
+		const internals = daemon as unknown as {
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		for (const command of [
+			{ type: "export_jsonl", activeSessionId: "active", outputPath: "/tmp/private.jsonl" },
+			{ type: "compact", activeSessionId: "active", customInstructions: "private prompt" },
+			{ type: "refine", activeSessionId: "active", instructions: "private prompt", global: true },
+			{ type: "cron_add", activeSessionId: "active", schedule: "0 * * * *", prompt: "private prompt" },
+		] as const) {
+			await expect(
+				internals.handleCommand(makeClient("supervisor", "active"), command as DaemonCommand),
+			).rejects.toThrow("unavailable for a nonpersistent daemon worker");
+		}
+	});
+
+	it("rejects recovery-shaped root transitions inside a nonpersistent worker", async () => {
+		const daemon = new AgentDaemon("/tmp/nonpersistent-worker-transitions.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+			worker: { authenticationToken: "token", recoveryMode: "disabled" },
+		});
+		const internals = daemon as unknown as {
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		const commands = [
+			{ type: "new_session", activeSessionId: "active" },
+			{ type: "switch_session", activeSessionId: "active", sessionPath: "/tmp/saved.jsonl" },
+			{ type: "fork", activeSessionId: "active", entryId: "entry" },
+			{ type: "import_jsonl", activeSessionId: "active", inputPath: "/tmp/import.jsonl" },
+			{ type: "restore_next_turn", activeSessionId: "active", messages: [] },
+			{ type: "restore_actions", activeSessionId: "active", snapshot: { formatVersion: 1, actions: [] } },
+		] as const;
+
+		for (const command of commands) {
+			await expect(
+				internals.handleCommand(makeClient("supervisor", "active"), command as DaemonCommand),
+			).rejects.toThrow("cannot change its root session");
+		}
+	});
+
+	it("rejects update snapshots and ownership transfer inside a nonpersistent worker", async () => {
+		const daemon = new AgentDaemon("/tmp/nonpersistent-worker-private-commands.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+			worker: { authenticationToken: "token", recoveryMode: "disabled" },
+		});
+		const beginUpdateRestartTransaction = vi.fn();
+		const writes: string[] = [];
+		const client = makeClient("supervisor", "active");
+		client.socket = {
+			destroyed: false,
+			write: vi.fn((chunk: string) => {
+				writes.push(chunk);
+				return true;
+			}),
+		} as unknown as Socket;
+		const internals = daemon as unknown as {
+			beginUpdateRestartTransaction: typeof beginUpdateRestartTransaction;
+			handleWorkerCommand(client: DaemonSocketClient, command: DaemonWorkerCommand): Promise<void>;
+		};
+		internals.beginUpdateRestartTransaction = beginUpdateRestartTransaction;
+
+		await internals.handleWorkerCommand(client, { type: "worker_prepare_update" });
+		await internals.handleWorkerCommand(client, {
+			type: "worker_transfer_acp_mcp_owner",
+			activeSessionId: "active",
+			transactionId: "transaction",
+			action: "transfer",
+			previousOwnerId: "old",
+			ownerId: "new",
+		});
+
+		expect(beginUpdateRestartTransaction).not.toHaveBeenCalled();
+		expect(writes.join(" ")).toContain("Update restart is unavailable");
+		expect(writes.join(" ")).toContain("Recoverable owned-session transfer is unavailable");
 	});
 
 	it("treats a depth-zero fork as a sibling of another root", () => {
@@ -1531,7 +1819,11 @@ describe("daemon mode helpers", () => {
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
-			worker: { authenticationToken: "worker-token" },
+			worker: {
+				authenticationToken: "worker-token",
+				recoveryMode: "enabled",
+				recoveryJournalPath: `/tmp/prime-agent-closing-test-${process.pid}.journal`,
+			},
 		});
 		const parentState = makeState("parent");
 		const childState = makeState("child", parentState.activeSessionId);
@@ -1640,7 +1932,7 @@ describe("daemon mode helpers", () => {
 			const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
 				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
 				createRuntime: vi.fn(),
-				worker: { authenticationToken: "worker-token" },
+				worker: { authenticationToken: "worker-token", recoveryMode: "disabled" },
 			});
 			const listSupervisorAgentPeers = (
 				daemon as unknown as { listSupervisorAgentPeers(): Promise<unknown[]> }
@@ -1660,7 +1952,7 @@ describe("daemon mode helpers", () => {
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
-			worker: { authenticationToken: "worker-token" },
+			worker: { authenticationToken: "worker-token", recoveryMode: "disabled" },
 		});
 		const source = makeState("source");
 		source.runtime = {
@@ -1741,7 +2033,7 @@ describe("daemon mode helpers", () => {
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
-			worker: { authenticationToken: "worker-token" },
+			worker: { authenticationToken: "worker-token", recoveryMode: "disabled" },
 		});
 		const source = makeState("source");
 		source.runtime = {
@@ -1787,7 +2079,7 @@ describe("daemon mode helpers", () => {
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
-			worker: { authenticationToken: "worker-token" },
+			worker: { authenticationToken: "worker-token", recoveryMode: "disabled" },
 		});
 		const source = makeState("source");
 		const sendRemoteAgentSessionMessage = vi.fn();
@@ -1871,7 +2163,7 @@ describe("daemon mode helpers", () => {
 				createRuntime: async () => {
 					throw new Error("unexpected runtime creation");
 				},
-				worker: { authenticationToken: "worker-token" },
+				worker: { authenticationToken: "worker-token", recoveryMode: "disabled" },
 			});
 			const sendRemoteAgentSessionMessage = (
 				daemon as unknown as {
@@ -1950,7 +2242,7 @@ describe("daemon mode helpers", () => {
 				createRuntime: async () => {
 					throw new Error("unexpected runtime creation");
 				},
-				worker: { authenticationToken: "worker-token" },
+				worker: { authenticationToken: "worker-token", recoveryMode: "disabled" },
 			});
 			const sendRemoteAgentSessionMessage = (
 				daemon as unknown as {
@@ -2025,7 +2317,7 @@ describe("daemon mode helpers", () => {
 			const daemon = new AgentDaemon(join(tempDir, "worker.sock"), {
 				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
 				createRuntime: vi.fn(),
-				worker: { authenticationToken: "token" },
+				worker: { authenticationToken: "token", recoveryMode: "disabled" },
 			});
 			const setSessionName = vi.fn((_name: string) => undefined);
 			const state = makeState("active");
@@ -8066,7 +8358,7 @@ describe("daemon mode helpers", () => {
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
-			worker: { authenticationToken: "worker-token" },
+			worker: { authenticationToken: "worker-token", recoveryMode: "disabled" },
 		});
 		const client = makeClient("unauthenticated", "active-1");
 		const end = vi.fn();
@@ -8088,6 +8380,122 @@ describe("daemon mode helpers", () => {
 
 		expect(end).toHaveBeenCalledOnce();
 		expect(internals.promptAdmissions.size).toBe(0);
+	});
+
+	it("does not expose or retain private correlated identity before worker authentication", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-private-auth-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+			worker: { authenticationToken: "worker-token", recoveryMode: "disabled" },
+		});
+		const internals = daemon as unknown as {
+			nonpersistentCorrelatedPromptRequests: Map<string, unknown>;
+			correlatedPromptSubmissions: Map<string, unknown>;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown;
+		};
+		const command = {
+			id: "private-1",
+			type: "submit_correlated_prompt",
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			correlationId: "correlation-1",
+			message: "private payload",
+			queueIfBusy: false,
+		};
+		for (const message of [command.message, "different guess"]) {
+			const client = makeClient("unauthenticated", "active-1");
+			const write = vi.fn((_payload: string) => true);
+			client.socket = { destroyed: false, write, end: vi.fn() } as unknown as Socket;
+			await internals.handleLine(client, JSON.stringify({ ...command, message }));
+			const response = JSON.parse(String(write.mock.calls[0]?.[0]).trim()) as { error?: string };
+			expect(response.error).toBe("Worker authentication failed");
+		}
+		expect(internals.nonpersistentCorrelatedPromptRequests.size).toBe(0);
+		expect(internals.correlatedPromptSubmissions.size).toBe(0);
+
+		for (const malformed of [{ images: {} }, { queueIfBusy: "false" }]) {
+			expect(() =>
+				internals.parseCommandAndRegisterPromptAdmission(
+					makeClient("malformed", "active-1"),
+					JSON.stringify({ ...command, ...malformed }),
+				),
+			).toThrow();
+		}
+		expect(internals.nonpersistentCorrelatedPromptRequests.size).toBe(0);
+		expect(internals.correlatedPromptSubmissions.size).toBe(0);
+	});
+
+	it("retains completed private retry identity across a pre-dispatch fence", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-private-retry-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+			worker: { authenticationToken: "worker-token", recoveryMode: "disabled" },
+		});
+		const lifecycle = {
+			correlationId: "correlation-1",
+			phase: "delivered" as const,
+			kind: "model_prompt" as const,
+			revision: 2,
+			deliveryCrossed: true,
+		};
+		const state = makeState("active-1") as ActiveSessionState;
+		state.runtime = {
+			...state.runtime,
+			session: {
+				sessionId: "session-1",
+				getPromptLifecycle: vi.fn(() => lifecycle),
+			},
+		} as never;
+		const client = makeClient("supervisor", "active-1");
+		const write = vi.fn((_payload: string) => true);
+		client.authenticated = true;
+		client.socket = { destroyed: false, write, end: vi.fn() } as unknown as Socket;
+		const claim = {
+			supervisorGeneration: "generation-1",
+			supervisorPid: 100,
+			supervisorSocketPath: "/tmp/supervisor.sock",
+		};
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			supervisorClaims: Map<DaemonSocketClient, { claim: typeof claim; ownerFingerprint: string }>;
+			nonpersistentCorrelatedPromptRequests: Map<string, unknown>;
+			correlatedPromptSubmissions: Map<string, unknown>;
+			correlatedPromptKey(activeSessionId: string, sessionId: string, correlationId: string): string;
+			updateRestart?: { phase: string };
+			assertSupervisorClaimCurrent(): Promise<string>;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		internals.supervisorClaims.set(client, { claim, ownerFingerprint: "owner-1" });
+		internals.assertSupervisorClaimCurrent = vi.fn(async () => "owner-1");
+		internals.updateRestart = { phase: "fencing" };
+		const command = {
+			id: "private-retry-1",
+			type: "submit_correlated_prompt",
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			correlationId: "correlation-1",
+			message: "private payload",
+			queueIfBusy: false,
+		};
+		internals.nonpersistentCorrelatedPromptRequests.set(
+			internals.correlatedPromptKey(command.activeSessionId, command.sessionId, command.correlationId),
+			{ message: command.message, images: undefined, queueIfBusy: command.queueIfBusy },
+		);
+
+		await internals.handleLine(client, JSON.stringify(command));
+		expect(internals.nonpersistentCorrelatedPromptRequests.size).toBe(1);
+		expect(internals.correlatedPromptSubmissions.size).toBe(0);
+
+		internals.updateRestart = undefined;
+		await internals.handleLine(client, JSON.stringify({ ...command, id: "private-retry-2" }));
+		const response = JSON.parse(String(write.mock.calls.at(-1)?.[0]).trim()) as {
+			success?: boolean;
+			data?: { duplicate?: boolean };
+		};
+		expect(response).toMatchObject({ success: true, data: { duplicate: true } });
+		expect(internals.nonpersistentCorrelatedPromptRequests.size).toBe(1);
 	});
 
 	it("clears prompt admission when restart fencing rejects before dispatch", async () => {
@@ -8128,7 +8536,7 @@ describe("daemon mode helpers", () => {
 				createRuntime: async () => {
 					throw new Error("unexpected runtime creation");
 				},
-				worker: { authenticationToken: "worker-token" },
+				worker: { authenticationToken: "worker-token", recoveryMode: "disabled" },
 			});
 			const client = makeClient("authenticated", "active-1");
 			client.authenticated = true;
@@ -9482,6 +9890,8 @@ function makeRuntimeSession(
 		getAvailableThinkingLevels: vi.fn(() => []),
 		scopedModels: [],
 		getActiveToolNames: vi.fn(() => []),
+		hasLoadedExtensions: vi.fn(() => false),
+		getAutonomousStatus: vi.fn(() => ({ enabled: false, gates: { commands: [] } })),
 		getContextUsage: vi.fn(() => undefined),
 		setSessionName: vi.fn((name: string) => sessionManager.appendSessionInfo(name)),
 		dispose: vi.fn(),

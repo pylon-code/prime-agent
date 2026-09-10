@@ -1,8 +1,18 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
 import { getLogger } from "@earendil-works/pi-ai";
@@ -60,7 +70,7 @@ import { SettingsManager } from "../../core/settings-manager.js";
 import { CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE } from "../../sdk-features.js";
 import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
-import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
+import { attachBoundedJsonlByteReader, attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
 import { createActiveSessionId, type DaemonSocketClient } from "./active-session-state.js";
 import {
@@ -133,8 +143,11 @@ import {
 } from "./daemon-supervisor-ownership.js";
 import { DaemonWorkerClient } from "./daemon-worker-client.js";
 import {
+	DAEMON_NONPERSISTENT_WORKER_MARKER,
+	DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX,
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_RECOVERY_MODE_ENV,
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
 	DAEMON_WORKER_STARTUP_GATE_FD_ENV,
@@ -172,6 +185,7 @@ import { createRlmLedgerRegistrySeedSource, RlmSpawnLedger } from "./rlm-ledger.
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import {
 	createSnapshotCacheProcessRoot,
+	NONPERSISTENT_SNAPSHOT_MEMORY_BYTES,
 	prepareSnapshotTranscriptCache,
 	SNAPSHOT_TARGET_CHUNK_BYTES,
 	SnapshotTranscriptCache,
@@ -187,6 +201,10 @@ const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const SNAPSHOT_ATTEMPT_TIMEOUT_MS = 30_000;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
+const MAX_DAEMON_INGRESS_BYTES = 64 * 1024 * 1024;
+const MAX_NONPERSISTENT_CREATE_REQUEST_BYTES = 1024 * 1024;
+const MAX_NONPERSISTENT_CREATE_RETAINED_BYTES = 8 * 1024 * 1024;
+const MAX_NONPERSISTENT_CREATE_RUNS = 32;
 
 function createPublicSnapshotTransferId(): string {
 	return `snapshot-${randomUUID()}`;
@@ -483,6 +501,8 @@ interface ResidentWorker {
 		promise: Promise<void>;
 	};
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
+	/** Exact physical owner transport for a nonpersistent worker; never persisted. */
+	nonpersistentOwnerClient?: DaemonSocketClient;
 	recoveryRecordId?: string;
 	recoverableAdoption?: RecoverableOwnedAdoption;
 	recoverableFinal?: RecoverableOwnedFinalReceipt;
@@ -584,6 +604,15 @@ interface SupervisorCorrelatedJournalRun {
 	resolve: (response: DaemonResponse) => void;
 }
 
+interface SupervisorNonpersistentCreateRun {
+	request: DaemonCreateCommand;
+	requestBytes: number;
+	activeSessionId?: string;
+	promise: Promise<DaemonResponse>;
+	resolve: (response: DaemonResponse) => void;
+	settled: boolean;
+}
+
 function correlatedCommandRequestIdentity(
 	command: Extract<DaemonCommand, { type: "submit_correlated_prompt" | "cancel_correlated_prompt" }>,
 ): string {
@@ -601,6 +630,12 @@ function correlatedCommandRequestIdentity(
 	]);
 }
 
+function commandRequestIdentity(command: DaemonCommand): string | undefined {
+	return command.type === "submit_correlated_prompt" || command.type === "cancel_correlated_prompt"
+		? correlatedCommandRequestIdentity(command)
+		: undefined;
+}
+
 interface SupervisorSessionInputPause {
 	owner: DaemonSocketClient;
 	worker: ResidentWorker;
@@ -610,6 +645,39 @@ interface SupervisorSessionInputPause {
 	pauseId: string;
 	releaseTask?: Promise<DaemonResponse>;
 }
+
+function isWorkerRecoveryModeMismatch(error: unknown): boolean {
+	return error instanceof Error && error.message === "worker_recovery_mode_mismatch";
+}
+
+const RECOVERABLE_OWNED_SESSION_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
+	"create_recoverable_owned_session",
+	"prepare_recoverable_owned_session_adoption",
+	"commit_recoverable_owned_session_adoption",
+	"confirm_recoverable_owned_session_adoption",
+]);
+
+const NONPERSISTENT_WORKER_FORBIDDEN_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
+	"new_session",
+	"switch_session",
+	"fork",
+	"import_jsonl",
+	"restore_next_turn",
+	"restore_actions",
+]);
+const NONPERSISTENT_SUPERVISOR_ALLOWED_TARGET_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
+	"attach",
+	"reattach",
+	"detach",
+	"complete_owned_session",
+	"get_owned_session_cleanup",
+	"promote_owned_session",
+	"retry_worker",
+	"abort",
+	"submit_correlated_prompt",
+	"cancel_correlated_prompt",
+	"get_prompt_lifecycles",
+]);
 
 function isCorrelationRetrySafeMutation(command: DaemonCommand): boolean {
 	return command.type === "submit_correlated_prompt" || command.type === "cancel_correlated_prompt";
@@ -624,6 +692,8 @@ class SupervisorRecoveryCancelledError extends Error {
 }
 
 class SnapshotLoadInvalidatedError extends Error {}
+
+class InvalidNonpersistentWorkerDescriptorError extends Error {}
 
 class WorkerStopTimeoutError extends Error {}
 
@@ -685,8 +755,36 @@ function withoutCommandId(command: DaemonCommand): DaemonCommandBody {
 }
 
 function withoutSupervisorCreateFields(command: DaemonCreateCommand): DaemonCreateCommand {
-	const { launchEnv: _launchEnv, launchEnvMode: _launchEnvMode, lifecycle: _lifecycle, ...workerCommand } = command;
+	const {
+		launchEnv: _launchEnv,
+		launchEnvMode: _launchEnvMode,
+		lifecycle: _lifecycle,
+		workerRecovery: _workerRecovery,
+		...workerCommand
+	} = command;
 	return workerCommand;
+}
+
+function assertWorkerRecoveryRequest(command: DaemonCreateCommand): void {
+	if (command.workerRecovery === undefined) return;
+	if (command.workerRecovery !== "disabled") {
+		throw new Error("Unsupported daemon worker recovery mode");
+	}
+	if (
+		command.lifecycle !== "client_owned" ||
+		command.noSession !== true ||
+		command.config?.noTools !== true ||
+		command.config.noExtensions !== true ||
+		(command.config.tools?.length ?? 0) !== 0 ||
+		(command.config.extensions?.length ?? 0) !== 0 ||
+		command.config.autonomous?.enabled === true ||
+		(command.config.autonomous?.gates?.commands?.length ?? 0) !== 0 ||
+		command.sessionPath !== undefined ||
+		(command.continueRecent !== undefined && typeof command.continueRecent !== "boolean") ||
+		command.continueRecent === true
+	) {
+		throw new Error("Disabled worker recovery requires a fresh client-owned session");
+	}
 }
 
 function prepareCallerOwnedCreateEnvironment(command: DaemonCreateCommand): DaemonCreateCommand {
@@ -714,13 +812,32 @@ function isSessionSummary(value: unknown): value is SessionSummary {
 	);
 }
 
+function nonpersistentWorkerMarkerPath(descriptorPath: string): string {
+	return `${descriptorPath}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`;
+}
+
+function nonpersistentWorkerMarkerState(descriptorPath: string): "absent" | "valid" | "invalid" {
+	const markerPath = nonpersistentWorkerMarkerPath(descriptorPath);
+	if (!existsSync(markerPath)) return "absent";
+	try {
+		return readFileSync(markerPath, "utf8") === DAEMON_NONPERSISTENT_WORKER_MARKER ? "valid" : "invalid";
+	} catch {
+		return "invalid";
+	}
+}
+
 function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is DaemonWorkerDescriptor {
 	if (!value || typeof value !== "object") {
 		return false;
 	}
 	const descriptor = value as Partial<DaemonWorkerDescriptor>;
 	return (
-		(descriptor.version === 1 || descriptor.version === 2) &&
+		(descriptor.version === 1 || descriptor.version === 2 || descriptor.version === 3) &&
+		(descriptor.version === 3
+			? descriptor.workerRecovery === "disabled" &&
+				typeof descriptor.ownerClientId === "string" &&
+				descriptor.recoveryJournalPath === undefined
+			: descriptor.workerRecovery === undefined) &&
 		typeof descriptor.supervisorSocketPath === "string" &&
 		normalizeSocketPath(descriptor.supervisorSocketPath) === socketPath &&
 		typeof descriptor.workerId === "string" &&
@@ -728,6 +845,8 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		(descriptor.pid ?? 0) > 0 &&
 		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string") &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
+		(descriptor.workerRecovery === undefined ||
+			(descriptor.workerRecovery === "disabled" && typeof descriptor.ownerClientId === "string")) &&
 		(descriptor.callerOwnedEnvironmentContract === undefined || descriptor.callerOwnedEnvironmentContract === true) &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
@@ -739,6 +858,35 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		typeof descriptor.createCommand === "object" &&
 		descriptor.createCommand.type === "create"
 	);
+}
+
+function normalizeDaemonWorkerDescriptor(
+	value: unknown,
+	socketPath: string,
+	descriptorPath: string,
+): DaemonWorkerDescriptor | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const candidate = value as Partial<DaemonWorkerDescriptor>;
+	const markerState = nonpersistentWorkerMarkerState(descriptorPath);
+	if (markerState === "valid") {
+		// The sidecar is independent recovery provenance. A downgraded or partially
+		// written descriptor is normalized only into a disabled stop tombstone; the
+		// loader never adopts or recovers a worker carrying this marker.
+		const containmentDescriptor = {
+			...candidate,
+			version: 3 as const,
+			workerRecovery: "disabled" as const,
+			recoveryJournalPath: undefined,
+		};
+		if (!isDaemonWorkerDescriptor(containmentDescriptor, socketPath)) {
+			throw new InvalidNonpersistentWorkerDescriptorError("Invalid nonpersistent daemon worker descriptor");
+		}
+		return containmentDescriptor;
+	}
+	if (markerState === "invalid" || candidate.version === 3 || candidate.workerRecovery !== undefined) {
+		throw new InvalidNonpersistentWorkerDescriptorError("Invalid nonpersistent daemon worker descriptor");
+	}
+	return isDaemonWorkerDescriptor(candidate, socketPath) ? candidate : undefined;
 }
 
 function sessionSummariesFromResponse(response: DaemonResponse): SessionSummary[] {
@@ -905,6 +1053,7 @@ export class DaemonSupervisor {
 	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
 	private readonly correlatedPromptReservations = new Map<string, SupervisorCorrelatedPromptReservation>();
 	private readonly correlatedJournalRuns = new Map<string, SupervisorCorrelatedJournalRun>();
+	private readonly nonpersistentCreateRuns = new Map<string, SupervisorNonpersistentCreateRun>();
 	private readonly sessionInputPauses = new Map<string, SupervisorSessionInputPause>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
 	private readonly descriptorDir: string;
@@ -1252,18 +1401,32 @@ export class DaemonSupervisor {
 
 	private loadWorkerDescriptors(): void {
 		for (const name of readdirSync(this.descriptorDir)) {
+			const path = join(this.descriptorDir, name);
+			if (
+				(name.endsWith(DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX) &&
+					!existsSync(path.slice(0, -DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX.length))) ||
+				name.endsWith(".tmp")
+			) {
+				this.removeWorkerCleanupFile(path);
+			}
+		}
+		for (const name of readdirSync(this.descriptorDir)) {
 			if (name === SUPERVISOR_CONFIG_FILE_NAME || !name.endsWith(".json")) {
 				continue;
 			}
 			const path = join(this.descriptorDir, name);
 			try {
-				const descriptor: unknown = JSON.parse(readFileSync(path, "utf8"));
-				if (!isDaemonWorkerDescriptor(descriptor, this.socketPath)) {
-					continue;
-				}
+				const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+				const descriptor = normalizeDaemonWorkerDescriptor(parsed, this.socketPath, path);
+				if (!descriptor) continue;
 				descriptor.supervisorSocketPath = normalizeSocketPath(descriptor.supervisorSocketPath);
-				descriptor.lifecycle = "recovering";
-				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
+				if (descriptor.workerRecovery === "disabled") {
+					descriptor.lifecycle = "stopping";
+					descriptor.stopRequestedAt ??= new Date().toISOString();
+				} else {
+					descriptor.lifecycle = "recovering";
+					descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
+				}
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
 				const durableDescriptor = durableDaemonWorkerDescriptor(descriptor);
 				const worker: ResidentWorker = {
@@ -1290,6 +1453,7 @@ export class DaemonSupervisor {
 					this.log(`Could not refresh worker descriptor ${path}: ${String(error)}`);
 				}
 			} catch (error) {
+				if (error instanceof InvalidNonpersistentWorkerDescriptorError) throw error;
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
 			}
 		}
@@ -1334,7 +1498,23 @@ export class DaemonSupervisor {
 		);
 	}
 
+	private persistNonpersistentWorkerMarker(descriptorPath: string): void {
+		const markerPath = nonpersistentWorkerMarkerPath(descriptorPath);
+		const markerState = nonpersistentWorkerMarkerState(descriptorPath);
+		if (markerState === "valid") return;
+		if (markerState === "invalid") throw new Error("Daemon worker recovery marker is invalid");
+		writeFileSync(markerPath, DAEMON_NONPERSISTENT_WORKER_MARKER, { encoding: "utf8", flag: "wx", mode: 0o600 });
+		chmodSync(markerPath, 0o600);
+	}
+
 	private persistWorker(worker: ResidentWorker): void {
+		const markerState = nonpersistentWorkerMarkerState(worker.descriptorPath);
+		if (
+			(worker.descriptor.workerRecovery === "disabled" && markerState !== "valid") ||
+			(worker.descriptor.workerRecovery !== "disabled" && markerState !== "absent")
+		) {
+			throw new Error("Daemon worker descriptor recovery provenance is inconsistent");
+		}
 		worker.descriptor.updatedAt = new Date().toISOString();
 		const persisted = durableDaemonWorkerDescriptor(worker.descriptor);
 		const tempPath = `${worker.descriptorPath}.${process.pid}.tmp`;
@@ -1359,13 +1539,21 @@ export class DaemonSupervisor {
 			// Ancillary journals are removed first. The descriptor is the durable
 			// registration and must remain present until every other cleanup step
 			// has succeeded and been verified.
-			this.removeWorkerCleanupFile(worker.descriptor.recoveryJournalPath);
+			this.removeWorkerCleanupFile(
+				worker.descriptor.recoveryJournalPath ??
+					join(this.descriptorDir, `${worker.descriptor.workerId}.recovery.jsonl`),
+			);
 			if (worker.descriptor.orphanProcessJournalPath) {
 				this.removeWorkerCleanupFile(worker.descriptor.orphanProcessJournalPath);
 			}
 			if (worker.recoverableAdoption) clearTimeout(worker.recoverableAdoption.timeout);
 			if (worker.recoveryConfirmationTimer) clearTimeout(worker.recoveryConfirmationTimer);
-			if (worker.recoveryRecordId) {
+			if (worker.descriptor.workerRecovery === "disabled") {
+				worker.recoveryRecordId = undefined;
+				worker.recoverableAdoption = undefined;
+				worker.recoverableFinal = undefined;
+				worker.recoveryConfirmationTimer = undefined;
+			} else if (worker.recoveryRecordId) {
 				const recordId = worker.recoveryRecordId;
 				let retained = false;
 				if (!this.shuttingDown) {
@@ -1399,7 +1587,26 @@ export class DaemonSupervisor {
 				}
 				worker.recoveryRecordId = undefined;
 			}
+			const descriptorDirectory = dirname(worker.descriptorPath);
+			const descriptorTempPrefix = `${basename(worker.descriptorPath)}.`;
+			if (existsSync(descriptorDirectory)) {
+				for (const name of readdirSync(descriptorDirectory)) {
+					if (name.startsWith(descriptorTempPrefix) && name.endsWith(".tmp")) {
+						this.removeWorkerCleanupFile(join(descriptorDirectory, name));
+					}
+				}
+			}
+			// Remove the authoritative descriptor before its provenance marker. If
+			// descriptor removal fails, the marker must remain so a finalizer can
+			// persist the stop tombstone and retry. If the process dies after the
+			// descriptor is gone, replacement startup removes the orphan marker.
 			this.removeWorkerCleanupFile(worker.descriptorPath);
+			this.removeWorkerCleanupFile(nonpersistentWorkerMarkerPath(worker.descriptorPath));
+			for (const [key, run] of this.nonpersistentCreateRuns ?? []) {
+				if (run.activeSessionId === worker.descriptor.rootActiveSessionId) {
+					this.nonpersistentCreateRuns.delete(key);
+				}
+			}
 		} catch (error) {
 			this.log(`Failed to remove worker descriptor ${worker.descriptorPath}: ${String(error)}`);
 			throw new Error("Worker cleanup could not verify durable registration removal");
@@ -1487,7 +1694,10 @@ export class DaemonSupervisor {
 			() => client.socket.destroy(),
 		);
 
-		client.detachInput = attachJsonlLineReader(socket, (line) => void this.handleLine(client, line));
+		client.detachInput = attachBoundedJsonlByteReader(socket, (line) => void this.handleLine(client, line), {
+			maxFrameBytes: MAX_DAEMON_INGRESS_BYTES,
+			onFrameTooLarge: () => socket.destroy(new Error("Daemon inbound frame exceeded the configured limit")),
+		});
 		let cleaned = false;
 		const cleanup = () => {
 			if (cleaned) {
@@ -1513,6 +1723,9 @@ export class DaemonSupervisor {
 				if (worker.recoverableAdoption?.client === client) {
 					this.rollbackRecoverableOwnedAdoption(worker, worker.recoverableAdoption);
 				}
+				if (worker.descriptor.workerRecovery === "disabled" && worker.nonpersistentOwnerClient === client) {
+					void this.retireNonpersistentWorker(worker);
+				}
 			}
 			this.scheduleOwnedWorkerCleanupForClient(this.protocolClientId(client));
 		};
@@ -1536,6 +1749,48 @@ export class DaemonSupervisor {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
 		}
+	}
+
+	private commandTargetsNonpersistentWorker(command: DaemonCommand): boolean {
+		const routed = command as DaemonCommand & {
+			activeSessionId?: unknown;
+			targetActiveSessionId?: unknown;
+			fromActiveSessionId?: unknown;
+		};
+		const selectors = [routed.activeSessionId, routed.targetActiveSessionId, routed.fromActiveSessionId].filter(
+			(selector): selector is string => typeof selector === "string",
+		);
+		const workers = Reflect.get(this, "workers") as Map<string, ResidentWorker> | undefined;
+		if (!workers || selectors.length === 0) return false;
+		for (const worker of workers.values()) {
+			if (worker.descriptor?.workerRecovery !== "disabled" || !worker.summaries?.values) continue;
+			for (const summary of worker.summaries.values()) {
+				const activeSessionId = summary.activeSessionId ?? summary.id;
+				if (
+					selectors.some(
+						(selector) =>
+							activeSessionId === selector ||
+							summary.sessionId === selector ||
+							summary.sessionName === selector ||
+							matchesSessionIdSuffix(activeSessionId, selector) ||
+							matchesSessionIdSuffix(summary.sessionId, selector),
+					)
+				) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private shouldPersistCommand(command: DaemonCommand): boolean {
+		if (command.type === "create" && command.workerRecovery === "disabled") return false;
+		if (this.commandTargetsNonpersistentWorker(command)) return false;
+		if (command.type !== "submit_correlated_prompt" && command.type !== "cancel_correlated_prompt") {
+			return true;
+		}
+		const matches = this.matchWorkers(command.activeSessionId);
+		return matches.length === 1;
 	}
 
 	private protocolClientId(client: DaemonSocketClient): string {
@@ -1611,7 +1866,13 @@ export class DaemonSupervisor {
 	private restoreRecoverableOwnedConnection(client: DaemonSocketClient): void {
 		const clientId = this.protocolClientId(client);
 		for (const worker of this.workers.values()) {
-			if (worker.descriptor.ownerClientId !== clientId || !worker.recoveryRecordId) continue;
+			if (
+				worker.descriptor.workerRecovery === "disabled" ||
+				worker.descriptor.ownerClientId !== clientId ||
+				!worker.recoveryRecordId
+			) {
+				continue;
+			}
 			const receipt = this.ownedSessionRecoveryStore.get(worker.recoveryRecordId);
 			if (!receipt || receipt.phase === "final") continue;
 			const summary = worker.summaries.get(receipt.authority.activeSessionId);
@@ -1648,6 +1909,19 @@ export class DaemonSupervisor {
 	}
 
 	private scheduleOwnedWorkerCleanup(worker: ResidentWorker): void {
+		if (worker.descriptor.workerRecovery === "disabled") {
+			if (worker.recoverableAdoption) clearTimeout(worker.recoverableAdoption.timeout);
+			if (worker.recoveryConfirmationTimer) clearTimeout(worker.recoveryConfirmationTimer);
+			worker.recoveryRecordId = undefined;
+			worker.recoverableAdoption = undefined;
+			worker.recoverableFinal = undefined;
+			worker.recoveryConfirmationTimer = undefined;
+		}
+		if (worker.descriptor.workerRecovery === "disabled") {
+			if (worker.nonpersistentOwnerClient && this.clients.has(worker.nonpersistentOwnerClient)) return;
+			void this.retireNonpersistentWorker(worker);
+			return;
+		}
 		if (worker.recoveryRecordId) {
 			this.scheduleRecoverableOwnedWorkerCleanup(worker);
 			return;
@@ -1677,6 +1951,13 @@ export class DaemonSupervisor {
 	}
 
 	private scheduleRecoverableOwnedWorkerCleanup(worker: ResidentWorker, force = false): void {
+		if (worker.descriptor.workerRecovery === "disabled") {
+			worker.recoveryRecordId = undefined;
+			worker.recoverableAdoption = undefined;
+			worker.recoverableFinal = undefined;
+			this.scheduleOwnedWorkerCleanup(worker);
+			return;
+		}
 		const ownerClientId = worker.descriptor.ownerClientId;
 		const recordId = worker.recoveryRecordId;
 		if (
@@ -1922,6 +2203,18 @@ export class DaemonSupervisor {
 		const command = preParsed.command;
 		const parsedAdmission = preParsed.admission;
 		const correlatedOrder = preParsed.correlatedOrder;
+		if (
+			RECOVERABLE_OWNED_SESSION_COMMANDS.has(command.type) &&
+			(command as DaemonCommand & { workerRecovery?: unknown }).workerRecovery !== undefined
+		) {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			correlatedOrder?.release();
+			this.write(
+				client,
+				recoverableOwnedCommandFailure(command.id, command.type, OWNED_SESSION_ADOPTION_UNAVAILABLE),
+			);
+			return;
+		}
 		if (command.type === "cancel_prompt_admission" && this.updateRestartPhase !== undefined) {
 			this.write(
 				client,
@@ -2022,17 +2315,89 @@ export class DaemonSupervisor {
 			return;
 		}
 
+		let nonpersistentCreateRequest: DaemonCreateCommand | undefined;
+		let nonpersistentCreateRequestBytes: number | undefined;
+		if (command.type === "create") {
+			try {
+				assertWorkerRecoveryRequest(command);
+				if (command.workerRecovery === "disabled") {
+					nonpersistentCreateRequestBytes = Buffer.byteLength(line, "utf8");
+					if (nonpersistentCreateRequestBytes > MAX_NONPERSISTENT_CREATE_REQUEST_BYTES) {
+						throw new Error("Nonpersistent daemon command was invalid");
+					}
+					nonpersistentCreateRequest = structuredClone(command) as DaemonCreateCommand;
+				}
+			} catch (error) {
+				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+				correlatedOrder?.release();
+				this.write(client, failure(command.id, command.type, error));
+				return;
+			}
+		}
+
+		let nonpersistentCreateRun: (SupervisorNonpersistentCreateRun & { key: string }) | undefined;
+		let nonpersistentCreateKey: string | undefined;
+		if (nonpersistentCreateRequest && envelopeClientId && command.id) {
+			const key = createCommandIdempotencyKey(envelopeClientId, command.id);
+			if (this.commandJournal.lookup(envelopeClientId, command.id)) {
+				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+				correlatedOrder?.release();
+				this.write(
+					client,
+					failure(command.id, command.type, "Nonpersistent daemon worker command id is already in use"),
+				);
+				return;
+			}
+			const inFlight = this.nonpersistentCreateRuns.get(key);
+			if (inFlight) {
+				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+				correlatedOrder?.release();
+				if (!isDeepStrictEqual(inFlight.request, nonpersistentCreateRequest)) {
+					this.write(
+						client,
+						failure(
+							command.id,
+							command.type,
+							"Nonpersistent daemon worker command id was reused with a different request",
+						),
+					);
+					return;
+				}
+				this.write(
+					client,
+					this.replayCreateResponse(client, command as DaemonCreateCommand, await inFlight.promise),
+				);
+				return;
+			}
+			nonpersistentCreateKey = key;
+		}
+
 		const mutation = isDaemonMutatingCommand(command);
+		const persistCommand = this.shouldPersistCommand(command);
+		const nondurableCorrelatedCommand =
+			!persistCommand &&
+			(command.type === "submit_correlated_prompt" || command.type === "cancel_correlated_prompt");
 		const journalIdentity =
-			envelopeClientId && command.id && mutation && commandRecoveryJournalAllows(command.type)
+			envelopeClientId && command.id && mutation && persistCommand && commandRecoveryJournalAllows(command.type)
 				? { clientId: envelopeClientId, commandId: command.id }
 				: undefined;
-		const correlatedRequestIdentity =
-			command.type === "submit_correlated_prompt" || command.type === "cancel_correlated_prompt"
-				? correlatedCommandRequestIdentity(command)
-				: undefined;
+		const requestIdentity = journalIdentity ? commandRequestIdentity(command) : undefined;
+		if (
+			journalIdentity &&
+			this.nonpersistentCreateRuns?.has(
+				createCommandIdempotencyKey(journalIdentity.clientId, journalIdentity.commandId),
+			)
+		) {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			correlatedOrder?.release();
+			this.write(
+				client,
+				failure(command.id, command.type, "Nonpersistent daemon worker command id is already in use"),
+			);
+			return;
+		}
 		const existing = journalIdentity
-			? this.commandJournal.lookup(journalIdentity.clientId, journalIdentity.commandId, correlatedRequestIdentity)
+			? this.commandJournal.lookup(journalIdentity.clientId, journalIdentity.commandId, requestIdentity)
 			: undefined;
 		if (existing?.status === "conflict") {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
@@ -2050,7 +2415,12 @@ export class DaemonSupervisor {
 		if (existing?.status === "complete") {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			correlatedOrder?.release();
-			this.write(client, existing.response);
+			this.write(
+				client,
+				command.type === "create"
+					? this.replayCreateResponse(client, command, existing.response)
+					: existing.response,
+			);
 			return;
 		}
 		if (existing?.status === "pending" && journalIdentity && !isCorrelationRetrySafeMutation(command)) {
@@ -2080,12 +2450,43 @@ export class DaemonSupervisor {
 			);
 			return;
 		}
+		if (nonpersistentCreateKey && nonpersistentCreateRequest && nonpersistentCreateRequestBytes !== undefined) {
+			const retainedBytes = [...this.nonpersistentCreateRuns.values()].reduce(
+				(total, run) => total + run.requestBytes,
+				0,
+			);
+			if (
+				this.nonpersistentCreateRuns.size >= MAX_NONPERSISTENT_CREATE_RUNS ||
+				retainedBytes > MAX_NONPERSISTENT_CREATE_RETAINED_BYTES - nonpersistentCreateRequestBytes
+			) {
+				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+				correlatedOrder?.release();
+				this.write(
+					client,
+					failure(command.id, command.type, "Too many unacknowledged nonpersistent daemon worker creates"),
+				);
+				return;
+			}
+			let resolveRun = (_response: DaemonResponse) => {};
+			const promise = new Promise<DaemonResponse>((resolve) => {
+				resolveRun = resolve;
+			});
+			nonpersistentCreateRun = {
+				key: nonpersistentCreateKey,
+				request: nonpersistentCreateRequest,
+				requestBytes: nonpersistentCreateRequestBytes,
+				promise,
+				resolve: resolveRun,
+				settled: false,
+			};
+			this.nonpersistentCreateRuns.set(nonpersistentCreateKey, nonpersistentCreateRun);
+		}
 		if (journalIdentity) {
 			const admitted = this.commandJournal.begin(
 				journalIdentity.clientId,
 				journalIdentity.commandId,
 				command.type,
-				correlatedRequestIdentity,
+				requestIdentity,
 			);
 			if (admitted.status === "conflict") {
 				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
@@ -2103,7 +2504,12 @@ export class DaemonSupervisor {
 			if (admitted.status === "complete") {
 				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 				correlatedOrder?.release();
-				this.write(client, admitted.response);
+				this.write(
+					client,
+					command.type === "create"
+						? this.replayCreateResponse(client, command, admitted.response)
+						: admitted.response,
+				);
 				return;
 			}
 			if (admitted.status === "pending" && !isCorrelationRetrySafeMutation(command)) {
@@ -2126,12 +2532,12 @@ export class DaemonSupervisor {
 			(command.type === "submit_correlated_prompt" || command.type === "cancel_correlated_prompt")
 		) {
 			const key = `${journalIdentity.clientId} ${journalIdentity.commandId}`;
-			const requestIdentity = correlatedRequestIdentity!;
+			const correlatedIdentity = requestIdentity!;
 			const inFlight = this.correlatedJournalRuns.get(key);
 			if (inFlight) {
 				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 				correlatedOrder?.release();
-				if (inFlight.requestIdentity !== requestIdentity) {
+				if (inFlight.requestIdentity !== correlatedIdentity) {
 					this.write(
 						client,
 						recoverableOwnedCommandFailure(
@@ -2149,7 +2555,13 @@ export class DaemonSupervisor {
 			const promise = new Promise<DaemonResponse>((resolve) => {
 				resolveRun = resolve;
 			});
-			correlatedJournalRun = { key, requestIdentity, promise, resolve: resolveRun, settled: false };
+			correlatedJournalRun = {
+				key,
+				requestIdentity: correlatedIdentity,
+				promise,
+				resolve: resolveRun,
+				settled: false,
+			};
 			this.correlatedJournalRuns.set(key, correlatedJournalRun);
 		}
 
@@ -2164,8 +2576,11 @@ export class DaemonSupervisor {
 		if (tracksMutation) this.mutationDrain.begin();
 		try {
 			await correlatedOrder?.previous;
-			const response = await this.handleCommand(client, command, cancellationAdmission, correlatedOrder);
+			let response = await this.handleCommand(client, command, cancellationAdmission, correlatedOrder);
 			if (response) {
+				if (command.type === "create") {
+					response = this.replayCreateResponse(client, command, response);
+				}
 				if (journalIdentity) {
 					await this.assertCurrentOwnership();
 					this.commandJournal.recordResult(journalIdentity.clientId, journalIdentity.commandId, response);
@@ -2174,11 +2589,37 @@ export class DaemonSupervisor {
 					correlatedJournalRun.settled = true;
 					correlatedJournalRun.resolve(response);
 				}
+				if (nonpersistentCreateRun) {
+					if (response.success && isSessionSummary(response.data)) {
+						nonpersistentCreateRun.activeSessionId = response.data.activeSessionId ?? response.data.id;
+					} else if (this.nonpersistentCreateRuns.get(nonpersistentCreateRun.key) === nonpersistentCreateRun) {
+						this.nonpersistentCreateRuns.delete(nonpersistentCreateRun.key);
+					}
+					nonpersistentCreateRun.settled = true;
+					nonpersistentCreateRun.resolve(response);
+				}
 				this.write(client, response);
 			}
 		} catch (error) {
-			this.log(`Supervisor command ${command.type} failed: ${error instanceof Error ? error.stack : String(error)}`);
-			let response = recoverableOwnedCommandFailure(command.id, command.type, error);
+			if (nondurableCorrelatedCommand || nonpersistentCreateRequest) {
+				this.log(`Nonpersistent supervisor command ${command.type} failed`);
+			} else {
+				this.log(
+					`Supervisor command ${command.type} failed: ${error instanceof Error ? error.stack : String(error)}`,
+				);
+			}
+			let response = nondurableCorrelatedCommand
+				? failure(command.id, command.type, "Nonpersistent correlated command failed")
+				: nonpersistentCreateRequest
+					? failure(
+							command.id,
+							command.type,
+							error instanceof Error &&
+								error.message === "Nonpersistent daemon worker create proof is unavailable"
+								? error.message
+								: "Nonpersistent daemon worker create failed",
+						)
+					: recoverableOwnedCommandFailure(command.id, command.type, error);
 			if (journalIdentity && !isSupervisorGenerationStale(error)) {
 				try {
 					await this.assertCurrentOwnership();
@@ -2191,9 +2632,25 @@ export class DaemonSupervisor {
 				correlatedJournalRun.settled = true;
 				correlatedJournalRun.resolve(response);
 			}
+			if (nonpersistentCreateRun) {
+				if (this.nonpersistentCreateRuns.get(nonpersistentCreateRun.key) === nonpersistentCreateRun) {
+					this.nonpersistentCreateRuns.delete(nonpersistentCreateRun.key);
+				}
+				nonpersistentCreateRun.settled = true;
+				nonpersistentCreateRun.resolve(response);
+			}
 			this.write(client, response);
 		} finally {
 			correlatedOrder?.release();
+			if (nonpersistentCreateRun && !nonpersistentCreateRun.settled) {
+				if (this.nonpersistentCreateRuns.get(nonpersistentCreateRun.key) === nonpersistentCreateRun) {
+					this.nonpersistentCreateRuns.delete(nonpersistentCreateRun.key);
+				}
+				nonpersistentCreateRun.settled = true;
+				nonpersistentCreateRun.resolve(
+					failure(command.id, command.type, "Nonpersistent daemon worker create failed"),
+				);
+			}
 			if (correlatedJournalRun) {
 				if (!correlatedJournalRun.settled) {
 					correlatedJournalRun.resolve(
@@ -2214,6 +2671,12 @@ export class DaemonSupervisor {
 		cancellationAdmission?: SupervisorPromptAdmission,
 		correlatedOrder?: SupervisorCorrelatedCommandOrder,
 	): Promise<DaemonResponse | undefined> {
+		if (
+			this.commandTargetsNonpersistentWorker(command) &&
+			!NONPERSISTENT_SUPERVISOR_ALLOWED_TARGET_COMMANDS.has(command.type)
+		) {
+			throw new Error(`Command ${command.type} is unavailable for a nonpersistent daemon worker`);
+		}
 		switch (command.type) {
 			case "cancel_prompt_admission": {
 				const admission =
@@ -2247,6 +2710,9 @@ export class DaemonSupervisor {
 			}
 			case "ack_result":
 				this.commandJournal.acknowledge(client.id, command.commandId);
+				this.nonpersistentCreateRuns?.delete(
+					createCommandIdempotencyKey(this.protocolClientId(client), command.commandId),
+				);
 				return undefined;
 			case "list":
 				return this.handleList(client, command);
@@ -2312,32 +2778,49 @@ export class DaemonSupervisor {
 				}
 			}
 			case "create": {
+				assertWorkerRecoveryRequest(command);
 				const createCommand = prepareCallerOwnedCreateEnvironment(command);
-				const worker = await this.createOrReuseWorker(this.protocolClientId(client), createCommand);
-				// The owner may disconnect while creation is waiting for daemon readiness,
-				// process launch, or session materialization. Re-evaluate ownership only
-				// after the worker is registered so the disconnect edge cannot be missed.
-				this.scheduleOwnedWorkerCleanup(worker);
-				const requestedSummary = createCommand.sessionPath
-					? this.findSummaryInWorker(worker, createCommand.sessionPath)
-					: undefined;
-				if (
-					requestedSummary &&
-					(requestedSummary.activeSessionId ?? requestedSummary.id) !== worker.descriptor.rootActiveSessionId
-				) {
-					// A create forwarded to a recovering worker still surfaces an opaque lifecycle error.
-					const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(createCommand));
-					if (response.success && isSessionSummary(response.data)) {
-						await this.refreshWorkerSummaries(worker);
-						return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
+				const worker =
+					createCommand.workerRecovery === "disabled"
+						? await this.createOrReuseWorker(this.protocolClientId(client), createCommand, undefined, client)
+						: await this.createOrReuseWorker(this.protocolClientId(client), createCommand);
+				try {
+					if (createCommand.workerRecovery === "disabled") {
+						if (worker.nonpersistentOwnerClient && worker.nonpersistentOwnerClient !== client) {
+							throw new Error("Nonpersistent daemon worker create result is uncertain");
+						}
+						worker.nonpersistentOwnerClient = client;
 					}
-					return responseWithId(response, command.id);
+					// The owner may disconnect while creation is waiting for daemon readiness,
+					// process launch, or session materialization. Re-evaluate ownership only
+					// after the worker is registered so the disconnect edge cannot be missed.
+					this.scheduleOwnedWorkerCleanup(worker);
+					const requestedSummary = createCommand.sessionPath
+						? this.findSummaryInWorker(worker, createCommand.sessionPath)
+						: undefined;
+					if (
+						requestedSummary &&
+						(requestedSummary.activeSessionId ?? requestedSummary.id) !== worker.descriptor.rootActiveSessionId
+					) {
+						// A create forwarded to a recovering worker still surfaces an opaque lifecycle error.
+						const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(createCommand));
+						if (response.success && isSessionSummary(response.data)) {
+							await this.refreshWorkerSummaries(worker);
+							return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
+						}
+						return responseWithId(response, command.id);
+					}
+					const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
+					if (!summary) {
+						throw new Error("Session worker started without a root session");
+					}
+					return success(command.id, "create", this.createResponseSummary(client, createCommand, worker, summary));
+				} catch (error) {
+					if (createCommand.workerRecovery === "disabled") {
+						await this.retireNonpersistentWorker(worker);
+					}
+					throw error;
 				}
-				const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
-				if (!summary) {
-					throw new Error("Session worker started without a root session");
-				}
-				return success(command.id, "create", this.publicSummary(worker, summary));
 			}
 			case "attach": {
 				if (
@@ -2346,6 +2829,8 @@ export class DaemonSupervisor {
 				) {
 					throw new OwnedSessionAdoptionUnavailableError();
 				}
+				const target = await this.findWorkerForClient(client, command.activeSessionId);
+				this.assertNonpersistentWorkerAttachable(target.worker, client);
 				const attachmentEpoch = this.advanceAttachmentEpoch(client, command.activeSessionId);
 				const requestedCapabilities = normalizeCapabilities(command.capabilities, command.supportsExtensionUi);
 				let releaseSnapshotReservation = requestedCapabilities.has("chunked_snapshot")
@@ -2355,6 +2840,7 @@ export class DaemonSupervisor {
 					const attached = await this.attachClient(client, command, {
 						selector: command.activeSessionId,
 						epoch: attachmentEpoch,
+						match: target,
 					});
 					if (client.capabilities.has("chunked_snapshot")) {
 						if (releaseSnapshotReservation) {
@@ -2401,6 +2887,7 @@ export class DaemonSupervisor {
 			}
 			case "reattach": {
 				const target = await this.findWorkerForClient(client, command.targetActiveSessionId);
+				this.assertNonpersistentWorkerAttachable(target.worker, client);
 				const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
 				if (targetActiveSessionId === command.activeSessionId) {
 					const detachingSessions = this.detachingInputPauseSessions?.get(client);
@@ -2421,7 +2908,7 @@ export class DaemonSupervisor {
 							type: "attach",
 							activeSessionId: targetActiveSessionId,
 						},
-						{ selector: targetActiveSessionId, epoch: attachmentEpoch },
+						{ selector: targetActiveSessionId, epoch: attachmentEpoch, match: target },
 					);
 					const detachingSessions = this.detachingInputPauseSessions?.get(client);
 					detachingSessions?.delete(command.activeSessionId);
@@ -2583,6 +3070,9 @@ export class DaemonSupervisor {
 			}
 			case "promote_owned_session": {
 				const match = await this.findWorkerForClient(client, command.activeSessionId);
+				if (match.worker.descriptor.workerRecovery === "disabled") {
+					throw new Error("A nonpersistent daemon worker cannot become resident");
+				}
 				await this.promoteOwnedWorker(client, match.worker);
 				return success(command.id, command.type, this.publicSummary(match.worker, match.summary));
 			}
@@ -2594,6 +3084,9 @@ export class DaemonSupervisor {
 				);
 				const worker = direct ?? (await this.findWorkerForClient(client, command.activeSessionId)).worker;
 				this.assertWorkerAccessibleToClient(client, worker, command.activeSessionId);
+				if (worker.descriptor.workerRecovery === "disabled") {
+					throw new Error("A nonpersistent daemon worker cannot be retried");
+				}
 				if ((this.workerStopCounts?.get(worker) ?? 0) > 0) {
 					throw new Error("Session worker is stopping; retry after it finishes");
 				}
@@ -2618,6 +3111,9 @@ export class DaemonSupervisor {
 				void this.shutdown(0, true, false, command.force === true, "shutdown");
 				return success(command.id, "shutdown");
 			case "prepare_update_restart": {
+				if ([...this.workers.values()].some((worker) => worker.descriptor.workerRecovery === "disabled")) {
+					throw new Error("Update restart is unavailable while a nonpersistent daemon worker exists");
+				}
 				const manifest = await this.prepareUpdateRestart();
 				return success(command.id, "prepare_update_restart", manifest);
 			}
@@ -2932,6 +3428,23 @@ export class DaemonSupervisor {
 			);
 			throwIfAdmissionCancelled(admission);
 			if (
+				match.worker.descriptor.workerRecovery === "disabled" &&
+				NONPERSISTENT_WORKER_FORBIDDEN_COMMANDS.has(command.type)
+			) {
+				throw new Error(`Command ${command.type} is unavailable for a nonpersistent daemon worker`);
+			}
+			if (
+				match.worker.descriptor.workerRecovery === "disabled" &&
+				command.type === "submit_correlated_prompt" &&
+				(Buffer.byteLength(command.message, "utf8") === 0 ||
+					Buffer.byteLength(command.message, "utf8") > 8 * 1024 ||
+					command.message.startsWith("/") ||
+					(command.images !== undefined && (!Array.isArray(command.images) || command.images.length !== 0)) ||
+					(command.queueIfBusy !== undefined && typeof command.queueIfBusy !== "boolean"))
+			) {
+				throw new Error("Nonpersistent correlated command failed");
+			}
+			if (
 				(command.type === "submit_correlated_prompt" ||
 					command.type === "cancel_correlated_prompt" ||
 					command.type === "get_prompt_lifecycles") &&
@@ -3099,6 +3612,7 @@ export class DaemonSupervisor {
 	): Promise<DaemonRecoverableOwnedSessionCreateResult> {
 		this.assertRecoverableOwnedSessionPlatform();
 		if (
+			(command as typeof command & { workerRecovery?: unknown }).workerRecovery !== undefined ||
 			command.expectedSupervisorGeneration !== this.generation ||
 			!isDaemonRecoveryRequestId(command.requestId) ||
 			!command.correlationId ||
@@ -3140,6 +3654,7 @@ export class DaemonSupervisor {
 			const summary = worker?.summaries.get(existing.authority.activeSessionId);
 			if (
 				!worker ||
+				worker.descriptor.workerRecovery === "disabled" ||
 				!summary ||
 				worker.recoveryRecordId !== existing.recordId ||
 				worker.workerIncarnation !== existing.authority.workerIncarnation ||
@@ -3199,7 +3714,9 @@ export class DaemonSupervisor {
 					createCommand,
 					(launched) => (launchedWorker = launched),
 				);
-				if (worker.recoveryRecordId !== undefined) throw new OwnedSessionAdoptionUnavailableError();
+				if (worker.descriptor.workerRecovery === "disabled" || worker.recoveryRecordId !== undefined) {
+					throw new OwnedSessionAdoptionUnavailableError();
+				}
 				const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
 				if (!summary) throw new OwnedSessionAdoptionUnavailableError();
 				const activeSessionId = summary.activeSessionId ?? summary.id;
@@ -3284,6 +3801,7 @@ export class DaemonSupervisor {
 	): Promise<DaemonRecoverableOwnedSessionPrepareResult> {
 		this.assertRecoverableOwnedSessionPlatform();
 		if (
+			(command as typeof command & { workerRecovery?: unknown }).workerRecovery !== undefined ||
 			!isDaemonRecoveryRequestId(command.requestId) ||
 			!command.capabilities.includes("event_sequence") ||
 			!command.capabilities.includes("attach_snapshot") ||
@@ -3306,6 +3824,7 @@ export class DaemonSupervisor {
 		const candidateWorker = this.workers.get(candidateReceipt.authority.workerId);
 		if (
 			!candidateWorker ||
+			candidateWorker.descriptor.workerRecovery === "disabled" ||
 			candidateWorker.recoveryRecordId !== candidateReceipt.recordId ||
 			candidateWorker.workerIncarnation !== candidateReceipt.authority.workerIncarnation ||
 			!candidateWorker.client?.matchesAuthenticatedIncarnation(candidateReceipt.authority.workerIncarnation)
@@ -3364,6 +3883,7 @@ export class DaemonSupervisor {
 		const worker = this.workers.get(receipt.authority.workerId);
 		if (
 			!worker ||
+			worker.descriptor.workerRecovery === "disabled" ||
 			worker !== candidateWorker ||
 			worker.recoveryRecordId !== receipt.recordId ||
 			worker.workerIncarnation !== receipt.authority.workerIncarnation ||
@@ -3437,6 +3957,7 @@ export class DaemonSupervisor {
 				);
 				if (
 					Date.now() >= prepareDeadline ||
+					worker.descriptor.workerRecovery === "disabled" ||
 					worker.recoverableAdoption !== adoption ||
 					worker.client !== workerClient ||
 					worker.workerIncarnation !== receipt.authority.workerIncarnation ||
@@ -3475,6 +3996,7 @@ export class DaemonSupervisor {
 		finalReceipt: RecoverableOwnedFinalReceipt | undefined,
 	): Promise<DaemonRecoverableOwnedSessionPrepareResult> {
 		if (
+			worker.descriptor.workerRecovery === "disabled" ||
 			!finalReceipt ||
 			finalReceipt.recordId !== receipt.recordId ||
 			finalReceipt.requestIdDigest !== requestIdDigest ||
@@ -3537,6 +4059,7 @@ export class DaemonSupervisor {
 				);
 				if (
 					Date.now() >= prepareDeadline ||
+					worker.descriptor.workerRecovery === "disabled" ||
 					worker.recoverableAdoption !== adoption ||
 					worker.client !== workerClient ||
 					worker.workerIncarnation !== workerIncarnation ||
@@ -3622,6 +4145,7 @@ export class DaemonSupervisor {
 		command: Extract<DaemonCommand, { type: "prepare_recoverable_owned_session_adoption" }>,
 		prepareDeadline: number,
 	): Promise<DaemonRecoverableOwnedSessionPrepareResult> {
+		if (worker.descriptor.workerRecovery === "disabled") throw new OwnedSessionAdoptionUnavailableError();
 		const response = await this.requireAvailableWorkerClient(worker).request(
 			{
 				type: "attach",
@@ -3687,6 +4211,7 @@ export class DaemonSupervisor {
 		client: DaemonSocketClient,
 	): void {
 		if (
+			worker.descriptor.workerRecovery === "disabled" ||
 			this.workers.get(worker.descriptor.workerId) !== worker ||
 			worker.recoverableAdoption !== adoption ||
 			adoption.client !== client ||
@@ -3739,6 +4264,7 @@ export class DaemonSupervisor {
 		previousOwnerId: string,
 		nextOwnerId: string,
 	): Promise<DaemonWorkerAcpMcpOwnerTransferProof> {
+		if (worker.descriptor.workerRecovery === "disabled") throw new OwnedSessionAdoptionUnavailableError();
 		const response = await this.requireAvailableWorkerClient(worker).requestWorker(
 			{
 				type: "worker_transfer_acp_mcp_owner",
@@ -3766,6 +4292,7 @@ export class DaemonSupervisor {
 		previousOwnerId: string,
 		nextOwnerId: string,
 	): Promise<void> {
+		if (worker.descriptor.workerRecovery === "disabled") throw new OwnedSessionAdoptionUnavailableError();
 		const response = await this.requireAvailableWorkerClient(worker).requestWorker(
 			{
 				type: "worker_transfer_acp_mcp_owner",
@@ -3871,6 +4398,7 @@ export class DaemonSupervisor {
 	): Promise<DaemonRecoverableOwnedSessionAdoptionProof> {
 		this.assertRecoverableOwnedSessionPlatform();
 		if (
+			(command as typeof command & { workerRecovery?: unknown }).workerRecovery !== undefined ||
 			command.expectedSupervisorGeneration !== this.generation ||
 			!isDaemonRecoveryRequestId(command.requestId) ||
 			command.proof.supervisorGeneration !== command.expectedSupervisorGeneration
@@ -3884,6 +4412,7 @@ export class DaemonSupervisor {
 		const adoptionMatches = [...this.workers.values()].filter((candidate) => {
 			const reserved = candidate.recoverableAdoption;
 			return (
+				candidate.descriptor.workerRecovery !== "disabled" &&
 				reserved?.client === client &&
 				reserved.requestIdDigest === requestIdDigest &&
 				reserved.result?.recoveryHandle === command.recoveryHandle &&
@@ -3893,6 +4422,7 @@ export class DaemonSupervisor {
 		const committedMatches = [...this.workers.values()].filter((candidate) => {
 			const final = candidate.recoverableFinal;
 			return (
+				candidate.descriptor.workerRecovery !== "disabled" &&
 				final?.ownerClientId === this.protocolClientId(client) &&
 				final.requestIdDigest === requestIdDigest &&
 				final.result.recoveryHandle === command.recoveryHandle &&
@@ -4083,6 +4613,7 @@ export class DaemonSupervisor {
 	): Promise<DaemonRecoverableOwnedSessionConfirmResult> {
 		this.assertRecoverableOwnedSessionPlatform();
 		if (
+			(command as typeof command & { workerRecovery?: unknown }).workerRecovery !== undefined ||
 			!isDaemonRecoveryRequestId(command.requestId) ||
 			command.expectedSupervisorGeneration !== this.generation ||
 			command.proof.supervisorGeneration !== command.expectedSupervisorGeneration
@@ -4094,7 +4625,11 @@ export class DaemonSupervisor {
 			requestId: command.requestId,
 		});
 		const receipt = this.ownedSessionRecoveryStore.getForConfirmation(command.recoveryHandle, requestIdDigest);
+		const worker = this.workers.get(receipt.authority.workerId);
 		if (
+			!worker ||
+			worker.descriptor.workerRecovery === "disabled" ||
+			worker.recoveryRecordId !== receipt.recordId ||
 			receipt.ownershipGeneration !== command.proof.ownershipGeneration ||
 			command.proof.supervisorGeneration !== this.generation ||
 			command.proof.sessionId !== receipt.authority.sessionId ||
@@ -4110,9 +4645,7 @@ export class DaemonSupervisor {
 			authorityDigest: this.recoverableAuthorityDigest(receipt.authority),
 			expiresAt: RECOVERABLE_OWNED_CONNECTED_EXPIRY,
 		});
-		const worker = this.workers.get(receipt.authority.workerId);
-		const finalReceipt =
-			worker?.recoverableFinal?.recordId === receipt.recordId ? worker.recoverableFinal : undefined;
+		const finalReceipt = worker.recoverableFinal?.recordId === receipt.recordId ? worker.recoverableFinal : undefined;
 		if (worker && finalReceipt?.mcpTransfer) {
 			await this.retireRecoverableOwnedMcpTransferReceipt(
 				worker,
@@ -4131,6 +4664,7 @@ export class DaemonSupervisor {
 	}
 
 	private retireRecoverableOwnedFinalTransferReceipt(worker: ResidentWorker): void {
+		if (worker.descriptor.workerRecovery === "disabled") return;
 		const finalReceipt = worker.recoverableFinal;
 		if (!finalReceipt?.mcpTransfer) return;
 		void this.retireRecoverableOwnedMcpTransferReceipt(
@@ -4143,6 +4677,7 @@ export class DaemonSupervisor {
 	}
 
 	private scheduleRecoverableOwnedConfirmationExpiry(worker: ResidentWorker, recordId: string): void {
+		if (worker.descriptor.workerRecovery === "disabled") return;
 		if (worker.recoveryConfirmationTimer) clearTimeout(worker.recoveryConfirmationTimer);
 		worker.recoveryConfirmationTimer = setTimeout(() => {
 			worker.recoveryConfirmationTimer = undefined;
@@ -4200,6 +4735,7 @@ export class DaemonSupervisor {
 		message: DaemonOutbound,
 		payload: Buffer,
 	): void {
+		if (worker.descriptor?.workerRecovery === "disabled") return;
 		const adoption = worker.recoverableAdoption;
 		if (!adoption || adoption.activeSessionId !== activeSessionId) return;
 		if (adoption.error) return;
@@ -4234,6 +4770,7 @@ export class DaemonSupervisor {
 	private rollbackRecoverableOwnedAdoption(worker: ResidentWorker, adoption: RecoverableOwnedAdoption): void {
 		clearTimeout(adoption.timeout);
 		if (worker.recoverableAdoption === adoption) worker.recoverableAdoption = undefined;
+		if (worker.descriptor.workerRecovery === "disabled") return;
 		try {
 			const receipt = this.ownedSessionRecoveryStore.get(adoption.recordId);
 			if (receipt?.phase === "final") {
@@ -4258,6 +4795,7 @@ export class DaemonSupervisor {
 		clientId: string,
 		command: DaemonCreateCommand,
 		onLaunched?: (worker: ResidentWorker) => void,
+		nonpersistentOwnerClient?: DaemonSocketClient,
 	): Promise<ResidentWorker> {
 		let createCommand = command;
 		if (command.name !== undefined) {
@@ -4274,7 +4812,12 @@ export class DaemonSupervisor {
 				activeMatches.length === 1 &&
 				!(await this.reclaimStaleWorkerRegistration(activeMatches[0]!.worker, command.launchEnv !== undefined))
 			) {
-				return this.reuseWorkerForCreate(activeMatches[0]!.worker, ownerClientId, command.sessionPath);
+				return this.reuseWorkerForCreate(
+					activeMatches[0]!.worker,
+					ownerClientId,
+					command.sessionPath,
+					command.workerRecovery,
+				);
 			}
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
@@ -4290,27 +4833,53 @@ export class DaemonSupervisor {
 			: `new:${command.id ? createCommandIdempotencyKey(clientId, command.id) : createActiveSessionId()}`;
 		const pending = this.openingWorkers.get(key);
 		if (pending) {
-			return this.joinOpeningWorker(pending, ownerClientId, createCommand.sessionPath ?? key);
+			return this.joinOpeningWorker(
+				pending,
+				ownerClientId,
+				createCommand.sessionPath ?? key,
+				createCommand.workerRecovery,
+			);
 		}
 		if (createCommand.sessionPath) {
 			const existing = this.findWorkerBySessionFile(createCommand.sessionPath);
 			if (existing && !(await this.reclaimStaleWorkerRegistration(existing, command.launchEnv !== undefined))) {
-				return this.reuseWorkerForCreate(existing, ownerClientId, createCommand.sessionPath);
+				return this.reuseWorkerForCreate(
+					existing,
+					ownerClientId,
+					createCommand.sessionPath,
+					createCommand.workerRecovery,
+				);
 			}
 			// The reclaim await may have let a concurrent opener register; join it instead of double-launching.
 			const opened = this.openingWorkers.get(key);
 			if (opened) {
-				return this.joinOpeningWorker(opened, ownerClientId, createCommand.sessionPath);
+				return this.joinOpeningWorker(
+					opened,
+					ownerClientId,
+					createCommand.sessionPath,
+					createCommand.workerRecovery,
+				);
 			}
 		}
 		if (createCommand.sessionPath) {
 			const existing = this.findWorkerBySessionFile(createCommand.sessionPath);
 			if (existing && !(await this.reclaimStaleWorkerRegistration(existing, command.launchEnv !== undefined))) {
-				return this.reuseWorkerForCreate(existing, ownerClientId, createCommand.sessionPath);
+				return this.reuseWorkerForCreate(
+					existing,
+					ownerClientId,
+					createCommand.sessionPath,
+					createCommand.workerRecovery,
+				);
 			}
 		}
 		const launchNewWorker = async (): Promise<ResidentWorker> => {
-			const worker = await this.launchWorker(createCommand, undefined, ownerClientId);
+			const worker = await this.launchWorker(
+				createCommand,
+				undefined,
+				ownerClientId,
+				undefined,
+				nonpersistentOwnerClient,
+			);
 			onLaunched?.(worker);
 			return worker;
 		};
@@ -4345,13 +4914,14 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		ownerClientId: string | undefined,
 		sessionPath: string,
+		workerRecovery: DaemonCreateCommand["workerRecovery"],
 	): Promise<ResidentWorker> {
 		if (worker.descriptor.lifecycle === "failed") {
 			throw new Error(
 				`Session "${sessionPath}" is registered to a failed worker that could not be safely reclaimed`,
 			);
 		}
-		this.assertWorkerCreateOwner(worker, ownerClientId, sessionPath);
+		this.assertWorkerCreateOwner(worker, ownerClientId, sessionPath, workerRecovery);
 		if (!this.isWorkerReadyForCreate(worker)) {
 			if (worker.recovery) {
 				await worker.recovery;
@@ -4363,7 +4933,7 @@ export class DaemonSupervisor {
 		if (!current) {
 			throw new Error(`Session "${sessionPath}" worker recovery was interrupted; retry opening the session`);
 		}
-		this.assertWorkerCreateOwner(current, ownerClientId, sessionPath);
+		this.assertWorkerCreateOwner(current, ownerClientId, sessionPath, workerRecovery);
 		if (!this.isWorkerReadyForCreate(current)) {
 			if (!current.summaries.has(current.descriptor.rootActiveSessionId)) {
 				throw new Error(
@@ -4380,9 +4950,10 @@ export class DaemonSupervisor {
 		pending: Promise<ResidentWorker>,
 		ownerClientId: string | undefined,
 		sessionPath: string,
+		workerRecovery: DaemonCreateCommand["workerRecovery"],
 	): Promise<ResidentWorker> {
 		const worker = await pending;
-		this.assertWorkerCreateOwner(worker, ownerClientId, sessionPath);
+		this.assertWorkerCreateOwner(worker, ownerClientId, sessionPath, workerRecovery);
 		return worker;
 	}
 
@@ -4390,9 +4961,13 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		ownerClientId: string | undefined,
 		sessionPath: string,
+		workerRecovery: DaemonCreateCommand["workerRecovery"],
 	): void {
 		if (worker.descriptor.ownerClientId !== ownerClientId) {
 			throw new SessionAlreadyActiveError(sessionPath, worker.descriptor.rootActiveSessionId);
+		}
+		if (worker.descriptor.workerRecovery !== workerRecovery) {
+			throw new Error(`Session "${sessionPath}" is active with an incompatible worker recovery mode`);
 		}
 	}
 
@@ -4413,6 +4988,7 @@ export class DaemonSupervisor {
 	 * caller launch a fresh worker for the saved session.
 	 */
 	private async reclaimStaleWorkerRegistration(worker: ResidentWorker, freshCreate = false): Promise<boolean> {
+		if (worker.descriptor.workerRecovery === "disabled") return false;
 		if (worker.client !== undefined || worker.recovery !== undefined) {
 			return false;
 		}
@@ -4492,7 +5068,11 @@ export class DaemonSupervisor {
 		existing?: ResidentWorker,
 		ownerClientId?: string,
 		promptLifecycleRecovery?: ReadonlyMap<string, WorkerSessionRecovery>,
+		nonpersistentOwnerClient?: DaemonSocketClient,
 	): Promise<ResidentWorker> {
+		if (existing?.descriptor.workerRecovery === "disabled") {
+			throw new Error("A nonpersistent daemon worker cannot be relaunched");
+		}
 		await this.assertRecoveryAllowed();
 		const recoveryStopRevision = existing?.stopRevision;
 		const assertLaunchCurrent = () => {
@@ -4522,6 +5102,13 @@ export class DaemonSupervisor {
 		const descriptorPath = existing?.descriptorPath ?? join(this.descriptorDir, `${workerId}.json`);
 		const recoveryJournalPath =
 			existing?.descriptor.recoveryJournalPath ?? join(this.descriptorDir, `${workerId}.recovery.jsonl`);
+		const workerRecovery = existing?.descriptor.workerRecovery ?? command.workerRecovery;
+		if (existing && workerRecovery === "disabled") {
+			throw new Error("A nonpersistent daemon worker cannot be relaunched");
+		}
+		if (workerRecovery === "disabled" && promptLifecycleRecovery !== undefined) {
+			throw new Error("A nonpersistent daemon worker cannot restore prompt lifecycle recovery state");
+		}
 		const orphanProcessJournalPath =
 			existing?.descriptor.orphanProcessJournalPath ?? join(this.descriptorDir, `${workerId}.orphans.jsonl`);
 		const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
@@ -4536,7 +5123,8 @@ export class DaemonSupervisor {
 			[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: rootActiveSessionId,
 			[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: this.socketPath,
 			[DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV]: createCommand.config?.agentDir ?? this.defaultSessionConfig.agentDir,
-			[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: recoveryJournalPath,
+			[DAEMON_WORKER_RECOVERY_MODE_ENV]: workerRecovery === "disabled" ? "disabled" : "enabled",
+			...(workerRecovery === "disabled" ? {} : { [DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: recoveryJournalPath }),
 			[DAEMON_WORKER_STARTUP_GATE_FD_ENV]: String(WORKER_STARTUP_GATE_FD),
 			[ORPHAN_PROCESS_JOURNAL_ENV]: orphanProcessJournalPath,
 			[SESSION_LEASES_ENABLED_ENV]: "1",
@@ -4544,6 +5132,7 @@ export class DaemonSupervisor {
 		};
 		const workerEnvironment: NodeJS.ProcessEnv =
 			launchEnvMode === "replace" ? workerEnvironmentSource : createCliSubprocessEnv(workerEnvironmentSource);
+		if (workerRecovery === "disabled") delete workerEnvironment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 		if (launchEnvMode !== "replace") delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
 		assertLaunchCurrent();
@@ -4554,16 +5143,32 @@ export class DaemonSupervisor {
 			stdio: ["ignore", "ignore", "pipe", "pipe"],
 		});
 		const detachWorkerStderr = child.stderr
-			? attachJsonlLineReader(child.stderr, (line) => this.log(`Session worker ${workerId} stderr: ${line}`), {
-					maxLineLength: 64 * 1024,
-					onLineOverflow: (prefix) => this.log(`Session worker ${workerId} stderr: ${prefix} [truncated]`),
-				})
+			? attachJsonlLineReader(
+					child.stderr,
+					(line) =>
+						this.log(
+							workerRecovery === "disabled"
+								? `Nonpersistent session worker ${workerId} wrote to stderr`
+								: `Session worker ${workerId} stderr: ${line}`,
+						),
+					{
+						maxLineLength: 64 * 1024,
+						onLineOverflow: (prefix) =>
+							this.log(
+								workerRecovery === "disabled"
+									? `Nonpersistent session worker ${workerId} stderr exceeded the line limit`
+									: `Session worker ${workerId} stderr: ${prefix} [truncated]`,
+							),
+					},
+				)
 			: () => {};
 		child.once("close", detachWorkerStderr);
 		const childClosed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
 		child.on("error", (error) => {
 			this.log(
-				`Session worker ${workerId} process error: ${error instanceof Error ? error.message : String(error)}`,
+				workerRecovery === "disabled"
+					? `Nonpersistent session worker ${workerId} process error`
+					: `Session worker ${workerId} process error: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		});
 		const startupGate = child.stdio[WORKER_STARTUP_GATE_FD];
@@ -4586,12 +5191,13 @@ export class DaemonSupervisor {
 			assertLaunchCurrent();
 
 			const descriptor: DaemonWorkerDescriptor = {
-				version: 2,
+				version: workerRecovery === "disabled" ? 3 : 2,
 				workerId,
 				pid: childPid,
 				...(childProcessStartId ? { processStartId: childProcessStartId } : {}),
 				socketPath,
-				recoveryJournalPath,
+				...(workerRecovery === "disabled" ? {} : { recoveryJournalPath }),
+				...(workerRecovery === "disabled" ? { workerRecovery: "disabled" as const } : {}),
 				orphanProcessJournalPath,
 				supervisorSocketPath: this.socketPath,
 				authenticationToken: token,
@@ -4623,9 +5229,11 @@ export class DaemonSupervisor {
 				launchEnv,
 				launchEnvMode,
 				exactEnvironmentAwaitingOwner: false,
-				transientCreateCommand: ownerClientId
-					? { ...createCommand, launchEnv, ...(launchEnvMode ? { launchEnvMode } : {}) }
-					: undefined,
+				nonpersistentOwnerClient: workerRecovery === "disabled" ? nonpersistentOwnerClient : undefined,
+				transientCreateCommand:
+					ownerClientId && workerRecovery !== "disabled"
+						? { ...createCommand, launchEnv, ...(launchEnvMode ? { launchEnvMode } : {}) }
+						: undefined,
 			};
 			await this.assertRecoveryAllowed();
 			assertLaunchCurrent();
@@ -4633,10 +5241,13 @@ export class DaemonSupervisor {
 			worker.launchEnv = launchEnv;
 			worker.launchEnvMode = launchEnvMode;
 			worker.exactEnvironmentAwaitingOwner = false;
-			worker.transientCreateCommand = descriptor.ownerClientId
-				? { ...createCommand, launchEnv, ...(launchEnvMode ? { launchEnvMode } : {}) }
-				: undefined;
+			worker.nonpersistentOwnerClient = workerRecovery === "disabled" ? nonpersistentOwnerClient : undefined;
+			worker.transientCreateCommand =
+				descriptor.ownerClientId && workerRecovery !== "disabled"
+					? { ...createCommand, launchEnv, ...(launchEnvMode ? { launchEnvMode } : {}) }
+					: undefined;
 			descriptorAssigned = true;
+			if (workerRecovery === "disabled") this.persistNonpersistentWorkerMarker(descriptorPath);
 			this.persistWorker(worker);
 			worker.intentionalStop = false;
 			this.workers.set(workerId, worker);
@@ -4648,6 +5259,9 @@ export class DaemonSupervisor {
 			child.unref();
 			try {
 				rmSync(`${descriptorPath}.${process.pid}.tmp`, { force: true });
+				if (workerRecovery === "disabled") {
+					rmSync(nonpersistentWorkerMarkerPath(descriptorPath), { force: true });
+				}
 			} catch (cleanupError) {
 				this.reportCleanupFailure(`worker launch temp ${workerId}`, cleanupError);
 			}
@@ -4661,6 +5275,7 @@ export class DaemonSupervisor {
 			throw error;
 		}
 
+		let launchStage = "startup_gate";
 		try {
 			try {
 				assertLaunchCurrent();
@@ -4673,8 +5288,10 @@ export class DaemonSupervisor {
 			} finally {
 				child.unref();
 			}
+			launchStage = "connect";
 			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS, assertLaunchCurrent);
 			assertLaunchCurrent();
+			launchStage = "create";
 			const response = await client.request(withoutCommandId(createCommand), WORKER_REQUEST_TIMEOUT_MS);
 			assertLaunchCurrent();
 			if (!response.success) {
@@ -4690,9 +5307,11 @@ export class DaemonSupervisor {
 			worker.summaries.set(rootActiveSessionId, summary);
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
+			launchStage = "subscribe";
 			await this.subscribeWorker(worker, rootActiveSessionId);
 			assertLaunchCurrent();
-			await this.refreshWorkerSummaries(worker, true, recoveryStopRevision);
+			launchStage = "refresh";
+			await this.refreshWorkerSummaries(worker, workerRecovery !== "disabled", recoveryStopRevision);
 			assertLaunchCurrent();
 			if (promptLifecycleRecovery !== undefined) {
 				await this.restoreWorkerPromptLifecycles(worker, promptLifecycleRecovery);
@@ -4700,6 +5319,7 @@ export class DaemonSupervisor {
 			}
 			await this.assertRecoveryAllowed();
 			assertLaunchCurrent();
+			launchStage = "persist_ready";
 			worker.descriptor.lifecycle = "ready";
 			worker.descriptor.consecutiveFailures = 0;
 			worker.descriptor.lastError = undefined;
@@ -4711,6 +5331,9 @@ export class DaemonSupervisor {
 			this.broadcastHeartbeatsChanged();
 			return worker;
 		} catch (error) {
+			if (workerRecovery === "disabled") {
+				this.log(`nonpersistent worker launch failed at ${launchStage}`);
+			}
 			if (isSupervisorGenerationStale(error)) {
 				throw error;
 			}
@@ -4776,6 +5399,15 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		nextWorkerIncarnation: string,
 	): void {
+		if (worker.descriptor.workerRecovery === "disabled") {
+			if (worker.recoverableAdoption) clearTimeout(worker.recoverableAdoption.timeout);
+			if (worker.recoveryConfirmationTimer) clearTimeout(worker.recoveryConfirmationTimer);
+			worker.recoveryRecordId = undefined;
+			worker.recoverableAdoption = undefined;
+			worker.recoverableFinal = undefined;
+			worker.recoveryConfirmationTimer = undefined;
+			return;
+		}
 		const recordId = worker.recoveryRecordId;
 		let recordedWorkerIncarnation = worker.workerIncarnation;
 		if (recordId) {
@@ -4828,7 +5460,10 @@ export class DaemonSupervisor {
 				await client.waitForHello(1000);
 				const workerIncarnation = await client.authenticateWorker(
 					worker.descriptor.authenticationToken,
-					this.supervisorAuthenticationClaim(),
+					{
+						...this.supervisorAuthenticationClaim(),
+						workerRecovery: worker.descriptor.workerRecovery ?? "enabled",
+					},
 					1000,
 				);
 				await this.assertRecoveryAllowed();
@@ -4847,7 +5482,7 @@ export class DaemonSupervisor {
 			} catch (error) {
 				lastError = error;
 				client.close();
-				if (isSupervisorRecoveryCancelled(error)) {
+				if (isSupervisorRecoveryCancelled(error) || isWorkerRecoveryModeMismatch(error)) {
 					throw error;
 				}
 				await delay(25);
@@ -4886,6 +5521,10 @@ export class DaemonSupervisor {
 	}
 
 	private async adoptOrRecoverWorker(worker: ResidentWorker): Promise<void> {
+		if (worker.descriptor.workerRecovery === "disabled") {
+			await this.retireNonpersistentWorker(worker);
+			return;
+		}
 		await this.assertRecoveryAllowed();
 		const adoptionRevision = worker.stopRevision;
 		if (worker.descriptor.stopRequestedAt) {
@@ -4972,6 +5611,16 @@ export class DaemonSupervisor {
 				worker.client = undefined;
 				return;
 			}
+			if (isWorkerRecoveryModeMismatch(error)) {
+				this.log(`Rejected a worker with mismatched recovery provenance ${worker.descriptor.workerId}`);
+				await this.stopWorker(worker, true, true);
+				return;
+			}
+			if (worker.descriptor.workerRecovery === "disabled") {
+				this.log(`Could not adopt nonpersistent worker ${worker.descriptor.workerId}`);
+				await this.retireNonpersistentWorker(worker);
+				return;
+			}
 			this.log(`Could not adopt worker ${worker.descriptor.workerId}: ${String(error)}`);
 			await this.recoverWorker(worker);
 		}
@@ -4983,7 +5632,11 @@ export class DaemonSupervisor {
 		}
 		const interruptedAdoption =
 			worker.recoverableAdoption?.workerClient === client ? worker.recoverableAdoption : undefined;
-		this.abortTranscriptPreparations(worker, error);
+		const safeError =
+			worker.descriptor.workerRecovery === "disabled"
+				? new Error("Nonpersistent daemon worker disconnected")
+				: error;
+		this.abortTranscriptPreparations(worker, safeError);
 		worker.client = undefined;
 		worker.workerIncarnation = undefined;
 		if (interruptedAdoption) this.rollbackRecoverableOwnedAdoption(worker, interruptedAdoption);
@@ -5021,6 +5674,10 @@ export class DaemonSupervisor {
 		if (this.shuttingDown || worker.intentionalStop) {
 			return;
 		}
+		if (worker.descriptor.workerRecovery === "disabled") {
+			await this.retireNonpersistentWorker(worker);
+			return;
+		}
 		try {
 			await this.assertRecoveryAllowed();
 		} catch (recoveryError) {
@@ -5038,12 +5695,27 @@ export class DaemonSupervisor {
 		void this.recoverWorker(worker);
 	}
 
+	private async retireNonpersistentWorker(worker: ResidentWorker): Promise<void> {
+		if (this.workers.get(worker.descriptor.workerId) !== worker) return;
+		worker.descriptor.lastError = "Nonpersistent daemon worker became unavailable";
+		try {
+			await this.stopWorker(worker, true, true);
+		} catch {
+			if (this.workers.get(worker.descriptor.workerId) !== worker) return;
+			worker.descriptor.lifecycle = "failed";
+			worker.descriptor.lastError = "Nonpersistent daemon worker cleanup is pending";
+			this.persistWorker(worker);
+			this.scheduleWorkerStopFinalization(worker);
+		}
+	}
+
 	private isWorkerRecoveryEligible(worker: ResidentWorker): boolean {
 		return this.isWorkerRecoveryCandidate(worker) && worker.recovery === undefined;
 	}
 
 	private isWorkerRecoveryCandidate(worker: ResidentWorker): boolean {
 		return (
+			worker.descriptor.workerRecovery !== "disabled" &&
 			!this.shuttingDown &&
 			!worker.intentionalStop &&
 			worker.descriptor.stopRequestedAt === undefined &&
@@ -5053,6 +5725,10 @@ export class DaemonSupervisor {
 	}
 
 	private deferWorkerRecovery(worker: ResidentWorker, disconnectError: Error): void {
+		if (worker.descriptor.workerRecovery === "disabled") {
+			void this.retireNonpersistentWorker(worker);
+			return;
+		}
 		if (worker.deferredRecovery) {
 			return;
 		}
@@ -5062,6 +5738,7 @@ export class DaemonSupervisor {
 	}
 
 	private async resumeDeferredWorkerRecovery(worker: ResidentWorker, disconnectError: Error): Promise<void> {
+		if (worker.descriptor.workerRecovery === "disabled") return;
 		while (true) {
 			await unrefDelay(DEFERRED_RECOVERY_RECHECK_MS);
 			if (!this.isWorkerRecoveryCandidate(worker)) {
@@ -5284,7 +5961,11 @@ export class DaemonSupervisor {
 			this.deliverPurposeBearingSnapshotFailure(activeSessionId, snapshotPurpose, error);
 			return;
 		}
-		this.log(`Ignored stale snapshot ${snapshotId} failure for ${activeSessionId}: ${error.message}`);
+		this.log(
+			worker.descriptor.workerRecovery === "disabled"
+				? `Ignored stale snapshot ${snapshotId} failure for nonpersistent worker ${worker.descriptor.workerId}`
+				: `Ignored stale snapshot ${snapshotId} failure for ${activeSessionId}: ${error.message}`,
+		);
 	}
 
 	private retireWorkerSnapshotCache(
@@ -5452,6 +6133,9 @@ export class DaemonSupervisor {
 	}
 
 	private async recoverWorker(worker: ResidentWorker): Promise<void> {
+		if (worker.descriptor.workerRecovery === "disabled") {
+			throw new Error("A nonpersistent daemon worker cannot be recovered");
+		}
 		if (this.isWorkerRecoveryCancelled(worker)) {
 			return;
 		}
@@ -5574,6 +6258,7 @@ export class DaemonSupervisor {
 
 	private isWorkerRecoveryCancelled(worker: ResidentWorker): boolean {
 		return (
+			worker.descriptor.workerRecovery === "disabled" ||
 			this.shuttingDown ||
 			worker.intentionalStop ||
 			worker.descriptor.stopRequestedAt !== undefined ||
@@ -5613,6 +6298,9 @@ export class DaemonSupervisor {
 		worker: ResidentWorker,
 		processToKill: { pid: number; processStartId: string } | false = false,
 	): Promise<Map<string, WorkerSessionRecovery>> {
+		if (worker.descriptor.workerRecovery === "disabled" || !worker.descriptor.recoveryJournalPath) {
+			throw new Error("A nonpersistent daemon worker cannot recover uncertain operations");
+		}
 		await this.assertRecoveryAllowed();
 		if (processToKill) this.signalCapturedProcess(processToKill, "SIGKILL");
 		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
@@ -6032,10 +6720,116 @@ export class DaemonSupervisor {
 		};
 	}
 
+	private createResponseSummary(
+		ownerClient: DaemonSocketClient,
+		command: DaemonCreateCommand,
+		worker: ResidentWorker,
+		summary: SessionSummary,
+	): SessionSummary | (SessionSummary & { workerRecovery: "disabled" }) {
+		const { workerRecovery: _workerRecovery, ...publicSummary } = this.publicSummary(
+			worker,
+			summary,
+		) as SessionSummary & { workerRecovery?: unknown };
+		if (command.workerRecovery !== "disabled") return publicSummary;
+		const ownerClientId = this.protocolClientId(ownerClient);
+		const unavailableProofs = Object.entries({
+			requestPersistence: command.noSession !== true,
+			requestTools: command.config?.noTools !== true,
+			requestExtensions: command.config?.noExtensions !== true,
+			requestToolAllowlist: (command.config?.tools?.length ?? 0) !== 0,
+			requestExtensionPaths: (command.config?.extensions?.length ?? 0) !== 0,
+			responseSessionFile: publicSummary.sessionFile !== undefined,
+			descriptorVersion: worker.descriptor.version !== 3,
+			descriptorMode: worker.descriptor.workerRecovery !== "disabled",
+			descriptorJournal: worker.descriptor.recoveryJournalPath !== undefined,
+			descriptorOwner: worker.descriptor.ownerClientId !== ownerClientId,
+			ownerTransport: worker.nonpersistentOwnerClient !== ownerClient,
+			workerMapping: this.workers.get(worker.descriptor.workerId) !== worker,
+			activeSessionMapping:
+				[...this.workers.values()].filter(
+					(candidate) => candidate.descriptor.rootActiveSessionId === worker.descriptor.rootActiveSessionId,
+				).length !== 1,
+			activeSessionIdentity: (summary.activeSessionId ?? summary.id) !== worker.descriptor.rootActiveSessionId,
+			sessionIdentity: worker.descriptor.rootSessionId !== summary.sessionId,
+			workerIncarnation: !worker.workerIncarnation,
+			authenticatedIncarnation:
+				worker.client?.matchesAuthenticatedIncarnation(worker.workerIncarnation ?? "") !== true,
+			recovery: worker.recovery !== undefined,
+			deferredRecovery: worker.deferredRecovery !== undefined,
+			recoveryRecord: worker.recoveryRecordId !== undefined,
+			recoverableAdoption: worker.recoverableAdoption !== undefined,
+			recoverableFinal: worker.recoverableFinal !== undefined,
+			recoveryConfirmation: worker.recoveryConfirmationTimer !== undefined,
+			transientCreate: worker.transientCreateCommand !== undefined,
+			marker: nonpersistentWorkerMarkerState(worker.descriptorPath) !== "valid",
+			ready: !this.isWorkerReadyForCreate(worker),
+		})
+			.filter(([, unavailable]) => unavailable)
+			.map(([name]) => name);
+		if (unavailableProofs.length > 0) {
+			this.log(`nonpersistent create proof unavailable: ${unavailableProofs.join(",")}`);
+			throw new Error("Nonpersistent daemon worker create proof is unavailable");
+		}
+		return { ...publicSummary, workerRecovery: "disabled" };
+	}
+
+	private replayCreateResponse(
+		client: DaemonSocketClient,
+		command: DaemonCreateCommand,
+		response: DaemonResponse,
+	): DaemonResponse {
+		if (command.workerRecovery !== "disabled") {
+			if (!response.success || !isSessionSummary(response.data)) return response;
+			const activeSessionId = response.data.activeSessionId ?? response.data.id;
+			if (
+				[...this.workers.values()].some(
+					(worker) =>
+						worker.descriptor.rootActiveSessionId === activeSessionId &&
+						worker.descriptor.workerRecovery === "disabled",
+				)
+			) {
+				return failure(command.id, command.type, "Daemon worker create result is uncertain");
+			}
+			const { workerRecovery: _workerRecovery, ...data } = response.data as SessionSummary & {
+				workerRecovery?: unknown;
+			};
+			return { ...response, data };
+		}
+		if (
+			!response.success ||
+			!isSessionSummary(response.data) ||
+			(response.data as SessionSummary & { workerRecovery?: unknown }).workerRecovery !== "disabled"
+		) {
+			return failure(command.id, command.type, "Nonpersistent daemon worker create result is uncertain");
+		}
+		const activeSessionId = response.data.activeSessionId ?? response.data.id;
+		const matches = [...this.workers.values()].filter(
+			(candidate) => candidate.descriptor.rootActiveSessionId === activeSessionId,
+		);
+		const worker = matches.length === 1 ? matches[0] : undefined;
+		const summary = worker?.summaries.get(activeSessionId);
+		if (
+			!worker ||
+			!summary ||
+			response.data.sessionId !== summary.sessionId ||
+			response.data.workerPid !== worker.descriptor.pid
+		) {
+			return failure(command.id, command.type, "Nonpersistent daemon worker create result is uncertain");
+		}
+		try {
+			return success(command.id, command.type, this.createResponseSummary(client, command, worker, summary));
+		} catch {
+			return failure(command.id, command.type, "Nonpersistent daemon worker create result is uncertain");
+		}
+	}
+
 	private publicSummary(worker: ResidentWorker, summary: SessionSummary): SessionSummary {
-		const activeSessionId = summary.activeSessionId ?? summary.id;
+		const { workerRecovery: _workerRecovery, ...safeSummary } = summary as SessionSummary & {
+			workerRecovery?: unknown;
+		};
+		const activeSessionId = safeSummary.activeSessionId ?? safeSummary.id;
 		return {
-			...summary,
+			...safeSummary,
 			attachedClients: [...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId))
 				.length,
 			workerState: this.effectiveWorkerState(worker),
@@ -6169,10 +6963,28 @@ export class DaemonSupervisor {
 		return responseWithId(response, command.id);
 	}
 
+	private assertNonpersistentWorkerAttachable(worker: ResidentWorker, client: DaemonSocketClient): void {
+		if (worker.descriptor?.workerRecovery !== "disabled") return;
+		if (
+			worker.nonpersistentOwnerClient === client &&
+			worker.client &&
+			worker.descriptor.lifecycle === "ready" &&
+			!this.isWorkerStopping(worker)
+		) {
+			return;
+		}
+		worker.launchEnv = undefined;
+		worker.launchEnvMode = undefined;
+		worker.exactEnvironmentAwaitingOwner = false;
+		worker.transientCreateCommand = undefined;
+		setImmediate(() => void this.retireNonpersistentWorker(worker));
+		throw new Error("A nonpersistent daemon worker cannot be recovered or reattached after disconnect");
+	}
+
 	private async attachClient(
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "attach" }>,
-		attachmentFence?: { selector: string; epoch: number; requireAttached?: boolean },
+		attachmentFence?: { selector: string; epoch: number; requireAttached?: boolean; match?: WorkerMatch },
 	): Promise<WorkerAttachData> {
 		const ownedWorker = [...this.workers.values()].find(
 			(worker) =>
@@ -6186,6 +6998,8 @@ export class DaemonSupervisor {
 		) {
 			throw new Error(`Unknown active session: ${command.activeSessionId}`);
 		}
+		if (ownedWorker) this.assertNonpersistentWorkerAttachable(ownedWorker, client);
+		if (attachmentFence?.match) this.assertNonpersistentWorkerAttachable(attachmentFence.match.worker, client);
 		const requestsExactEnvironment =
 			command.capabilities?.includes(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE) === true;
 		if (requestsExactEnvironment !== (command.launchEnvMode === "replace")) {
@@ -6215,28 +7029,33 @@ export class DaemonSupervisor {
 						throw new Error("Caller-owned launch environment does not match the established snapshot");
 					}
 				} else {
-					if (ownedWorker.exactEnvironmentAwaitingOwner !== true) {
+					if (
+						ownedWorker.descriptor.workerRecovery === "disabled" ||
+						ownedWorker.exactEnvironmentAwaitingOwner !== true
+					) {
 						throw new Error("Caller-owned launch environment cannot be rebound");
 					}
 					ownedWorker.launchEnv = exactLaunchEnv;
 					ownedWorker.exactEnvironmentAwaitingOwner = false;
 				}
-				ownedWorker.transientCreateCommand = {
-					...ownedWorker.descriptor.createCommand,
-					config: {
-						...command.recoveryConfig!,
-						...(ownedWorker.descriptor.telemetryDisabled === true ? { telemetryDisabled: true } : {}),
-					},
-					env: command.env,
-					launchEnv: ownedWorker.launchEnv,
-					launchEnvMode: "replace",
-					lifecycle: "client_owned",
-				};
+				if (ownedWorker.descriptor.workerRecovery !== "disabled") {
+					ownedWorker.transientCreateCommand = {
+						...ownedWorker.descriptor.createCommand,
+						config: {
+							...command.recoveryConfig!,
+							...(ownedWorker.descriptor.telemetryDisabled === true ? { telemetryDisabled: true } : {}),
+						},
+						env: command.env,
+						launchEnv: ownedWorker.launchEnv,
+						launchEnvMode: "replace",
+						lifecycle: "client_owned",
+					};
+				}
 				if (
 					ownedWorker.launchEnvMode !== "replace" ||
 					ownedWorker.descriptor.callerOwnedEnvironmentContract !== true ||
 					!ownedWorker.launchEnv ||
-					!ownedWorker.transientCreateCommand.config
+					(ownedWorker.descriptor.workerRecovery !== "disabled" && !ownedWorker.transientCreateCommand?.config)
 				) {
 					throw new Error("Caller-owned environment recovery state is incomplete");
 				}
@@ -6269,7 +7088,8 @@ export class DaemonSupervisor {
 			}
 		}
 
-		const match = await this.findWorkerForClient(client, command.activeSessionId);
+		const match = attachmentFence?.match ?? (await this.findWorkerForClient(client, command.activeSessionId));
+		this.assertNonpersistentWorkerAttachable(match.worker, client);
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
 		this.requireAvailableWorkerClient(match.worker);
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
@@ -6533,6 +7353,9 @@ export class DaemonSupervisor {
 				snapshotId: loaded.snapshotStream.id,
 				cacheRoot: this.snapshotCacheRoot,
 				targetChunkBytes: loaded.snapshotStream.targetChunkBytes,
+				...(worker.descriptor.workerRecovery === "disabled"
+					? { memoryCacheBytes: NONPERSISTENT_SNAPSHOT_MEMORY_BYTES, memoryOnly: true }
+					: {}),
 			});
 		}
 		if (!generation) {
@@ -6637,6 +7460,9 @@ export class DaemonSupervisor {
 				messages: result.snapshot.messages,
 				cacheRoot: this.snapshotCacheRoot,
 				targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
+				...(worker.descriptor.workerRecovery === "disabled"
+					? { memoryCacheBytes: NONPERSISTENT_SNAPSHOT_MEMORY_BYTES, memoryOnly: true }
+					: {}),
 				signal: AbortSignal.any([controller.signal, AbortSignal.timeout(SNAPSHOT_ATTEMPT_TIMEOUT_MS)]),
 			});
 			const preparation: SupervisorTranscriptPreparation = {
@@ -7195,6 +8021,9 @@ export class DaemonSupervisor {
 						snapshotId: begin.snapshotId,
 						cacheRoot: this.snapshotCacheRoot,
 						targetChunkBytes: begin.targetChunkBytes,
+						...(worker.descriptor.workerRecovery === "disabled"
+							? { memoryCacheBytes: NONPERSISTENT_SNAPSHOT_MEMORY_BYTES, memoryOnly: true }
+							: {}),
 					});
 					generation = {
 						transcript,
@@ -7848,6 +8677,9 @@ export class DaemonSupervisor {
 
 	private async prepareUpdateRestartFenced(deadline: number): Promise<DaemonUpdateRestartManifest> {
 		const residents = [...this.workers.values()];
+		if (residents.some((worker) => worker.descriptor.workerRecovery === "disabled")) {
+			throw new Error("Update restart is unavailable while a nonpersistent daemon worker exists");
+		}
 		const unavailable = residents.find(
 			(worker) =>
 				this.isWorkerStopping(worker) || worker.descriptor.lifecycle !== "ready" || worker.client === undefined,
@@ -8079,6 +8911,11 @@ export class DaemonSupervisor {
 		recoveryCleanup = false,
 		directChild?: { child: ChildProcess; closed: Promise<void> },
 	): Promise<void> {
+		if (worker.descriptor.workerRecovery === "disabled" && !removeDescriptor) {
+			removeDescriptor = true;
+			force = true;
+			recoveryCleanup = false;
+		}
 		if (removeDescriptor && !directChild) {
 			const pending = worker.stopOperation;
 			if (pending) {
@@ -8143,6 +8980,18 @@ export class DaemonSupervisor {
 		if (worker.ownerCleanupTimer) {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
+		}
+		if (worker.descriptor.workerRecovery === "disabled") {
+			worker.launchEnv = undefined;
+			worker.launchEnvMode = undefined;
+			worker.exactEnvironmentAwaitingOwner = false;
+			worker.transientCreateCommand = undefined;
+			if (worker.recoverableAdoption) clearTimeout(worker.recoverableAdoption.timeout);
+			if (worker.recoveryConfirmationTimer) clearTimeout(worker.recoveryConfirmationTimer);
+			worker.recoveryRecordId = undefined;
+			worker.recoverableAdoption = undefined;
+			worker.recoverableFinal = undefined;
+			worker.recoveryConfirmationTimer = undefined;
 		}
 		this.abortTranscriptPreparations(worker, new Error("Session worker stopped during snapshot preparation"));
 		if (!recoveryCleanup) {
@@ -8333,7 +9182,8 @@ export class DaemonSupervisor {
 		const stopRevision = worker.stopRevision;
 		const existing = worker.stopFinalization;
 		if (
-			existing?.pid === pid &&
+			existing !== undefined &&
+			existing.pid === pid &&
 			existing.processStartId === processStartId &&
 			existing.stopRevision === stopRevision
 		) {
@@ -8662,6 +9512,7 @@ export class DaemonSupervisor {
 		closingReason?: DaemonClosingReason,
 	): Promise<never> {
 		this.shuttingDown = true;
+		this.nonpersistentCreateRuns?.clear();
 		this.clearIdleEvictionTimer();
 		const idleEvictionSweep = this.idleEvictionSweep;
 		if (closingReason) {
@@ -8709,6 +9560,24 @@ export class DaemonSupervisor {
 				rmSync(this.supervisorConfigPath, { force: true });
 			}
 		} else {
+			const nonpersistentWorkers = [...this.workers.values()].filter(
+				(worker) => worker.descriptor.workerRecovery === "disabled",
+			);
+			for (const worker of nonpersistentWorkers) {
+				try {
+					await this.stopWorker(worker, true, true);
+				} catch (error) {
+					this.log(
+						`Nonpersistent worker ${worker.descriptor.workerId} remains tombstoned while shutdown drains cleanup: ${String(error)}`,
+					);
+				}
+				while (this.workers.get(worker.descriptor.workerId) === worker) {
+					this.scheduleWorkerStopFinalization(worker);
+					const finalization = worker.stopFinalization;
+					if (finalization) await finalization.promise.catch(() => undefined);
+					else await unrefDelay(STOP_FINALIZATION_RECHECK_MS);
+				}
+			}
 			for (const worker of this.workers.values()) {
 				worker.intentionalStop = true;
 				worker.client?.close();

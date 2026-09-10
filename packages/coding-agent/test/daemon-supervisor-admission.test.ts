@@ -75,6 +75,12 @@ function createHarness(
 			record: { token: "test-owner", processStartId: "test-process", socketPath: "/tmp/test.sock" },
 		},
 		workers: new Map(),
+		matchWorkers: vi.fn((selector: string) => [
+			{
+				worker: { descriptor: { workerRecovery: "enabled" } },
+				summary: { id: selector, activeSessionId: selector, sessionId: `session:${selector}` },
+			},
+		]),
 		clients: new Set(),
 		connectionIds: new WeakMap(),
 		sessionInputPauseEpochs: new WeakMap(),

@@ -216,6 +216,7 @@ describe("DaemonClient", () => {
 			"negotiated_daemon_session_capabilities_v1",
 			"caller_owned_session_environment_cleanup_v1",
 			"recoverable_owned_session_adoption_v1",
+			"nonpersistent_daemon_worker_v1",
 		];
 		const rootConnectionOptions: RootDaemonAgentConnectionOptions = {
 			ownedSession: true,
@@ -234,6 +235,7 @@ describe("DaemonClient", () => {
 			"caller_owned_session_environment_cleanup_v1",
 		);
 		expect(publicSdk.RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE).toBe("recoverable_owned_session_adoption_v1");
+		expect(publicSdk.NONPERSISTENT_DAEMON_WORKER_FEATURE).toBe("nonpersistent_daemon_worker_v1");
 		expect(publicSdk.createRecoverableOwnedSession).toEqual(expect.any(Function));
 		expect(publicSdk.adoptRecoverableOwnedSession).toEqual(expect.any(Function));
 		expect(publicSdk.confirmRecoverableOwnedSessionAdoption).toEqual(expect.any(Function));
@@ -533,6 +535,50 @@ describe("DaemonClient", () => {
 		await expect(client.request({ type: "heartbeats_list" })).rejects.toThrow("does not support heartbeat_catalog");
 		expect(socket.writes).toEqual([]);
 		client.close();
+	});
+
+	it("does not send nonpersistent creates without the supervisor capability and schema", async () => {
+		for (const hello of [
+			{ capabilities: ["client_owned_sessions"], schemaRevision: DAEMON_SCHEMA_REVISION },
+			{
+				capabilities: ["client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+				schemaRevision: DAEMON_SCHEMA_REVISION - 1,
+			},
+		] as const) {
+			const client = new DaemonClient("/tmp/prime-agent.sock");
+			const connect = client.connect();
+			const socket = netMock.sockets.at(-1)!;
+			socket.emit("connect");
+			await connect;
+			emitHello(socket, DAEMON_PROTOCOL_VERSION, [...hello.capabilities], hello.schemaRevision);
+
+			await expect(
+				client.request({ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", noSession: true }),
+			).rejects.toThrow("does not support nonpersistent_daemon_worker_v1");
+			expect(socket.writes).toEqual([]);
+			client.close();
+		}
+	});
+
+	it("keeps ordinary creates compatible with a supervisor that offers nonpersistent workers", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(
+			socket,
+			DAEMON_PROTOCOL_VERSION,
+			["client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+			DAEMON_SCHEMA_REVISION,
+		);
+
+		const request = client.request({ type: "create" });
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!.trim()) as { command: Record<string, unknown> };
+		expect(envelope.command).not.toHaveProperty("workerRecovery");
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
 	it("does not send authoritative cleanup queries to stock-compatible capability offers", async () => {
@@ -1269,6 +1315,222 @@ describe("DaemonClient", () => {
 			`${JSON.stringify({ id: ordinaryEnvelope.id, type: "response", command: "list", success: true })}\n`,
 		);
 		await expect(ordinary).resolves.toMatchObject({ id: ordinaryEnvelope.id, success: true });
+		client.close();
+	});
+
+	it("never replays a disabled create through a shared recovery-enabled client", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(
+			firstSocket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+			DAEMON_SCHEMA_REVISION,
+		);
+
+		const ordinary = client.request({ type: "list" });
+		const ordinaryWireData = firstSocket.writes[0]!;
+		const ordinaryEnvelope = JSON.parse(ordinaryWireData) as { id: string };
+		const privateCreate = client.request({
+			type: "create",
+			lifecycle: "client_owned",
+			workerRecovery: "disabled",
+			noSession: true,
+			config: { noTools: true, noExtensions: true, apiKey: "private-create-secret" },
+		});
+		expect(firstSocket.writes).toHaveLength(2);
+		firstSocket.emit("close");
+
+		await expect(privateCreate).rejects.toThrow("Connection to the Prime Agent daemon closed");
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(
+			secondSocket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+			DAEMON_SCHEMA_REVISION,
+			"replacement-supervisor-generation",
+		);
+		expect(secondSocket.writes).toEqual([ordinaryWireData]);
+		expect(secondSocket.writes.join(" ")).not.toContain("private-create-secret");
+		secondSocket.emit(
+			"data",
+			`${JSON.stringify({ id: ordinaryEnvelope.id, type: "response", command: "list", success: true })}
+`,
+		);
+		await expect(ordinary).resolves.toMatchObject({ id: ordinaryEnvelope.id, success: true });
+		client.close();
+	});
+
+	it("preserves ordinary wire JSON semantics while snapshotting public commands", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connecting = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connecting;
+		emitHello(socket);
+		const response = client.request({
+			type: "append_custom_message",
+			activeSessionId: "active-1",
+			message: {
+				customType: "ordinary-details",
+				content: "details",
+				display: true,
+				details: {
+					buffer: Buffer.from([1, 2, 3]),
+					custom: {
+						toJSON: () => ({ serialized: "by-json" }),
+					},
+				},
+			},
+		});
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!) as {
+			id: string;
+			command: { message: { details: unknown } };
+		};
+		expect(envelope.command.message.details).toEqual({
+			buffer: { type: "Buffer", data: [1, 2, 3] },
+			custom: { serialized: "by-json" },
+		});
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "append_custom_message",
+				success: true,
+			})}\n`,
+		);
+		await expect(response).resolves.toMatchObject({ success: true });
+		client.close();
+	});
+
+	it("snapshots disabled create classification and payload before waiting for hello", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const connecting = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connecting;
+		const command = {
+			type: "create" as const,
+			lifecycle: "client_owned" as const,
+			workerRecovery: "disabled" as const,
+			noSession: true,
+			config: { noTools: true, noExtensions: true, apiKey: "entry-private-value" },
+		};
+		const response = client.request(command);
+		Object.assign(command as unknown as Record<string, unknown>, {
+			workerRecovery: undefined,
+			noSession: false,
+			config: { noTools: false, noExtensions: false, apiKey: "mutated-private-value" },
+		});
+
+		emitHello(
+			socket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+			DAEMON_SCHEMA_REVISION,
+		);
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!) as {
+			id: string;
+			command: Record<string, unknown> & { config?: Record<string, unknown> };
+		};
+		expect(envelope.command).toMatchObject({
+			workerRecovery: "disabled",
+			noSession: true,
+			config: { noTools: true, noExtensions: true, apiKey: "entry-private-value" },
+		});
+		expect(JSON.stringify(envelope)).not.toContain("mutated-private-value");
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id: envelope.id, type: "response", command: "create", success: true })}
+`,
+		);
+		await expect(response).resolves.toMatchObject({ success: true });
+		client.close();
+	});
+
+	it("does not acquire disabled-create behavior from caller mutation while waiting for hello", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const connecting = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connecting;
+		const command = { type: "create" as const, lifecycle: "client_owned" as const };
+		const response = client.request(command);
+		Object.assign(command as unknown as Record<string, unknown>, {
+			workerRecovery: "disabled",
+			noSession: true,
+			config: { noTools: true, noExtensions: true, apiKey: "late-private-value" },
+		});
+
+		emitHello(
+			socket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "client_owned_sessions"],
+			DAEMON_SCHEMA_REVISION,
+		);
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!) as { id: string; command: Record<string, unknown> };
+		expect(envelope.command).toMatchObject({ type: "create", lifecycle: "client_owned" });
+		expect(envelope.command).not.toHaveProperty("workerRecovery");
+		expect(envelope.command).not.toHaveProperty("noSession");
+		expect(envelope.command).not.toHaveProperty("config");
+		expect(JSON.stringify(envelope)).not.toContain("late-private-value");
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id: envelope.id, type: "response", command: "create", success: true })}
+`,
+		);
+		await expect(response).resolves.toMatchObject({ success: true });
+		client.close();
+	});
+
+	it("rejects a disabled create response that resolves before a silent transport reset", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connecting = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connecting;
+		emitHello(
+			socket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+			DAEMON_SCHEMA_REVISION,
+		);
+
+		const privateCreate = client.request({
+			type: "create",
+			lifecycle: "client_owned",
+			workerRecovery: "disabled",
+			noSession: true,
+			config: { noTools: true, noExtensions: true },
+		});
+		const envelope = JSON.parse(socket.writes[0]!) as { id: string };
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "create",
+				success: true,
+				data: { activeSessionId: "private-active", sessionId: "private-session", workerRecovery: "disabled" },
+			})}
+`,
+		);
+		client.resetTransportForReconnect();
+
+		await expect(privateCreate).rejects.toThrow("Nonpersistent daemon worker create result is uncertain");
 		client.close();
 	});
 

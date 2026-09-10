@@ -266,6 +266,23 @@ decisions:
       - Prime upstream exposes an equivalent generation-scoped, post-attach public proof that is false before attach and after invalidation.
       - Pylon and Comet can remove the fork SDK token/accessor without enabling optional behavior from a server offer, version, or method presence.
 
+  nonpersistent-daemon-worker:
+    area: runtime-reliability
+    state: candidate
+    owner: shared
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/20
+      - https://github.com/pylon-code/pylon/issues/114
+      - https://github.com/rynfar/comet/issues/7
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/tree/a903d4b6768f484bd6d459b7b0aa7dee38e461e2
+    fork_change: nonpersistent-daemon-worker-v1
+    upstream_support: Prime through a903d4b6768f has recoverable daemon workers and client-owned cleanup, but no capability-gated fresh worker mode that keeps create secrets, prompt payloads, correlation identities, transcripts, and snapshot caches out of durable state and permanently excludes that worker from recovery, adoption, relaunch, residency, and update snapshots.
+    revisit_when:
+      - Prime upstream exposes an equivalent frozen SDK token, exact create-only live-generation receipt, memory-only private retry and snapshot handling, and strict disabled-recovery provenance.
+      - Comet and Pylon can remove the fork token without weakening prompt privacy, worker-loss containment, owner cleanup, or ordinary-worker compatibility.
+
   child-scoped-provider-identity:
     area: runtime-reliability
     state: shipped

@@ -535,10 +535,18 @@ export interface PromptOptions {
 	customMessage?: CustomMessage;
 }
 
+const NONPERSISTENT_DAEMON_PROMPT = Symbol("nonpersistent-daemon-prompt");
+
 interface InternalPromptOptions extends PromptOptions {
 	skipPrePromptWork?: boolean;
 	returnAfterAccepted?: boolean;
 	agentMessageId?: string;
+	[NONPERSISTENT_DAEMON_PROMPT]?: true;
+}
+
+/** @internal Trusted daemon-worker boundary; intentionally not re-exported by the SDK entry point. */
+export function prepareNonpersistentDaemonPromptOptions(options: PromptOptions): PromptOptions {
+	return { ...options, [NONPERSISTENT_DAEMON_PROMPT]: true } as InternalPromptOptions;
 }
 
 type SubmissionExtensionCommandPolicy = "execute" | "reject" | "ignore";
@@ -5307,11 +5315,13 @@ export class AgentSession {
 			this._beginPromptLifecycle(
 				promptCorrelationId,
 				kind,
-				createPromptRequestFingerprint({
-					message: text,
-					images: options?.images,
-					queueIfBusy: options?.queueIfBusy,
-				}),
+				(options as InternalPromptOptions | undefined)?.[NONPERSISTENT_DAEMON_PROMPT]
+					? undefined
+					: createPromptRequestFingerprint({
+							message: text,
+							images: options?.images,
+							queueIfBusy: options?.queueIfBusy,
+						}),
 			);
 			correlatedAdmissionController = new AbortController();
 			this._pendingCorrelatedPromptAdmissions.set(promptCorrelationId, correlatedAdmissionController);
@@ -12595,6 +12605,10 @@ export class AgentSession {
 		context.sendMessage = (message, options) => this.sendCustomMessage(message, options);
 		context.sendUserMessage = (content, options) => this.sendUserMessage(content, options);
 		return context;
+	}
+
+	hasLoadedExtensions(): boolean {
+		return this._extensionRunner.hasExtensions();
 	}
 
 	hasExtensionHandlers(eventType: string): boolean {

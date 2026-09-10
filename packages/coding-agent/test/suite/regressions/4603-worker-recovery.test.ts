@@ -26,6 +26,8 @@ import {
 } from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_RECOVERY_MODE_ENV,
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
 	DAEMON_WORKER_STARTUP_GATE_FD_ENV,
@@ -193,6 +195,8 @@ function spawnStandaloneWorker(
 					[DAEMON_WORKER_ROLE_ENV]: "1",
 					[DAEMON_WORKER_TOKEN_ENV]: token,
 					[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: "eng-4603-worker",
+					[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: join(paths.agentDir, "worker-command-recovery.jsonl"),
+					[DAEMON_WORKER_RECOVERY_MODE_ENV]: "enabled",
 					[DAEMON_WORKER_STARTUP_GATE_FD_ENV]: "3",
 					[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: paths.socketPath,
 					PI_OFFLINE: "1",
@@ -910,6 +914,7 @@ describe("ENG-4603 worker recovery convergence", () => {
 						id: authId,
 						type: "worker_auth",
 						token,
+						workerRecovery: "enabled",
 						supervisorGeneration: oldOwner.record.generation,
 						supervisorPid: oldOwner.record.pid,
 						supervisorProcessStartId: oldOwner.record.processStartId,

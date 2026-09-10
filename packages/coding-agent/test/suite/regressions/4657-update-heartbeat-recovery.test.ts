@@ -51,7 +51,12 @@ describe("ENG-4657 update heartbeat recovery", () => {
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
-			worker: { authenticationToken: "test-token", restoreActiveSessionId: activeSessionId },
+			worker: {
+				authenticationToken: "test-token",
+				restoreActiveSessionId: activeSessionId,
+				recoveryMode: "enabled",
+				recoveryJournalPath: `${harness.tempDir}/worker-recovery.jsonl`,
+			},
 		});
 		const internals = daemon as unknown as AgentDaemonCronInternals;
 		const state: ActiveSessionState = {

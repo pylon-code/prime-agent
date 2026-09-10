@@ -294,6 +294,7 @@ export {
 	type AgentConnectionState,
 	DaemonAgentConnection,
 	type DaemonAgentConnectionOptions,
+	type DaemonNonpersistentWorkerCreateProof,
 	type DaemonOwnedSessionContractProof,
 	type DaemonOwnedSessionDaemonIdentity,
 	type DaemonOwnedSessionDisposeOptions,
@@ -440,6 +441,7 @@ export {
 } from "./modes/interactive/theme/theme.js";
 export {
 	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+	NONPERSISTENT_DAEMON_WORKER_FEATURE,
 	PRIME_AGENT_SDK_FEATURES,
 	type PrimeAgentSdkFeature,
 	RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE,

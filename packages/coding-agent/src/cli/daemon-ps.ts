@@ -18,7 +18,11 @@ import {
 } from "../modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import { acquireDaemonShutdownAdmission } from "../modes/daemon/daemon-supervisor-ownership.js";
-import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-protocol.js";
+import {
+	DAEMON_NONPERSISTENT_WORKER_MARKER,
+	DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX,
+	type DaemonWorkerDescriptor,
+} from "../modes/daemon/daemon-worker-protocol.js";
 import { signalProcessGroupOrProcess } from "../utils/child-process.js";
 import { formatDaemonListTable } from "./daemon-ps-format.js";
 import { promptYesNo } from "./daemon-stop-confirm.js";
@@ -919,12 +923,23 @@ async function stopBackgroundService(
 	return { reaped: `force-killed unresponsive background service (pid ${pid})` };
 }
 
+interface TrackedWorkerDescriptor {
+	workerId: string;
+	pid: number;
+	processStartId?: string;
+	socketPath: string;
+	supervisorSocketPath: string;
+	recoveryJournalPath?: string;
+	orphanProcessJournalPath?: string;
+	workerRecovery?: "disabled";
+}
+
 interface TrackedWorker {
-	descriptor: DaemonWorkerDescriptor;
+	descriptor: TrackedWorkerDescriptor;
 	descriptorPath: string;
 }
 
-async function forceStopTrackedWorkers(
+export async function forceStopTrackedWorkers(
 	supervisorSocketPath: string,
 	assertAdmission: () => Promise<void>,
 ): Promise<string[]> {
@@ -974,11 +989,21 @@ async function forceStopTrackedWorkers(
 		if (cleanupWorkerRecords) {
 			try {
 				removeSocketFile(descriptor.socketPath);
-				rmSync(worker.descriptorPath, { force: true });
-				rmSync(descriptor.recoveryJournalPath, { force: true });
+				if (descriptor.recoveryJournalPath) rmSync(descriptor.recoveryJournalPath, { force: true });
+				if (descriptor.workerRecovery === "disabled") {
+					rmSync(join(dirname(worker.descriptorPath), `${descriptor.workerId}.recovery.jsonl`), { force: true });
+				}
 				if (descriptor.orphanProcessJournalPath) {
 					rmSync(descriptor.orphanProcessJournalPath, { force: true });
 				}
+				const descriptorName = basename(worker.descriptorPath);
+				for (const name of readdirSync(dirname(worker.descriptorPath))) {
+					if (name.startsWith(`${descriptorName}.`) && name.endsWith(".tmp")) {
+						rmSync(join(dirname(worker.descriptorPath), name), { force: true });
+					}
+				}
+				rmSync(`${worker.descriptorPath}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`, { force: true });
+				rmSync(worker.descriptorPath, { force: true });
 			} catch (error) {
 				failures.push(`could not clean up worker ${descriptor.workerId}: ${String(error)}`);
 			}
@@ -1028,9 +1053,8 @@ function findAllTrackedWorkers(): TrackedWorker[] {
 			const descriptorPath = join(directory, fileName);
 			try {
 				const value: unknown = JSON.parse(readFileSync(descriptorPath, "utf8"));
-				if (isTrackedWorkerDescriptor(value)) {
-					workers.push({ descriptor: value, descriptorPath });
-				}
+				const descriptor = trackedWorkerDescriptor(value, descriptorPath);
+				if (descriptor) workers.push({ descriptor, descriptorPath });
 			} catch {
 				// Invalid or concurrently removed descriptors are not safe shutdown targets.
 			}
@@ -1039,21 +1063,54 @@ function findAllTrackedWorkers(): TrackedWorker[] {
 	return workers;
 }
 
-function isTrackedWorkerDescriptor(value: unknown): value is DaemonWorkerDescriptor {
-	if (!value || typeof value !== "object") {
-		return false;
-	}
-	const descriptor = value as Partial<DaemonWorkerDescriptor>;
+function isTrackedWorkerIdentity(value: unknown): value is TrackedWorkerDescriptor & Record<string, unknown> {
+	if (!value || typeof value !== "object") return false;
+	const descriptor = value as Partial<TrackedWorkerDescriptor>;
 	return (
-		(descriptor.version === 1 || descriptor.version === 2) &&
 		typeof descriptor.supervisorSocketPath === "string" &&
 		typeof descriptor.workerId === "string" &&
 		Number.isInteger(descriptor.pid) &&
 		(descriptor.pid ?? 0) > 0 &&
 		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string") &&
 		typeof descriptor.socketPath === "string" &&
-		typeof descriptor.recoveryJournalPath === "string"
+		(descriptor.orphanProcessJournalPath === undefined || typeof descriptor.orphanProcessJournalPath === "string")
 	);
+}
+
+function isTrackedWorkerDescriptor(value: unknown): value is DaemonWorkerDescriptor {
+	if (!isTrackedWorkerIdentity(value)) return false;
+	const descriptor = value as Partial<DaemonWorkerDescriptor>;
+	return descriptor.version === 3
+		? descriptor.workerRecovery === "disabled" &&
+				typeof descriptor.ownerClientId === "string" &&
+				descriptor.recoveryJournalPath === undefined
+		: (descriptor.version === 1 || descriptor.version === 2) &&
+				descriptor.workerRecovery === undefined &&
+				typeof descriptor.recoveryJournalPath === "string";
+}
+
+function trackedWorkerDescriptor(value: unknown, descriptorPath: string): TrackedWorkerDescriptor | undefined {
+	if (isTrackedWorkerDescriptor(value)) return value;
+	if (!isTrackedWorkerIdentity(value)) return undefined;
+	try {
+		if (
+			readFileSync(`${descriptorPath}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`, "utf8") !==
+			DAEMON_NONPERSISTENT_WORKER_MARKER
+		) {
+			return undefined;
+		}
+	} catch {
+		return undefined;
+	}
+	return {
+		workerId: value.workerId,
+		pid: value.pid,
+		...(value.processStartId ? { processStartId: value.processStartId } : {}),
+		socketPath: value.socketPath,
+		supervisorSocketPath: value.supervisorSocketPath,
+		...(value.orphanProcessJournalPath ? { orphanProcessJournalPath: value.orphanProcessJournalPath } : {}),
+		workerRecovery: "disabled",
+	};
 }
 
 async function stopTrackedProcess(
