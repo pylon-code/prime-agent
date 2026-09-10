@@ -3164,7 +3164,9 @@ export class DaemonAgentConnection implements AgentConnection {
 	): Promise<DaemonResponse> {
 		const deadline = this.ownedSessionDisposeDeadline;
 		let effectiveTimeoutMs = timeoutMs;
-		let effectiveOptions = options;
+		let effectiveOptions = this.options.nonpersistentWorkerCreateProof
+			? { ...options, recoverAcrossReconnect: false }
+			: options;
 		if (deadline !== undefined) {
 			const remainingMs = deadline - Date.now();
 			if (remainingMs <= 0) return Promise.reject(new OwnedSessionCleanupDeadlineError());
@@ -3725,7 +3727,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				await this.client.reconnect(1000);
 				if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
 				if (this.disposed || this.terminalCloseEmitted) return;
-				const response = await this.client.request({ type: "list" }, 30000);
+				const response = await this.requestDaemonCommandWithinOwnedSessionDeadline({ type: "list" }, 30000);
 				if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
 				if (this.disposed || this.terminalCloseEmitted) return;
 				if (!response.success) {

@@ -64,6 +64,7 @@ class FakeDaemonClient {
 	reconnectCount = 0;
 	resetTransportCount = 0;
 	reconnectError: Error | undefined;
+	requestRecoveryEnabled = false;
 	recoverablePrepareResultFactory:
 		| ((
 				command: Extract<DaemonCommand, { type: "prepare_recoverable_owned_session_adoption" }>,
@@ -702,7 +703,9 @@ class FakeDaemonClient {
 		}
 	}
 
-	enableRequestRecovery(): void {}
+	enableRequestRecovery(): void {
+		this.requestRecoveryEnabled = true;
+	}
 
 	get clientId(): string {
 		return "fake-protocol-client";
@@ -4100,6 +4103,7 @@ describe("DaemonAgentConnection", () => {
 	it("preserves optional correlated retry fields for exact in-memory comparison", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		fakeClient.enableRequestRecovery();
 		const proof = {
 			id: "active-1",
 			activeSessionId: "active-1",
@@ -4126,6 +4130,8 @@ describe("DaemonAgentConnection", () => {
 			}),
 		).rejects.toThrow("Prompt correlation id is reserved for another session generation or request");
 		expect(fakeClient.requests.filter((request) => request.type === "submit_correlated_prompt")).toHaveLength(2);
+		expect(fakeClient.requestRecoveryEnabled).toBe(true);
+		expect(fakeClient.requestOptions.every((options) => options.recoverAcrossReconnect === false)).toBe(true);
 		const privateRoutes = (connection as unknown as { correlatedPromptRoutes: Map<string, { request: unknown }> })
 			.correlatedPromptRoutes;
 		expect([...privateRoutes.values()].every((route) => typeof route.request === "object")).toBe(true);

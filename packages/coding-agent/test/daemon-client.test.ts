@@ -1318,6 +1318,56 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("never replays a disabled create through a shared recovery-enabled client", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(
+			firstSocket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+			DAEMON_SCHEMA_REVISION,
+		);
+
+		const ordinary = client.request({ type: "list" });
+		const ordinaryWireData = firstSocket.writes[0]!;
+		const ordinaryEnvelope = JSON.parse(ordinaryWireData) as { id: string };
+		const privateCreate = client.request({
+			type: "create",
+			lifecycle: "client_owned",
+			workerRecovery: "disabled",
+			noSession: true,
+			config: { noTools: true, noExtensions: true, apiKey: "private-create-secret" },
+		});
+		expect(firstSocket.writes).toHaveLength(2);
+		firstSocket.emit("close");
+
+		await expect(privateCreate).rejects.toThrow("Connection to the Prime Agent daemon closed");
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(
+			secondSocket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+			DAEMON_SCHEMA_REVISION,
+			"replacement-supervisor-generation",
+		);
+		expect(secondSocket.writes).toEqual([ordinaryWireData]);
+		expect(secondSocket.writes.join(" ")).not.toContain("private-create-secret");
+		secondSocket.emit(
+			"data",
+			`${JSON.stringify({ id: ordinaryEnvelope.id, type: "response", command: "list", success: true })}
+`,
+		);
+		await expect(ordinary).resolves.toMatchObject({ id: ordinaryEnvelope.id, success: true });
+		client.close();
+	});
+
 	it("pauses request timeouts while a recoverable connection is disconnected", async () => {
 		vi.useFakeTimers();
 		const client = new DaemonClient("/tmp/prime-agent.sock");

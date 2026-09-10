@@ -401,10 +401,14 @@ export class DaemonClient {
 			throw new DaemonCapabilityUnavailableError(command.type, missingCompatibility.capability);
 		}
 		const envelopeProtocolVersion = Math.min(hello.protocol.version, DAEMON_PROTOCOL_VERSION);
+		const requestOptions =
+			command.type === "create" && command.workerRecovery === "disabled"
+				? { ...options, recoverAcrossReconnect: false }
+				: options;
 		return this.requestWire(
 			command,
 			timeoutMs,
-			options,
+			requestOptions,
 			envelopeProtocolVersion >= DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION ? envelopeProtocolVersion : undefined,
 			compatibilities,
 		);
