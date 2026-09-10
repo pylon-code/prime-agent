@@ -22,6 +22,7 @@ export const PYLON_RELEASE_EXPECTED_SDK_FEATURES = Object.freeze([
 	"negotiated_daemon_session_capabilities_v1",
 	"caller_owned_session_environment_cleanup_v1",
 	"recoverable_owned_session_adoption_v1",
+	"nonpersistent_daemon_worker_v1",
 ]);
 
 function parseArgs(args) {

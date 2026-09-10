@@ -265,6 +265,7 @@ test("smokes the exact caller-owned session SDK contract", () => {
 		"negotiated_daemon_session_capabilities_v1",
 		"caller_owned_session_environment_cleanup_v1",
 		"recoverable_owned_session_adoption_v1",
+		"nonpersistent_daemon_worker_v1",
 	]);
 	assert.equal(Object.isFrozen(PYLON_RELEASE_EXPECTED_SDK_FEATURES), true);
 	const smokeSource = readFileSync(join(root, "scripts", "smoke-pylon-prime-agent-release.mjs"), "utf8");
