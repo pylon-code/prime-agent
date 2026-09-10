@@ -501,6 +501,8 @@ interface ResidentWorker {
 		promise: Promise<void>;
 	};
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
+	/** Exact physical owner transport for a nonpersistent worker; never persisted. */
+	nonpersistentOwnerClient?: DaemonSocketClient;
 	recoveryRecordId?: string;
 	recoverableAdoption?: RecoverableOwnedAdoption;
 	recoverableFinal?: RecoverableOwnedFinalReceipt;
@@ -1721,6 +1723,9 @@ export class DaemonSupervisor {
 				if (worker.recoverableAdoption?.client === client) {
 					this.rollbackRecoverableOwnedAdoption(worker, worker.recoverableAdoption);
 				}
+				if (worker.descriptor.workerRecovery === "disabled" && worker.nonpersistentOwnerClient === client) {
+					void this.retireNonpersistentWorker(worker);
+				}
 			}
 			this.scheduleOwnedWorkerCleanupForClient(this.protocolClientId(client));
 		};
@@ -1912,6 +1917,11 @@ export class DaemonSupervisor {
 			worker.recoverableFinal = undefined;
 			worker.recoveryConfirmationTimer = undefined;
 		}
+		if (worker.descriptor.workerRecovery === "disabled") {
+			if (worker.nonpersistentOwnerClient && this.clients.has(worker.nonpersistentOwnerClient)) return;
+			void this.retireNonpersistentWorker(worker);
+			return;
+		}
 		if (worker.recoveryRecordId) {
 			this.scheduleRecoverableOwnedWorkerCleanup(worker);
 			return;
@@ -1922,10 +1932,6 @@ export class DaemonSupervisor {
 			worker.ownerCleanupTimer ||
 			[...this.clients].some((client) => this.protocolClientId(client) === ownerClientId)
 		) {
-			return;
-		}
-		if (worker.descriptor.workerRecovery === "disabled") {
-			void this.retireNonpersistentWorker(worker);
 			return;
 		}
 		worker.ownerCleanupTimer = setTimeout(() => {
@@ -2774,8 +2780,19 @@ export class DaemonSupervisor {
 			case "create": {
 				assertWorkerRecoveryRequest(command);
 				const createCommand = prepareCallerOwnedCreateEnvironment(command);
-				const worker = await this.createOrReuseWorker(this.protocolClientId(client), createCommand);
+				const worker = await this.createOrReuseWorker(
+					this.protocolClientId(client),
+					createCommand,
+					undefined,
+					client,
+				);
 				try {
+					if (createCommand.workerRecovery === "disabled") {
+						if (worker.nonpersistentOwnerClient && worker.nonpersistentOwnerClient !== client) {
+							throw new Error("Nonpersistent daemon worker create result is uncertain");
+						}
+						worker.nonpersistentOwnerClient = client;
+					}
 					// The owner may disconnect while creation is waiting for daemon readiness,
 					// process launch, or session materialization. Re-evaluate ownership only
 					// after the worker is registered so the disconnect edge cannot be missed.
@@ -2799,11 +2816,7 @@ export class DaemonSupervisor {
 					if (!summary) {
 						throw new Error("Session worker started without a root session");
 					}
-					return success(
-						command.id,
-						"create",
-						this.createResponseSummary(this.protocolClientId(client), createCommand, worker, summary),
-					);
+					return success(command.id, "create", this.createResponseSummary(client, createCommand, worker, summary));
 				} catch (error) {
 					if (createCommand.workerRecovery === "disabled") {
 						await this.retireNonpersistentWorker(worker);
@@ -2819,7 +2832,7 @@ export class DaemonSupervisor {
 					throw new OwnedSessionAdoptionUnavailableError();
 				}
 				const target = await this.findWorkerForClient(client, command.activeSessionId);
-				this.assertNonpersistentWorkerAttachable(target.worker);
+				this.assertNonpersistentWorkerAttachable(target.worker, client);
 				const attachmentEpoch = this.advanceAttachmentEpoch(client, command.activeSessionId);
 				const requestedCapabilities = normalizeCapabilities(command.capabilities, command.supportsExtensionUi);
 				let releaseSnapshotReservation = requestedCapabilities.has("chunked_snapshot")
@@ -2876,7 +2889,7 @@ export class DaemonSupervisor {
 			}
 			case "reattach": {
 				const target = await this.findWorkerForClient(client, command.targetActiveSessionId);
-				this.assertNonpersistentWorkerAttachable(target.worker);
+				this.assertNonpersistentWorkerAttachable(target.worker, client);
 				const targetActiveSessionId = target.summary.activeSessionId ?? target.summary.id;
 				if (targetActiveSessionId === command.activeSessionId) {
 					const detachingSessions = this.detachingInputPauseSessions?.get(client);
@@ -4784,6 +4797,7 @@ export class DaemonSupervisor {
 		clientId: string,
 		command: DaemonCreateCommand,
 		onLaunched?: (worker: ResidentWorker) => void,
+		nonpersistentOwnerClient?: DaemonSocketClient,
 	): Promise<ResidentWorker> {
 		let createCommand = command;
 		if (command.name !== undefined) {
@@ -4861,7 +4875,13 @@ export class DaemonSupervisor {
 			}
 		}
 		const launchNewWorker = async (): Promise<ResidentWorker> => {
-			const worker = await this.launchWorker(createCommand, undefined, ownerClientId);
+			const worker = await this.launchWorker(
+				createCommand,
+				undefined,
+				ownerClientId,
+				undefined,
+				nonpersistentOwnerClient,
+			);
 			onLaunched?.(worker);
 			return worker;
 		};
@@ -5050,6 +5070,7 @@ export class DaemonSupervisor {
 		existing?: ResidentWorker,
 		ownerClientId?: string,
 		promptLifecycleRecovery?: ReadonlyMap<string, WorkerSessionRecovery>,
+		nonpersistentOwnerClient?: DaemonSocketClient,
 	): Promise<ResidentWorker> {
 		if (existing?.descriptor.workerRecovery === "disabled") {
 			throw new Error("A nonpersistent daemon worker cannot be relaunched");
@@ -5210,6 +5231,7 @@ export class DaemonSupervisor {
 				launchEnv,
 				launchEnvMode,
 				exactEnvironmentAwaitingOwner: false,
+				nonpersistentOwnerClient: workerRecovery === "disabled" ? nonpersistentOwnerClient : undefined,
 				transientCreateCommand:
 					ownerClientId && workerRecovery !== "disabled"
 						? { ...createCommand, launchEnv, ...(launchEnvMode ? { launchEnvMode } : {}) }
@@ -5221,6 +5243,7 @@ export class DaemonSupervisor {
 			worker.launchEnv = launchEnv;
 			worker.launchEnvMode = launchEnvMode;
 			worker.exactEnvironmentAwaitingOwner = false;
+			worker.nonpersistentOwnerClient = workerRecovery === "disabled" ? nonpersistentOwnerClient : undefined;
 			worker.transientCreateCommand =
 				descriptor.ownerClientId && workerRecovery !== "disabled"
 					? { ...createCommand, launchEnv, ...(launchEnvMode ? { launchEnvMode } : {}) }
@@ -6700,7 +6723,7 @@ export class DaemonSupervisor {
 	}
 
 	private createResponseSummary(
-		ownerClientId: string,
+		ownerClient: DaemonSocketClient,
 		command: DaemonCreateCommand,
 		worker: ResidentWorker,
 		summary: SessionSummary,
@@ -6710,6 +6733,7 @@ export class DaemonSupervisor {
 			summary,
 		) as SessionSummary & { workerRecovery?: unknown };
 		if (command.workerRecovery !== "disabled") return publicSummary;
+		const ownerClientId = this.protocolClientId(ownerClient);
 		const unavailableProofs = Object.entries({
 			requestPersistence: command.noSession !== true,
 			requestTools: command.config?.noTools !== true,
@@ -6721,6 +6745,7 @@ export class DaemonSupervisor {
 			descriptorMode: worker.descriptor.workerRecovery !== "disabled",
 			descriptorJournal: worker.descriptor.recoveryJournalPath !== undefined,
 			descriptorOwner: worker.descriptor.ownerClientId !== ownerClientId,
+			ownerTransport: worker.nonpersistentOwnerClient !== ownerClient,
 			workerMapping: this.workers.get(worker.descriptor.workerId) !== worker,
 			activeSessionMapping:
 				[...this.workers.values()].filter(
@@ -6794,11 +6819,7 @@ export class DaemonSupervisor {
 			return failure(command.id, command.type, "Nonpersistent daemon worker create result is uncertain");
 		}
 		try {
-			return success(
-				command.id,
-				command.type,
-				this.createResponseSummary(this.protocolClientId(client), command, worker, summary),
-			);
+			return success(command.id, command.type, this.createResponseSummary(client, command, worker, summary));
 		} catch {
 			return failure(command.id, command.type, "Nonpersistent daemon worker create result is uncertain");
 		}
@@ -6944,10 +6965,13 @@ export class DaemonSupervisor {
 		return responseWithId(response, command.id);
 	}
 
-	private assertNonpersistentWorkerAttachable(worker: ResidentWorker): void {
+	private assertNonpersistentWorkerAttachable(worker: ResidentWorker, client: DaemonSocketClient): void {
+		if (worker.descriptor?.workerRecovery !== "disabled") return;
 		if (
-			worker.descriptor?.workerRecovery !== "disabled" ||
-			(worker.client && worker.descriptor.lifecycle === "ready" && !this.isWorkerStopping(worker))
+			worker.nonpersistentOwnerClient === client &&
+			worker.client &&
+			worker.descriptor.lifecycle === "ready" &&
+			!this.isWorkerStopping(worker)
 		) {
 			return;
 		}
@@ -6976,8 +7000,8 @@ export class DaemonSupervisor {
 		) {
 			throw new Error(`Unknown active session: ${command.activeSessionId}`);
 		}
-		if (ownedWorker) this.assertNonpersistentWorkerAttachable(ownedWorker);
-		if (attachmentFence?.match) this.assertNonpersistentWorkerAttachable(attachmentFence.match.worker);
+		if (ownedWorker) this.assertNonpersistentWorkerAttachable(ownedWorker, client);
+		if (attachmentFence?.match) this.assertNonpersistentWorkerAttachable(attachmentFence.match.worker, client);
 		const requestsExactEnvironment =
 			command.capabilities?.includes(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE) === true;
 		if (requestsExactEnvironment !== (command.launchEnvMode === "replace")) {
@@ -7067,7 +7091,7 @@ export class DaemonSupervisor {
 		}
 
 		const match = attachmentFence?.match ?? (await this.findWorkerForClient(client, command.activeSessionId));
-		this.assertNonpersistentWorkerAttachable(match.worker);
+		this.assertNonpersistentWorkerAttachable(match.worker, client);
 		this.assertTelemetryAttachAllowed(match.worker, command.telemetryDisabled);
 		this.requireAvailableWorkerClient(match.worker);
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;

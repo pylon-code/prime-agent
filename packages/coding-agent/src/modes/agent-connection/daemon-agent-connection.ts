@@ -633,6 +633,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private updateRestartPending = false;
 	private updateReconnectFailed = false;
 	private terminalCloseEmitted = false;
+	private nonpersistentTransportLost = false;
 	private updateReconnectPromise?: Promise<void>;
 	private readonly activeSideQuestionIds = new Set<string>();
 	private readonly snapshotAssemblies = new Map<string, DaemonSnapshotAssembly>();
@@ -826,13 +827,17 @@ export class DaemonAgentConnection implements AgentConnection {
 			} finally {
 				this.transportCloseRetirementInProgress = false;
 			}
-			if (this.disposed || this.terminalCloseEmitted) {
-				return;
-			}
 			if (this.options.nonpersistentWorkerCreateProof) {
+				this.nonpersistentTransportLost = true;
 				this.correlatedPromptRoutes.clear();
+				this.latestSnapshot = undefined;
+				this.latestSnapshotIsFresh = false;
+				if (this.disposed || this.terminalCloseEmitted) return;
 				this.terminalCloseEmitted = true;
 				void this.emit({ type: "closed", error: this.formatDaemonConnectionClosedError(error) });
+				return;
+			}
+			if (this.disposed || this.terminalCloseEmitted) {
 				return;
 			}
 			if (this.client.isClosed) {
@@ -1130,6 +1135,11 @@ export class DaemonAgentConnection implements AgentConnection {
 		allowWhileDisposing = false,
 		preserveRuntimeSnapshotAttempt = false,
 	): Promise<void> {
+		if (this.options.nonpersistentWorkerCreateProof && this.nonpersistentTransportLost) {
+			return Promise.reject(
+				new Error("A nonpersistent daemon worker cannot be recovered or reattached after disconnect"),
+			);
+		}
 		const admissionRevision = ++this.attachmentAdmissionRevision;
 		this.attachmentAdmissionInFlight = true;
 		this.fenceSnapshotTransfersForAttachmentAdmission(preserveRuntimeSnapshotAttempt);
@@ -3162,6 +3172,11 @@ export class DaemonAgentConnection implements AgentConnection {
 		timeoutMs?: number,
 		options?: Parameters<DaemonClient["request"]>[2],
 	): Promise<DaemonResponse> {
+		if (this.options.nonpersistentWorkerCreateProof && this.nonpersistentTransportLost) {
+			return Promise.reject(
+				new Error("A nonpersistent daemon worker cannot be recovered or reattached after disconnect"),
+			);
+		}
 		const deadline = this.ownedSessionDisposeDeadline;
 		let effectiveTimeoutMs = timeoutMs;
 		let effectiveOptions = this.options.nonpersistentWorkerCreateProof

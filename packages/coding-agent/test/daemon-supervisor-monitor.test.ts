@@ -2638,6 +2638,53 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(worker.ownerCleanupTimer).toBeUndefined();
 	});
 
+	it("does not let an overlapping same-ID transport suppress private owner retirement or attach", async () => {
+		const original = { id: "shared-owner" } as DaemonSocketClient;
+		const replacement = { id: "shared-owner" } as DaemonSocketClient;
+		const worker = {
+			descriptor: {
+				workerId: "private-overlapping-owner",
+				ownerClientId: "shared-owner",
+				workerRecovery: "disabled" as const,
+				lifecycle: "ready",
+			},
+			client: {},
+			nonpersistentOwnerClient: original,
+			ownerCleanupTimer: undefined,
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const clients = new Set<DaemonSocketClient>([original, replacement]);
+		const protocolClientIds = new WeakMap<DaemonSocketClient, string>([
+			[original, "shared-owner"],
+			[replacement, "shared-owner"],
+		]);
+		const retireNonpersistentWorker = vi.fn(async () => undefined);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients,
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			protocolClientIds,
+			retireNonpersistentWorker,
+		}) as {
+			scheduleOwnedWorkerCleanup(target: typeof worker): void;
+			assertNonpersistentWorkerAttachable(target: typeof worker, client: DaemonSocketClient): void;
+		};
+
+		supervisor.scheduleOwnedWorkerCleanup(worker);
+		expect(retireNonpersistentWorker).not.toHaveBeenCalled();
+		expect(() => supervisor.assertNonpersistentWorkerAttachable(worker, replacement)).toThrow(
+			"cannot be recovered or reattached after disconnect",
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(retireNonpersistentWorker).toHaveBeenCalledExactlyOnceWith(worker);
+		retireNonpersistentWorker.mockClear();
+
+		clients.delete(original);
+		supervisor.scheduleOwnedWorkerCleanup(worker);
+		expect(retireNonpersistentWorker).toHaveBeenCalledExactlyOnceWith(worker);
+		expect(clients.has(replacement)).toBe(true);
+	});
+
 	it("arms owner cleanup after a client-owned create registers without its disconnected client", async () => {
 		const client = { id: "owner-create-race" } as DaemonSocketClient;
 		const worker = {
@@ -5828,6 +5875,7 @@ describe("daemon worker supervisor monitoring", () => {
 			`${descriptorPath}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`,
 			DAEMON_NONPERSISTENT_WORKER_MARKER,
 		);
+		const ownerClient = { id: "nonpersistent-owner" } as DaemonSocketClient;
 		const summary = {
 			id: "active-nonpersistent",
 			activeSessionId: "active-nonpersistent",
@@ -5851,6 +5899,7 @@ describe("daemon worker supervisor monitoring", () => {
 			summaries: new Map([["active-nonpersistent", summary]]),
 			intentionalStop: false,
 			stopRevision: 0,
+			nonpersistentOwnerClient: ownerClient,
 		};
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			clients: new Set<DaemonSocketClient>(),
@@ -5860,7 +5909,7 @@ describe("daemon worker supervisor monitoring", () => {
 		}) as {
 			workers: Map<string, typeof worker>;
 			createResponseSummary(
-				ownerClientId: string,
+				ownerClient: DaemonSocketClient,
 				command: {
 					type: "create";
 					lifecycle: "client_owned";
@@ -5887,7 +5936,7 @@ describe("daemon worker supervisor monitoring", () => {
 
 		expect(
 			supervisor.createResponseSummary(
-				"nonpersistent-owner",
+				ownerClient,
 				{
 					type: "create",
 					lifecycle: "client_owned",
@@ -5902,7 +5951,7 @@ describe("daemon worker supervisor monitoring", () => {
 		writeFileSync(`${descriptorPath}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`, "tampered-nonpersistent-marker");
 		expect(() =>
 			supervisor.createResponseSummary(
-				"nonpersistent-owner",
+				ownerClient,
 				{
 					type: "create",
 					lifecycle: "client_owned",
@@ -5920,7 +5969,7 @@ describe("daemon worker supervisor monitoring", () => {
 		);
 		expect(() =>
 			supervisor.createResponseSummary(
-				"nonpersistent-owner",
+				ownerClient,
 				{
 					type: "create",
 					lifecycle: "client_owned",
@@ -5933,15 +5982,10 @@ describe("daemon worker supervisor monitoring", () => {
 			),
 		).toThrow("proof is unavailable");
 		expect(
-			supervisor.createResponseSummary(
-				"nonpersistent-owner",
-				{ type: "create", lifecycle: "client_owned" },
-				worker,
-				summary,
-			),
+			supervisor.createResponseSummary(ownerClient, { type: "create", lifecycle: "client_owned" }, worker, summary),
 		).not.toHaveProperty("workerRecovery");
 		const exactReplay = supervisor.replayCreateResponse(
-			{ id: "nonpersistent-owner" } as DaemonSocketClient,
+			ownerClient,
 			{
 				type: "create",
 				id: "stable-create",
@@ -5959,7 +6003,7 @@ describe("daemon worker supervisor monitoring", () => {
 		);
 		expect(exactReplay).toMatchObject({ success: true, data: { workerRecovery: "disabled" } });
 		const staleGenerationReplay = supervisor.replayCreateResponse(
-			{ id: "nonpersistent-owner" } as DaemonSocketClient,
+			ownerClient,
 			{
 				type: "create",
 				id: "stable-create",
@@ -5977,7 +6021,7 @@ describe("daemon worker supervisor monitoring", () => {
 		);
 		expect(staleGenerationReplay).toMatchObject({ success: false });
 		const staleProcessReplay = supervisor.replayCreateResponse(
-			{ id: "nonpersistent-owner" } as DaemonSocketClient,
+			ownerClient,
 			{
 				type: "create",
 				id: "stable-create",
@@ -5997,7 +6041,7 @@ describe("daemon worker supervisor monitoring", () => {
 		supervisor.workers.delete(worker.descriptor.workerId);
 		expect(() =>
 			supervisor.createResponseSummary(
-				"nonpersistent-owner",
+				ownerClient,
 				{
 					type: "create",
 					lifecycle: "client_owned",
@@ -6010,7 +6054,7 @@ describe("daemon worker supervisor monitoring", () => {
 			),
 		).toThrow("proof is unavailable");
 		const replay = supervisor.replayCreateResponse(
-			{ id: "nonpersistent-owner" } as DaemonSocketClient,
+			ownerClient,
 			{
 				type: "create",
 				id: "stable-create",
@@ -6029,7 +6073,7 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(replay).toMatchObject({ success: false });
 		expect(JSON.stringify(replay)).not.toContain('"workerRecovery"');
 		const defaultReplay = supervisor.replayCreateResponse(
-			{ id: "nonpersistent-owner" } as DaemonSocketClient,
+			ownerClient,
 			{ type: "create", id: "stable-create", lifecycle: "client_owned" },
 			{
 				type: "response",

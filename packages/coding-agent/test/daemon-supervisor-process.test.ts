@@ -3474,6 +3474,71 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 		await waitForSocketGone(socketPath);
 	}, 60_000);
 
+	it("retires a private worker across an overlapping reconnect with the same logical client id", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const socketPath = join(tmpdir(), `prime-np-overlap-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const owner = await connectEventually(socketPath, supervisor);
+		const created = await owner.request({
+			type: "create",
+			lifecycle: "client_owned",
+			workerRecovery: "disabled",
+			noSession: true,
+			launchEnv: { TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json") },
+			config: {
+				cwd: projectDir,
+				agentDir,
+				noTools: true,
+				noExtensions: true,
+				apiKey: `private-overlap-${randomUUID()}`,
+			},
+		});
+		if (!created.success) {
+			const diagnostics = childDiagnostics.get(supervisor);
+			throw new Error(`${created.error}
+${diagnostics?.stderr ?? ""}`);
+		}
+		const summary = requireSummary(created.data);
+		if (!summary.workerPid || !summary.activeSessionId) throw new Error("Private worker identity is incomplete");
+		workerPids.add(summary.workerPid);
+
+		const replacement = new DaemonClient(socketPath);
+		(replacement as unknown as { protocolClientId: string }).protocolClientId = owner.clientId;
+		await replacement.connect();
+		await replacement.waitForHello();
+		await expect(replacement.request({ type: "list" })).resolves.toMatchObject({
+			success: false,
+			error: "Client identity is already connected",
+		});
+
+		await disconnectDaemonClientWithServerCloseBarrier(owner);
+		const attach = await replacement.request({
+			type: "attach",
+			activeSessionId: summary.activeSessionId,
+			clientId: replacement.clientId,
+			capabilities: [],
+		});
+		expect(attach).toMatchObject({
+			success: false,
+			error: expect.stringContaining("cannot be recovered or reattached after disconnect"),
+		});
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		await waitForCondition(
+			() => countWorkerDescriptors(agentDir) === 0,
+			"Same-ID replacement suppressed private worker retirement",
+		);
+
+		owner.close();
+		await replacement.request({ type: "shutdown" });
+		replacement.close();
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
 	it("retires a live nonpersistent worker after replacement even when its descriptor marker was stripped", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");

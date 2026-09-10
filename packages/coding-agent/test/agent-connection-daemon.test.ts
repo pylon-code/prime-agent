@@ -4186,11 +4186,21 @@ describe("DaemonAgentConnection", () => {
 			.correlatedPromptRoutes;
 		expect(privateRoutes.size).toBe(1);
 
+		fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-1", reason: "killed" });
+		await vi.waitFor(() => expect(events.some((event) => event.type === "closed")).toBe(true));
 		fakeClient.emitClose(new Error("transport lost"));
 
-		await vi.waitFor(() => expect(events.some((event) => event.type === "closed")).toBe(true));
 		expect(privateRoutes.size).toBe(0);
 		expect(events.some((event) => event.type === "connection_status" && event.status === "reconnecting")).toBe(false);
+		const requestCount = fakeClient.requests.length;
+		fakeClient.connected = true;
+		await expect(connection.attach()).rejects.toThrow(
+			"A nonpersistent daemon worker cannot be recovered or reattached after disconnect",
+		);
+		await expect(connection.getState()).rejects.toThrow(
+			"A nonpersistent daemon worker cannot be recovered or reattached after disconnect",
+		);
+		expect(fakeClient.requests).toHaveLength(requestCount);
 	});
 
 	it("rejects an unbound nonpersistent create receipt", () => {
