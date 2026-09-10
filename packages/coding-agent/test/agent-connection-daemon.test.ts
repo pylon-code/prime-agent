@@ -2662,6 +2662,36 @@ describe("DaemonAgentConnection", () => {
 		);
 	});
 
+	it("rejects an old response whose completion races a silent private reset", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			ownedSession: true,
+			nonpersistentWorkerCreateProof: {
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionId: "session-current",
+				workerRecovery: "disabled",
+			},
+		});
+		await connection.attach();
+		(connection as unknown as { latestSnapshotIsFresh: boolean }).latestSnapshotIsFresh = false;
+		let releaseResponse!: () => void;
+		fakeClient.connectionStateGate = new Promise<void>((resolve) => {
+			releaseResponse = resolve;
+		});
+
+		const state = connection.getState();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.filter((request) => request.type === "get_connection_state")).toHaveLength(1),
+		);
+		releaseResponse();
+		fakeClient.resetTransportForReconnect();
+
+		await expect(state).rejects.toThrow(
+			"A nonpersistent daemon worker cannot be recovered or reattached after disconnect",
+		);
+	});
+
 	it("fences an in-flight attach when its session closes before the response", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");

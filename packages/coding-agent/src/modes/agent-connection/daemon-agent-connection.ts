@@ -1421,6 +1421,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				? this.getPromptLifecycles()
 				: Promise.resolve(undefined),
 		]);
+		this.assertNonpersistentTransportAvailable();
 		const observedSnapshot = this.latestSnapshot;
 		const sameGeneration = observedSnapshot?.state.sessionId === state.sessionId;
 		const children = sameGeneration ? observedSnapshot.children : undefined;
@@ -3220,7 +3221,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
-	private requestDaemonCommandWithinOwnedSessionDeadline(
+	private async requestDaemonCommandWithinOwnedSessionDeadline(
 		command: DaemonCommandBody,
 		timeoutMs?: number,
 		options?: Parameters<DaemonClient["request"]>[2],
@@ -3241,7 +3242,11 @@ export class DaemonAgentConnection implements AgentConnection {
 			effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs ?? remainingMs, remainingMs));
 			effectiveOptions = { ...options, recoverAcrossReconnect: false };
 		}
-		return this.awaitOwnedSessionDisposeDeadline(this.client.request(command, effectiveTimeoutMs, effectiveOptions));
+		const response = await this.awaitOwnedSessionDisposeDeadline(
+			this.client.request(command, effectiveTimeoutMs, effectiveOptions),
+		);
+		this.assertNonpersistentTransportAvailable();
+		return response;
 	}
 
 	private async requestOk(command: DaemonCommandBody): Promise<void> {
