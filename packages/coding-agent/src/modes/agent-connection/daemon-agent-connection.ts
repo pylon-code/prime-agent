@@ -687,6 +687,19 @@ export class DaemonAgentConnection implements AgentConnection {
 		return false;
 	}
 
+	private assertNonpersistentTransportAvailable(): void {
+		if (this.hasLostNonpersistentTransport()) {
+			throw new Error("A nonpersistent daemon worker cannot be recovered or reattached after disconnect");
+		}
+	}
+
+	private assertNonpersistentSupervisorHelperAvailable(): void {
+		this.assertNonpersistentTransportAvailable();
+		if (this.options.nonpersistentWorkerCreateProof) {
+			throw new Error("Nonpersistent daemon command was invalid");
+		}
+	}
+
 	private dispatchDaemonMessage(message: DaemonOutbound): void {
 		if (this.hasLostNonpersistentTransport()) return;
 		if (this.recoverableAdoptionStaging) {
@@ -1366,6 +1379,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getState(): Promise<AgentConnectionState> {
+		this.assertNonpersistentTransportAvailable();
 		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
 			return this.latestSnapshot.state;
 		}
@@ -1376,6 +1390,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getInitialSnapshot(): Promise<AgentConnectionSnapshot> {
+		this.assertNonpersistentTransportAvailable();
 		const snapshotRecovery = this.runtimeSnapshotAttempt?.recovery;
 		if (snapshotRecovery) await snapshotRecovery;
 		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
@@ -1456,6 +1471,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getMessages(): Promise<AgentMessage[]> {
+		this.assertNonpersistentTransportAvailable();
 		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
 			return this.latestSnapshot.messages;
 		}
@@ -1490,6 +1506,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	supportsAcpMcpServers(): boolean {
+		if (this.hasLostNonpersistentTransport()) return false;
 		return this.client.supportsServerCapability("acp_mcp_servers");
 	}
 
@@ -1561,6 +1578,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	 * attachment is invalidated. Server hello offers alone are not proof.
 	 */
 	supportsNegotiatedCapability(capability: DaemonClientCapability): boolean {
+		if (this.hasLostNonpersistentTransport()) return false;
 		if (
 			this.disposing ||
 			this.disposed ||
@@ -1578,6 +1596,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private supportsNegotiatedRuntimeCapability(capability: DaemonClientCapability): boolean {
+		if (this.hasLostNonpersistentTransport()) return false;
 		const activeSessionId = this.sharedAttachmentActiveSessionId;
 		return (
 			!this.disposed &&
@@ -1598,6 +1617,7 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	/** Server-offer evidence used to construct the pre-attach capability list. */
 	supportsCorrelatedPromptLifecycle(): boolean {
+		if (this.hasLostNonpersistentTransport()) return false;
 		return this.client.supportsServerCapability("correlated_prompt_lifecycle_v1");
 	}
 
@@ -1804,6 +1824,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getSessionContext(): Promise<AgentConnectionSessionContext> {
+		this.assertNonpersistentTransportAvailable();
 		if (this.latestSnapshotIsFresh && this.latestSnapshot?.sessionContext) {
 			return this.latestSnapshot.sessionContext;
 		}
@@ -1815,6 +1836,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }> {
+		this.assertNonpersistentTransportAvailable();
 		if (this.latestSnapshotIsFresh && this.latestSnapshot?.sessionTree) {
 			return this.latestSnapshot.sessionTree;
 		}
@@ -1832,6 +1854,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		scope: AgentConnectionSavedSessionScope,
 		callbacks?: AgentConnectionSessionListCallbacks,
 	): Promise<AgentConnectionSavedSessionInfo[]> {
+		this.assertNonpersistentSupervisorHelperAvailable();
 		return listDaemonSavedSessions(this.client, { activeSessionId: this.activeSessionId }, scope, callbacks);
 	}
 
@@ -1848,6 +1871,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		expectedText: string,
 		mutation: AgentConnectionQueuedMessageMutation,
 	): Promise<AgentConnectionQueuedMessageMutationStatus> {
+		this.assertNonpersistentTransportAvailable();
 		if (!this.client.supportsServerCapability("queue_message_mutation")) return "unsupported";
 		const data = await this.requestData<{ status: AgentConnectionQueuedMessageMutationStatus }>({
 			type: "mutate_queued_message",
@@ -1882,6 +1906,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async acquireSessionInputPause(leaseKey: string): Promise<AgentConnectionSessionInputPause> {
+		this.assertNonpersistentTransportAvailable();
 		if (this.terminalCloseEmitted) throw new Error("Daemon connection is closed; cannot acquire an input pause.");
 		const activeSessionId = this.activeSessionId;
 		const generation = this.sessionInputPauseGeneration;
@@ -1945,6 +1970,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async listHeartbeats(): Promise<AgentConnectionHeartbeat[]> {
+		this.assertNonpersistentSupervisorHelperAvailable();
 		return listDaemonHeartbeats(this.client, this.options.ownedSession ? this.activeSessionId : undefined);
 	}
 
@@ -2781,14 +2807,17 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async renameSavedSession(sessionPath: string, name: string): Promise<void> {
+		this.assertNonpersistentSupervisorHelperAvailable();
 		await renameDaemonSavedSession(this.client, { activeSessionId: this.activeSessionId }, sessionPath, name);
 	}
 
 	async deleteSavedSession(sessionPath: string): Promise<DeleteSessionFileResult> {
+		this.assertNonpersistentSupervisorHelperAvailable();
 		return deleteDaemonSavedSession(this.client, { activeSessionId: this.activeSessionId }, sessionPath);
 	}
 
 	async watchSession(activeSessionId: string): Promise<AgentConnectionSessionWatcher | undefined> {
+		this.assertNonpersistentSupervisorHelperAvailable();
 		// A second connection on the shared client; each one filters to its own session id.
 		// attach() rejects for an unknown/exited session — treat that as unreachable.
 		let connection: DaemonAgentConnection;
