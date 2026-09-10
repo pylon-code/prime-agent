@@ -2591,6 +2591,36 @@ describe("DaemonAgentConnection", () => {
 		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(false);
 	});
 
+	it("permanently fences a proof-bound connection across a silent shared transport reset", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			ownedSession: true,
+			nonpersistentWorkerCreateProof: {
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionId: "session-current",
+				workerRecovery: "disabled",
+			},
+		});
+		await connection.attach();
+		await connection.submitCorrelatedPrompt("private input", { correlationId: "silent-private-reset" });
+		const routes = (connection as unknown as { correlatedPromptRoutes: Map<string, unknown> }).correlatedPromptRoutes;
+		expect(routes.size).toBe(1);
+		const requestCount = fakeClient.requests.length;
+
+		fakeClient.resetTransportForReconnect();
+		fakeClient.connected = true;
+		await expect(connection.attach()).rejects.toThrow(
+			"A nonpersistent daemon worker cannot be recovered or reattached after disconnect",
+		);
+		await expect(connection.getState()).rejects.toThrow(
+			"A nonpersistent daemon worker cannot be recovered or reattached after disconnect",
+		);
+		expect(routes.size).toBe(0);
+		expect(fakeClient.requests).toHaveLength(requestCount);
+	});
+
 	it("fences an in-flight attach when its session closes before the response", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");

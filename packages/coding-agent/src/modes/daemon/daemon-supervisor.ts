@@ -2780,12 +2780,10 @@ export class DaemonSupervisor {
 			case "create": {
 				assertWorkerRecoveryRequest(command);
 				const createCommand = prepareCallerOwnedCreateEnvironment(command);
-				const worker = await this.createOrReuseWorker(
-					this.protocolClientId(client),
-					createCommand,
-					undefined,
-					client,
-				);
+				const worker =
+					createCommand.workerRecovery === "disabled"
+						? await this.createOrReuseWorker(this.protocolClientId(client), createCommand, undefined, client)
+						: await this.createOrReuseWorker(this.protocolClientId(client), createCommand);
 				try {
 					if (createCommand.workerRecovery === "disabled") {
 						if (worker.nonpersistentOwnerClient && worker.nonpersistentOwnerClient !== client) {

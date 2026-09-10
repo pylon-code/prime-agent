@@ -634,6 +634,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private updateReconnectFailed = false;
 	private terminalCloseEmitted = false;
 	private nonpersistentTransportLost = false;
+	private readonly nonpersistentTransportGeneration: number | undefined;
 	private updateReconnectPromise?: Promise<void>;
 	private readonly activeSideQuestionIds = new Set<string>();
 	private readonly snapshotAssemblies = new Map<string, DaemonSnapshotAssembly>();
@@ -667,7 +668,27 @@ export class DaemonAgentConnection implements AgentConnection {
 	private recoverableAdoptionBufferedBytes = 0;
 	private recoverableAdoptionError?: Error;
 
+	private retireNonpersistentTransportState(): void {
+		this.nonpersistentTransportLost = true;
+		this.correlatedPromptRoutes.clear();
+		this.latestSnapshot = undefined;
+		this.latestSnapshotIsFresh = false;
+	}
+
+	private hasLostNonpersistentTransport(): boolean {
+		if (!this.options.nonpersistentWorkerCreateProof) return false;
+		if (
+			this.nonpersistentTransportLost ||
+			this.nonpersistentTransportGeneration !== this.client.getTransportGeneration()
+		) {
+			this.retireNonpersistentTransportState();
+			return true;
+		}
+		return false;
+	}
+
 	private dispatchDaemonMessage(message: DaemonOutbound): void {
+		if (this.hasLostNonpersistentTransport()) return;
 		if (this.recoverableAdoptionStaging) {
 			if (this.recoverableAdoptionError) return;
 			try {
@@ -804,6 +825,9 @@ export class DaemonAgentConnection implements AgentConnection {
 				? { nonpersistentWorkerCreateProof: { ...connectionOptions.nonpersistentWorkerCreateProof } }
 				: {}),
 		};
+		this.nonpersistentTransportGeneration = connectionOptions.nonpersistentWorkerCreateProof
+			? client.getTransportGeneration()
+			: undefined;
 		this.ownedSessionLaunchEnv =
 			ownedSessionLaunchEnv === undefined ? undefined : cloneCallerOwnedSessionLaunchEnv(ownedSessionLaunchEnv);
 		if (options.recoverDaemon) {
@@ -828,10 +852,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.transportCloseRetirementInProgress = false;
 			}
 			if (this.options.nonpersistentWorkerCreateProof) {
-				this.nonpersistentTransportLost = true;
-				this.correlatedPromptRoutes.clear();
-				this.latestSnapshot = undefined;
-				this.latestSnapshotIsFresh = false;
+				this.retireNonpersistentTransportState();
 				if (this.disposed || this.terminalCloseEmitted) return;
 				this.terminalCloseEmitted = true;
 				void this.emit({ type: "closed", error: this.formatDaemonConnectionClosedError(error) });
@@ -1135,7 +1156,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		allowWhileDisposing = false,
 		preserveRuntimeSnapshotAttempt = false,
 	): Promise<void> {
-		if (this.options.nonpersistentWorkerCreateProof && this.nonpersistentTransportLost) {
+		if (this.hasLostNonpersistentTransport()) {
 			return Promise.reject(
 				new Error("A nonpersistent daemon worker cannot be recovered or reattached after disconnect"),
 			);
@@ -3172,7 +3193,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		timeoutMs?: number,
 		options?: Parameters<DaemonClient["request"]>[2],
 	): Promise<DaemonResponse> {
-		if (this.options.nonpersistentWorkerCreateProof && this.nonpersistentTransportLost) {
+		if (this.hasLostNonpersistentTransport()) {
 			return Promise.reject(
 				new Error("A nonpersistent daemon worker cannot be recovered or reattached after disconnect"),
 			);
