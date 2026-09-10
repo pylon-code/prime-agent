@@ -377,6 +377,8 @@ export class DaemonClient {
 		timeoutMs = 30000,
 		options: DaemonClientRequestOptions = {},
 	): Promise<DaemonResponse> {
+		const nonpersistentCreateTransportGeneration =
+			command.type === "create" && command.workerRecovery === "disabled" ? this.transportGeneration : undefined;
 		if (!this.socket || this.socket.destroyed) {
 			if (this.terminalTransportError) {
 				throw this.terminalTransportError;
@@ -386,6 +388,12 @@ export class DaemonClient {
 			);
 		}
 		const hello = this.helloMessage ?? (await this.waitForHello());
+		if (
+			nonpersistentCreateTransportGeneration !== undefined &&
+			this.transportGeneration !== nonpersistentCreateTransportGeneration
+		) {
+			throw new Error("Nonpersistent daemon worker create result is uncertain");
+		}
 		const expectedSupervisorGeneration =
 			"expectedSupervisorGeneration" in command && typeof command.expectedSupervisorGeneration === "string"
 				? command.expectedSupervisorGeneration
@@ -405,13 +413,20 @@ export class DaemonClient {
 			command.type === "create" && command.workerRecovery === "disabled"
 				? { ...options, recoverAcrossReconnect: false }
 				: options;
-		return this.requestWire(
+		const response = await this.requestWire(
 			command,
 			timeoutMs,
 			requestOptions,
 			envelopeProtocolVersion >= DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION ? envelopeProtocolVersion : undefined,
 			compatibilities,
 		);
+		if (
+			nonpersistentCreateTransportGeneration !== undefined &&
+			this.transportGeneration !== nonpersistentCreateTransportGeneration
+		) {
+			throw new Error("Nonpersistent daemon worker create result is uncertain");
+		}
+		return response;
 	}
 
 	private meetsCommandCompatibility(hello: DaemonHello, compatibility: DaemonCommandCompatibility): boolean {

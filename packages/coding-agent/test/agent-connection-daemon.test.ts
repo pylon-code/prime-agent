@@ -15,6 +15,7 @@ import {
 	type RecoverableOwnedSessionAdoptionOptions,
 } from "../src/modes/agent-connection/recoverable-owned-session.js";
 import type {
+	AgentConnectionCorrelatedPromptResult,
 	AgentConnectionEvent,
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSavedSessionInfo,
@@ -2690,6 +2691,79 @@ describe("DaemonAgentConnection", () => {
 		await expect(state).rejects.toThrow(
 			"A nonpersistent daemon worker cannot be recovered or reattached after disconnect",
 		);
+	});
+
+	it("rechecks the private generation after the request wrapper settles", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			ownedSession: true,
+			nonpersistentWorkerCreateProof: {
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionId: "session-current",
+				workerRecovery: "disabled",
+			},
+		});
+		await connection.attach();
+		Object.assign(
+			connection as unknown as {
+				latestSnapshotIsFresh: boolean;
+				requestDaemonCommandWithinOwnedSessionDeadline: () => Promise<DaemonResponse>;
+			},
+			{
+				latestSnapshotIsFresh: false,
+				requestDaemonCommandWithinOwnedSessionDeadline: async () => {
+					queueMicrotask(() => fakeClient.resetTransportForReconnect());
+					return {
+						type: "response",
+						command: "get_connection_state",
+						success: true,
+						data: createConnectionState("active-1", "session-current"),
+					};
+				},
+			},
+		);
+
+		await expect(connection.getState()).rejects.toThrow(
+			"A nonpersistent daemon worker cannot be recovered or reattached after disconnect",
+		);
+	});
+
+	it("rechecks the private generation before committing a correlated response", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("correlated_prompt_lifecycle_v1");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			ownedSession: true,
+			nonpersistentWorkerCreateProof: {
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionId: "session-current",
+				workerRecovery: "disabled",
+			},
+		});
+		await connection.attach();
+		Object.assign(connection as unknown as { requestData: () => Promise<AgentConnectionCorrelatedPromptResult> }, {
+			requestData: async () => {
+				queueMicrotask(() => fakeClient.resetTransportForReconnect());
+				return {
+					duplicate: false,
+					lifecycle: {
+						correlationId: "private-commit-race",
+						phase: "queued",
+						kind: "model_prompt",
+						revision: 1,
+						deliveryCrossed: false,
+					},
+				};
+			},
+		});
+
+		await expect(
+			connection.submitCorrelatedPrompt("private input", { correlationId: "private-commit-race" }),
+		).rejects.toThrow("A nonpersistent daemon worker cannot be recovered or reattached after disconnect");
+		expect(
+			(connection as unknown as { correlatedPromptRoutes: Map<string, unknown> }).correlatedPromptRoutes.size,
+		).toBe(0);
 	});
 
 	it("fences an in-flight attach when its session closes before the response", async () => {

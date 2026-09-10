@@ -1368,6 +1368,44 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("rejects a disabled create response that resolves before a silent transport reset", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connecting = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connecting;
+		emitHello(
+			socket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+			DAEMON_SCHEMA_REVISION,
+		);
+
+		const privateCreate = client.request({
+			type: "create",
+			lifecycle: "client_owned",
+			workerRecovery: "disabled",
+			noSession: true,
+			config: { noTools: true, noExtensions: true },
+		});
+		const envelope = JSON.parse(socket.writes[0]!) as { id: string };
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "create",
+				success: true,
+				data: { activeSessionId: "private-active", sessionId: "private-session", workerRecovery: "disabled" },
+			})}
+`,
+		);
+		client.resetTransportForReconnect();
+
+		await expect(privateCreate).rejects.toThrow("Nonpersistent daemon worker create result is uncertain");
+		client.close();
+	});
+
 	it("pauses request timeouts while a recoverable connection is disconnected", async () => {
 		vi.useFakeTimers();
 		const client = new DaemonClient("/tmp/prime-agent.sock");

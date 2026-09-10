@@ -1713,6 +1713,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				},
 				DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
 			);
+			this.assertNonpersistentTransportAvailable();
 			if (
 				typeof result !== "object" ||
 				result === null ||
@@ -3259,6 +3260,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		options?: Parameters<DaemonClient["request"]>[2],
 	): Promise<T> {
 		const response = await this.requestDaemonCommandWithinOwnedSessionDeadline(command, timeoutMs, options);
+		this.assertNonpersistentTransportAvailable();
 		if (!response.success) {
 			const error = deserializeDaemonError(response);
 			this.definitiveRequestErrors.add(error);
