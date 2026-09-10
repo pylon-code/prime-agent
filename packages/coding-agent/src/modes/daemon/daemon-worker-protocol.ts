@@ -12,6 +12,9 @@ export const DAEMON_WORKER_ACTIVE_SESSION_ID_ENV = "PRIME_AGENT_INTERNAL_DAEMON_
 export const DAEMON_WORKER_SUPERVISOR_SOCKET_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET";
 export const DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_AGENT_DIR";
 export const DAEMON_WORKER_RECOVERY_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL";
+export const DAEMON_WORKER_RECOVERY_MODE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_MODE";
+export const DAEMON_NONPERSISTENT_WORKER_MARKER = "nonpersistent_daemon_worker_v1\n";
+export const DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX = ".nonpersistent";
 export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_STARTUP_GATE_FD";
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
 
@@ -22,6 +25,7 @@ export const DAEMON_WORKER_BOOTSTRAP_ENV_KEYS = [
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_RECOVERY_MODE_ENV,
 	DAEMON_WORKER_STARTUP_GATE_FD_ENV,
 ] as const;
 
@@ -103,6 +107,7 @@ export type DaemonWorkerCommand =
 			supervisorPid: number;
 			supervisorProcessStartId?: string;
 			supervisorSocketPath: string;
+			workerRecovery: DaemonWorkerRecoveryMode;
 	  }
 	| {
 			id?: string;
@@ -148,12 +153,14 @@ export type DaemonWorkerCommandBody = DaemonWorkerCommand extends infer TCommand
 	: never;
 
 export interface DaemonWorkerDescriptor {
-	version: 1 | 2;
+	version: 1 | 2 | 3;
 	workerId: string;
 	pid: number;
 	processStartId?: string;
 	socketPath: string;
-	recoveryJournalPath: string;
+	recoveryJournalPath?: string;
+	/** The worker never receives a recovery-journal path and cannot be relaunched. */
+	workerRecovery?: "disabled";
 	orphanProcessJournalPath?: string;
 	supervisorSocketPath: string;
 	authenticationToken: string;
@@ -180,6 +187,16 @@ export interface DaemonWorkerDescriptor {
 }
 
 export function durableDaemonWorkerDescriptor(descriptor: DaemonWorkerDescriptor): DaemonWorkerDescriptor {
+	if (descriptor.workerRecovery === "disabled") {
+		if (!descriptor.ownerClientId) {
+			throw new Error("A nonpersistent daemon worker descriptor requires an owner");
+		}
+		if (descriptor.version !== 3 || descriptor.recoveryJournalPath !== undefined) {
+			throw new Error("A nonpersistent daemon worker descriptor has invalid recovery provenance");
+		}
+	} else if (descriptor.version === 3 || !descriptor.recoveryJournalPath) {
+		throw new Error("A recoverable daemon worker descriptor has invalid recovery provenance");
+	}
 	const versionOneCreateCommand = descriptor.createCommand as unknown as { config?: unknown };
 	const versionOneConfig =
 		descriptor.version === 1 &&
@@ -192,12 +209,13 @@ export function durableDaemonWorkerDescriptor(descriptor: DaemonWorkerDescriptor
 		(typeof versionOneConfig?.sessionDir === "string" ? versionOneConfig.sessionDir : undefined);
 	const telemetryDisabled = descriptor.telemetryDisabled === true || versionOneConfig?.telemetryDisabled === true;
 	return {
-		version: 2,
+		version: descriptor.workerRecovery === "disabled" ? 3 : 2,
 		workerId: descriptor.workerId,
 		pid: descriptor.pid,
 		...(descriptor.processStartId !== undefined ? { processStartId: descriptor.processStartId } : {}),
 		socketPath: descriptor.socketPath,
-		recoveryJournalPath: descriptor.recoveryJournalPath,
+		...(descriptor.recoveryJournalPath !== undefined ? { recoveryJournalPath: descriptor.recoveryJournalPath } : {}),
+		...(descriptor.workerRecovery !== undefined ? { workerRecovery: descriptor.workerRecovery } : {}),
 		...(descriptor.orphanProcessJournalPath !== undefined
 			? { orphanProcessJournalPath: descriptor.orphanProcessJournalPath }
 			: {}),
@@ -255,18 +273,30 @@ export function requireDaemonWorkerAuthenticationToken(environment: NodeJS.Proce
 	return token;
 }
 
+export type DaemonWorkerRecoveryMode = "enabled" | "disabled";
+
 export interface DaemonWorkerBootstrapEnvironment {
 	authenticationToken: string;
 	activeSessionId?: string;
 	supervisorSocketPath?: string;
 	supervisorAgentDir?: string;
+	recoveryMode: DaemonWorkerRecoveryMode;
 	recoveryJournalPath?: string;
 }
 
-/** Capture worker bootstrap authority once, before the private variables are scrubbed from process.env. */
+/** Capture and validate worker recovery provenance before constructing any journal or scrubbing private env. */
 export function readDaemonWorkerBootstrapEnvironment(
 	environment: NodeJS.ProcessEnv = process.env,
 ): DaemonWorkerBootstrapEnvironment {
+	const recoveryMode = environment[DAEMON_WORKER_RECOVERY_MODE_ENV];
+	const recoveryJournalPath = environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+	if (
+		(recoveryMode !== "enabled" && recoveryMode !== "disabled") ||
+		(recoveryMode === "enabled" && !recoveryJournalPath) ||
+		(recoveryMode === "disabled" && recoveryJournalPath !== undefined)
+	) {
+		throw new Error("Daemon session worker has invalid recovery bootstrap");
+	}
 	return {
 		authenticationToken: requireDaemonWorkerAuthenticationToken(environment),
 		...(environment[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]
@@ -278,9 +308,8 @@ export function readDaemonWorkerBootstrapEnvironment(
 		...(environment[DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV]
 			? { supervisorAgentDir: environment[DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV] }
 			: {}),
-		...(environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]
-			? { recoveryJournalPath: environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV] }
-			: {}),
+		recoveryMode,
+		...(recoveryJournalPath ? { recoveryJournalPath } : {}),
 	};
 }
 

@@ -216,6 +216,7 @@ describe("DaemonClient", () => {
 			"negotiated_daemon_session_capabilities_v1",
 			"caller_owned_session_environment_cleanup_v1",
 			"recoverable_owned_session_adoption_v1",
+			"nonpersistent_daemon_worker_v1",
 		];
 		const rootConnectionOptions: RootDaemonAgentConnectionOptions = {
 			ownedSession: true,
@@ -234,6 +235,7 @@ describe("DaemonClient", () => {
 			"caller_owned_session_environment_cleanup_v1",
 		);
 		expect(publicSdk.RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE).toBe("recoverable_owned_session_adoption_v1");
+		expect(publicSdk.NONPERSISTENT_DAEMON_WORKER_FEATURE).toBe("nonpersistent_daemon_worker_v1");
 		expect(publicSdk.createRecoverableOwnedSession).toEqual(expect.any(Function));
 		expect(publicSdk.adoptRecoverableOwnedSession).toEqual(expect.any(Function));
 		expect(publicSdk.confirmRecoverableOwnedSessionAdoption).toEqual(expect.any(Function));
@@ -533,6 +535,50 @@ describe("DaemonClient", () => {
 		await expect(client.request({ type: "heartbeats_list" })).rejects.toThrow("does not support heartbeat_catalog");
 		expect(socket.writes).toEqual([]);
 		client.close();
+	});
+
+	it("does not send nonpersistent creates without the supervisor capability and schema", async () => {
+		for (const hello of [
+			{ capabilities: ["client_owned_sessions"], schemaRevision: DAEMON_SCHEMA_REVISION },
+			{
+				capabilities: ["client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+				schemaRevision: DAEMON_SCHEMA_REVISION - 1,
+			},
+		] as const) {
+			const client = new DaemonClient("/tmp/prime-agent.sock");
+			const connect = client.connect();
+			const socket = netMock.sockets.at(-1)!;
+			socket.emit("connect");
+			await connect;
+			emitHello(socket, DAEMON_PROTOCOL_VERSION, [...hello.capabilities], hello.schemaRevision);
+
+			await expect(
+				client.request({ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", noSession: true }),
+			).rejects.toThrow("does not support nonpersistent_daemon_worker_v1");
+			expect(socket.writes).toEqual([]);
+			client.close();
+		}
+	});
+
+	it("keeps ordinary creates compatible with a supervisor that offers nonpersistent workers", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(
+			socket,
+			DAEMON_PROTOCOL_VERSION,
+			["client_owned_sessions", "nonpersistent_daemon_worker_v1"],
+			DAEMON_SCHEMA_REVISION,
+		);
+
+		const request = client.request({ type: "create" });
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!.trim()) as { command: Record<string, unknown> };
+		expect(envelope.command).not.toHaveProperty("workerRecovery");
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
 	it("does not send authoritative cleanup queries to stock-compatible capability offers", async () => {

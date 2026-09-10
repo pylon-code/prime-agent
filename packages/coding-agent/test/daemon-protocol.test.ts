@@ -31,12 +31,17 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
 	DAEMON_WORKER_BOOTSTRAP_ENV_KEYS,
+	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_RECOVERY_MODE_ENV,
+	DAEMON_WORKER_TOKEN_ENV,
 	type DaemonWorkerDescriptor,
 	durableDaemonWorkerDescriptor,
+	readDaemonWorkerBootstrapEnvironment,
 	sanitizeDaemonWorkerBootstrapEnvironment,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import {
 	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+	NONPERSISTENT_DAEMON_WORKER_FEATURE,
 	PRIME_AGENT_SDK_FEATURES,
 	RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE,
 } from "../src/sdk-features.js";
@@ -140,6 +145,44 @@ describe("daemon protocol helpers", () => {
 		expect(JSON.stringify(durable)).not.toContain("secret-");
 	});
 
+	it("preserves the version 3 nonpersistent worker marker across durable serialization", () => {
+		const descriptor = {
+			version: 3,
+			workerId: "nonpersistent-worker",
+			pid: 123,
+			socketPath: "/tmp/nonpersistent-worker.sock",
+			workerRecovery: "disabled",
+			supervisorSocketPath: "/tmp/supervisor.sock",
+			authenticationToken: "local-worker-token",
+			rootActiveSessionId: "active",
+			ownerClientId: "owner",
+			callerOwnedEnvironmentContract: true,
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			lifecycle: "ready",
+			createCommand: { type: "create" },
+			consecutiveFailures: 0,
+		} satisfies DaemonWorkerDescriptor;
+
+		expect(() => durableDaemonWorkerDescriptor({ ...descriptor, ownerClientId: undefined })).toThrow(
+			"requires an owner",
+		);
+		expect(() =>
+			durableDaemonWorkerDescriptor({
+				...descriptor,
+				recoveryJournalPath: "/state/nonpersistent.recovery.jsonl",
+			}),
+		).toThrow("invalid recovery provenance");
+		const durable = durableDaemonWorkerDescriptor(descriptor);
+		expect(durable).toMatchObject({
+			version: 3,
+			workerRecovery: "disabled",
+			ownerClientId: "owner",
+			callerOwnedEnvironmentContract: true,
+		});
+		expect(durable).not.toHaveProperty("recoveryJournalPath");
+	});
+
 	it("defensively clones exact caller-owned environments without exposing rejected values", () => {
 		const source = { PROVIDER_TOKEN: "secret-a", Path: "/caller/bin" };
 		const snapshot = cloneCallerOwnedSessionLaunchEnv(source, "linux");
@@ -228,6 +271,43 @@ describe("daemon protocol helpers", () => {
 		expect(windowsEnvironment).toEqual({ keep_public: "yes" });
 	});
 
+	it("requires an explicit recovery mode with a consistent worker journal bootstrap", () => {
+		const token = "worker-token";
+		const journalPath = "/private/worker-recovery.jsonl";
+		expect(
+			readDaemonWorkerBootstrapEnvironment({
+				[DAEMON_WORKER_TOKEN_ENV]: token,
+				[DAEMON_WORKER_RECOVERY_MODE_ENV]: "enabled",
+				[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: journalPath,
+			}),
+		).toMatchObject({ authenticationToken: token, recoveryMode: "enabled", recoveryJournalPath: journalPath });
+		expect(
+			readDaemonWorkerBootstrapEnvironment({
+				[DAEMON_WORKER_TOKEN_ENV]: token,
+				[DAEMON_WORKER_RECOVERY_MODE_ENV]: "disabled",
+			}),
+		).toMatchObject({ authenticationToken: token, recoveryMode: "disabled" });
+		for (const environment of [
+			{ [DAEMON_WORKER_TOKEN_ENV]: token },
+			{
+				[DAEMON_WORKER_TOKEN_ENV]: token,
+				[DAEMON_WORKER_RECOVERY_MODE_ENV]: "enabled",
+			},
+			{
+				[DAEMON_WORKER_TOKEN_ENV]: token,
+				[DAEMON_WORKER_RECOVERY_MODE_ENV]: "disabled",
+				[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: journalPath,
+			},
+			{
+				[DAEMON_WORKER_TOKEN_ENV]: token,
+				[DAEMON_WORKER_RECOVERY_MODE_ENV]: "unknown",
+				[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: journalPath,
+			},
+		]) {
+			expect(() => readDaemonWorkerBootstrapEnvironment(environment)).toThrow("invalid recovery bootstrap");
+		}
+	});
+
 	it("capability-gates exact launch replacement without changing legacy commands", () => {
 		const exact = getDaemonCommandCompatibilities({
 			type: "create",
@@ -249,6 +329,25 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_SUPPORTED_CLIENT_CAPABILITIES).toContain(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE);
 		expect(DAEMON_SUPERVISOR_SERVER_CAPABILITIES).toContain(CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE);
+	});
+
+	it("capability-gates nonpersistent workers without changing ordinary create semantics", () => {
+		expect(NONPERSISTENT_DAEMON_WORKER_FEATURE).toBe("nonpersistent_daemon_worker_v1");
+		expect(PRIME_AGENT_SDK_FEATURES).toContain(NONPERSISTENT_DAEMON_WORKER_FEATURE);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain(NONPERSISTENT_DAEMON_WORKER_FEATURE);
+		expect(DAEMON_SUPERVISOR_SERVER_CAPABILITIES).toContain(NONPERSISTENT_DAEMON_WORKER_FEATURE);
+		expect(
+			getDaemonCommandCompatibilities({
+				type: "create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+			}),
+		).toEqual([
+			{ minProtocol: 7, capability: "client_owned_sessions" },
+			{ minProtocol: 7, minSchemaRevision: 31, capability: NONPERSISTENT_DAEMON_WORKER_FEATURE },
+			{ minProtocol: 7 },
+		]);
+		expect(getDaemonCommandCompatibilities({ type: "create" })).toEqual([{ minProtocol: 7 }]);
 	});
 
 	it("independently freezes and schema/capability-gates recoverable owned adoption", () => {
@@ -285,7 +384,7 @@ describe("daemon protocol helpers", () => {
 		const workerSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-worker-protocol.ts"), "utf8");
 		const baseline = daemonSchemaDigest(daemonSource, workerSource);
 		const daemonMutations = [
-			['| "daemon_recoverable_owned_session_adoption_v1";', '| "daemon_recoverable_owned_session_adoption_v2";'],
+			['| "daemon_recoverable_owned_session_adoption_v1"', '| "daemon_recoverable_owned_session_adoption_v2"'],
 			['type: "create_recoverable_owned_session";', 'type: "create_recoverable_owned_session_v2";'],
 			[
 				'type: "commit_recoverable_owned_session_adoption";',
@@ -398,7 +497,7 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("capability- and schema-gates fresh snapshot generation nonces", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(30);
+		expect(DAEMON_SCHEMA_REVISION).toBe(31);
 		expect(DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION).toBe(28);
 		expect(
 			getDaemonCommandCompatibilities({

@@ -72,6 +72,35 @@ describe("snapshot transcript cache", () => {
 		cache.dispose();
 	});
 
+	it("fails closed instead of spilling private transcripts to disk", async () => {
+		const incomingRoot = tempDir();
+		expect(
+			() =>
+				new SnapshotTranscriptCache({
+					activeSessionId: "active-private",
+					snapshotId: "snapshot-private",
+					messages: messages(6, 100),
+					cacheRoot: incomingRoot,
+					targetChunkBytes: 180,
+					memoryCacheBytes: 300,
+					memoryOnly: true,
+				}),
+		).toThrow("Private snapshot transcript exceeds its in-memory limit");
+		expect(readdirSync(incomingRoot)).toEqual([]);
+
+		const payloadRoot = tempDir();
+		await expect(
+			prepareSnapshotTranscriptPayload({
+				messages: messages(6, 100),
+				cacheRoot: payloadRoot,
+				targetChunkBytes: 180,
+				memoryCacheBytes: 300,
+				memoryOnly: true,
+			}),
+		).rejects.toThrow("Private snapshot transcript exceeds its in-memory limit");
+		expect(readdirSync(payloadRoot)).toEqual([]);
+	});
+
 	it("streams opaque worker chunks to waiting attachments", async () => {
 		const cache = new SnapshotTranscriptCache({
 			activeSessionId: "active-c",

@@ -526,6 +526,10 @@ export class ExtensionRunner {
 		}
 	}
 
+	hasExtensions(): boolean {
+		return this.extensions.length > 0;
+	}
+
 	hasHandlers(eventType: string): boolean {
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get(eventType);

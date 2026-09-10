@@ -1,6 +1,15 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -28,7 +37,10 @@ import {
 	createDaemonCommandEnvelope,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	type DaemonWorkerDescriptor,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
@@ -172,17 +184,19 @@ function readDaemonLogs(agentDir: string): string {
 	}
 }
 
-function readWorkerDescriptor(agentDir: string): DaemonWorkerDescriptor {
+function workerDescriptorPath(agentDir: string): string {
 	const workersRoot = join(agentDir, "daemon-workers");
 	for (const directory of readdirSync(workersRoot)) {
 		const descriptorDirectory = join(workersRoot, directory);
 		for (const name of readdirSync(descriptorDirectory)) {
-			if (name.endsWith(".json")) {
-				return JSON.parse(readFileSync(join(descriptorDirectory, name), "utf8")) as DaemonWorkerDescriptor;
-			}
+			if (name.endsWith(".json")) return join(descriptorDirectory, name);
 		}
 	}
 	throw new Error("Worker descriptor was not persisted");
+}
+
+function readWorkerDescriptor(agentDir: string): DaemonWorkerDescriptor {
+	return JSON.parse(readFileSync(workerDescriptorPath(agentDir), "utf8")) as DaemonWorkerDescriptor;
 }
 
 function readWorkerDescriptors(agentDir: string): DaemonWorkerDescriptor[] {
@@ -208,6 +222,20 @@ function countWorkerDescriptors(agentDir: string): number {
 	} catch {
 		return 0;
 	}
+}
+
+function treeContains(root: string, needle: string): boolean {
+	if (!existsSync(root)) return false;
+	for (const name of readdirSync(root)) {
+		const path = join(root, name);
+		const metadata = lstatSync(path);
+		if (metadata.isDirectory()) {
+			if (treeContains(path, needle)) return true;
+		} else if (metadata.isFile() && readFileSync(path).includes(Buffer.from(needle))) {
+			return true;
+		}
+	}
+	return false;
 }
 
 async function waitForWorkerStopTombstone(agentDir: string): Promise<DaemonWorkerDescriptor> {
@@ -3258,5 +3286,243 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 		await waitForSocketGone(socketPath);
 		await waitForProcessGone(summary.workerPid);
 		workerPids.delete(summary.workerPid);
+	});
+	it("proves fresh nonpersistent workers without journaling correlated lifecycle identity", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const socketPath = join(
+			tmpdir(),
+			`prime-supervisor-nonpersistent-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+		);
+		mkdirSync(projectDir, { recursive: true });
+
+		const inheritedRecoveryPath = join(root, "inherited-recovery.jsonl");
+		const injectedRecoveryPath = join(root, "injected-recovery.jsonl");
+		const launchCanary = `PRIVATE-LAUNCH-CANARY-${randomUUID()}`;
+		const configCanary = `PRIVATE-CONFIG-CANARY-${randomUUID()}`;
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir, [], {
+			[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: inheritedRecoveryPath,
+		});
+		const client = await connectEventually(socketPath, supervisor);
+		expect(client.supportsServerCapability("nonpersistent_daemon_worker_v1")).toBe(true);
+		for (const invalid of [
+			{ type: "create", lifecycle: "client_owned", workerRecovery: "ignored" },
+			{ type: "create", workerRecovery: "disabled" },
+			{
+				type: "create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: false,
+				config: { noTools: true, noExtensions: true },
+			},
+			{ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", sessionPath: "/tmp/saved.jsonl" },
+			{ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", continueRecent: true },
+		]) {
+			const rejected = await client.request(invalid as never);
+			expect(rejected.success).toBe(false);
+		}
+		expect(countWorkerDescriptors(agentDir)).toBe(0);
+		const created = await client.request({
+			type: "create",
+			lifecycle: "client_owned",
+			workerRecovery: "disabled",
+			noSession: true,
+			launchEnv: {
+				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
+				[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: injectedRecoveryPath,
+				PRIVATE_LAUNCH_CANARY: launchCanary,
+			},
+			config: { cwd: projectDir, agentDir, noTools: true, noExtensions: true, apiKey: configCanary },
+		});
+		if (!created.success) throw new Error(created.error);
+		const summary = requireSummary(created.data);
+		expect((created.data as { workerRecovery?: unknown }).workerRecovery).toBe("disabled");
+		if (!summary.workerPid || !summary.activeSessionId) {
+			throw new Error("Nonpersistent worker did not expose its process identity");
+		}
+		workerPids.add(summary.workerPid);
+		const descriptorPath = workerDescriptorPath(agentDir);
+		const descriptor = JSON.parse(readFileSync(descriptorPath, "utf8")) as DaemonWorkerDescriptor;
+		const unexpectedRecoveryPath = join(dirname(descriptorPath), `${descriptor.workerId}.recovery.jsonl`);
+		expect(descriptor).toMatchObject({
+			version: 3,
+			pid: summary.workerPid,
+			workerRecovery: "disabled",
+			ownerClientId: expect.any(String),
+		});
+		expect(descriptor.createCommand).not.toHaveProperty("workerRecovery");
+		expect(JSON.stringify(descriptor)).not.toContain(inheritedRecoveryPath);
+		expect(JSON.stringify(descriptor)).not.toContain(injectedRecoveryPath);
+		expect(descriptor).not.toHaveProperty("recoveryJournalPath");
+		expect(existsSync(unexpectedRecoveryPath)).toBe(false);
+		expect(existsSync(inheritedRecoveryPath)).toBe(false);
+		expect(existsSync(injectedRecoveryPath)).toBe(false);
+		expect(treeContains(agentDir, launchCanary)).toBe(false);
+		expect(treeContains(agentDir, configCanary)).toBe(false);
+		const listed = await client.request({ type: "list", includeClientOwned: true });
+		expect(listed.success).toBe(true);
+		expect(JSON.stringify(listed.success ? listed.data : undefined)).not.toContain("workerRecovery");
+		expect(summary.sessionFile).toBeUndefined();
+		await expect(
+			client.request({ type: "new_session", activeSessionId: summary.activeSessionId }),
+		).resolves.toMatchObject({
+			success: false,
+			error: expect.stringContaining("unavailable for a nonpersistent daemon worker"),
+		});
+
+		const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
+			supportsExtensionUi: false,
+		});
+		expect(connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")).toBe(true);
+		const correlationId = `PRIVATE-CORRELATION-CANARY-${randomUUID()}`;
+		const promptCanary = `PRIVATE-PROMPT-CANARY-${randomUUID()}`;
+		await connection.submitCorrelatedPrompt(promptCanary, {
+			correlationId,
+			queueIfBusy: false,
+		});
+		await connection.cancelPromptLifecycle(correlationId);
+		const lifecycles = await connection.getPromptLifecycles();
+		expect(lifecycles.records.some((record) => record.correlationId === correlationId)).toBe(true);
+		const rawFailure = await client.request({
+			type: "submit_correlated_prompt",
+			activeSessionId: summary.sessionId,
+			sessionId: summary.sessionId,
+			correlationId,
+			message: "/agents",
+			queueIfBusy: false,
+		});
+		expect(rawFailure).toMatchObject({
+			success: false,
+			error: "Nonpersistent correlated command failed",
+		});
+		expect(JSON.stringify(rawFailure)).not.toContain(correlationId);
+		await expect(
+			client.request({
+				type: "cancel_correlated_prompt",
+				activeSessionId: summary.sessionId,
+				sessionId: summary.sessionId,
+				correlationId,
+			}),
+		).resolves.toMatchObject({ success: true });
+		await connection.cancelPromptLifecycle(correlationId);
+		expect(existsSync(unexpectedRecoveryPath)).toBe(false);
+		expect(treeContains(agentDir, correlationId)).toBe(false);
+		expect(treeContains(agentDir, promptCanary)).toBe(false);
+		const updateRestart = await client.request({ type: "prepare_update_restart" });
+		expect(updateRestart).toMatchObject({
+			success: false,
+			error: expect.stringContaining("unavailable while a nonpersistent daemon worker exists"),
+		});
+		expect(treeContains(agentDir, correlationId)).toBe(false);
+		expect(treeContains(agentDir, promptCanary)).toBe(false);
+
+		const promote = await client.request({
+			type: "promote_owned_session",
+			activeSessionId: summary.activeSessionId,
+		});
+		expect(promote).toMatchObject({ success: false, error: expect.stringContaining("cannot become resident") });
+		process.kill(summary.workerPid, "SIGKILL");
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		await waitForCondition(
+			() => countWorkerDescriptors(agentDir) === 0,
+			"Nonpersistent worker loss did not retire its durable registration",
+		);
+		expect(existsSync(unexpectedRecoveryPath)).toBe(false);
+		const lateRetry = await client.request({
+			type: "submit_correlated_prompt",
+			activeSessionId: summary.activeSessionId,
+			sessionId: summary.sessionId,
+			correlationId,
+			message: "/agents",
+			queueIfBusy: false,
+		});
+		expect(lateRetry).toMatchObject({ success: false, error: "Nonpersistent correlated command failed" });
+		expect(JSON.stringify(lateRetry)).not.toContain(correlationId);
+		expect(treeContains(agentDir, correlationId)).toBe(false);
+		expect(treeContains(agentDir, promptCanary)).toBe(false);
+		await expect(
+			client.request({
+				type: "get_owned_session_cleanup",
+				activeSessionId: summary.activeSessionId,
+			}),
+		).resolves.toMatchObject({ success: true, data: { status: "settled" } });
+		await connection.dispose().catch(() => undefined);
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForSocketGone(socketPath);
+	}, 60_000);
+
+	it("retires a nonpersistent worker after replacement even when its descriptor marker was stripped", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const socketPath = join(tmpdir(), `prime-supervisor-nonpersistent-replacement-${process.pid}.sock`);
+		const registryDir = join(root, "supervisor-owners");
+		const supervisorEnvironment = { PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR: registryDir };
+		mkdirSync(projectDir, { recursive: true });
+
+		const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir, [], supervisorEnvironment);
+		const firstClient = await connectEventually(socketPath, firstSupervisor);
+		const created = await firstClient.request({
+			type: "create",
+			lifecycle: "client_owned",
+			workerRecovery: "disabled",
+			noSession: true,
+			config: { cwd: projectDir, agentDir, noTools: true, noExtensions: true },
+		});
+		if (!created.success || !created.data || typeof created.data !== "object") {
+			throw new Error(created.success ? "Create omitted its summary" : created.error);
+		}
+		const summary = created.data as SessionSummary;
+		if (!summary.activeSessionId || !summary.workerPid) throw new Error("Create omitted worker identity");
+		workerPids.add(summary.workerPid);
+		const descriptorPath = workerDescriptorPath(agentDir);
+		const descriptor = JSON.parse(readFileSync(descriptorPath, "utf8")) as DaemonWorkerDescriptor;
+		const unexpectedRecoveryPath = join(dirname(descriptorPath), `${descriptor.workerId}.recovery.jsonl`);
+		expect(descriptor).toMatchObject({ version: 3, workerRecovery: "disabled", pid: summary.workerPid });
+		expect(descriptor).not.toHaveProperty("recoveryJournalPath");
+		const { workerRecovery: _workerRecovery, ...downgradedDescriptor } = descriptor;
+		writeFileSync(
+			workerDescriptorPath(agentDir),
+			`${JSON.stringify({ ...downgradedDescriptor, version: 1 }, null, 2)}
+`,
+		);
+
+		const ownerRecordPath = readdirSync(registryDir, { recursive: true })
+			.map(String)
+			.map((path) => join(registryDir, path))
+			.find((path) => path.endsWith("owner.json"));
+		if (!ownerRecordPath) throw new Error("Supervisor owner record was not persisted");
+		const ownerRecord = JSON.parse(readFileSync(ownerRecordPath, "utf8")) as { pid?: unknown };
+		if (!Number.isInteger(ownerRecord.pid)) throw new Error("Supervisor owner record omitted its pid");
+		process.kill(ownerRecord.pid as number, "SIGKILL");
+		firstSupervisor.kill("SIGKILL");
+		await waitForExit(firstSupervisor);
+		firstClient.close();
+		process.kill(summary.workerPid, "SIGKILL");
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+
+		const replacement = spawnSupervisor(agentDir, socketPath, projectDir, [], supervisorEnvironment);
+		const replacementClient = await connectEventually(socketPath, replacement);
+		await waitForProcessGone(summary.workerPid);
+		workerPids.delete(summary.workerPid);
+		expect(countWorkerDescriptors(agentDir)).toBe(0);
+		expect(existsSync(unexpectedRecoveryPath)).toBe(false);
+		await expect(
+			replacementClient.request({
+				type: "get_owned_session_cleanup",
+				activeSessionId: summary.activeSessionId,
+			}),
+		).resolves.toMatchObject({ success: true, data: { status: "settled" } });
+		await expect(replacementClient.request({ type: "list", includeClientOwned: true })).resolves.toMatchObject({
+			success: true,
+			data: { sessions: [] },
+		});
+		await replacementClient.request({ type: "shutdown" });
+		replacementClient.close();
+		await waitForExit(replacement);
 	});
 });

@@ -67,7 +67,11 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
+import {
+	type PromptOptions,
+	prepareNonpersistentDaemonPromptOptions,
+	rlmChildLabel,
+} from "../../core/agent-session.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
@@ -184,13 +188,13 @@ import {
 } from "./daemon-socket.js";
 import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
 import {
-	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_SUPERVISOR_AGENT_DIR_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	type DaemonWorkerAcpMcpOwnerTransferProof,
 	type DaemonWorkerAuthenticationResult,
 	type DaemonWorkerCommand,
 	type DaemonWorkerFrameHeader,
+	type DaemonWorkerRecoveryMode,
 	isDaemonWorkerFrameHeader,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
@@ -213,6 +217,7 @@ import {
 import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import {
 	createImmutableSnapshotMessages,
+	NONPERSISTENT_SNAPSHOT_MEMORY_BYTES,
 	prepareSnapshotTranscriptPayload,
 	SNAPSHOT_TARGET_CHUNK_BYTES,
 	type SnapshotTranscriptChunkSource,
@@ -230,6 +235,7 @@ export interface DaemonModeOptions {
 		restoreActiveSessionId?: string;
 		supervisorSocketPath?: string;
 		supervisorAgentDir?: string;
+		recoveryMode: DaemonWorkerRecoveryMode;
 		recoveryJournalPath?: string;
 	};
 }
@@ -250,8 +256,39 @@ const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const WORKER_SNAPSHOT_PREPARATION_TIMEOUT_MS = 30_000;
 const WORKER_PRIVATE_FRAME_WRITE_BYTES = 64 * 1024;
+const NONPERSISTENT_CORRELATED_PROMPT_BYTES = 8 * 1024;
+const MAX_NONPERSISTENT_CORRELATED_PROMPT_REQUESTS = 256;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
+const NONPERSISTENT_WORKER_FORBIDDEN_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
+	"new_session",
+	"switch_session",
+	"fork",
+	"import_jsonl",
+	"restore_next_turn",
+	"restore_actions",
+	"prepare_update_restart",
+]);
+const NONPERSISTENT_WORKER_ALLOWED_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
+	"list",
+	"create",
+	"attach",
+	"set_session_name",
+	"cancel_prompt_admission",
+	"abort",
+	"submit_correlated_prompt",
+	"cancel_correlated_prompt",
+	"get_prompt_lifecycles",
+	"shutdown",
+]);
+const NONPERSISTENT_WORKER_ALLOWED_PRIVATE_COMMANDS: ReadonlySet<DaemonWorkerCommand["type"]> = new Set([
+	"worker_subscribe",
+	"worker_unsubscribe",
+	"worker_transfer_acp_mcp_owner",
+	"worker_prepare_update",
+	"worker_commit_update",
+	"worker_cancel_update",
+]);
 
 function createSnapshotTransferId(): string {
 	return `snapshot-${randomUUID()}`;
@@ -407,7 +444,10 @@ function delay(ms: number): Promise<void> {
 }
 
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
-type SupervisorGenerationClaim = Omit<Extract<DaemonWorkerCommand, { type: "worker_auth" }>, "id" | "type" | "token">;
+type SupervisorGenerationClaim = Omit<
+	Extract<DaemonWorkerCommand, { type: "worker_auth" }>,
+	"id" | "type" | "token" | "workerRecovery"
+>;
 
 interface BoundSupervisorGenerationClaim {
 	claim: SupervisorGenerationClaim;
@@ -475,6 +515,14 @@ export async function runDaemonMode(options: DaemonModeOptions): Promise<never> 
 	await daemon.start();
 	return new Promise(() => {});
 }
+
+interface CorrelatedPromptRequest {
+	message: string;
+	images: Extract<DaemonCommand, { type: "submit_correlated_prompt" }>["images"];
+	queueIfBusy: boolean | undefined;
+}
+
+class InvalidNonpersistentCorrelatedCommandError extends Error {}
 
 export class AgentDaemon {
 	private server?: Server;
@@ -552,13 +600,15 @@ export class AgentDaemon {
 			sessionId: string;
 			correlationId: string;
 			ownerCommandId: string;
-			requestFingerprint: string;
+			requestIdentity: string | CorrelatedPromptRequest;
 			controller: AbortController;
 			result: Promise<PromptLifecycleSnapshot>;
 			resolveResult: (lifecycle: PromptLifecycleSnapshot) => void;
 			rejectResult: (error: unknown) => void;
 		}
 	>();
+	/** Exact private request identities retained only in memory for nonpersistent retry comparison. */
+	private readonly nonpersistentCorrelatedPromptRequests = new Map<string, CorrelatedPromptRequest>();
 	/** Live prompt admissions, keyed by session and caller-generated admission id. */
 	private readonly promptAdmissions = new Map<
 		string,
@@ -600,6 +650,7 @@ export class AgentDaemon {
 		},
 	);
 	private readonly recoveryJournal?: WorkerRecoveryJournal;
+	private readonly workerRecoveryMode?: DaemonWorkerRecoveryMode;
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
 	/** In-flight admission spawn appends, awaited (and consumed) by createRlmSubagentRuntime. */
 	private readonly pendingRlmSpawnAppends = new Map<string, Promise<void>>();
@@ -616,9 +667,16 @@ export class AgentDaemon {
 			? AgentCronJobStore.forSessionArtifacts()
 			: new AgentCronJobStore(getCronJobsPath(this.agentDir));
 		this.restoreActiveSessionId = options.worker?.restoreActiveSessionId;
-		const recoveryJournalPath =
-			options.worker?.recoveryJournalPath ?? process.env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
-		if (recoveryJournalPath) {
+		const recoveryJournalPath = options.worker?.recoveryJournalPath;
+		this.workerRecoveryMode = options.worker?.recoveryMode;
+		if (
+			(options.worker !== undefined && this.workerRecoveryMode === undefined) ||
+			(this.workerRecoveryMode === "enabled" && !recoveryJournalPath) ||
+			(this.workerRecoveryMode === "disabled" && recoveryJournalPath !== undefined)
+		) {
+			throw new Error("Daemon session worker has invalid recovery bootstrap");
+		}
+		if (this.workerRecoveryMode === "enabled" && recoveryJournalPath) {
 			this.recoveryJournal = new WorkerRecoveryJournal(recoveryJournalPath);
 		}
 		this.cronScheduler = new AgentCronScheduler(this.cronStore, {
@@ -743,6 +801,10 @@ export class AgentDaemon {
 		if (this.shuttingDown || this.hasAuthenticatedSupervisorConnection()) {
 			return;
 		}
+		if (this.workerRecoveryMode === "disabled") {
+			await this.shutdown(1);
+			return;
+		}
 		if (await isDaemonShutdownAdmissionActive()) {
 			this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
 			return;
@@ -840,6 +902,9 @@ export class AgentDaemon {
 	}
 
 	private async launchReplacementSupervisor(supervisorSocketPath: string): Promise<void> {
+		if (this.workerRecoveryMode === "disabled") {
+			throw new Error("A nonpersistent daemon worker cannot launch a replacement supervisor");
+		}
 		if (this.supervisorLaunchInProgress || this.shuttingDown) {
 			return;
 		}
@@ -1531,7 +1596,17 @@ export class AgentDaemon {
 		command: Extract<DaemonCommand, { type: "create" }>,
 		runtimeOpenGuard?: RuntimeOpenGuard,
 	): Promise<ActiveSessionState> {
-		const config = mergeAgentSessionRuntimeConfig(this.options.defaultSessionConfig, command.config);
+		const mergedConfig = mergeAgentSessionRuntimeConfig(this.options.defaultSessionConfig, command.config);
+		const config =
+			this.workerRecoveryMode === "disabled"
+				? {
+						...mergedConfig,
+						noTools: true,
+						noExtensions: true,
+						tools: [],
+						extensions: [],
+					}
+				: mergedConfig;
 		if (!config.cwd) {
 			throw new Error("Active session config is missing cwd");
 		}
@@ -1738,6 +1813,13 @@ export class AgentDaemon {
 					},
 				}),
 			);
+			if (
+				this.workerRecoveryMode === "disabled" &&
+				(runtime.session.getActiveToolNames().length > 0 || runtime.session.hasLoadedExtensions())
+			) {
+				await runtime.dispose().catch(() => undefined);
+				throw new Error("Nonpersistent daemon command was invalid");
+			}
 			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
 				await runtime.dispose().catch(() => undefined);
 				throw new RuntimeOpenCancelledError();
@@ -3279,6 +3361,81 @@ export class AgentDaemon {
 		return `${activeSessionId}\0${sessionId}\0${correlationId}`;
 	}
 
+	private registerCorrelatedPromptSubmission(parsed: {
+		id: string;
+		type: "submit_correlated_prompt";
+		activeSessionId: string;
+		sessionId: string;
+		correlationId: string;
+		message: string;
+		images?: unknown;
+		queueIfBusy?: unknown;
+	}): void {
+		const key = this.correlatedPromptKey(parsed.activeSessionId, parsed.sessionId, parsed.correlationId);
+		const nonpersistentWorker = this.workerRecoveryMode === "disabled";
+		const normalizedImages = Array.isArray(parsed.images)
+			? (parsed.images as Extract<DaemonCommand, { type: "submit_correlated_prompt" }>["images"])
+			: undefined;
+		const normalizedQueueIfBusy = typeof parsed.queueIfBusy === "boolean" ? parsed.queueIfBusy : undefined;
+		const privateRequest = nonpersistentWorker
+			? structuredClone({
+					message: parsed.message,
+					images: normalizedImages,
+					queueIfBusy: normalizedQueueIfBusy,
+				})
+			: undefined;
+		const requestIdentity =
+			privateRequest ??
+			createPromptRequestFingerprint({
+				message: parsed.message,
+				images: normalizedImages,
+				queueIfBusy: normalizedQueueIfBusy,
+			});
+		const retainedPrivateRequest = this.nonpersistentCorrelatedPromptRequests.get(key);
+		if (retainedPrivateRequest && !isDeepStrictEqual(retainedPrivateRequest, privateRequest)) {
+			throw new InvalidNonpersistentCorrelatedCommandError();
+		}
+		const currentSubmission = this.correlatedPromptSubmissions.get(key);
+		if (currentSubmission && !isDeepStrictEqual(currentSubmission.requestIdentity, requestIdentity)) {
+			if (nonpersistentWorker) throw new InvalidNonpersistentCorrelatedCommandError();
+			throw new Error("Prompt correlation id was reused with a different request");
+		}
+		if (currentSubmission) return;
+		if (
+			privateRequest &&
+			!retainedPrivateRequest &&
+			this.sessions.get(parsed.activeSessionId)?.runtime.session.getPromptLifecycle(parsed.correlationId)
+		) {
+			throw new InvalidNonpersistentCorrelatedCommandError();
+		}
+		if (privateRequest && !retainedPrivateRequest) {
+			while (this.nonpersistentCorrelatedPromptRequests.size >= MAX_NONPERSISTENT_CORRELATED_PROMPT_REQUESTS) {
+				const oldest = this.nonpersistentCorrelatedPromptRequests.keys().next().value;
+				if (oldest === undefined) break;
+				this.nonpersistentCorrelatedPromptRequests.delete(oldest);
+			}
+			this.nonpersistentCorrelatedPromptRequests.set(key, privateRequest);
+		}
+		let resolveResult = (_lifecycle: PromptLifecycleSnapshot) => {};
+		let rejectResult = (_error: unknown) => {};
+		const result = new Promise<PromptLifecycleSnapshot>((resolve, reject) => {
+			resolveResult = resolve;
+			rejectResult = reject;
+		});
+		void result.catch(() => undefined);
+		this.correlatedPromptSubmissions.set(key, {
+			activeSessionId: parsed.activeSessionId,
+			sessionId: parsed.sessionId,
+			correlationId: parsed.correlationId,
+			ownerCommandId: parsed.id,
+			requestIdentity,
+			controller: new AbortController(),
+			result,
+			resolveResult,
+			rejectResult,
+		});
+	}
+
 	/**
 	 * Parse and synchronously register prompt admission before returning a promise.
 	 * This method is intentionally non-async: handleLine invokes it before its first await.
@@ -3330,35 +3487,30 @@ export class AgentDaemon {
 			if (parsed.correlationId.length === 0 || parsed.correlationId.length > 128) {
 				throw new Error("correlationId must contain between 1 and 128 characters");
 			}
-			const key = this.correlatedPromptKey(parsed.activeSessionId, parsed.sessionId, parsed.correlationId);
-			const requestFingerprint = createPromptRequestFingerprint({
-				message: parsed.message,
-				images: Array.isArray(parsed.images) ? parsed.images : undefined,
-				queueIfBusy: typeof parsed.queueIfBusy === "boolean" ? parsed.queueIfBusy : undefined,
-			});
-			const currentSubmission = this.correlatedPromptSubmissions.get(key);
-			if (currentSubmission && currentSubmission.requestFingerprint !== requestFingerprint) {
-				throw new Error("Prompt correlation id was reused with a different request");
+			const nonpersistentWorker = this.workerRecoveryMode === "disabled";
+			if (
+				nonpersistentWorker &&
+				(Buffer.byteLength(parsed.message, "utf8") === 0 ||
+					Buffer.byteLength(parsed.message, "utf8") > NONPERSISTENT_CORRELATED_PROMPT_BYTES ||
+					parsed.message.startsWith("/") ||
+					(parsed.images !== undefined && (!Array.isArray(parsed.images) || parsed.images.length !== 0)) ||
+					(parsed.queueIfBusy !== undefined && typeof parsed.queueIfBusy !== "boolean"))
+			) {
+				throw new InvalidNonpersistentCorrelatedCommandError();
 			}
-			if (!currentSubmission) {
-				let resolveResult = (_lifecycle: PromptLifecycleSnapshot) => {};
-				let rejectResult = (_error: unknown) => {};
-				const result = new Promise<PromptLifecycleSnapshot>((resolve, reject) => {
-					resolveResult = resolve;
-					rejectResult = reject;
-				});
-				void result.catch(() => undefined);
-				this.correlatedPromptSubmissions.set(key, {
-					activeSessionId: parsed.activeSessionId,
-					sessionId: parsed.sessionId,
-					correlationId: parsed.correlationId,
-					ownerCommandId: parsed.id,
-					requestFingerprint,
-					controller: new AbortController(),
-					result,
-					resolveResult,
-					rejectResult,
-				});
+			if (!(nonpersistentWorker && this.options.worker)) {
+				this.registerCorrelatedPromptSubmission(
+					parsed as {
+						id: string;
+						type: "submit_correlated_prompt";
+						activeSessionId: string;
+						sessionId: string;
+						correlationId: string;
+						message: string;
+						images?: unknown;
+						queueIfBusy?: unknown;
+					},
+				);
 			}
 		}
 		return parsed;
@@ -3377,6 +3529,7 @@ export class AgentDaemon {
 				supervisorPid?: unknown;
 				supervisorProcessStartId?: unknown;
 				supervisorSocketPath?: unknown;
+				workerRecovery?: unknown;
 				activeSessionId?: unknown;
 				sessionId?: unknown;
 				admissionId?: unknown;
@@ -3393,7 +3546,7 @@ export class AgentDaemon {
 							this.promptAdmissionKey(parsed.activeSessionId, (parsed as { admissionId: string }).admissionId),
 						)
 					: undefined;
-			const parsedCorrelatedSubmission =
+			let parsedCorrelatedSubmission =
 				parsed.type === "submit_correlated_prompt" &&
 				typeof parsed.id === "string" &&
 				typeof parsed.activeSessionId === "string" &&
@@ -3419,6 +3572,10 @@ export class AgentDaemon {
 					);
 					if (this.correlatedPromptSubmissions.get(key) === correlatedSubmission) {
 						this.correlatedPromptSubmissions.delete(key);
+						const retainedLifecycle = this.sessions
+							.get(correlatedSubmission.activeSessionId)
+							?.runtime.session.getPromptLifecycle(correlatedSubmission.correlationId);
+						if (!retainedLifecycle) this.nonpersistentCorrelatedPromptRequests.delete(key);
 						correlatedSubmission.rejectResult(new Error("Correlated prompt was not admitted"));
 					}
 				}
@@ -3455,6 +3612,20 @@ export class AgentDaemon {
 				} catch {
 					this.write(client, failure(commandId, "worker_auth", "supervisor_generation_stale"));
 					client.socket.end();
+					return;
+				}
+				const nonpersistentWorker = this.workerRecoveryMode === "disabled";
+				if (parsed.workerRecovery !== "enabled" && parsed.workerRecovery !== "disabled") {
+					this.write(client, failure(commandId, "worker_auth", "worker_recovery_mode_mismatch"));
+					client.socket.end();
+					if (nonpersistentWorker) setImmediate(() => void this.shutdown(1));
+					return;
+				}
+				const requestedRecoveryMode = parsed.workerRecovery;
+				if (requestedRecoveryMode !== this.workerRecoveryMode) {
+					this.write(client, failure(commandId, "worker_auth", "worker_recovery_mode_mismatch"));
+					client.socket.end();
+					if (nonpersistentWorker) setImmediate(() => void this.shutdown(1));
 					return;
 				}
 				for (const previous of this.supervisorClaims.keys()) {
@@ -3529,6 +3700,32 @@ export class AgentDaemon {
 					return;
 				}
 			}
+			if (
+				this.options.worker &&
+				this.workerRecoveryMode === "disabled" &&
+				parsed.type === "submit_correlated_prompt" &&
+				typeof parsed.id === "string" &&
+				typeof parsed.activeSessionId === "string" &&
+				typeof parsed.sessionId === "string" &&
+				typeof parsed.correlationId === "string" &&
+				typeof (parsed as { message?: unknown }).message === "string"
+			) {
+				this.registerCorrelatedPromptSubmission(
+					parsed as {
+						id: string;
+						type: "submit_correlated_prompt";
+						activeSessionId: string;
+						sessionId: string;
+						correlationId: string;
+						message: string;
+						images?: unknown;
+						queueIfBusy?: unknown;
+					},
+				);
+				parsedCorrelatedSubmission = this.correlatedPromptSubmissions.get(
+					this.correlatedPromptKey(parsed.activeSessionId, parsed.sessionId, parsed.correlationId),
+				);
+			}
 			if (this.options.worker && typeof parsed.type === "string" && parsed.type.startsWith("worker_")) {
 				const workerCommand = parsed as DaemonWorkerCommand;
 				const updateLifecycle =
@@ -3559,7 +3756,19 @@ export class AgentDaemon {
 			}
 			command = parsed as DaemonCommand;
 		} catch (error) {
-			this.write(client, failure(salvageDaemonCommandId(line), "parse", error, serializeDaemonError(error)));
+			const nonpersistentWorker = this.options.worker !== undefined && this.workerRecoveryMode === "disabled";
+			this.write(
+				client,
+				nonpersistentWorker
+					? error instanceof InvalidNonpersistentCorrelatedCommandError
+						? failure(
+								salvageDaemonCommandId(line),
+								"submit_correlated_prompt",
+								"Nonpersistent correlated command failed",
+							)
+						: failure(salvageDaemonCommandId(line), "parse", "Nonpersistent daemon command was invalid")
+					: failure(salvageDaemonCommandId(line), "parse", error, serializeDaemonError(error)),
+			);
 			return;
 		}
 
@@ -3586,13 +3795,33 @@ export class AgentDaemon {
 				this.write(client, response);
 			}
 		} catch (error) {
-			// Only the error message reaches the client (serializeDaemonError drops
-			// the rest), so log the full stack here — this is the one place a handler
-			// crash like a RangeError from a pathological session is recoverable.
-			this.log(
-				`daemon command "${command.type}" failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
-			);
-			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
+			const redact =
+				this.options.worker !== undefined &&
+				this.workerRecoveryMode === "disabled" &&
+				(command.type === "create" ||
+					command.type === "submit_correlated_prompt" ||
+					command.type === "cancel_correlated_prompt");
+			if (redact) {
+				this.log(`nonpersistent daemon command "${command.type}" failed`);
+				this.write(
+					client,
+					failure(
+						command.id,
+						command.type,
+						command.type === "create"
+							? "Nonpersistent daemon command was invalid"
+							: "Nonpersistent correlated command failed",
+					),
+				);
+			} else {
+				// Only the error message reaches the client (serializeDaemonError drops
+				// the rest), so log the full stack here — this is the one place a handler
+				// crash like a RangeError from a pathological session is recoverable.
+				this.log(
+					`daemon command "${command.type}" failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+				);
+				this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
+			}
 		} finally {
 			if (!promptHandlerOwnsAdmission) clearParsedAdmission();
 			if (mutation) this.mutationDrain.end();
@@ -3611,6 +3840,20 @@ export class AgentDaemon {
 
 	private async handleWorkerCommand(client: DaemonSocketClient, command: DaemonWorkerCommand): Promise<void> {
 		try {
+			if (
+				this.workerRecoveryMode === "disabled" &&
+				(command.type === "worker_prepare_update" ||
+					command.type === "worker_commit_update" ||
+					command.type === "worker_cancel_update")
+			) {
+				throw new Error("Update restart is unavailable for a nonpersistent daemon worker");
+			}
+			if (
+				this.workerRecoveryMode === "disabled" &&
+				!NONPERSISTENT_WORKER_ALLOWED_PRIVATE_COMMANDS.has(command.type)
+			) {
+				throw new Error(`Worker command ${command.type} is unavailable for a nonpersistent daemon worker`);
+			}
 			switch (command.type) {
 				case "worker_auth":
 					this.write(client, failure(command.id, command.type, "Worker is already authenticated"));
@@ -3634,6 +3877,11 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_transfer_acp_mcp_owner": {
+					if (this.workerRecoveryMode === "disabled") {
+						throw new Error(
+							"Recoverable owned-session transfer is unavailable for a nonpersistent daemon worker",
+						);
+					}
 					const state = this.getBoundSessionState(command.activeSessionId);
 					const current = this.acpMcpOwners.get(state.activeSessionId);
 					if (current?.release) throw new Error("ACP MCP configuration is being released");
@@ -3780,6 +4028,12 @@ export class AgentDaemon {
 		if ("admissionId" in command && command.admissionId === "") {
 			throw new Error("admissionId must not be empty");
 		}
+		if (this.workerRecoveryMode === "disabled" && NONPERSISTENT_WORKER_FORBIDDEN_COMMANDS.has(command.type)) {
+			throw new Error("A nonpersistent daemon worker cannot change its root session");
+		}
+		if (this.workerRecoveryMode === "disabled" && !NONPERSISTENT_WORKER_ALLOWED_COMMANDS.has(command.type)) {
+			throw new Error(`Command ${command.type} is unavailable for a nonpersistent daemon worker`);
+		}
 		if ((command.type === "steer" || command.type === "follow_up") && command.expandPromptTemplates !== false) {
 			const replayFields = (["content", "customMessage", "prefixMessages"] as const).filter(
 				(field) => command[field] !== undefined,
@@ -3872,6 +4126,19 @@ export class AgentDaemon {
 			}
 
 			case "create": {
+				if (
+					this.workerRecoveryMode === "disabled" &&
+					(command.noSession !== true ||
+						command.config?.noTools !== true ||
+						command.config.noExtensions !== true ||
+						(command.config.tools?.length ?? 0) !== 0 ||
+						(command.config.extensions?.length ?? 0) !== 0)
+				) {
+					this.log(
+						`nonpersistent create privacy precondition failed: noSession=${command.noSession === true},noTools=${command.config?.noTools === true},noExtensions=${command.config?.noExtensions === true},toolsEmpty=${(command.config?.tools?.length ?? 0) === 0},extensionsEmpty=${(command.config?.extensions?.length ?? 0) === 0}`,
+					);
+					throw new Error("Nonpersistent daemon command was invalid");
+				}
 				const state = await this.createRuntime(command);
 				return success(command.id, "create", summaryForActiveSession(state));
 			}
@@ -4260,10 +4527,15 @@ export class AgentDaemon {
 					}
 					const existing = state.runtime.session.getPromptLifecycle(command.correlationId);
 					if (existing) {
-						if (
-							state.runtime.session.getPromptLifecycleRequestFingerprint(command.correlationId) !==
-							submission.requestFingerprint
-						) {
+						const requestMatches =
+							this.workerRecoveryMode === "disabled"
+								? isDeepStrictEqual(
+										this.nonpersistentCorrelatedPromptRequests.get(key),
+										submission.requestIdentity,
+									)
+								: state.runtime.session.getPromptLifecycleRequestFingerprint(command.correlationId) ===
+									submission.requestIdentity;
+						if (!requestMatches) {
 							throw new Error("Prompt correlation id was reused with a different request");
 						}
 						submission.resolveResult(existing);
@@ -4278,14 +4550,20 @@ export class AgentDaemon {
 					if (busy && command.queueIfBusy !== true) {
 						throw new Error("Agent is busy and queueIfBusy was not enabled");
 					}
-					await state.runtime.session.promptUntilAccepted(command.message, {
+					const promptOptions: PromptOptions = {
 						images: command.images,
 						streamingBehavior: busy ? "followUp" : undefined,
 						queueIfBusy: command.queueIfBusy,
 						source: "interactive",
 						signal: submission.controller.signal,
 						promptCorrelationId: command.correlationId,
-					});
+					};
+					await state.runtime.session.promptUntilAccepted(
+						command.message,
+						this.workerRecoveryMode === "disabled"
+							? prepareNonpersistentDaemonPromptOptions(promptOptions)
+							: promptOptions,
+					);
 					const lifecycle = state.runtime.session.getPromptLifecycle(command.correlationId);
 					if (!lifecycle) throw new Error("Correlated prompt was accepted without a lifecycle record");
 					submission.resolveResult(lifecycle);
@@ -4295,7 +4573,10 @@ export class AgentDaemon {
 					const state = this.sessions.get(command.activeSessionId);
 					const lifecycle = state?.runtime.session.getPromptLifecycle(command.correlationId);
 					if (lifecycle) submission.resolveResult(lifecycle);
-					else submission.rejectResult(error);
+					else {
+						submission.rejectResult(error);
+						this.nonpersistentCorrelatedPromptRequests.delete(key);
+					}
 					throw error;
 				} finally {
 					if (this.correlatedPromptSubmissions.get(key) === submission) {
@@ -5276,6 +5557,9 @@ export class AgentDaemon {
 				promise: prepareSnapshotTranscriptPayload({
 					messages: options.messages,
 					targetChunkBytes: SNAPSHOT_TARGET_CHUNK_BYTES,
+					...(this.workerRecoveryMode === "disabled"
+						? { memoryCacheBytes: NONPERSISTENT_SNAPSHOT_MEMORY_BYTES, memoryOnly: true }
+						: {}),
 					signal: options.signal ?? AbortSignal.timeout(WORKER_SNAPSHOT_PREPARATION_TIMEOUT_MS),
 				}),
 			};
@@ -7388,6 +7672,8 @@ export class AgentDaemon {
 		for (const state of [...this.sessions.values()]) {
 			await this.closeSession(state, closingReason);
 		}
+		this.correlatedPromptSubmissions.clear();
+		this.nonpersistentCorrelatedPromptRequests.clear();
 		for (const client of this.clients) {
 			client.detachInput();
 			client.socket.end();

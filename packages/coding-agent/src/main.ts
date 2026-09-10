@@ -1361,6 +1361,7 @@ export async function main(args: string[], options?: MainOptions) {
 					restoreActiveSessionId: daemonWorkerBootstrap.activeSessionId,
 					supervisorSocketPath: daemonWorkerBootstrap.supervisorSocketPath,
 					supervisorAgentDir: daemonWorkerBootstrap.supervisorAgentDir,
+					recoveryMode: daemonWorkerBootstrap.recoveryMode,
 					recoveryJournalPath: daemonWorkerBootstrap.recoveryJournalPath,
 				},
 			});

@@ -179,7 +179,13 @@ interface DaemonRuntimeSnapshotAttempt {
 interface CorrelatedPromptRoute {
 	activeSessionId: string;
 	sessionId: string;
-	requestFingerprint: string;
+	request:
+		| string
+		| {
+				message: string;
+				images: AgentConnectionCorrelatedPromptOptions["images"];
+				queueIfBusy: AgentConnectionCorrelatedPromptOptions["queueIfBusy"];
+		  };
 	pending: boolean;
 }
 
@@ -338,6 +344,14 @@ function reconnectDaemonTransportAfterUpdate(client: DaemonClient): Promise<void
 	return reconnectPromise;
 }
 
+export interface DaemonNonpersistentWorkerCreateProof {
+	readonly id: string;
+	readonly activeSessionId?: string;
+	readonly sessionId: string;
+	readonly sessionFile?: never;
+	readonly workerRecovery: "disabled";
+}
+
 export interface DaemonAgentConnectionOptions {
 	closeClientOnDispose?: boolean;
 	/** Restart/probe the detached supervisor after a transient socket loss. */
@@ -357,6 +371,8 @@ export interface DaemonAgentConnectionOptions {
 	supportsExtensionUi?: boolean;
 	/** Dispose the connection by stopping its hidden worker instead of detaching. */
 	ownedSession?: boolean;
+	/** Exact create receipt for a fresh disabled-recovery worker. Requires `ownedSession`. */
+	nonpersistentWorkerCreateProof?: DaemonNonpersistentWorkerCreateProof;
 	/**
 	 * Fresh runtime context used only if the owned worker must be relaunched.
 	 * Required whenever `ownedSessionLaunchEnv` is supplied.
@@ -757,12 +773,33 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (ownedSessionLaunchEnv !== undefined && options.ownedSession !== true) {
 			throw new Error("ownedSessionLaunchEnv requires ownedSession");
 		}
+		if (options.nonpersistentWorkerCreateProof !== undefined) {
+			const proof = options.nonpersistentWorkerCreateProof;
+			if (
+				options.ownedSession !== true ||
+				typeof proof.id !== "string" ||
+				proof.id.length === 0 ||
+				(proof.activeSessionId !== undefined && typeof proof.activeSessionId !== "string") ||
+				(proof.activeSessionId ?? proof.id) !== activeSessionId ||
+				typeof proof.sessionId !== "string" ||
+				proof.sessionId.length === 0 ||
+				proof.workerRecovery !== "disabled" ||
+				proof.sessionFile !== undefined
+			) {
+				throw new Error("Nonpersistent daemon worker create proof is unavailable");
+			}
+		}
 		if (ownedSessionLaunchEnv !== undefined && options.ownedSessionRecoveryConfig === undefined) {
 			throw new Error("ownedSessionLaunchEnv requires ownedSessionRecoveryConfig");
 		}
 		this.client = client;
 		this.activeSessionId = activeSessionId;
-		this.options = connectionOptions;
+		this.options = {
+			...connectionOptions,
+			...(connectionOptions.nonpersistentWorkerCreateProof
+				? { nonpersistentWorkerCreateProof: { ...connectionOptions.nonpersistentWorkerCreateProof } }
+				: {}),
+		};
 		this.ownedSessionLaunchEnv =
 			ownedSessionLaunchEnv === undefined ? undefined : cloneCallerOwnedSessionLaunchEnv(ownedSessionLaunchEnv);
 		if (options.recoverDaemon) {
@@ -1562,17 +1599,27 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		const sessionId = this.attachedSessionId;
 		if (!sessionId) throw new Error("Correlated prompt submission requires an attached session generation");
-		const requestFingerprint = createPromptRequestFingerprint({
-			message,
-			images: options.images,
-			queueIfBusy: options.queueIfBusy,
-		});
+		const nonpersistentProof = this.options.nonpersistentWorkerCreateProof;
+		if (nonpersistentProof && nonpersistentProof.sessionId !== sessionId) {
+			throw new Error("Nonpersistent daemon worker create proof is unavailable");
+		}
+		const request = nonpersistentProof
+			? structuredClone({
+					message,
+					images: options.images,
+					queueIfBusy: options.queueIfBusy,
+				})
+			: createPromptRequestFingerprint({
+					message,
+					images: options.images,
+					queueIfBusy: options.queueIfBusy,
+				});
 		const existingRoute = this.correlatedPromptRoutes.get(options.correlationId);
 		if (
 			existingRoute &&
 			(existingRoute.activeSessionId !== this.activeSessionId ||
 				existingRoute.sessionId !== sessionId ||
-				existingRoute.requestFingerprint !== requestFingerprint)
+				!isDeepStrictEqual(existingRoute.request, request))
 		) {
 			throw new Error("Prompt correlation id is reserved for another session generation or request");
 		}
@@ -1581,7 +1628,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			({
 				activeSessionId: this.activeSessionId,
 				sessionId,
-				requestFingerprint,
+				request,
 				pending: true,
 			} satisfies CorrelatedPromptRoute);
 		if (!existingRoute) this.correlatedPromptRoutes.set(options.correlationId, route);

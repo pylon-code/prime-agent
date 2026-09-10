@@ -91,7 +91,15 @@ function createDaemonInternals(
 			agentDir: harness.tempDir,
 			...(options.sessionDir ? { sessionDir: options.sessionDir } : {}),
 		},
-		...(options.worker ? { worker: { authenticationToken: "token" } } : {}),
+		...(options.worker
+			? {
+					worker: {
+						authenticationToken: "token",
+						recoveryMode: "enabled" as const,
+						recoveryJournalPath: `${harness.tempDir}/worker-recovery.jsonl`,
+					},
+				}
+			: {}),
 		createRuntime: async () => {
 			throw new Error("unexpected runtime creation");
 		},

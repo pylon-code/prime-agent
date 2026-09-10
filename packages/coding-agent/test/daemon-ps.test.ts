@@ -1,8 +1,12 @@
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	type DaemonInfo,
 	evaluateShutdownQuietPeriod,
+	forceStopTrackedWorkers,
 	isWorkerSocketPath,
 	mergeDiscoveredDaemonProcesses,
 	parseLsofListeners,
@@ -15,8 +19,13 @@ import {
 	sortDaemons,
 	verifyHelloSupervisorPid,
 } from "../src/cli/daemon-ps.js";
+import { ENV_AGENT_DIR } from "../src/config.js";
 import { getProcessStartId } from "../src/core/session-lease.js";
 import { defaultDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
+import {
+	DAEMON_NONPERSISTENT_WORKER_MARKER,
+	DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("worker socket classification", () => {
 	it.runIf(process.platform !== "win32")("recognizes only worker sockets in the default service directory", () => {
@@ -24,6 +33,77 @@ describe("worker socket classification", () => {
 		expect(isWorkerSocketPath(join(defaultDaemonSocketDir(), "daemon.sock"))).toBe(false);
 		expect(isWorkerSocketPath("/tmp/worker-abc.sock")).toBe(false);
 	});
+});
+
+describe("forced tracked-worker cleanup", () => {
+	it.runIf(process.platform !== "win32")(
+		"stops and removes a version 3 nonpersistent worker without a recovery journal",
+		async () => {
+			const root = mkdtempSync(join(tmpdir(), "prime-daemon-ps-nonpersistent-"));
+			const previousAgentDir = process.env[ENV_AGENT_DIR];
+			const descriptorDir = join(root, "daemon-workers", "test-supervisor");
+			const descriptorPath = join(descriptorDir, "worker.json");
+			const markerPath = `${descriptorPath}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`;
+			const tempPath = `${descriptorPath}.123.tmp`;
+			const workerSocketPath = join(root, "worker.sock");
+			const orphanJournalPath = join(descriptorDir, "worker.orphans.jsonl");
+			const unexpectedRecoveryPath = join(descriptorDir, "nonpersistent-worker.recovery.jsonl");
+			const supervisorSocketPath = join(root, "supervisor.sock");
+			mkdirSync(descriptorDir, { recursive: true });
+			const child = spawn(process.execPath, ["--eval", "setInterval(() => {}, 1000)"], {
+				detached: true,
+				stdio: "ignore",
+			});
+			try {
+				if (!child.pid) throw new Error("Tracked-worker fixture did not start");
+				const processStartId = getProcessStartId(child.pid);
+				if (!processStartId) throw new Error("Tracked-worker fixture has no process start id");
+				writeFileSync(workerSocketPath, "socket");
+				writeFileSync(orphanJournalPath, "");
+				writeFileSync(unexpectedRecoveryPath, "unexpected");
+				writeFileSync(markerPath, DAEMON_NONPERSISTENT_WORKER_MARKER);
+				writeFileSync(tempPath, "temporary descriptor");
+				writeFileSync(
+					descriptorPath,
+					JSON.stringify({
+						version: 3,
+						workerId: "nonpersistent-worker",
+						pid: child.pid,
+						processStartId,
+						socketPath: workerSocketPath,
+						orphanProcessJournalPath: orphanJournalPath,
+						workerRecovery: "disabled",
+						ownerClientId: "owner",
+						supervisorSocketPath,
+					}),
+				);
+				process.env[ENV_AGENT_DIR] = root;
+
+				await expect(forceStopTrackedWorkers(supervisorSocketPath, async () => {})).resolves.toEqual([]);
+				for (const path of [
+					descriptorPath,
+					markerPath,
+					tempPath,
+					workerSocketPath,
+					orphanJournalPath,
+					unexpectedRecoveryPath,
+				]) {
+					expect(existsSync(path), path).toBe(false);
+				}
+				expect(() => process.kill(child.pid!, 0)).toThrow();
+			} finally {
+				if (previousAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+				else process.env[ENV_AGENT_DIR] = previousAgentDir;
+				try {
+					if (child.pid) process.kill(-child.pid, "SIGKILL");
+				} catch {
+					// The expected cleanup already stopped the isolated process group.
+				}
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+		10_000,
+	);
 });
 
 describe("parseSsListeners", () => {

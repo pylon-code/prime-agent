@@ -30,6 +30,7 @@ import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import {
 	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
+	NONPERSISTENT_DAEMON_WORKER_FEATURE,
 	type RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE,
 } from "../../sdk-features.js";
 import type {
@@ -85,8 +86,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 28 negotiates fresh snapshot generations and adds private worker chunk routing metadata.
 // Revision 29 capability-gates exact caller-owned launch environments and observable cleanup results.
 // Revision 30 adds capability-gated same-supervisor recoverable owned-session adoption.
-export const DAEMON_SCHEMA_REVISION = 30;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-2e0904d3ad1a";
+// Revision 31 adds capability-proved nonpersistent fresh daemon workers.
+export const DAEMON_SCHEMA_REVISION = 31;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-31-241186b40713";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -146,7 +148,8 @@ export type DaemonServerCapability =
 	| "acp_mcp_servers"
 	| "snapshot_generation_nonce_v1"
 	| "authoritative_owned_session_cleanup_v1"
-	| "daemon_recoverable_owned_session_adoption_v1";
+	| "daemon_recoverable_owned_session_adoption_v1"
+	| typeof NONPERSISTENT_DAEMON_WORKER_FEATURE;
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -205,6 +208,7 @@ export const DAEMON_SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapabil
 	"authoritative_owned_session_cleanup_v1",
 	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
 	"daemon_recoverable_owned_session_adoption_v1",
+	NONPERSISTENT_DAEMON_WORKER_FEATURE,
 ];
 
 export function daemonSupervisorServerCapabilities(
@@ -593,6 +597,7 @@ export type DaemonCommand =
 			config?: AgentSessionRuntimeConfig;
 			runtimeMetadata?: AgentSessionRuntimeMetadata;
 			lifecycle?: DaemonSessionLifecycle;
+			workerRecovery?: "disabled";
 	  } & DaemonClientEnv &
 			DaemonLaunchEnv)
 	// Attach env is adopt-if-absent only: it fills identity for env-less
@@ -929,6 +934,11 @@ const CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_COMMAND = {
 	minSchemaRevision: 29,
 	capability: CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
 } as const;
+const NONPERSISTENT_DAEMON_WORKER_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 31,
+	capability: NONPERSISTENT_DAEMON_WORKER_FEATURE,
+} as const;
 const DELETE_RLM_SUBAGENT_COMMAND = {
 	minProtocol: 7,
 	capability: "delete_rlm_subagent",
@@ -1100,6 +1110,9 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 		((command.type === "attach" || command.type === "reattach") && command.telemetryDisabled !== undefined) ||
 		(command.type === "create" && command.config?.telemetryDisabled !== undefined);
 	if (carriesTelemetryPolicy) requirements.push(TELEMETRY_POLICY_COMMAND);
+	if (command.type === "create" && command.workerRecovery === "disabled") {
+		requirements.push(CLIENT_OWNED_DAEMON_COMMAND, NONPERSISTENT_DAEMON_WORKER_COMMAND);
+	}
 	if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
 		requirements.push(PROMPT_ADMISSION_CANCELLATION_COMMAND);
 	}

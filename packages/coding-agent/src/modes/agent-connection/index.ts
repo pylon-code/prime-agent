@@ -17,6 +17,7 @@ export type {
 } from "../daemon/daemon-protocol.js";
 export type {
 	DaemonAgentConnectionOptions,
+	DaemonNonpersistentWorkerCreateProof,
 	DaemonOwnedSessionContractProof,
 	DaemonOwnedSessionDaemonIdentity,
 	DaemonOwnedSessionDisposeOptions,

@@ -16,13 +16,18 @@ import {
 	createDaemonCommandEnvelope,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
+	type DaemonCommand,
+	failure,
 	success,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
+	DAEMON_NONPERSISTENT_WORKER_MARKER,
+	DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX,
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
@@ -320,7 +325,11 @@ describe("daemon worker supervisor monitoring", () => {
 				createRuntime: async () => {
 					throw new Error("unexpected runtime creation");
 				},
-				worker: { authenticationToken: "token" },
+				worker: {
+					authenticationToken: "token",
+					recoveryMode: "enabled",
+					recoveryJournalPath: "/tmp/worker.recovery.jsonl",
+				},
 			});
 			const socket = Object.assign(new EventEmitter(), {
 				destroyed: false,
@@ -378,6 +387,7 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 			options: { worker: { authenticationToken: "token" } },
+			recoveryJournal: {},
 			supervisorClaims: new Map([[client, oldClaim]]),
 			updateRestart: transaction,
 			shuttingDown: false,
@@ -426,6 +436,7 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 			options: { worker: { authenticationToken: "token" } },
+			recoveryJournal: {},
 			supervisorClaims: new Map([[client, oldClaim]]),
 			updateRestart: transaction,
 			handleWorkerCommand: vi.fn(async () => undefined),
@@ -467,6 +478,8 @@ describe("daemon worker supervisor monitoring", () => {
 		const handleWorkerCommand = vi.fn(async () => undefined);
 		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 			options: { worker: { authenticationToken: "token" } },
+			recoveryJournal: {},
+			workerRecoveryMode: "enabled",
 			supervisorClaims: new Map(),
 			shuttingDown: false,
 			clearSupervisorAvailabilityCheck: vi.fn(),
@@ -500,6 +513,7 @@ describe("daemon worker supervisor monitoring", () => {
 				supervisorGeneration: generation,
 				supervisorPid: 123,
 				supervisorSocketPath: "/tmp/supervisor.sock",
+				workerRecovery: "enabled",
 			});
 		const oldClient = makeClient();
 		const replacementClient = makeClient();
@@ -582,6 +596,7 @@ describe("daemon worker supervisor monitoring", () => {
 				"PRIME_AGENT_INTERNAL_DAEMON_WORKER",
 				"PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID",
 				"PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL",
+				"PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_MODE",
 				"PRIME_AGENT_INTERNAL_DAEMON_WORKER_STARTUP_GATE_FD",
 				"PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN",
 				"PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL",
@@ -1090,6 +1105,52 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
+	it("removes nonpersistent workers during a normal shutdown while leaving ordinary workers adoptable", async () => {
+		const disabledClient = { close: vi.fn() };
+		const ordinaryClient = { close: vi.fn() };
+		const disabled = {
+			descriptor: { workerId: "disabled", workerRecovery: "disabled" as const },
+			client: disabledClient,
+		};
+		const ordinary = {
+			descriptor: { workerId: "ordinary" },
+			client: ordinaryClient,
+			intentionalStop: false,
+		};
+		const workers = new Map<string, typeof disabled | typeof ordinary>([
+			["disabled", disabled],
+			["ordinary", ordinary],
+		]);
+		const stopWorker = vi.fn(async (worker: typeof disabled | typeof ordinary) => {
+			workers.delete(worker.descriptor.workerId);
+		});
+		const exit = vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+			throw new Error(`exit ${code}`);
+		}) as typeof process.exit);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			shuttingDown: false,
+			signalCleanupHandlers: [],
+			workers,
+			clients: new Set(),
+			stopWorker,
+			catalog: { stop: vi.fn(async () => undefined) },
+			cleanupSocket: vi.fn(),
+			snapshotCacheRoot: "\0",
+			log: vi.fn(),
+		}) as { shutdown(exitCode: number, stopWorkers: boolean): Promise<never> };
+
+		try {
+			await expect(supervisor.shutdown(0, false)).rejects.toThrow("exit 0");
+			expect(stopWorker).toHaveBeenCalledExactlyOnceWith(disabled, true, true);
+			expect(workers.get("disabled")).toBeUndefined();
+			expect(workers.get("ordinary")).toBe(ordinary);
+			expect(ordinary.intentionalStop).toBe(true);
+			expect(ordinaryClient.close).toHaveBeenCalledOnce();
+		} finally {
+			exit.mockRestore();
+		}
+	});
+
 	it("keeps shutdown cleanup retries active before releasing daemon ownership", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-shutdown-finalization-test-"));
 		supervisorRegistryDirs.add(root);
@@ -1168,6 +1229,28 @@ describe("daemon worker supervisor monitoring", () => {
 			exit.mockRestore();
 			existsSpy.mockRestore();
 		}
+	});
+
+	it("retires a nonpersistent worker instead of probing or launching a replacement supervisor", async () => {
+		const shutdown = vi.fn(async () => undefined);
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			shuttingDown: false,
+			workerRecoveryMode: "disabled",
+			supervisorClaims: new Map(),
+			shutdown,
+			canConnectToSupervisor: vi.fn(async () => true),
+			launchReplacementSupervisor: vi.fn(async () => undefined),
+		}) as unknown as {
+			checkSupervisorAvailability(path: string): Promise<void>;
+			canConnectToSupervisor: ReturnType<typeof vi.fn>;
+			launchReplacementSupervisor: ReturnType<typeof vi.fn>;
+		};
+
+		await daemon.checkSupervisorAvailability("/tmp/old-supervisor.sock");
+
+		expect(shutdown).toHaveBeenCalledExactlyOnceWith(1);
+		expect(daemon.canConnectToSupervisor).not.toHaveBeenCalled();
+		expect(daemon.launchReplacementSupervisor).not.toHaveBeenCalled();
 	});
 
 	it("does not poll a healthy supervisor after the startup check", async () => {
@@ -5477,5 +5560,952 @@ describe("daemon worker supervisor monitoring", () => {
 
 		await expect(supervisor.prepareUpdateRestartFenced()).rejects.toThrow(/resident-1.*recovering.*disconnected/);
 		expect(requestWorker).not.toHaveBeenCalled();
+	});
+	it("rejects old supervisors and retires when a nonpersistent worker auth marker is missing or malformed", async () => {
+		const writes: string[] = [];
+		const shutdown = vi.fn(async () => undefined);
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { authenticationToken: "token" } },
+			recoveryJournal: undefined,
+			workerRecoveryMode: "disabled",
+			supervisorClaims: new Map(),
+			shuttingDown: false,
+			assertSupervisorClaimCurrent: vi.fn(async () => "fingerprint"),
+			shutdown,
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+		const client = {
+			id: "supervisor",
+			authenticated: false,
+			socket: {
+				destroyed: false,
+				write: vi.fn((chunk: string) => {
+					writes.push(chunk);
+					return true;
+				}),
+				end: vi.fn(),
+			},
+			attachedActiveSessionIds: new Set(),
+			detachInput: vi.fn(),
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+
+		for (const workerRecovery of [undefined, "unknown"] as const) {
+			writes.length = 0;
+			await daemon.handleLine(
+				client,
+				JSON.stringify({
+					type: "worker_auth",
+					token: "token",
+					supervisorGeneration: "old-supervisor",
+					supervisorPid: process.pid,
+					supervisorSocketPath: "/tmp/supervisor.sock",
+					...(workerRecovery === undefined ? {} : { workerRecovery }),
+				}),
+			);
+			await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+			expect(writes.join(" ")).toContain("worker_recovery_mode_mismatch");
+		}
+
+		expect(client.socket.end).toHaveBeenCalledTimes(2);
+		expect(shutdown).toHaveBeenCalledTimes(2);
+		expect(shutdown).toHaveBeenNthCalledWith(1, 1);
+		expect(shutdown).toHaveBeenNthCalledWith(2, 1);
+	});
+
+	it("does not let a bad worker token retire a nonpersistent worker", async () => {
+		const shutdown = vi.fn(async () => undefined);
+		const end = vi.fn();
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { authenticationToken: "correct-token" } },
+			workerRecoveryMode: "disabled",
+			supervisorClaims: new Map(),
+			shutdown,
+		}) as unknown as { handleLine(client: DaemonSocketClient, line: string): Promise<void> };
+		const client = {
+			id: "untrusted",
+			authenticated: false,
+			socket: { destroyed: false, write: vi.fn(() => true), end },
+			attachedActiveSessionIds: new Set(),
+			detachInput: vi.fn(),
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+
+		await daemon.handleLine(
+			client,
+			JSON.stringify({
+				type: "worker_auth",
+				token: "wrong-token",
+				supervisorGeneration: "attacker",
+				supervisorPid: process.pid,
+				supervisorSocketPath: "/tmp/supervisor.sock",
+			}),
+		);
+		await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate));
+
+		expect(end).toHaveBeenCalledOnce();
+		expect(shutdown).not.toHaveBeenCalled();
+	});
+
+	it("never joins or reuses a worker with a different recovery mode", async () => {
+		const root = {
+			id: "active-nonpersistent",
+			activeSessionId: "active-nonpersistent",
+			sessionId: "session-nonpersistent",
+			cwd: "/tmp",
+		};
+		const worker = {
+			descriptor: {
+				workerId: "nonpersistent-worker",
+				rootActiveSessionId: root.activeSessionId,
+				ownerClientId: "owner",
+				workerRecovery: "disabled" as const,
+				lifecycle: "ready",
+			},
+			client: {},
+			summaries: new Map([[root.activeSessionId, root as SessionSummary]]),
+		};
+		const supervisor = Object.create(DaemonSupervisor.prototype) as {
+			reuseWorkerForCreate(
+				target: typeof worker,
+				ownerClientId: string,
+				sessionPath: string,
+				workerRecovery?: "disabled",
+			): Promise<typeof worker>;
+			joinOpeningWorker(
+				target: Promise<typeof worker>,
+				ownerClientId: string,
+				sessionPath: string,
+				workerRecovery?: "disabled",
+			): Promise<typeof worker>;
+		};
+
+		await expect(supervisor.reuseWorkerForCreate(worker, "owner", "/tmp/session.jsonl")).rejects.toThrow(
+			"incompatible worker recovery mode",
+		);
+		await expect(
+			supervisor.joinOpeningWorker(Promise.resolve(worker), "owner", "/tmp/session.jsonl"),
+		).rejects.toThrow("incompatible worker recovery mode");
+	});
+
+	it("rejects malformed or resumable nonpersistent worker creates before launch", async () => {
+		const client = { id: "nonpersistent-owner" } as DaemonSocketClient;
+		const createOrReuseWorker = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients: new Set([client]),
+			workers: new Map(),
+			protocolClientIds: new WeakMap(),
+			createOrReuseWorker,
+		}) as {
+			handleCommand(requestClient: DaemonSocketClient, command: unknown): Promise<unknown>;
+		};
+		for (const command of [
+			{ type: "create", lifecycle: "client_owned", workerRecovery: "ignored" },
+			{ type: "create", workerRecovery: "disabled" },
+			{ type: "create", lifecycle: "client_owned", workerRecovery: "disabled" },
+			{ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", noSession: false },
+			{
+				type: "create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: true,
+				config: { noTools: false, noExtensions: true },
+			},
+			{
+				type: "create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: true,
+				config: { noTools: true, noExtensions: false },
+			},
+			{
+				type: "create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: true,
+				config: { noTools: true, noExtensions: true, tools: ["ipython"] },
+			},
+			{
+				type: "create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: true,
+				config: { noTools: true, noExtensions: true, extensions: ["/tmp/private-extension.ts"] },
+			},
+			{ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", sessionPath: "/saved.jsonl" },
+			{ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", continueRecent: true },
+			{ type: "create", lifecycle: "client_owned", workerRecovery: "disabled", continueRecent: "false" },
+		]) {
+			await expect(supervisor.handleCommand(client, command)).rejects.toThrow();
+		}
+		expect(createOrReuseWorker).not.toHaveBeenCalled();
+	});
+
+	it("rejects disabled recovery fields before recoverable-owned receipt hashing", async () => {
+		const digestRequest = vi.fn(() => "digest");
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			platform: "darwin",
+			ownedSessionRecoveryStore: { digestRequest },
+		}) as unknown as {
+			createRecoverableOwnedSession(client: DaemonSocketClient, command: unknown): Promise<unknown>;
+			prepareRecoverableOwnedSessionAdoption(client: DaemonSocketClient, command: unknown): Promise<unknown>;
+			commitRecoverableOwnedSessionAdoption(client: DaemonSocketClient, command: unknown): Promise<unknown>;
+			confirmRecoverableOwnedSessionAdoption(client: DaemonSocketClient, command: unknown): Promise<unknown>;
+		};
+		const client = {} as DaemonSocketClient;
+		for (const [method, command] of [
+			["createRecoverableOwnedSession", { type: "create_recoverable_owned_session", workerRecovery: "disabled" }],
+			[
+				"prepareRecoverableOwnedSessionAdoption",
+				{ type: "prepare_recoverable_owned_session_adoption", workerRecovery: "disabled" },
+			],
+			[
+				"commitRecoverableOwnedSessionAdoption",
+				{ type: "commit_recoverable_owned_session_adoption", workerRecovery: "disabled" },
+			],
+			[
+				"confirmRecoverableOwnedSessionAdoption",
+				{ type: "confirm_recoverable_owned_session_adoption", workerRecovery: "disabled" },
+			],
+		] as const) {
+			await expect(supervisor[method](client, command)).rejects.toThrow("adoption is unavailable");
+		}
+		expect(digestRequest).not.toHaveBeenCalled();
+	});
+
+	it("publishes the disabled-recovery receipt only from the exact worker generation", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-nonpersistent-receipt-"));
+		supervisorRegistryDirs.add(root);
+		const descriptorPath = join(root, "worker.json");
+		writeFileSync(
+			`${descriptorPath}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`,
+			DAEMON_NONPERSISTENT_WORKER_MARKER,
+		);
+		const summary = {
+			id: "active-nonpersistent",
+			activeSessionId: "active-nonpersistent",
+			sessionId: "session-nonpersistent",
+			cwd: "/tmp/project",
+		} as SessionSummary;
+		const worker = {
+			descriptor: {
+				version: 3,
+				workerId: "worker-nonpersistent",
+				rootActiveSessionId: "active-nonpersistent",
+				rootSessionId: "session-nonpersistent",
+				ownerClientId: "nonpersistent-owner",
+				pid: 12_345,
+				lifecycle: "ready",
+				workerRecovery: "disabled",
+			},
+			descriptorPath,
+			workerIncarnation: "A".repeat(43),
+			client: { matchesAuthenticatedIncarnation: () => true },
+			summaries: new Map([["active-nonpersistent", summary]]),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients: new Set<DaemonSocketClient>(),
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			protocolClientIds: new WeakMap(),
+			log: vi.fn(),
+		}) as {
+			workers: Map<string, typeof worker>;
+			createResponseSummary(
+				ownerClientId: string,
+				command: {
+					type: "create";
+					lifecycle: "client_owned";
+					workerRecovery?: "disabled";
+					noSession?: boolean;
+					config?: { noTools?: boolean; noExtensions?: boolean };
+				},
+				target: typeof worker,
+				value: SessionSummary,
+			): SessionSummary & { workerRecovery?: "disabled" };
+			replayCreateResponse(
+				client: DaemonSocketClient,
+				command: {
+					type: "create";
+					id?: string;
+					lifecycle: "client_owned";
+					workerRecovery?: "disabled";
+					noSession?: boolean;
+					config?: { noTools?: boolean; noExtensions?: boolean };
+				},
+				response: unknown,
+			): { success: boolean; data?: unknown };
+		};
+
+		expect(
+			supervisor.createResponseSummary(
+				"nonpersistent-owner",
+				{
+					type: "create",
+					lifecycle: "client_owned",
+					workerRecovery: "disabled",
+					noSession: true,
+					config: { noTools: true, noExtensions: true },
+				},
+				worker,
+				summary,
+			),
+		).toMatchObject({ workerPid: 12_345, workerRecovery: "disabled" });
+		writeFileSync(`${descriptorPath}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`, "tampered-nonpersistent-marker");
+		expect(() =>
+			supervisor.createResponseSummary(
+				"nonpersistent-owner",
+				{
+					type: "create",
+					lifecycle: "client_owned",
+					workerRecovery: "disabled",
+					noSession: true,
+					config: { noTools: true, noExtensions: true },
+				},
+				worker,
+				summary,
+			),
+		).toThrow("proof is unavailable");
+		writeFileSync(
+			`${descriptorPath}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`,
+			DAEMON_NONPERSISTENT_WORKER_MARKER,
+		);
+		expect(() =>
+			supervisor.createResponseSummary(
+				"nonpersistent-owner",
+				{
+					type: "create",
+					lifecycle: "client_owned",
+					workerRecovery: "disabled",
+					noSession: true,
+					config: { noTools: true, noExtensions: true },
+				},
+				worker,
+				{ ...summary, sessionFile: "/tmp/private.jsonl" },
+			),
+		).toThrow("proof is unavailable");
+		expect(
+			supervisor.createResponseSummary(
+				"nonpersistent-owner",
+				{ type: "create", lifecycle: "client_owned" },
+				worker,
+				summary,
+			),
+		).not.toHaveProperty("workerRecovery");
+		const exactReplay = supervisor.replayCreateResponse(
+			{ id: "nonpersistent-owner" } as DaemonSocketClient,
+			{
+				type: "create",
+				id: "stable-create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: true,
+				config: { noTools: true, noExtensions: true },
+			},
+			{
+				type: "response",
+				command: "create",
+				success: true,
+				data: { ...summary, workerPid: 12_345, workerRecovery: "disabled" },
+			},
+		);
+		expect(exactReplay).toMatchObject({ success: true, data: { workerRecovery: "disabled" } });
+		const staleGenerationReplay = supervisor.replayCreateResponse(
+			{ id: "nonpersistent-owner" } as DaemonSocketClient,
+			{
+				type: "create",
+				id: "stable-create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: true,
+				config: { noTools: true, noExtensions: true },
+			},
+			{
+				type: "response",
+				command: "create",
+				success: true,
+				data: { ...summary, sessionId: "stale-session", workerPid: 12_345, workerRecovery: "disabled" },
+			},
+		);
+		expect(staleGenerationReplay).toMatchObject({ success: false });
+		const staleProcessReplay = supervisor.replayCreateResponse(
+			{ id: "nonpersistent-owner" } as DaemonSocketClient,
+			{
+				type: "create",
+				id: "stable-create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: true,
+				config: { noTools: true, noExtensions: true },
+			},
+			{
+				type: "response",
+				command: "create",
+				success: true,
+				data: { ...summary, workerPid: 99_999, workerRecovery: "disabled" },
+			},
+		);
+		expect(staleProcessReplay).toMatchObject({ success: false });
+		supervisor.workers.delete(worker.descriptor.workerId);
+		expect(() =>
+			supervisor.createResponseSummary(
+				"nonpersistent-owner",
+				{
+					type: "create",
+					lifecycle: "client_owned",
+					workerRecovery: "disabled",
+					noSession: true,
+					config: { noTools: true, noExtensions: true },
+				},
+				worker,
+				summary,
+			),
+		).toThrow("proof is unavailable");
+		const replay = supervisor.replayCreateResponse(
+			{ id: "nonpersistent-owner" } as DaemonSocketClient,
+			{
+				type: "create",
+				id: "stable-create",
+				lifecycle: "client_owned",
+				workerRecovery: "disabled",
+				noSession: true,
+				config: { noTools: true, noExtensions: true },
+			},
+			{
+				type: "response",
+				command: "create",
+				success: true,
+				data: { ...summary, workerRecovery: "disabled" },
+			},
+		);
+		expect(replay).toMatchObject({ success: false });
+		expect(JSON.stringify(replay)).not.toContain('"workerRecovery"');
+		const defaultReplay = supervisor.replayCreateResponse(
+			{ id: "nonpersistent-owner" } as DaemonSocketClient,
+			{ type: "create", id: "stable-create", lifecycle: "client_owned" },
+			{
+				type: "response",
+				command: "create",
+				success: true,
+				data: { ...summary, workerRecovery: "disabled" },
+			},
+		);
+		expect(defaultReplay).toMatchObject({ success: true });
+		expect(JSON.stringify(defaultReplay)).not.toContain('"workerRecovery"');
+	});
+
+	it("retires persisted nonpersistent workers instead of adopting them after supervisor replacement", async () => {
+		const worker = {
+			descriptor: { workerId: "worker-nonpersistent", workerRecovery: "disabled" },
+			stopRevision: 0,
+		};
+		const retireNonpersistentWorker = vi.fn(async () => undefined);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			retireNonpersistentWorker,
+		}) as {
+			adoptOrRecoverWorker(target: typeof worker): Promise<void>;
+		};
+
+		await supervisor.adoptOrRecoverWorker(worker);
+
+		expect(retireNonpersistentWorker).toHaveBeenCalledExactlyOnceWith(worker);
+	});
+
+	it("never admits a nonpersistent worker to recovery", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-nonpersistent",
+				workerRecovery: "disabled",
+				stopRequestedAt: undefined,
+			},
+			intentionalStop: false,
+			client: undefined,
+			recovery: undefined,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+		}) as {
+			isWorkerRecoveryEligible(target: typeof worker): boolean;
+			recoverWorker(target: typeof worker): Promise<void>;
+		};
+
+		expect(supervisor.isWorkerRecoveryEligible(worker)).toBe(false);
+		await expect(supervisor.recoverWorker(worker)).rejects.toThrow("cannot be recovered");
+	});
+
+	it("contains sidecar-marked downgrade-ambiguous descriptors while ignoring unrelated malformed records", () => {
+		const descriptorDir = mkdtempSync(join(tmpdir(), "prime-supervisor-descriptor-test-"));
+		try {
+			const orphanMarker = join(descriptorDir, `orphan.json${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`);
+			const staleTemp = join(descriptorDir, "stale.json.123.tmp");
+			writeFileSync(orphanMarker, DAEMON_NONPERSISTENT_WORKER_MARKER);
+			writeFileSync(staleTemp, "stale descriptor temp");
+			writeFileSync(
+				join(descriptorDir, "malformed.json"),
+				`${JSON.stringify({
+					version: 1,
+					supervisorSocketPath: "/tmp/supervisor.sock",
+					workerId: "worker-1",
+					rootActiveSessionId: "active-1",
+				})}\n`,
+			);
+			const otherwiseValid = {
+				supervisorSocketPath: "/tmp/supervisor.sock",
+				pid: process.pid,
+				socketPath: "/tmp/worker.sock",
+				authenticationToken: "token",
+				rootActiveSessionId: "active",
+				ownerClientId: "owner",
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: "2026-01-01T00:00:00.000Z",
+				consecutiveFailures: 0,
+				createCommand: { type: "create" },
+			};
+			writeFileSync(
+				join(descriptorDir, "version-2-disabled.json"),
+				`${JSON.stringify({ ...otherwiseValid, version: 2, workerId: "worker-2", workerRecovery: "disabled" })}
+`,
+			);
+			writeFileSync(
+				join(descriptorDir, "version-3-recoverable.json"),
+				`${JSON.stringify({ ...otherwiseValid, version: 3, workerId: "worker-3" })}
+`,
+			);
+			writeFileSync(
+				join(descriptorDir, "version-1-stripped.json"),
+				`${JSON.stringify({ ...otherwiseValid, version: 1, workerId: "worker-4" })}
+`,
+			);
+			for (const descriptorName of [
+				"version-2-disabled.json",
+				"version-3-recoverable.json",
+				"version-1-stripped.json",
+			]) {
+				writeFileSync(
+					`${join(descriptorDir, descriptorName)}${DAEMON_NONPERSISTENT_WORKER_MARKER_SUFFIX}`,
+					DAEMON_NONPERSISTENT_WORKER_MARKER,
+				);
+			}
+			const ordinaryRecoveryJournal = join(descriptorDir, "worker-5.recovery.jsonl");
+			writeFileSync(
+				ordinaryRecoveryJournal,
+				`${JSON.stringify({
+					version: 1,
+					activeSessionId: "active",
+					sessionId: "session-ordinary",
+					busy: false,
+					operation: "ready",
+					recordedAt: "2026-01-01T00:00:00.000Z",
+				})}
+`,
+			);
+			writeFileSync(
+				join(descriptorDir, "version-2-ordinary.json"),
+				`${JSON.stringify({
+					...otherwiseValid,
+					version: 2,
+					workerId: "worker-5",
+					recoveryJournalPath: ordinaryRecoveryJournal,
+				})}
+`,
+			);
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				descriptorDir,
+				socketPath: "/tmp/supervisor.sock",
+				workers: new Map(),
+				log: vi.fn(),
+			}) as {
+				workers: Map<string, { descriptor: DaemonWorkerDescriptor }>;
+				loadWorkerDescriptors(): void;
+			};
+
+			supervisor.loadWorkerDescriptors();
+
+			expect(existsSync(orphanMarker)).toBe(false);
+			expect(existsSync(staleTemp)).toBe(false);
+			expect(supervisor.workers.size).toBe(4);
+			for (const workerId of ["worker-2", "worker-3", "worker-4"]) {
+				expect(supervisor.workers.get(workerId)?.descriptor).toMatchObject({
+					version: 3,
+					workerRecovery: "disabled",
+					ownerClientId: "owner",
+				});
+			}
+			expect(supervisor.workers.get("worker-5")?.descriptor).toMatchObject({
+				version: 2,
+				ownerClientId: "owner",
+			});
+			expect(supervisor.workers.get("worker-5")?.descriptor).not.toHaveProperty("workerRecovery");
+		} finally {
+			rmSync(descriptorDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects disconnected nonpersistent attach recovery before rescinding its cleanup tombstone", async () => {
+		const activeSessionId = "active-nonpersistent-recovery";
+		const worker = {
+			descriptor: {
+				workerId: "worker-nonpersistent-recovery",
+				ownerClientId: "client-1",
+				rootActiveSessionId: activeSessionId,
+				workerRecovery: "disabled" as const,
+				lifecycle: "stopping",
+				stopRequestedAt: "2026-01-01T00:00:00.000Z",
+				archiveOnStop: false,
+				consecutiveFailures: 0,
+				createCommand: { type: "create" as const },
+			},
+			client: undefined,
+			summaries: new Map(),
+			intentionalStop: true,
+			stopRevision: 1,
+			launchEnv: undefined,
+			transientCreateCommand: undefined,
+		};
+		const client = {
+			id: "client-1",
+			capabilities: new Set<string>(),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set<string>(),
+		};
+		const persistWorker = vi.fn();
+		const recoverWorker = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([client]),
+			protocolClientIds: new WeakMap(),
+			persistWorker,
+			recoverWorker,
+			retireNonpersistentWorker: vi.fn(),
+		}) as {
+			attachClient(
+				attachClient: typeof client,
+				command: {
+					type: "attach";
+					activeSessionId: string;
+					recoveryConfig: { cwd: string };
+					launchEnv: Record<string, string>;
+				},
+			): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.attachClient(client, {
+				type: "attach",
+				activeSessionId,
+				recoveryConfig: { cwd: "/tmp/fresh-owner" },
+				launchEnv: { OWNER_SECRET: "fresh" },
+			}),
+		).rejects.toThrow("cannot be recovered or reattached after disconnect");
+		expect(worker.descriptor).toMatchObject({
+			lifecycle: "stopping",
+			stopRequestedAt: "2026-01-01T00:00:00.000Z",
+			archiveOnStop: false,
+		});
+		expect(worker.intentionalStop).toBe(true);
+		expect(worker.launchEnv).toBeUndefined();
+		expect(worker.transientCreateCommand).toBeUndefined();
+		expect(persistWorker).not.toHaveBeenCalled();
+		expect(recoverWorker).not.toHaveBeenCalled();
+	});
+
+	it("rejects disconnected nonpersistent reattach before mutating attachment state", async () => {
+		const activeSessionId = "active-nonpersistent-reattach";
+		const summary = {
+			id: activeSessionId,
+			activeSessionId,
+			sessionId: "session-nonpersistent-reattach",
+			cwd: "/tmp",
+		} as SessionSummary;
+		const worker = {
+			descriptor: {
+				workerId: "worker-nonpersistent-reattach",
+				ownerClientId: "client-1",
+				rootActiveSessionId: activeSessionId,
+				workerRecovery: "disabled" as const,
+				lifecycle: "stopping",
+				stopRequestedAt: "2026-01-01T00:00:00.000Z",
+			},
+			client: undefined,
+			summaries: new Map([[activeSessionId, summary]]),
+			intentionalStop: true,
+			stopRevision: 1,
+		};
+		const client = {
+			id: "client-1",
+			capabilities: new Set<string>(),
+			supportsExtensionUi: false,
+			attachedActiveSessionIds: new Set(["old-active"]),
+		};
+		const advanceAttachmentEpoch = vi.fn();
+		const reserveSnapshotStream = vi.fn();
+		const detaching = new Set(["old-active", activeSessionId]);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			clients: new Set([client]),
+			protocolClientIds: new WeakMap(),
+			advanceAttachmentEpoch,
+			reserveSnapshotStream,
+			detachingInputPauseSessions: new Map([[client, detaching]]),
+			retireNonpersistentWorker: vi.fn(),
+		}) as {
+			handleCommand(requestClient: typeof client, command: DaemonCommand): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.handleCommand(client, {
+				type: "reattach",
+				activeSessionId: "old-active",
+				targetActiveSessionId: activeSessionId,
+			}),
+		).rejects.toThrow("cannot be recovered or reattached after disconnect");
+		expect(advanceAttachmentEpoch).not.toHaveBeenCalled();
+		expect(reserveSnapshotStream).not.toHaveBeenCalled();
+		expect(detaching).toEqual(new Set(["old-active", activeSessionId]));
+	});
+
+	it("rejects every recovery-shaped lifetime command for a nonpersistent worker", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-nonpersistent-lifetime",
+				rootActiveSessionId: "active-1",
+				workerRecovery: "disabled" as const,
+			},
+		};
+		const summary = { id: "active-1", activeSessionId: "active-1", sessionId: "session-1" };
+		const write = vi.fn();
+		const forwardToWorker = vi.fn();
+		const commandJournal = {
+			lookup: vi.fn(() => undefined),
+			begin: vi.fn(() => ({ status: "new" as const })),
+			recordResult: vi.fn(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			ready: Promise.resolve(),
+			clients: new Set(),
+			workers: new Map([[worker.descriptor.workerId, { ...worker, summaries: new Map([["active-1", summary]]) }]]),
+			protocolClientIds: new WeakMap(),
+			correlatedPromptReservations: new Map(),
+			correlatedJournalRuns: new Map(),
+			restoreRecoverableOwnedConnection: vi.fn(),
+			commandJournal,
+			mutationDrain: { begin: vi.fn(), end: vi.fn() },
+			assertCurrentOwnership: vi.fn(async () => undefined),
+			cancelOwnedWorkerCleanup: vi.fn(),
+			findWorkerForClient: vi.fn(async () => ({ worker, summary })),
+			forwardToWorker,
+			write,
+			log: vi.fn(),
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+		const commands = [
+			{ type: "new_session", activeSessionId: "active-1" },
+			{ type: "switch_session", activeSessionId: "active-1", sessionPath: "/tmp/saved.jsonl" },
+			{ type: "fork", activeSessionId: "active-1", entryId: "entry-1" },
+			{ type: "import_jsonl", activeSessionId: "active-1", inputPath: "/tmp/import.jsonl" },
+			{ type: "restore_next_turn", activeSessionId: "active-1", messages: [] },
+			{ type: "restore_actions", activeSessionId: "active-1", snapshot: { formatVersion: 1, actions: [] } },
+			{ type: "export_jsonl", activeSessionId: "active-1", outputPath: "/tmp/private.jsonl" },
+			{ type: "compact", activeSessionId: "active-1", customInstructions: "private prompt" },
+			{ type: "refine", activeSessionId: "active-1", instructions: "private prompt", global: true },
+			{ type: "cron_add", activeSessionId: "active-1", schedule: "0 * * * *", prompt: "private prompt" },
+			{
+				type: "submit_correlated_prompt",
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				correlationId: "bad-images",
+				message: "private prompt",
+				images: {},
+			},
+			{
+				type: "submit_correlated_prompt",
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				correlationId: "bad-queue",
+				message: "private prompt",
+				queueIfBusy: "false",
+			},
+		] as const;
+		const owner = { id: "owner", attachedActiveSessionIds: new Set(), capabilities: new Set() } as DaemonSocketClient;
+
+		for (const [index, command] of commands.entries()) {
+			await supervisor.handleLine(
+				owner,
+				JSON.stringify(createDaemonCommandEnvelope(command as DaemonCommand, `forbidden-${index}`, "owner")),
+			);
+		}
+
+		expect(forwardToWorker).not.toHaveBeenCalled();
+		expect(commandJournal.begin).not.toHaveBeenCalled();
+		expect(commandJournal.recordResult).not.toHaveBeenCalled();
+		expect(write).toHaveBeenCalledTimes(commands.length);
+		for (const call of write.mock.calls) {
+			expect(call[1]).toMatchObject({ success: false });
+			expect((call[1] as { error: string }).error).toMatch(
+				/unavailable for a nonpersistent daemon worker|Nonpersistent correlated command failed/,
+			);
+		}
+	});
+
+	it("rejects a nonpersistent worker at the fenced update boundary without requesting a snapshot", async () => {
+		const requestWorker = vi.fn();
+		const worker = {
+			descriptor: {
+				workerId: "nonpersistent-1",
+				lifecycle: "ready",
+				workerRecovery: "disabled",
+			},
+			client: { requestWorker },
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([["nonpersistent-1", worker]]),
+		}) as {
+			prepareUpdateRestartFenced(): Promise<unknown>;
+		};
+
+		await expect(supervisor.prepareUpdateRestartFenced()).rejects.toThrow(
+			"Update restart is unavailable while a nonpersistent daemon worker exists",
+		);
+		expect(requestWorker).not.toHaveBeenCalled();
+	});
+
+	it("keeps disabled create replay in memory without persisting or hashing exact launch environments", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-disabled-create-replay-"));
+		const journalPath = join(root, "commands.jsonl");
+		const commandJournal = new CommandRecoveryJournal(journalPath);
+		const writes: string[] = [];
+		const client = {
+			id: "socket-client",
+			socket: {
+				destroyed: false,
+				write: vi.fn((chunk: string) => {
+					writes.push(chunk);
+					return true;
+				}),
+			},
+			attachedActiveSessionIds: new Set<string>(),
+			capabilities: new Set<string>(),
+		} as unknown as DaemonSocketClient;
+		const handleCommand = vi.fn(async (_client: DaemonSocketClient, command: { id?: string }) =>
+			success(command.id, "create", {
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				cwd: "/tmp/project",
+				workerRecovery: "disabled",
+			}),
+		);
+		const nonpersistentCreateRuns = new Map();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			ready: Promise.resolve(),
+			clients: new Set([client]),
+			workers: new Map(),
+			protocolClientIds: new WeakMap(),
+			commandJournal,
+			nonpersistentCreateRuns,
+			correlatedPromptReservations: new Map(),
+			correlatedJournalRuns: new Map(),
+			mutationDrain: { begin: vi.fn(), end: vi.fn() },
+			assertCurrentOwnership: vi.fn(async () => undefined),
+			cancelOwnedWorkerCleanup: vi.fn(),
+			restoreRecoverableOwnedConnection: vi.fn(),
+			handleCommand,
+			replayCreateResponse: (_client: DaemonSocketClient, _command: unknown, response: unknown) => response,
+			log: vi.fn(),
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+		const baseCommand = {
+			type: "create" as const,
+			lifecycle: "client_owned" as const,
+			workerRecovery: "disabled" as const,
+			noSession: true,
+			config: {
+				cwd: "/tmp/project",
+				apiKey: "PRIVATE-CREATE-SECRET",
+				noTools: true,
+				noExtensions: true,
+			},
+			launchEnv: { PROVIDER_TOKEN: "PRIVATE-LAUNCH-SECRET" },
+			launchEnvMode: "replace" as const,
+		};
+
+		try {
+			await supervisor.handleLine(client, JSON.stringify(createDaemonCommandEnvelope(baseCommand, "", "client-1")));
+			expect(nonpersistentCreateRuns.size).toBe(0);
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope(baseCommand, "stable-create", "client-1")),
+			);
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope(baseCommand, "stable-create", "client-1")),
+			);
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(
+					createDaemonCommandEnvelope(
+						{ ...baseCommand, launchEnv: { PROVIDER_TOKEN: "DIFFERENT-LAUNCH-SECRET" } },
+						"stable-create",
+						"client-1",
+					),
+				),
+			);
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(
+					createDaemonCommandEnvelope({ ...baseCommand, lifecycle: "resident" }, "stable-create", "client-1"),
+				),
+			);
+
+			Object.assign(supervisor, { updateRestartPhase: "draining" });
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope(baseCommand, "restart-rejected", "client-1")),
+			);
+			expect(nonpersistentCreateRuns.has(JSON.stringify(["client-1", "restart-rejected"]))).toBe(false);
+			Object.assign(supervisor, { updateRestartPhase: undefined });
+
+			handleCommand.mockResolvedValueOnce(failure("failed-create", "create", "private failure"));
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope(baseCommand, "failed-create", "client-1")),
+			);
+			expect(nonpersistentCreateRuns.has(JSON.stringify(["client-1", "failed-create"]))).toBe(false);
+
+			commandJournal.begin("client-1", "durable-collision", "create");
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope(baseCommand, "durable-collision", "client-1")),
+			);
+			expect(nonpersistentCreateRuns.has(JSON.stringify(["client-1", "durable-collision"]))).toBe(false);
+
+			expect(handleCommand.mock.calls.map((call) => call[1].id)).toEqual(["", "stable-create", "failed-create"]);
+			expect(writes.join(" ")).toContain("command id was reused with a different request");
+			expect(writes.join(" ")).toContain("fresh client-owned session");
+			expect(writes.join(" ")).toContain("preparing an update restart");
+			expect(writes.join(" ")).toContain("already in use");
+			expect(nonpersistentCreateRuns.size).toBe(1);
+			const durableJournal = readFileSync(journalPath, "utf8");
+			expect(durableJournal).toContain("durable-collision");
+			expect(durableJournal).not.toContain("stable-create");
+			expect(durableJournal).not.toContain("PRIVATE-CREATE-SECRET");
+			expect(durableJournal).not.toContain("PRIVATE-LAUNCH-SECRET");
+
+			await Reflect.apply(Reflect.get(DaemonSupervisor.prototype, "handleCommand"), supervisor, [
+				client,
+				{ type: "ack_result", commandId: "stable-create" },
+			]);
+			expect(nonpersistentCreateRuns.size).toBe(0);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

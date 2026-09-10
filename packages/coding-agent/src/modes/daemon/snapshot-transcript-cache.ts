@@ -19,6 +19,7 @@ import { isProcessAlive } from "../../utils/child-process.js";
 
 export const SNAPSHOT_TARGET_CHUNK_BYTES = 512 * 1024;
 export const SNAPSHOT_MEMORY_CACHE_BYTES = 4 * 1024 * 1024;
+export const NONPERSISTENT_SNAPSHOT_MEMORY_BYTES = 16 * 1024 * 1024;
 const SNAPSHOT_CACHE_UID = typeof process.getuid === "function" ? process.getuid() : "user";
 const SNAPSHOT_TRANSFER_CACHE_PARENT = join(tmpdir(), `prime-agent-snapshot-transfers-${SNAPSHOT_CACHE_UID}`);
 const SNAPSHOT_CACHE_OWNER_PREFIX = "owner-";
@@ -164,6 +165,7 @@ export interface SnapshotTranscriptCacheOptions {
 	cacheRoot: string;
 	targetChunkBytes?: number;
 	memoryCacheBytes?: number;
+	memoryOnly?: boolean;
 	io?: SnapshotTranscriptCacheIo;
 }
 
@@ -353,6 +355,7 @@ export interface SnapshotTranscriptPayloadOptions {
 	cacheRoot?: string;
 	targetChunkBytes?: number;
 	memoryCacheBytes?: number;
+	memoryOnly?: boolean;
 	signal?: AbortSignal;
 	validateGeneration?: () => void;
 	io?: SnapshotTranscriptCacheIo;
@@ -374,6 +377,7 @@ export class SnapshotTranscriptPayloadCache {
 			cacheRoot: string;
 			targetChunkBytes?: number;
 			memoryCacheBytes?: number;
+			memoryOnly?: boolean;
 			io?: SnapshotTranscriptCacheIo;
 		},
 	) {
@@ -567,6 +571,9 @@ export class SnapshotTranscriptPayloadCache {
 		this.totalBytes += bytes;
 		const memoryLimit = this.options.memoryCacheBytes ?? SNAPSHOT_MEMORY_CACHE_BYTES;
 		if (!this.cacheDirectory && this.totalBytes > memoryLimit) {
+			if (this.options.memoryOnly) {
+				throw new Error("Private snapshot transcript exceeds its in-memory limit");
+			}
 			this.cacheDirectory = join(this.options.cacheRoot, `payload-${randomUUID()}`);
 			await this.io.mkdir(this.cacheDirectory, { recursive: false, mode: 0o700 });
 			for (let index = 0; index < this.chunks.length; index++) {
@@ -621,6 +628,7 @@ export async function prepareSnapshotTranscriptPayload(
 		cacheRoot: options.cacheRoot ?? getDefaultSnapshotTransferCacheRoot(),
 		...(options.targetChunkBytes !== undefined ? { targetChunkBytes: options.targetChunkBytes } : {}),
 		...(options.memoryCacheBytes !== undefined ? { memoryCacheBytes: options.memoryCacheBytes } : {}),
+		...(options.memoryOnly === true ? { memoryOnly: true } : {}),
 		...(options.io ? { io: options.io } : {}),
 	});
 	try {
@@ -679,6 +687,7 @@ export async function prepareSnapshotTranscriptCache(options: {
 	cacheRoot?: string;
 	targetChunkBytes?: number;
 	memoryCacheBytes?: number;
+	memoryOnly?: boolean;
 	signal?: AbortSignal;
 	validateGeneration?: () => void;
 	io?: SnapshotTranscriptCacheIo;
@@ -899,6 +908,9 @@ export class SnapshotTranscriptCache {
 		this.totalBytes += buffer.length;
 		const memoryLimit = this.options.memoryCacheBytes ?? SNAPSHOT_MEMORY_CACHE_BYTES;
 		if (!this.cacheDirectory && this.totalBytes > memoryLimit) {
+			if (this.options.memoryOnly) {
+				throw new Error("Private snapshot transcript exceeds its in-memory limit");
+			}
 			this.cacheDirectory = join(
 				this.options.cacheRoot,
 				`${this.options.snapshotId.replaceAll(/[^a-zA-Z0-9_-]/g, "_")}-${randomUUID()}`,
