@@ -45,6 +45,14 @@ const options = { stateMaxBytes: config.stateMaxBytes ?? 1024, now: () => config
   beforeCommitDecision: () => barrier("semantic", { phase: "before", operation: "commit-decision", path: state }),
   afterCommitDecision: () => barrier("semantic", { phase: "after", operation: "commit-decision", path: state }),
  } };
+if (config.pauseLosingBuilderRead) options.afterInitialPathStat = async ({ path, stat }) => {
+ if (readPaused || !path.includes("/.building-") || basename(path) !== "checkpoint.json") return;
+ readPaused = true;
+ await send({ type: "cut", pid: process.pid, phase: "losing-builder-before-open", path, identity: { dev: stat.dev, ino: stat.ino } });
+ await new Promise((resolve, reject) => process.once("message", (message) => {
+  if (message?.type === "release") resolve(); else reject(new Error("Unexpected losing-builder barrier release."));
+ }));
+};
 if (config.pauseRead === "receipt-") options.lstatEntry = async (path) => {
  const stat = await lstat(path);
  if (basename(path).startsWith("receipt-")) await pauseRead(path, "receipt-");

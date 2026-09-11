@@ -9,8 +9,9 @@ const rounds = 10;
 const refusals = /actively locked|changed|disappeared|ENOENT|EEXIST|inode|receipt|publication|authority|conflicting|writer|ownership|claim|checkpoint|namespace|unfinished|incomplete|unsafe type, owner or exact permissions/;
 const migrationScenarios = new Set(families.map((family) => `migrate-${family}`));
 const staleMigrationTarget = "Migration temporary has an unknown immutable target.";
+const lostBuilderCheckpoint = "Generation builder conflicts with the independently installed winner.";
 function assertRefusal(scenario, message) {
- if (migrationScenarios.has(scenario) && message === staleMigrationTarget) return;
+ if (migrationScenarios.has(scenario) && [staleMigrationTarget, lostBuilderCheckpoint].includes(message)) return;
  assert.match(message, refusals);
 }
 async function competition(t, f, scenarios, round, historyProof) {
@@ -157,6 +158,44 @@ for (const family of families) test(`publication stale pre-intent migration refu
   }
   for (const marker of ["stale", "publisher", "recovery"]) await assert.rejects(lstat(join(f.directory, `${marker}.callbacks`)), { code: "ENOENT" });
   t.diagnostic(JSON.stringify({ family, pids: workers.map((worker) => worker.process.pid), refusal: refused.message, blocker: basename(finalBlocker), root: recovered.root, sourceAuthoritySha256: checkpoint.sourceAuthoritySha256 }));
+ } finally { await Promise.all(workers.map((worker) => worker.stop())); await cleanup(f); }
+});
+
+test("publication losing-builder reader refuses native open loss after peer cleanup", { timeout: 60000 }, async (t) => {
+ const f = await fixture("loser-cleanup"); const workers = [];
+ try {
+  const names = await readdir(f.root);
+  const winner = names.find((name) => name.startsWith("generation-"));
+  const loser = names.find((name) => name.startsWith(".building-"));
+  assert.ok(winner && loser);
+  const winnerPath = join(f.root, winner, "checkpoint.json");
+  const winnerBytes = await readFile(winnerPath); const winnerStat = await lstat(winnerPath);
+  assert.deepEqual(await readFile(join(f.root, loser, "checkpoint.json")), winnerBytes);
+  const reader = child(f, "loser-cleanup", { pauseLosingBuilderRead: true, marker: "stale-builder" }); workers.push(reader);
+  const cut = await reader.wait("cut");
+  assert.equal(cut.pid, reader.process.pid); assert.equal(cut.phase, "losing-builder-before-open");
+  assert.equal(cut.path, join(f.root, loser, "checkpoint.json"));
+  const pinned = await lstat(cut.path);
+  assert.deepEqual(cut.identity, { dev: pinned.dev, ino: pinned.ino });
+  const peer = child(f, "loser-cleanup", { marker: "cleanup-peer" }); workers.push(peer);
+  const cleaned = await peer.finish(); assert.deepEqual(cleaned.entries, [winner]);
+  await assert.rejects(lstat(cut.path), { code: "ENOENT" });
+  reader.process.send({ type: "release" });
+  assert.deepEqual(await reader.exit, { code: 1, signal: null });
+  const refusal = reader.messages.find((message) => message.type === "error");
+  assert.equal(refusal.pid, reader.process.pid);
+  assert.equal(refusal.message, lostBuilderCheckpoint);
+  const recovery = child(f, "loser-cleanup", { marker: "fresh-builder" }); workers.push(recovery);
+  const recovered = await recovery.finish();
+  assert.deepEqual(recovered.root, cleaned.root); assert.deepEqual(recovered.entries, [winner]);
+  assert.equal(await projection(f), null);
+  assert.deepEqual(await readFile(winnerPath), winnerBytes);
+  const finalStat = await lstat(winnerPath);
+  assert.deepEqual([finalStat.dev, finalStat.ino, finalStat.nlink], [winnerStat.dev, winnerStat.ino, winnerStat.nlink]);
+  for (const marker of ["stale-builder", "cleanup-peer", "fresh-builder"]) await assert.rejects(lstat(join(f.directory, `${marker}.callbacks`)), { code: "ENOENT" });
+  t.diagnostic(JSON.stringify({ pids: workers.map((worker) => worker.process.pid), refusal: refusal.message, winnerSha256: digest(winnerBytes), root: recovered.root, callbacks: 0 }));
+  assertRefusal("migrate-v1-v2", refusal.message);
+  for (const denied of ["commit", "rotate", "migrate-unknown"]) assert.throws(() => assertRefusal(denied, refusal.message), assert.AssertionError);
  } finally { await Promise.all(workers.map((worker) => worker.stop())); await cleanup(f); }
 });
 
