@@ -344,7 +344,7 @@ jobs:
     needs: trust
     if: needs.trust.outputs.allowed == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
