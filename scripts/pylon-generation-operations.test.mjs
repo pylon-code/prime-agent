@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { test } from "node:test";
-import { buildConsumerGeneration, discoverConsumerGenerations, prepareConsumerGeneration, publishConsumerGeneration, readConsumerGeneration, recoverConsumerGenerationBuilder, rotateConsumerGeneration, withConsumerGenerationLock } from "./lib/pylon-consumer-lock.mjs";
+import { buildConsumerGeneration, discoverConsumerGenerations, prepareConsumerGeneration, publishConsumerGeneration, readConsumerGeneration, recoverConsumerGenerationBuilder, rotateConsumerGeneration, withConsumerGenerationLock, withConsumerStateLock } from "./lib/pylon-consumer-lock.mjs";
 
 async function fixture(t) {
 	const directory = await mkdtemp(join(tmpdir(), "pylon-generation-operations-"));
@@ -420,6 +420,48 @@ test("v3 operation every pinned canonical metadata read preserves hook errors ac
 			assert.ok(fired, `${kind} ${code}`);
 		}
 	}
+});
+
+test("v3 operation preparation heartbeat capacity rotates before callback admission", async (t) => {
+	const f = await fixture(t); const state = join(await realpath(f.directory), "state.json");
+	const runtime = { ...options, stale: 100, now: () => 1000 };
+	await withConsumerStateLock(state, async (_path, tx) => tx.commitState("base"), runtime);
+	let clock = 2000;
+	await withConsumerStateLock(state, async () => {}, { ...runtime, now: () => clock++ });
+	const interrupted = new Error("Interrupted exact third claim index"); let cut = false;
+	await assert.rejects(withConsumerStateLock(state, async () => assert.fail("Interrupted claim must not enter its callback"), {
+		...runtime, now: () => 100000, hooks: { generationBoundary: ({ phase, operation, path }) => {
+			if (phase === "after" && operation === "link" && path.endsWith("/claim-index-0000000000000003.json")) { cut = true; throw interrupted; }
+		} },
+	}), (error) => error === interrupted);
+	assert.ok(cut);
+	let callbacks = 0; let schedules = 0; let stopped = 0; let rotated = false;
+	await withConsumerStateLock(state, async (_path, tx) => {
+		callbacks++;
+		assert.ok(rotated); assert.equal(schedules, 1); assert.equal(tx.readStateBytes().toString(), "base");
+	}, {
+		...runtime, now: () => 1000000,
+		hooks: { afterGenerationRename: () => { assert.equal(callbacks, 0); assert.equal(schedules, 0); rotated = true; } },
+		startHeartbeat: () => { schedules++; return async () => { stopped++; }; },
+	});
+	assert.equal(callbacks, 1); assert.equal(schedules, 1); assert.equal(stopped, 1);
+	assert.equal((await readFile(state)).toString(), "base");
+	const selected = JSON.parse(await readFile(`${state}.journal-v3/root.json`));
+	const finals = await readdir(join(`${state}.journal-v3`, selected.goal));
+	assert.equal(finals.length, 1); assert.match(finals[0], /^generation-0000000000000002-/);
+});
+
+for (const stage of ["afterClaim", "afterProjectionRename"]) test(`v3 operation preparation preserves ${stage} errors without callback or scheduler admission`, async (t) => {
+	const f = await fixture(t); f.authority.genesis.stateBytes = Buffer.from("base");
+	const failure = Object.assign(new Error(`Original ${stage} error`), { code: "ENOENT" });
+	let fired = false; let callbacks = 0; let schedules = 0;
+	await assert.rejects(withConsumerGenerationLock(f.root, f.authority, async () => { callbacks++; }, {
+		...options,
+		hooks: { [stage]: () => { fired = true; throw failure; } },
+		startHeartbeat: () => { schedules++; return async () => {}; },
+	}), (error) => error === failure);
+	assert.ok(fired); assert.equal(callbacks, 0); assert.equal(schedules, 0);
+	await withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => assert.equal(tx.readStateBytes().toString(), "base"), options);
 });
 
 test("v3 operation schedules callback heartbeats only after projection preparation", async (t) => {

@@ -4923,6 +4923,24 @@ async function generationHasOperationCapacity(snapshot, options) {
 	return certificateBytes + 2048 <= options.metadataMaxBytes && snapshot.epochRecords.size + 16 < GENERATION_EPOCH_MAX_ENTRIES && snapshot.receiptEntries.length + 32 < GENERATION_RECEIPT_MAX_ENTRIES && await generationRootPreflight(dirname(snapshot.path), options) + reserve <= options.maxJournalBytes;
 }
 
+async function generationReleaseOwnedClaim(snapshot, claim, options) {
+	const owned = await generationOwnsClaim(snapshot, claim, options);
+	const released = { schemaVersion: 2, generation: claim.generation, token: claim.token, outcome: "released" };
+	const result = await generationWriteReceipt(owned.snapshot, `epoch/terminal-${generationName(claim.generation)}-${claim.token}.json`, metadataBytes(released), options,
+		async (temporary) => generationOwnsClaim(owned.snapshot, claim, options, temporary));
+	if (!result.bytes.equals(metadataBytes(released))) throw new Error("Generation capacity release lost its exact claim ownership.");
+}
+
+async function generationBeatOwnedClaim(snapshot, claim, options) {
+	const owned = await generationOwnsClaim(snapshot, claim, options);
+	if (!(await generationHasOperationCapacity(owned.snapshot, options))) return false;
+	const refreshedAtMs = options.now();
+	const value = { schemaVersion: 2, generation: claim.generation, token: claim.token, refreshedAtMs };
+	await generationWriteReceipt(owned.snapshot, `epoch/heartbeat-${generationName(claim.generation)}-${claim.token}-${generationName(refreshedAtMs)}.json`, metadataBytes(value), options,
+		async (temporary) => generationOwnsClaim(snapshot, claim, options, temporary));
+	return true;
+}
+
 export async function withConsumerGenerationLock(root, authority, action, rawOptions = {}) {
 	if (typeof action !== "function" || !authority?.genesis?.statePath) throw new Error("Generation operation requires an action and exact genesis authority.");
 	const options = generationOptions(rawOptions);
@@ -4930,6 +4948,7 @@ export async function withConsumerGenerationLock(root, authority, action, rawOpt
 	await generationDirectory(dirname(statePath), options);
 	let snapshot;
 	let claim;
+	let base;
 	let acquired = false;
 	for (let attempt = 0; attempt < PROJECTION_RETRY_LIMIT; attempt += 1) {
 		snapshot = await prepareConsumerGeneration(root, authority, options);
@@ -4965,12 +4984,31 @@ export async function withConsumerGenerationLock(root, authority, action, rawOpt
 		if (!(await generationHasOperationCapacity(owned.snapshot, options))) {
 			// Claim/index publication can consume the remaining admission margin.
 			// Release and rotate before heartbeat scheduling or callback entry.
-			const released = { schemaVersion: 2, generation: claim.generation, token: claim.token, outcome: "released" };
-			const result = await generationWriteReceipt(owned.snapshot, `epoch/terminal-${generationName(claim.generation)}-${claim.token}.json`, metadataBytes(released), options,
-				async (temporary) => generationOwnsClaim(owned.snapshot, claim, options, temporary));
-			if (!result.bytes.equals(metadataBytes(released))) throw new Error("Generation capacity release lost its exact claim ownership.");
+			await generationReleaseOwnedClaim(owned.snapshot, claim, options);
 			await rotateConsumerGeneration(root, authority, options);
 			continue;
+		}
+		try {
+			let prepared = await generationBeatOwnedClaim(snapshot, claim, options);
+			if (prepared) {
+				await options.hooks?.afterClaim?.({ claim });
+				base = await generationRepairProjection(root, authority, statePath, options);
+				prepared = await generationBeatOwnedClaim(snapshot, claim, options);
+			}
+			if (prepared) {
+				const current = await generationOwnsClaim(snapshot, claim, options);
+				prepared = await generationHasOperationCapacity(current.snapshot, options);
+			}
+			if (!prepared) {
+				// Preparation heartbeats also consume certificate space. No callback
+				// or scheduler has started, so release this exact claim and rotate.
+				await generationReleaseOwnedClaim(snapshot, claim, options);
+				await rotateConsumerGeneration(root, authority, options);
+				continue;
+			}
+		} catch (error) {
+			try { await generationReleaseOwnedClaim(snapshot, claim, options); } catch { /* Preserve the original preparation error for recovery. */ }
+			throw error;
 		}
 		acquired = true;
 		break;
@@ -4984,12 +5022,7 @@ export async function withConsumerGenerationLock(root, authority, action, rawOpt
 	const beat = async () => {
 		if (!active) return false;
 		try {
-			const owned = await generationOwnsClaim(snapshot, claim, options);
-			if (!(await generationHasOperationCapacity(owned.snapshot, options))) throw new Error("Generation heartbeat must quiesce to preserve rotation headroom.");
-			const refreshedAtMs = options.now();
-			const value = { schemaVersion: 2, generation: claim.generation, token: claim.token, refreshedAtMs };
-			await generationWriteReceipt(owned.snapshot, `epoch/heartbeat-${generationName(claim.generation)}-${claim.token}-${generationName(refreshedAtMs)}.json`, metadataBytes(value), options,
-				async (temporary) => generationOwnsClaim(snapshot, claim, options, temporary));
+			if (!(await generationBeatOwnedClaim(snapshot, claim, options))) throw new Error("Generation heartbeat must quiesce to preserve rotation headroom.");
 			return true;
 		} catch (error) { heartbeatFailure = error; throw error; }
 	};
@@ -5002,11 +5035,7 @@ export async function withConsumerGenerationLock(root, authority, action, rawOpt
 		if (!result.bytes.equals(metadataBytes(wanted))) throw new Error("Generation operation lost ownership before its terminal decision.");
 	};
 	try {
-		await beat();
-		await options.hooks?.afterClaim?.({ claim });
-		const base = await generationRepairProjection(root, authority, statePath, options);
-		// Serialize preparation writes; only a live callback needs concurrent heartbeats.
-		await beat();
+		// Only the fully prepared callback needs concurrent heartbeats.
 		stopHeartbeat = (options.startHeartbeat ?? defaultHeartbeatScheduler)({ interval: options.update ?? PYLON_CONSUMER_LOCK_UPDATE_MS, beat });
 		const transaction = Object.freeze({
 			readStateBytes: () => base.tipBytes === null ? null : Buffer.from(base.tipBytes),

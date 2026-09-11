@@ -50,6 +50,17 @@ if (config.pauseRead === "receipt-") options.lstatEntry = async (path) => {
  if (basename(path).startsWith("receipt-")) await pauseRead(path, "receipt-");
  return stat;
 };
+if (config.pauseMigrationMetaRead) options.readDirectory = async (path) => {
+ const names = await readdir(path);
+ if (path === `${state}.journal-v3` && !readPaused) {
+  readPaused = true;
+  await send({ type: "cut", pid: process.pid, phase: "pre-intent-meta-read", names });
+  await new Promise((resolve, reject) => process.once("message", (message) => {
+   if (message?.type === "release") resolve(); else reject(new Error("Unexpected migration metadata barrier release."));
+  }));
+ }
+ return names;
+};
 async function callback(_path, tx) {
  const marker = config.marker ?? "owner";
  await appendFile(join(directory, `${marker}.callbacks`), "entered\n", { mode: 0o600 });

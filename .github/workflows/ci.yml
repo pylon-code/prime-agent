@@ -377,17 +377,17 @@ jobs:
           set -o pipefail
           npm run test:pylon-publication 2>&1 | tee publication-evidence/publication.log
 
-      - name: Every captured-process crash boundary
-        shell: bash
-        run: |
-          set -o pipefail
-          npm run test:pylon-publication-crash 2>&1 | tee publication-evidence/crash.log
-
       - name: Repeated process stress and read handoffs
         shell: bash
         run: |
           set -o pipefail
           npm run test:pylon-publication-stress 2>&1 | tee publication-evidence/stress.log
+
+      - name: Every captured-process crash boundary
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run test:pylon-publication-crash 2>&1 | tee publication-evidence/crash.log
 
       - name: Actual 16 MiB maximum, serialized after complete suite
         shell: bash
