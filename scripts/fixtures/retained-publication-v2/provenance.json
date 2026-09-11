@@ -1,0 +1,22 @@
+{
+  "repository": "pylon-code/prime-agent",
+  "commit": "c4f3cf669961d85718f767b1e6f0869304c03f14",
+  "transform": "Retained v2 implementation before public v3 dispatch; omit v3-only imports/engine and rewrite local imports. Shared current bounded-file evidence classes are intentional. No fixture is shipped as a public entrypoint.",
+  "files": [
+    {
+      "path": "pylon-consumer-lock.mjs",
+      "sourcePath": "scripts/lib/pylon-consumer-lock.mjs",
+      "sha256": "0288682cee693f286a840514744e15142ee82d18a9ddfb0083af31fcb87e85a8"
+    },
+    {
+      "path": "verify-pylon-preview-history.mjs",
+      "sourcePath": "scripts/verify-pylon-preview-history.mjs",
+      "sha256": "3b58766a65d0ab2c497c8b79328f28b05d1c1d1f3c6748b6a5f3f4ca956f9de6"
+    },
+    {
+      "path": "verify-pylon-stable-history.mjs",
+      "sourcePath": "scripts/verify-pylon-stable-history.mjs",
+      "sha256": "88a779785eb35dcfbd858c0f17c593826ff4501aabc8d16654ff2bd72123219d"
+    }
+  ]
+}

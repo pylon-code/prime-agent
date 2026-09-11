@@ -1,3 +1,5 @@
+import "./pylon-generation-migration.test.mjs";
+import "./pylon-public-state.test.mjs";
 import "./pylon-generation-operations.test.mjs";
 import "./pylon-generation.test.mjs";
 import "./pylon-bounded-file.test.mjs";
@@ -86,15 +88,15 @@ import {
 	PYLON_PUBLICATION_RULESET_GRAPHQL_VARIABLES,
 } from "./lib/pylon-ruleset-auditor.mjs";
 import { validatePreviewWorkflowRunEvidence, verifyGhAttestationResult } from "./verify-pylon-publication-attestations.mjs";
-import { recordPreviewHighWater } from "./verify-pylon-preview-history.mjs";
-import { verifyStableHistoryWithState } from "./verify-pylon-stable-history.mjs";
+import { recordPreviewHighWater } from "./fixtures/retained-publication-v2/verify-pylon-preview-history.mjs";
+import { verifyStableHistoryWithState } from "./fixtures/retained-publication-v2/verify-pylon-stable-history.mjs";
 import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
 import {
 	ensureDurableConsumerStateDirectory,
 	migrateConsumerStateJournal,
 	rotateConsumerStateJournal,
 	withConsumerStateLock,
-} from "./lib/pylon-consumer-lock.mjs";
+} from "./fixtures/retained-publication-v2/pylon-consumer-lock.mjs";
 import {
 	BoundedFileLinkRetiredBeforeReadError,
 	BoundedFileLinkRetiredDuringReadError,
@@ -3793,7 +3795,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 	};
 	const runConsumerChild = (statePath, candidate) => {
 		const source = `
-			import { withConsumerStateLock } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/pylon-consumer-lock.mjs")).href)};
+			import { withConsumerStateLock } from ${JSON.stringify(pathToFileURL(resolve("scripts/fixtures/retained-publication-v2/pylon-consumer-lock.mjs")).href)};
 			const statePath = process.argv[1];
 			const candidate = process.argv[2];
 			try {
@@ -3820,7 +3822,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 	};
 	const runRotationChild = (statePath) => {
 		const source = `
-			import { rotateConsumerStateJournal } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/pylon-consumer-lock.mjs")).href)};
+			import { rotateConsumerStateJournal } from ${JSON.stringify(pathToFileURL(resolve("scripts/fixtures/retained-publication-v2/pylon-consumer-lock.mjs")).href)};
 			try {
 				const result = await rotateConsumerStateJournal(process.argv[1]);
 				process.stdout.write(JSON.stringify(result));
@@ -4395,7 +4397,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 
 		const stagedCrashPath = join(fixture, "staged-then-crashed.json");
 		const crashingSource = `
-			import { withConsumerStateLock } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/pylon-consumer-lock.mjs")).href)};
+			import { withConsumerStateLock } from ${JSON.stringify(pathToFileURL(resolve("scripts/fixtures/retained-publication-v2/pylon-consumer-lock.mjs")).href)};
 			const hold = setInterval(() => {}, 1000);
 			await withConsumerStateLock(process.argv[1], async (_path, transaction) => {
 				await transaction.commitState(Buffer.from(JSON.stringify({ value: "crashed-stage" }) + "\\n"));
