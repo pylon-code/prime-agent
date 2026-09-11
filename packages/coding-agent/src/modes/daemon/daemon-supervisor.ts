@@ -969,6 +969,7 @@ export class DaemonSupervisor {
 	private cleanupPromise?: Promise<void>;
 	private shutdownTask?: Promise<never>;
 	private shuttingDown = false;
+	private pendingShutdownCommand?: Extract<DaemonCommand, { type: "shutdown" }>;
 	private startupComplete = false;
 	private updateRestartPhase?: "draining" | "fencing" | "prepared";
 	private readonly mutationDrain = new MutationDrainLatch();
@@ -2585,6 +2586,7 @@ export class DaemonSupervisor {
 				if (command.type === "shutdown" && response.success) {
 					// The ownership-checked journal result and socket write precede
 					// shutdown's closing notice and end(), which flushes queued writes.
+					this.pendingShutdownCommand = undefined;
 					void this.shutdown(0, true, false, command.force === true, "shutdown");
 				}
 			}
@@ -2594,6 +2596,12 @@ export class DaemonSupervisor {
 			if (journalIdentity && !isSupervisorGenerationStale(error)) {
 				try {
 					await this.assertCurrentOwnership();
+					if (this.pendingShutdownCommand === command && !this.shuttingDown && !this.shutdownTask) {
+						// A failed acknowledgment may release only its own admission fence,
+						// after ownership and lease checks, even if journaling is still unavailable.
+						this.assertSocketLeaseHeld();
+						this.pendingShutdownCommand = undefined;
+					}
 					this.commandJournal.recordResult(journalIdentity.clientId, journalIdentity.commandId, response);
 				} catch (ownershipError) {
 					response = recoverableOwnedCommandFailure(command.id, command.type, ownershipError);
@@ -3036,7 +3044,7 @@ export class DaemonSupervisor {
 				return success(command.id, command.type);
 			case "shutdown":
 				// Fence new admission while handleLine commits the acknowledgment.
-				this.shuttingDown = true;
+				this.pendingShutdownCommand = command;
 				return success(command.id, "shutdown");
 			case "prepare_update_restart": {
 				const manifest = await this.prepareUpdateRestart();
@@ -10005,7 +10013,7 @@ export class DaemonSupervisor {
 
 	private assertSupervisorServing(): void {
 		this.assertSocketLeaseHeld();
-		if (this.shuttingDown) {
+		if (this.shuttingDown || this.pendingShutdownCommand) {
 			const error = new Error(`Daemon supervisor generation ${this.generation} is shutting down; retry the command`);
 			Object.assign(error, { code: "supervisor_generation_stale" as const });
 			throw error;

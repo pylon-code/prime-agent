@@ -33,6 +33,8 @@ async function shutdownFixture(backpressured = false) {
 			reason: string,
 		): Promise<never>;
 		shuttingDown: boolean;
+		pendingShutdownCommand?: unknown;
+		socketLeaseCompromise?: Error;
 	};
 	internals.ready = Promise.resolve();
 	internals.commandJournal = new CommandRecoveryJournal(join(harness.tempDir, "commands.jsonl"));
@@ -86,7 +88,7 @@ describe("issue #44 supervisor shutdown acknowledgment", () => {
 		try {
 			await recheckReached.promise;
 			expect(journal.lookup("owner", "shutdown-1")).toMatchObject({ status: "pending" });
-			expect(internals.shuttingDown).toBe(true);
+			expect(internals.pendingShutdownCommand).toMatchObject({ id: "shutdown-1", type: "shutdown" });
 			expect(shutdown).not.toHaveBeenCalled();
 			expect(frames).toEqual([]);
 		} finally {
@@ -118,4 +120,68 @@ describe("issue #44 supervisor shutdown acknowledgment", () => {
 		expect(frames[0]).toMatchObject({ type: "response", command: "shutdown", success: false });
 		expect(internals.commandJournal.lookup("owner", "shutdown-1")).toMatchObject({ status: "pending" });
 	});
+
+	it.each([false, true])(
+		"accepts fresh commands after failed shutdown journaling, failure persisted=%s",
+		async (persistFailure) => {
+			const { internals, frames, client, shutdown, command } = await shutdownFixture();
+			vi.spyOn(internals, "assertCurrentOwnership").mockResolvedValue();
+			const journal = internals.commandJournal;
+			const writeResult = vi.spyOn(journal, "recordResult");
+			const failWrite = () => {
+				throw new Error("journal unavailable");
+			};
+			if (persistFailure) writeResult.mockImplementationOnce(failWrite);
+			else writeResult.mockImplementation(failWrite);
+			await internals.handleLine(client, command);
+			expect(shutdown).not.toHaveBeenCalled();
+			expect(frames.at(-1)).toMatchObject({ command: "shutdown", success: false });
+			expect(journal.lookup("owner", "shutdown-1")).toMatchObject({
+				status: persistFailure ? "complete" : "pending",
+			});
+			writeResult.mockRestore();
+
+			await internals.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope({ type: "roster_unsubscribe" }, "fresh-command", "owner")),
+			);
+			expect(frames.at(-1)).toMatchObject({ id: "fresh-command", command: "roster_unsubscribe", success: true });
+			await internals.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope({ type: "shutdown" }, "fresh-shutdown", "owner")),
+			);
+			expect(frames.at(-1)).toMatchObject({ id: "fresh-shutdown", command: "shutdown", success: true });
+			expect(journal.lookup("owner", "fresh-shutdown")).toMatchObject({
+				status: "complete",
+				response: frames.at(-1),
+			});
+			expect(shutdown).toHaveBeenCalledExactlyOnceWith(0, true, false, false, "shutdown");
+		},
+	);
+
+	it.each(["ownership", "cleanup", "lease"] as const)(
+		"keeps the %s fence after a failed shutdown attempt",
+		async (fence) => {
+			const { internals, frames, client, shutdown, command } = await shutdownFixture();
+			let checks = 0;
+			const ownership = vi.spyOn(internals, "assertCurrentOwnership").mockImplementation(async () => {
+				if (++checks > 1 && fence === "ownership")
+					throw Object.assign(new Error("ownership changed"), { code: "supervisor_generation_stale" });
+				if (checks === 3 && fence === "cleanup") internals.shuttingDown = true;
+				if (checks === 3 && fence === "lease") internals.socketLeaseCompromise = new Error("lease compromised");
+			});
+			const writeResult = vi.spyOn(internals.commandJournal, "recordResult").mockImplementation(() => {
+				throw new Error("journal unavailable");
+			});
+			await internals.handleLine(client, command);
+			writeResult.mockRestore();
+			ownership.mockResolvedValue();
+			await internals.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope({ type: "roster_unsubscribe" }, "fresh-command", "owner")),
+			);
+			expect(frames.at(-1)).toMatchObject({ id: "fresh-command", command: "dispatch", success: false });
+			expect(shutdown).not.toHaveBeenCalled();
+		},
+	);
 });
