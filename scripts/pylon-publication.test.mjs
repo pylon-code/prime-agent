@@ -1,3 +1,10 @@
+import "./pylon-publication-handoff.test.mjs";
+import "./pylon-generation-migration.test.mjs";
+import "./pylon-publication-durability.test.mjs";
+import "./pylon-public-state.test.mjs";
+import "./pylon-generation-operations.test.mjs";
+import "./pylon-generation.test.mjs";
+import "./pylon-bounded-file.test.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -83,15 +90,15 @@ import {
 	PYLON_PUBLICATION_RULESET_GRAPHQL_VARIABLES,
 } from "./lib/pylon-ruleset-auditor.mjs";
 import { validatePreviewWorkflowRunEvidence, verifyGhAttestationResult } from "./verify-pylon-publication-attestations.mjs";
-import { recordPreviewHighWater } from "./verify-pylon-preview-history.mjs";
-import { verifyStableHistoryWithState } from "./verify-pylon-stable-history.mjs";
+import { recordPreviewHighWater } from "./fixtures/retained-publication-v2/verify-pylon-preview-history.mjs";
+import { verifyStableHistoryWithState } from "./fixtures/retained-publication-v2/verify-pylon-stable-history.mjs";
 import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
 import {
 	ensureDurableConsumerStateDirectory,
 	migrateConsumerStateJournal,
 	rotateConsumerStateJournal,
 	withConsumerStateLock,
-} from "./lib/pylon-consumer-lock.mjs";
+} from "./fixtures/retained-publication-v2/pylon-consumer-lock.mjs";
 import {
 	BoundedFileLinkRetiredBeforeReadError,
 	BoundedFileLinkRetiredDuringReadError,
@@ -1212,15 +1219,24 @@ test("bounded reads authenticate only exact pre-read link retirement transitions
 		const symlinkMoved = join(fixture, "symlink-moved");
 		writeFileSync(symlinkSource, exactBytes);
 		writeFileSync(symlinkTarget, exactBytes);
-		await rejectGenericChange(() => readBoundedRegularFile(symlinkSource, {
+		let symlinkOpenError;
+		await assert.rejects(() => readBoundedRegularFile(symlinkSource, {
 			maxBytes: 1024,
 			expectedSha256: exactDigest,
 			openFile: async (path, flags) => {
 				renameSync(path, symlinkMoved);
 				symlinkSync(symlinkTarget, path);
-				return openFileHandle(path, flags);
+				try { return await openFileHandle(path, flags); }
+				catch (error) { symlinkOpenError = error; throw error; }
 			},
-		}));
+		}), (error) => {
+			assert.ok(symlinkOpenError);
+			assert.equal(error, symlinkOpenError);
+			assert.equal(error.code, "ELOOP");
+			assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, false);
+			assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+			return true;
+		});
 
 		const ioCases = [
 			["initial lstat", (_path, failure) => ({ lstatEntry: async () => { throw failure; } })],
@@ -1521,23 +1537,18 @@ test("bounded reads authenticate every exact monotone retirement cut and confirm
 			writeFileSync(path, exactBytes);
 			const base = lstatSync(path);
 			const pathEntry = preciseStat(base, transition === "link" ? 2 : 1, 10);
-			const before = preciseStat(base, transition === "link" ? 2 : 1, 10);
+			const before = transition === "unlink" ? base : preciseStat(base, 2, 10);
 			const after = preciseStat(base, transition === "link" ? 1 : 0, 20);
 			const finalPathEntry = preciseStat(base, 1, 20);
 			let lstats = 0;
 			await rejectGenericAsync(() => readBoundedRegularFile(path, {
 				maxBytes: 1024,
 				expectedSha256: exactDigest,
-				lstatEntry: async () => {
+				lstatEntry: transition === "unlink" ? lstatFile : async () => {
 					lstats += 1;
-					if (lstats === 1) return pathEntry;
-					if (transition === "unlink") {
-						const missing = new Error("precise final path is absent");
-						missing.code = "ENOENT";
-						throw missing;
-					}
-					return finalPathEntry;
+					return lstats === 1 ? pathEntry : finalPathEntry;
 				},
+				hooks: transition === "unlink" ? { afterFinalStat: () => rmSync(path) } : {},
 				openFile: async (openedPath, flags) => {
 					const handle = await openFileHandle(openedPath, flags);
 					let stats = 0;
@@ -1551,7 +1562,7 @@ test("bounded reads authenticate every exact monotone retirement cut and confirm
 					};
 				},
 			}));
-			assert.equal(lstats, 2);
+			assert.equal(lstats, transition === "unlink" ? 0 : 2);
 		};
 		await asyncExtraTransition("eligible-link", "link");
 		await asyncExtraTransition("eligible-unlink", "unlink");
@@ -1804,7 +1815,7 @@ test("bounded reads authenticate every exact monotone retirement cut and confirm
 	}
 });
 
-test("checkpoint readers converge across exact publication-link and retained-link retirement", async () => {
+test("retained checkpoint proofs refuse stale link snapshots and converge across authenticated retirement", async () => {
 	const deferred = () => {
 		let resolvePromise;
 		const promise = new Promise((resolvePromiseValue) => { resolvePromise = resolvePromiseValue; });
@@ -1862,75 +1873,60 @@ test("checkpoint readers converge across exact publication-link and retained-lin
 		await withConsumerStateLock(linkedStatePath, async (_path, transaction) => {
 			await transaction.commitState(linkedAnchor);
 		}, runtime());
-		const linkedJournalDirectory = `${linkedStatePath}.journal`;
+		const retainedLinkedJournal = consumerJournal(linkedStatePath);
 		const publicLinkSynced = deferred();
 		const releasePublisher = deferred();
-		const privateLinkRemoved = deferred();
 		let publishedCheckpointPath;
-		let publicPathStat;
 		const publisher = rotateConsumerStateJournal(linkedStatePath, runtime({
 			afterMetadataDirectorySync: async ({ kind, path, linked }) => {
 				if (kind !== "checkpoint" || !linked) return;
 				publishedCheckpointPath = path;
-				publicPathStat = lstatSync(path);
-				assert.equal(publicPathStat.nlink, 2);
+				assert.equal(lstatSync(path).nlink, 2);
 				publicLinkSynced.resolve();
 				await releasePublisher.promise;
 			},
-		}, {
-			removeFile: async (path, options) => {
-				rmSync(path, options);
-				if (
-					publishedCheckpointPath && path !== publishedCheckpointPath &&
-					basename(path).includes("-kcheckpoint-")
-				) privateLinkRemoved.resolve();
-			},
 		}));
 		await publicLinkSynced.promise;
-
-		const readerBeforeOpen = deferred();
-		const releaseReaderOpen = deferred();
-		let checkpointOpens = 0;
-		let readerPathStat;
-		let latestPathStat;
-		const linkedReader = rotateConsumerStateJournal(linkedStatePath, runtime({}, {
-			lstatEntry: async (path) => {
-				const entry = await lstatFile(path);
-				if (path === publishedCheckpointPath) latestPathStat = entry;
-				return entry;
+		let retiredPublicationLink = false;
+		let linkedCallbackCalls = 0;
+		// V2 retains an exact checkpoint stat across proof reads. A legitimate
+		// publisher retirement can invalidate that snapshot before admission.
+		await assert.rejects(withConsumerStateLock(linkedStatePath, async () => {
+			linkedCallbackCalls += 1;
+		}, runtime({
+			beforeStableCheckpointProofRead: async ({ path, target }) => {
+				if (path !== publishedCheckpointPath || retiredPublicationLink) return;
+				assert.equal(target, true);
+				retiredPublicationLink = true;
+				const before = lstatSync(path);
+				releasePublisher.resolve();
+				await publisher;
+				const after = lstatSync(path);
+				assert.deepEqual(
+					[before.dev, before.ino, before.size, before.mtimeMs],
+					[after.dev, after.ino, after.size, after.mtimeMs],
+				);
+				assert.deepEqual([before.nlink, after.nlink], [2, 1]);
+				assert.notEqual(before.ctimeMs, after.ctimeMs);
 			},
-			openFile: async (path, flags, mode) => {
-				if (path === publishedCheckpointPath) {
-					checkpointOpens += 1;
-					if (checkpointOpens === 2) {
-						readerPathStat = latestPathStat;
-						readerBeforeOpen.resolve();
-						await releaseReaderOpen.promise;
-					}
-				}
-				return openFileHandle(path, flags, mode);
-			},
-		}));
-		await readerBeforeOpen.promise;
-		assert.equal(readerPathStat.nlink, 2);
-		releasePublisher.resolve();
-		await privateLinkRemoved.promise;
-		const retiredLinkStat = lstatSync(publishedCheckpointPath);
-		assert.deepEqual(
-			[retiredLinkStat.dev, retiredLinkStat.ino, retiredLinkStat.size, retiredLinkStat.mtimeMs],
-			[publicPathStat.dev, publicPathStat.ino, publicPathStat.size, publicPathStat.mtimeMs],
-		);
-		assert.deepEqual([publicPathStat.nlink, retiredLinkStat.nlink], [2, 1]);
-		assert.equal(publicPathStat.ctimeMs === retiredLinkStat.ctimeMs, false);
-		releaseReaderOpen.resolve();
-		const [linkedReaderReceipt, publisherReceipt] = await Promise.all([linkedReader, publisher]);
-		assert.equal(
-			Buffer.from(JSON.stringify(linkedReaderReceipt)).equals(Buffer.from(JSON.stringify(publisherReceipt))),
-			true,
-		);
-		assert.deepEqual(publisherReceipt, { epoch: 2, tipSha256: sha256Bytes(linkedAnchor) });
-		assertFinalEpoch(linkedStatePath, sha256Bytes(linkedAnchor));
-		assert.equal(dirname(publishedCheckpointPath), linkedJournalDirectory);
+		})), {
+			message: "Consumer high-water journal root has neither its byte-exact current checkpoint nor one exact immediate successor.",
+		});
+		assert.equal(retiredPublicationLink, true);
+		assert.equal(linkedCallbackCalls, 0);
+		assert.deepEqual(readFileSync(linkedStatePath), linkedAnchor);
+		assert.deepEqual(await publisher, { epoch: 2, tipSha256: sha256Bytes(linkedAnchor) });
+		const publishedCheckpoint = JSON.parse(readFileSync(publishedCheckpointPath));
+		assert.deepEqual(readdirSync(`${linkedStatePath}.journal`).sort(), [
+			".owned-temporaries-v2",
+			basename(retainedLinkedJournal.checkpoint),
+			basename(retainedLinkedJournal.epoch),
+			basename(publishedCheckpointPath),
+			`epoch-0000000000000002-${publishedCheckpoint.epochId}`,
+		].sort());
+		assert.equal(publishedCheckpoint.epoch, 2);
+		assert.equal(publishedCheckpoint.anchorDigest, sha256Bytes(linkedAnchor));
+		assert.deepEqual(readdirSync(join(`${linkedStatePath}.journal`, ".owned-temporaries-v2")), []);
 
 		const unlinkedStatePath = join(fixture, "unlinked-retained.json");
 		const unlinkedAnchor = stateBytes("unlinked-retained-anchor");
@@ -2611,6 +2607,13 @@ test("stable checkpoint proof consumes exact retirements and fences namespace ch
 					await releaseProof.promise;
 				},
 				metadataRead: {
+					afterInitialPathStat: ({ path }) => {
+						if (removeBeforeScanOpen && path === original.checkpoint) {
+							assert.equal(scanRootCaptured, true);
+							removeBeforeScanOpen = false;
+							rmSync(path);
+						}
+					},
 					afterInitialStat: async ({ path }) => {
 						if (!phaseArmed || phase !== "afterInitialStat" || path !== proofPath) return;
 						phaseArmed = false;
@@ -2632,14 +2635,6 @@ test("stable checkpoint proof consumes exact retirements and fences namespace ch
 						scanRootCaptured = true;
 					}
 					return names;
-				},
-				openFile: async (path, flags, mode) => {
-					if (removeBeforeScanOpen && path === original.checkpoint) {
-						assert.equal(scanRootCaptured, true);
-						removeBeforeScanOpen = false;
-						rmSync(path);
-					}
-					return openFileHandle(path, flags, mode);
 				},
 			}));
 			const readerOutcome = outcome(reader);
@@ -3025,13 +3020,14 @@ test("stable checkpoint proof consumes exact retirements and fences namespace ch
 		const noHigherEpochBefore = directoryBytes(noHigherJournal.epoch);
 		let removeNoHigher = true;
 		await assert.rejects(
-			() => rotateConsumerStateJournal(noHigherPath, runtime({}, {
-				openFile: async (path, flags, mode) => {
-					if (removeNoHigher && path === noHigherJournal.checkpoint) {
-						removeNoHigher = false;
-						rmSync(path);
-					}
-					return openFileHandle(path, flags, mode);
+			() => rotateConsumerStateJournal(noHigherPath, runtime({
+				metadataRead: {
+					afterInitialPathStat: ({ path }) => {
+						if (removeNoHigher && path === noHigherJournal.checkpoint) {
+							removeNoHigher = false;
+							rmSync(path);
+						}
+					},
 				},
 			})),
 			/lost its current checkpoint/,
@@ -3795,7 +3791,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 	};
 	const runConsumerChild = (statePath, candidate) => {
 		const source = `
-			import { withConsumerStateLock } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/pylon-consumer-lock.mjs")).href)};
+			import { withConsumerStateLock } from ${JSON.stringify(pathToFileURL(resolve("scripts/fixtures/retained-publication-v2/pylon-consumer-lock.mjs")).href)};
 			const statePath = process.argv[1];
 			const candidate = process.argv[2];
 			try {
@@ -3818,32 +3814,6 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		return captured.closed.then((status) => {
 			if ([0, 2].includes(status.code) && status.spawnError === null) return status.code;
 			throw closedChildError("consumer child", status, stderr);
-		});
-	};
-	const runRotationChild = (statePath) => {
-		const source = `
-			import { rotateConsumerStateJournal } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/pylon-consumer-lock.mjs")).href)};
-			try {
-				const result = await rotateConsumerStateJournal(process.argv[1]);
-				process.stdout.write(JSON.stringify(result));
-			} catch (error) {
-				console.error(error.stack);
-				process.exitCode = 1;
-			}
-		`;
-		const captured = captureChild(
-			["--input-type=module", "--eval", source, statePath],
-			{ cwd: resolve("."), stdio: ["ignore", "pipe", "pipe"] },
-		);
-		let stdout = "";
-		let stderr = "";
-		captured.child.stdout.setEncoding("utf8");
-		captured.child.stderr.setEncoding("utf8");
-		captured.child.stdout.on("data", (chunk) => { stdout += chunk; });
-		captured.child.stderr.on("data", (chunk) => { stderr += chunk; });
-		return captured.closed.then((status) => {
-			if (status.code === 0 && status.spawnError === null) return JSON.parse(stdout);
-			throw closedChildError("rotation child", status, stderr);
 		});
 	};
 	const startLegacyLockChild = async (statePath, afterReleasePath = "") => {
@@ -4397,7 +4367,7 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 
 		const stagedCrashPath = join(fixture, "staged-then-crashed.json");
 		const crashingSource = `
-			import { withConsumerStateLock } from ${JSON.stringify(pathToFileURL(resolve("scripts/lib/pylon-consumer-lock.mjs")).href)};
+			import { withConsumerStateLock } from ${JSON.stringify(pathToFileURL(resolve("scripts/fixtures/retained-publication-v2/pylon-consumer-lock.mjs")).href)};
 			const hold = setInterval(() => {}, 1000);
 			await withConsumerStateLock(process.argv[1], async (_path, transaction) => {
 				await transaction.commitState(Buffer.from(JSON.stringify({ value: "crashed-stage" }) + "\\n"));
@@ -5962,15 +5932,34 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			await transaction.commitState(bytes("concurrent-after-rotation"));
 		}, { ...manualRuntime({ value: 3 }), maxLockGenerations: 2 });
 
-		const rotationWavePath = join(fixture, "concurrent-rotation-process-wave.json");
-		await withConsumerStateLock(rotationWavePath, async (_path, transaction) => {
-			await transaction.commitState(bytes("wave-anchor"));
+		// V2 cannot recover a cold root listing whose checkpoint is retired before
+		// its first read. Current-public multiprocess handoff is tested separately.
+		const oldRootHandoffPath = join(fixture, "retained-cold-root-handoff.json");
+		const oldRootAnchor = bytes("wave-anchor");
+		await withConsumerStateLock(oldRootHandoffPath, async (_path, transaction) => {
+			await transaction.commitState(oldRootAnchor);
 		}, manualRuntime({ value: 1 }));
-		const rotationWave = await Promise.all(Array.from({ length: 12 }, () => runRotationChild(rotationWavePath)));
-		assert.equal(rotationWave.every((result) => result.epoch === 2), true);
-		assert.deepEqual(rotationWave, Array.from({ length: 12 }, () => rotationWave[0]));
-		assert.equal(readdirSync(`${rotationWavePath}.journal`).filter((name) => name.startsWith("checkpoint-")).length, 1);
-		assert.equal(readdirSync(`${rotationWavePath}.journal`).filter((name) => name.startsWith("epoch-")).length, 1);
+		let oldRootHandedOff = false;
+		let oldRootCallbackCalls = 0;
+		await assert.rejects(withConsumerStateLock(oldRootHandoffPath, async () => {
+			oldRootCallbackCalls += 1;
+		}, {
+			...manualRuntime({ value: 2 }),
+			readDirectory: async (path) => {
+				const names = await readDirectoryEntries(path);
+				if (path === `${oldRootHandoffPath}.journal` && !oldRootHandedOff) {
+					oldRootHandedOff = true;
+					await rotateConsumerStateJournal(oldRootHandoffPath, manualRuntime({ value: 3 }));
+					await rotateConsumerStateJournal(oldRootHandoffPath, manualRuntime({ value: 3 }));
+					const currentNames = await readDirectoryEntries(path);
+					assert.ok(names.some((name) => name.startsWith("checkpoint-") && !currentNames.includes(name)));
+				}
+				return names;
+			},
+		}), { message: "Consumer high-water journal lost its current checkpoint during an authenticated scan." });
+		assert.equal(oldRootHandedOff, true);
+		assert.equal(oldRootCallbackCalls, 0);
+		assert.deepEqual(readFileSync(oldRootHandoffPath), oldRootAnchor);
 
 		for (const competitorHook of ["afterRotationEpochSync", "afterMetadataLink"]) {
 			const competingRotationPath = join(fixture, `competing-rotation-${competitorHook}.json`);

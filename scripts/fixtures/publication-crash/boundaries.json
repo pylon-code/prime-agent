@@ -1,0 +1,74 @@
+{
+  "recover-builder-checkpoint": {
+    "count": 76,
+    "sha256": "f03c819ecf4e5cc6b4486326782cc2acdaea2c5dd5e18f2ef5137ad0a9b9c128"
+  },
+  "recover-dead-receipt": {
+    "count": 82,
+    "sha256": "f325ad16e669f36c143dd3e42a66ef4906e974589c81b84ba594b680750e753e"
+  },
+  "recover-commit-receipt": {
+    "count": 82,
+    "sha256": "fe8239abceb9692d490fe9d0539bccb6476b09b0403532cac6953c792122826a"
+  },
+  "recover-migration-intent": {
+    "count": 199,
+    "sha256": "ad2daa927b5c4378189d44c6eee4dc0475371b0cd69a5183ebbfeabcb87c704f"
+  },
+  "recover-projection": {
+    "count": 115,
+    "sha256": "c144f9c471b25fc107dfdcad513d97a358f0a836c2395bed2bb9f23213e45e8e"
+  },
+  "fresh": {
+    "count": 220,
+    "sha256": "7c2067aa769e9b601fcc8e3ba0a3284182a1df737f3aef4324b1d5eacf9d52aa"
+  },
+  "fresh-nested": {
+    "count": 232,
+    "sha256": "4723b58753989ebc367f9a2a4d5ce03d5a9dfeb804e543af95f60325511e263e"
+  },
+  "commit": {
+    "count": 116,
+    "sha256": "da47b8c92b86ecf9122cac5b3d73d328a2a694bd082431c622f8f2f1b6c2a9b5"
+  },
+  "rotate": {
+    "count": 240,
+    "sha256": "ab65cb7e113885e1043cfc993a8254581d6e44f2e7da240c24944317ae442770"
+  },
+  "builder": {
+    "count": 26,
+    "sha256": "40dc44c30a950465f31b359bacf21443aed3b050326c248a4ad6c54db54ef463"
+  },
+  "loser-cleanup": {
+    "count": 20,
+    "sha256": "a8a77cefd6c48155f92f86880505791de3e6325eb31e73b1e0c598e2d155f2e0"
+  },
+  "migrate-v1": {
+    "count": 220,
+    "sha256": "ac3502338da7a659713c74df5ebc327700bcd533e6906c430aa9be3957691139"
+  },
+  "migrate-prior-retired-v1": {
+    "count": 245,
+    "sha256": "b9f4e8739f4ac32fdb5f326af9c5a4f0b2e1266d50e17b645477a47eccb66ccc"
+  },
+  "migrate-v2": {
+    "count": 220,
+    "sha256": "42f56e23e01fe0fdd0d09672e104454be4fd6b41e6a33ede0331bdc8aa1b4b92"
+  },
+  "migrate-v1-v2": {
+    "count": 224,
+    "sha256": "d4376743040c554ad95287190d4f4731a236c654c703c1b9b1feac6ac78c2673"
+  },
+  "migrate-prior-retired-v1-v2": {
+    "count": 249,
+    "sha256": "1cc9354d6430f059d24834332a262ba571f3c7858ac4b1271f6c9f86fd76ac3a"
+  },
+  "migrate-v2-incomplete": {
+    "count": 231,
+    "sha256": "b80165115441c6fc674bf8b215e33d924527735b69be4247a2da7c1dd28eb813"
+  },
+  "migrate-v2-retained": {
+    "count": 237,
+    "sha256": "f9164e1a79e770a5e40e700ea9519430bc39befddc92ba2957809414b2fa7d30"
+  }
+}

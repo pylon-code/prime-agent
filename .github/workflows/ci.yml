@@ -339,6 +339,71 @@ jobs:
       - name: Verify temporary-prefix runtime
         run: npm run release:pylon:smoke
 
+  pylon-publication:
+    name: Pylon publication (${{ matrix.os }})
+    needs: trust
+    if: needs.trust.outputs.allowed == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
+
+      - name: Setup pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.2
+
+      - name: Install test dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Record source identity
+        run: |
+          mkdir -p publication-evidence
+          git rev-parse HEAD > publication-evidence/commit.txt
+          git rev-parse 'HEAD^{tree}' > publication-evidence/tree.txt
+          node --version > publication-evidence/node.txt
+
+      - name: Complete retained and current-public contract suite
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run test:pylon-publication 2>&1 | tee publication-evidence/publication.log
+
+      - name: Repeated process stress and read handoffs
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run test:pylon-publication-stress 2>&1 | tee publication-evidence/stress.log
+
+      - name: Every captured-process crash boundary
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run test:pylon-publication-crash 2>&1 | tee publication-evidence/crash.log
+
+      - name: Actual 16 MiB maximum, serialized after complete suite
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run test:pylon-publication-maximum 2>&1 | tee publication-evidence/maximum.log
+
+      - name: Retain exact-source verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pylon-publication-${{ matrix.os }}
+          path: publication-evidence
+          if-no-files-found: error
+          retention-days: 7
+
   build-check-test:
     name: build-check-test
     if: always() && (needs.trust.outputs.allowed == 'true' || inputs.require_trusted)
@@ -350,6 +415,7 @@ jobs:
       - pylon-artifact-pack
       - pylon-artifact-reproducibility
       - pylon-artifact-install
+      - pylon-publication
     runs-on: ubuntu-latest
     steps:
       - name: Verify CI results
@@ -360,6 +426,7 @@ jobs:
           WINDOWS_OWNED_SESSION_RESULT: ${{ needs.owned-session-contract-windows.result }}
           ARTIFACT_PACK_RESULT: ${{ needs.pylon-artifact-pack.result }}
           ARTIFACT_REPRODUCIBILITY_RESULT: ${{ needs.pylon-artifact-reproducibility.result }}
+          PUBLICATION_RESULT: ${{ needs.pylon-publication.result }}
           ARTIFACT_INSTALL_RESULT: ${{ needs.pylon-artifact-install.result }}
         run: |
           test "$TRUST_ALLOWED" = true
@@ -369,3 +436,4 @@ jobs:
           test "$ARTIFACT_PACK_RESULT" = success
           test "$ARTIFACT_REPRODUCIBILITY_RESULT" = success
           test "$ARTIFACT_INSTALL_RESULT" = success
+          test "$PUBLICATION_RESULT" = success

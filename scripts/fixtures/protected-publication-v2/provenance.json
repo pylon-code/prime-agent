@@ -1,0 +1,16 @@
+{
+  "repository": "pylon-code/prime-agent",
+  "commit": "68603ed89bb597cd715fd6a77bc1c39d7e110298",
+  "files": [
+    {
+      "path": "pylon-consumer-lock.mjs",
+      "sourcePath": "scripts/lib/pylon-consumer-lock.mjs",
+      "sha256": "b9baea4d051d7276a203f0c8b519ce132c51ca55d450fa5b69aac99a16220d49"
+    },
+    {
+      "path": "pylon-bounded-file.mjs",
+      "sourcePath": "scripts/lib/pylon-bounded-file.mjs",
+      "sha256": "7098a628df2cf840cc5c4c42757f2c5f10d30378e16f81ed46f39c19d6b0d81e"
+    }
+  ]
+}
