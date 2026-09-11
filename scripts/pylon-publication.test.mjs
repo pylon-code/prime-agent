@@ -2095,16 +2095,21 @@ test("retained checkpoint proofs refuse stale link snapshots and converge across
 			const epochPublished = deferred();
 			const releasePublisherEpoch = deferred();
 			let nextCheckpointPath;
+			let expectedCheckpoint;
 			let nextEpochPath;
+			let publisherParked = false;
 			const publisher = rotateConsumerStateJournal(statePath, runtime({
 				afterRotationEpochSync: async ({ checkpoint, nextEpoch }) => {
+					expectedCheckpoint = structuredClone(checkpoint);
 					nextEpochPath = nextEpoch;
 					nextCheckpointPath = join(
 						journal.journal,
 						`checkpoint-${String(checkpoint.epoch).padStart(16, "0")}-${checkpoint.epochId}.json`,
 					);
+					publisherParked = true;
 					epochPublished.resolve();
 					await releasePublisherEpoch.promise;
+					publisherParked = false;
 				},
 			}));
 			const publisherOutcome = publisher.then(
@@ -2157,8 +2162,27 @@ test("retained checkpoint proofs refuse stale link snapshots and converge across
 			mutateInProgressRoot(mutation, statePath, journal.checkpoint, nextEpochPath);
 			releaseProof.resolve();
 			if (mutation === null) {
-				releasePublisherEpoch.resolve();
-				const [readerReceipt, publisherResult] = await Promise.all([reader, publisherOutcome]);
+				let readerReceipt;
+				try {
+					// Keep the original publisher parked while the discovered proof
+					// finishes its own authenticated checkpoint publication.
+					assert.equal(publisherParked, true);
+					readerReceipt = await reader;
+					assert.equal(publisherParked, true);
+					const checkpointBytes = readFileSync(nextCheckpointPath);
+					const checkpoint = JSON.parse(checkpointBytes);
+					assert.deepEqual(checkpoint, expectedCheckpoint);
+					assert.deepEqual(checkpointBytes, Buffer.from(`${JSON.stringify(checkpoint)}\n`));
+					assert.equal(checkpoint.epoch, 2);
+					assert.equal(checkpoint.anchorDigest, sha256Bytes(anchor));
+					assert.equal(lstatSync(nextCheckpointPath).nlink, 1);
+					assert.deepEqual(readFileSync(statePath), anchor);
+				} finally {
+					releasePublisherEpoch.resolve();
+					await publisherOutcome;
+				}
+				const publisherResult = await publisherOutcome;
+				assert.equal(publisherParked, false);
 				assert.equal(publisherResult.error, null);
 				assert.deepEqual(readerReceipt, publisherResult.value);
 				assert.deepEqual(readerReceipt, { epoch: 2, tipSha256: sha256Bytes(anchor) });
