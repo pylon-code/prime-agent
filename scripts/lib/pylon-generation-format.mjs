@@ -9,7 +9,7 @@ export const GENERATION_RECEIPT_MAX_ENTRIES = GENERATION_EPOCH_MAX_ENTRIES * 2 +
 export const GENERATION_JOURNAL_MAX_BYTES = 512 * 1024 * 1024;
 const hex = /^[0-9a-f]{64}$/;
 const fields = [
-	"schemaVersion", "epoch", "epochId", "statePathSha256", "previousCheckpointSha256", "previousGeneration",
+	"schemaVersion", "epoch", "epochId", "statePathSha256", "previousCheckpointSha256", "previousGeneration", "previousGenerationIdentity", "retirementAuthoritySha256",
 	"previousTipSha256", "historySha256", "anchorDigest", "anchorBase64", "sourceKind", "sourceAuthoritySha256",
 	"sourceTipDigest", "sourceTipBase64", "migrationKind", "migrationAuthoritySha256", "migrationTipDigest", "migrationTipBase64",
 ];
@@ -22,6 +22,7 @@ export function generationCheckpointMaxBytes(stateMaxBytes = GENERATION_STATE_MA
 const checkpointEnvelopeBytes = generationBytes({
 	schemaVersion: 3, epoch: Number.MAX_SAFE_INTEGER, epochId: GENERATION_ZERO, statePathSha256: GENERATION_ZERO,
 	previousCheckpointSha256: GENERATION_ZERO, previousGeneration: `generation-9007199254740991-${GENERATION_ZERO}`,
+	previousGenerationIdentity: { dev: Number.MAX_SAFE_INTEGER, ino: Number.MAX_SAFE_INTEGER }, retirementAuthoritySha256: GENERATION_ZERO,
 	previousTipSha256: GENERATION_ZERO, historySha256: GENERATION_ZERO, anchorDigest: GENERATION_ZERO, anchorBase64: "",
 	sourceKind: "v2", sourceAuthoritySha256: GENERATION_ZERO, sourceTipDigest: GENERATION_ZERO, sourceTipBase64: "",
 	migrationKind: "v1", migrationAuthoritySha256: GENERATION_ZERO, migrationTipDigest: GENERATION_ZERO, migrationTipBase64: "",
@@ -86,7 +87,7 @@ export function consumerGenerationGenesisCheckpoint({ statePath, stateBytes = nu
 	if (src.kind !== null && (src.digest !== anchor.digest || src.base64 !== anchor.base64)) throw new Error("Generation source must bind the exact genesis state.");
 	const value = {
 		schemaVersion: 3, epoch: 1, epochId: "", statePathSha256: generationDigest(Buffer.from(resolve(statePath))),
-		previousCheckpointSha256: GENERATION_ZERO, previousGeneration: null, previousTipSha256: GENERATION_ZERO,
+		previousCheckpointSha256: GENERATION_ZERO, previousGeneration: null, previousGenerationIdentity: null, retirementAuthoritySha256: GENERATION_ZERO, previousTipSha256: GENERATION_ZERO,
 		historySha256: "", anchorDigest: anchor.digest, anchorBase64: anchor.base64,
 		sourceKind: src.kind, sourceAuthoritySha256: src.authoritySha256, sourceTipDigest: src.digest, sourceTipBase64: src.base64,
 		migrationKind: old.kind, migrationAuthoritySha256: old.authoritySha256, migrationTipDigest: old.digest, migrationTipBase64: old.base64,
@@ -107,7 +108,7 @@ export function validateGenerationCheckpoint(input, stateMaxBytes = GENERATION_S
 	const value = Object.fromEntries(fields.map((key) => [key, input[key]]));
 	if (value.schemaVersion !== 3 || !Number.isSafeInteger(value.epoch) || value.epoch < 1 ||
 		![value.epochId, value.statePathSha256, value.previousCheckpointSha256, value.previousTipSha256, value.historySha256,
-			value.sourceAuthoritySha256, value.migrationAuthoritySha256].every((v) => typeof v === "string" && hex.test(v))) throw new Error("Generation checkpoint is malformed.");
+			value.sourceAuthoritySha256, value.migrationAuthoritySha256, value.retirementAuthoritySha256].every((v) => typeof v === "string" && hex.test(v))) throw new Error("Generation checkpoint is malformed.");
 	const anchorBytes = decodeState(value.anchorBase64, value.anchorDigest, stateMaxBytes);
 	decodeState(value.sourceTipBase64, value.sourceTipDigest, stateMaxBytes);
 	decodeState(value.migrationTipBase64, value.migrationTipDigest, stateMaxBytes);
@@ -117,8 +118,10 @@ export function validateGenerationCheckpoint(input, stateMaxBytes = GENERATION_S
 		} else if (!(prefix === "source" ? ["v1", "v2"] : ["v1"]).includes(value[`${prefix}Kind`]) || value[`${prefix}AuthoritySha256`] === GENERATION_ZERO) throw new Error("Generation provenance is malformed.");
 	}
 	if (value.migrationKind !== null && value.sourceKind !== "v2") throw new Error("Generation migration provenance is malformed.");
+	if (value.previousGenerationIdentity !== null && (!value.previousGenerationIdentity || Object.keys(value.previousGenerationIdentity).sort().join() !== "dev,ino" || !Object.values(value.previousGenerationIdentity).every((v) => Number.isSafeInteger(v) && v >= 0))) throw new Error("Generation predecessor inode is malformed.");
+	if ((value.previousGenerationIdentity === null) !== (value.retirementAuthoritySha256 === GENERATION_ZERO)) throw new Error("Generation retirement commitment and inode must be paired.");
 	if (value.epoch === 1) {
-		if (value.previousCheckpointSha256 !== GENERATION_ZERO || value.previousTipSha256 !== GENERATION_ZERO || value.previousGeneration !== null || value.historySha256 !== genesisHistory(value) ||
+		if (value.previousGenerationIdentity !== null || value.previousCheckpointSha256 !== GENERATION_ZERO || value.previousTipSha256 !== GENERATION_ZERO || value.previousGeneration !== null || value.historySha256 !== genesisHistory(value) ||
 			(value.sourceKind !== null && (value.anchorBase64 !== value.sourceTipBase64 || value.anchorDigest !== value.sourceTipDigest))) throw new Error("Generation genesis is not exact.");
 	} else if (typeof value.previousGeneration !== "string" || !/^generation-[0-9]{16}-[0-9a-f]{64}$/.test(value.previousGeneration) || value.previousTipSha256 !== value.anchorDigest) throw new Error("Generation successor is malformed.");
 	if (generationBytes(value).length > generationCheckpointMaxBytes(stateMaxBytes)) throw new Error("Generation checkpoint exceeds its exact envelope byte bound.");
@@ -131,7 +134,8 @@ export function consumerGenerationSuccessorCheckpoint(predecessor, tip, stateMax
 	if (anchor.digest !== tip.tipDigest || checkpoint.epoch === Number.MAX_SAFE_INTEGER) throw new Error("Generation immutable tip or epoch is malformed.");
 	const previousDigest = generationDigest(generationBytes(checkpoint));
 	const next = { ...checkpoint, epoch: checkpoint.epoch + 1, epochId: "", previousCheckpointSha256: previousDigest,
-		previousGeneration: consumerGenerationName(checkpoint), previousTipSha256: anchor.digest,
+		previousGeneration: consumerGenerationName(checkpoint), previousGenerationIdentity: tip.previousGenerationIdentity ?? null,
+		retirementAuthoritySha256: tip.retirementAuthoritySha256 ?? GENERATION_ZERO, previousTipSha256: anchor.digest,
 		historySha256: commitment("pylon-generation-rotation-history-v3", [checkpoint.historySha256, previousDigest, anchor.digest]),
 		anchorDigest: anchor.digest, anchorBase64: anchor.base64 };
 	next.epochId = identity(next);

@@ -1,3 +1,4 @@
+import "./pylon-generation-operations.test.mjs";
 import "./pylon-generation.test.mjs";
 import "./pylon-bounded-file.test.mjs";
 import assert from "node:assert/strict";
