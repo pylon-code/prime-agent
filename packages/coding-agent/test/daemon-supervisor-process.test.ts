@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -28,7 +28,12 @@ import {
 	createDaemonCommandEnvelope,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	type DaemonWorkerDescriptor,
+	type DaemonWorkerFrameHeader,
+	isDaemonWorkerFrameHeader,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
+import { encodePrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
@@ -60,6 +65,8 @@ afterEach(async () => {
 			child.kill("SIGTERM");
 		}
 	}
+	// Await owned exits before rmSync: a dying worker's log writer otherwise races it into ENOTEMPTY.
+	await Promise.all([...children].map((child) => waitForExit(child).catch(() => undefined)));
 	children.clear();
 	for (const [pid, processStartId] of identityTrackedProcesses) {
 		const identity = { pid, processStartId };
@@ -97,9 +104,10 @@ afterEach(async () => {
 			}
 		}
 	}
+	await Promise.all([...workerPids].map((pid) => waitForProcessGone(pid).catch(() => undefined)));
 	workerPids.clear();
 	for (const directory of tempDirs.splice(0)) {
-		rmSync(directory, { recursive: true, force: true });
+		rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 	}
 });
 
@@ -122,6 +130,22 @@ function tempDir(): string {
 	return directory;
 }
 
+function fixtureHomePath(agentDir: string): string {
+	return join(agentDir, "home");
+}
+
+function fixtureHomeEnvironment(agentDir: string): NodeJS.ProcessEnv {
+	const homePath = fixtureHomePath(agentDir);
+	return { HOME: homePath, USERPROFILE: homePath };
+}
+
+function collectFixtureLaunchEnv(agentDir: string): Record<string, string> {
+	// The exact owner environment must locate the same private ownership registry
+	// as the supervisor, without introducing forbidden internal bootstrap keys.
+	const homePath = fixtureHomePath(agentDir);
+	return { ...collectDaemonLaunchEnv(), HOME: homePath, USERPROFILE: homePath };
+}
+
 function spawnSupervisor(
 	agentDir: string,
 	socketPath: string,
@@ -142,6 +166,7 @@ function spawnSupervisor(
 			env: {
 				...inheritedEnv,
 				...extraEnv,
+				...fixtureHomeEnvironment(agentDir),
 				[ENV_AGENT_DIR]: agentDir,
 				PI_OFFLINE: "1",
 				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
@@ -665,6 +690,9 @@ describe("daemon supervisor resident workers", () => {
 
 		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir, [], { RLM_DEPTH: "1" });
 		const client = await connectEventually(socketPath, supervisor);
+		const registryPath = join(fixtureHomePath(agentDir), ".prime", "supervisor-owners");
+		expect(existsSync(join(registryPath, `${client.hello?.supervisorGeneration}.owner`, "owner.json"))).toBe(true);
+
 		const created = await client.request({
 			type: "create",
 			config: {
@@ -691,6 +719,134 @@ describe("daemon supervisor resident workers", () => {
 		workerPids.delete(summary.workerPid);
 		await waitForSocketGone(socketPath);
 	}, 60_000);
+
+	it("restarts an adopted pre-roster worker from the current binary", async () => {
+		const directory = tempDir();
+		const agentDir = join(directory, "agent");
+		const projectDir = join(directory, "project");
+		const sessionDir = join(agentDir, "sessions");
+		mkdirSync(projectDir, { recursive: true });
+		const manager = SessionManager.create(projectDir, sessionDir);
+		manager.appendMessage({ role: "user", content: "pre-roster fixture", timestamp: 1 });
+		manager.flushNow();
+		const sessionPath = manager.getSessionFile();
+		const sessionId = manager.getSessionId();
+		if (!sessionPath) throw new Error("Fixture session did not persist");
+
+		// A long-lived stand-in process plays the pre-roster worker's pid.
+		const legacyProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+		children.add(legacyProcess);
+		if (!legacyProcess.pid) throw new Error("Missing legacy process pid");
+
+		// A fake worker socket that authenticates without advertising the roster capability.
+		const workerSocketPath = join(directory, "legacy-worker.sock");
+		const fakeWorker = createServer((socket) => {
+			const decoder = new PrivateFrameDecoder(isDaemonWorkerFrameHeader);
+			socket.write(
+				encodePrivateFrame<DaemonWorkerFrameHeader>(
+					{ kind: "outbound", outboundType: "daemon_hello" },
+					Buffer.from(`${JSON.stringify({ type: "daemon_hello" })}\n`),
+				),
+			);
+			socket.on("data", (chunk: Buffer) => {
+				for (const frame of decoder.push(chunk)) {
+					if (frame.header.kind !== "command") continue;
+					const command = JSON.parse(frame.payload.toString("utf8")) as { id: string; type: string };
+					const data =
+						command.type === "list"
+							? {
+									sessions: [
+										{
+											id: "legacy-root-active",
+											activeSessionId: "legacy-root-active",
+											sessionId,
+											sessionFile: sessionPath,
+											lifecycle: "live",
+											activity: "idle",
+											isSessionActive: false,
+											cwd: projectDir,
+											isStreaming: false,
+											isCompacting: false,
+											attachedClients: 0,
+											messageCount: 1,
+											sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+										},
+									],
+								}
+							: { workerIncarnation: "legacy-worker-incarnation".padEnd(43, "x") };
+					socket.write(
+						encodePrivateFrame<DaemonWorkerFrameHeader>(
+							{ kind: "outbound", outboundType: "response", requestId: frame.header.requestId },
+							Buffer.from(
+								`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true, data })}\n`,
+							),
+						),
+					);
+				}
+			});
+		});
+		const socketPath = join(directory, "daemon.sock");
+		await new Promise<void>((resolveListen) => fakeWorker.listen(workerSocketPath, resolveListen));
+		const descriptorDir = join(
+			agentDir,
+			"daemon-workers",
+			createHash("sha256").update(socketPath).digest("hex").slice(0, 12),
+		);
+		mkdirSync(descriptorDir, { recursive: true });
+		const now = new Date().toISOString();
+		writeFileSync(
+			join(descriptorDir, "legacy-worker.json"),
+			`${JSON.stringify({
+				version: 2,
+				workerId: "legacy-worker",
+				pid: legacyProcess.pid,
+				socketPath: workerSocketPath,
+				recoveryJournalPath: join(descriptorDir, "legacy-worker.recovery.jsonl"),
+				supervisorSocketPath: socketPath,
+				authenticationToken: "legacy-token",
+				rootActiveSessionId: "legacy-root-active",
+				rootSessionId: sessionId,
+				sessionFile: sessionPath,
+				sessionDir,
+				createdAt: now,
+				updatedAt: now,
+				lifecycle: "ready",
+				createCommand: { type: "create", sessionPath },
+				consecutiveFailures: 0,
+			})}\n`,
+		);
+
+		// Once the supervisor kills the old pid, its socket goes quiet exactly like a dead worker's.
+		legacyProcess.once("exit", () => {
+			fakeWorker.close();
+			rmSync(workerSocketPath, { force: true });
+		});
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const client = await connectEventually(socketPath, supervisor);
+		let restarted: SessionSummary | undefined;
+		const deadline = Date.now() + 30_000;
+		while (Date.now() < deadline) {
+			const listed = await client.request({ type: "list" });
+			restarted = requireSessionList(listed.success ? listed.data : undefined).find(
+				(candidate) => candidate.sessionId === sessionId,
+			);
+			if (restarted?.workerState === "ready" && restarted.workerPid !== undefined) break;
+			restarted = undefined;
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+		}
+		if (!restarted?.workerPid) {
+			throw new Error(`Pre-roster worker was not restarted:\n${readDaemonLogs(agentDir)}`);
+		}
+		workerPids.add(restarted.workerPid);
+		// A fresh current-binary worker owns the reloaded idle session; the fake pre-roster pid is not adopted.
+		expect(restarted.workerPid).not.toBe(legacyProcess.pid);
+		expect(restarted.isSessionActive).toBe(false);
+		// The seeded user message plus the harness digest injected on resume.
+		expect(restarted.messageCount).toBe(2);
+		await waitForProcessGone(legacyProcess.pid);
+		fakeWorker.close();
+		client.close();
+	}, 90_000);
 
 	it("lists, creates, and attaches passive children through their owning worker", async () => {
 		const root = tempDir();
@@ -856,6 +1012,7 @@ describe("daemon supervisor resident workers", () => {
 			await client.waitForHello(3_000);
 			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 				supportsExtensionUi: false,
+				directTransport: false,
 				snapshotTimeoutMs: 3_000,
 			});
 			const snapshot = await connection.getInitialSnapshot();
@@ -916,6 +1073,7 @@ describe("daemon supervisor resident workers", () => {
 			await client.waitForHello(3_000);
 			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 				supportsExtensionUi: false,
+				directTransport: false,
 				snapshotTimeoutMs: 250,
 			});
 			await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
@@ -975,6 +1133,7 @@ describe("daemon supervisor resident workers", () => {
 			await expect(
 				DaemonAgentConnection.attach(client, summary.activeSessionId, {
 					supportsExtensionUi: false,
+					directTransport: false,
 					snapshotTimeoutMs: 1_000,
 				}),
 			).rejects.toThrow();
@@ -1031,6 +1190,7 @@ describe("daemon supervisor resident workers", () => {
 			await blockedClient.waitForHello(3_000);
 			const failedAttach = DaemonAgentConnection.attach(blockedClient, summary.activeSessionId, {
 				supportsExtensionUi: false,
+				directTransport: false,
 				snapshotTimeoutMs: 3_000,
 			});
 			const bufferedBytes = await proxy.aborted;
@@ -1044,6 +1204,7 @@ describe("daemon supervisor resident workers", () => {
 		const recoveryClient = await connectEventually(socketPath);
 		const connection = await DaemonAgentConnection.attach(recoveryClient, summary.activeSessionId, {
 			supportsExtensionUi: false,
+			directTransport: false,
 			snapshotTimeoutMs: 5_000,
 		});
 		const recovered = await connection.getInitialSnapshot();
@@ -1201,7 +1362,7 @@ describe("daemon supervisor resident workers", () => {
 				noExtensions: false,
 			};
 			const launchEnv = {
-				...collectDaemonLaunchEnv(),
+				...collectFixtureLaunchEnv(agentDir),
 				PRIME_AGENT_RECOVERY_TEST: `canary-${randomUUID()}`,
 			};
 			const createRequestId = randomUUID();
@@ -1496,7 +1657,7 @@ describe("daemon supervisor resident workers", () => {
 				noExtensions: false,
 			};
 			const launchEnv = {
-				...collectDaemonLaunchEnv(),
+				...collectFixtureLaunchEnv(agentDir),
 				PRIME_AGENT_RECOVERY_RACE: `canary-${randomUUID()}`,
 			};
 			const created = await createRecoverableOwnedSession(owner, {
@@ -1599,7 +1760,7 @@ describe("daemon supervisor resident workers", () => {
 				noTools: true,
 				noExtensions: false,
 			};
-			const launchEnv = collectDaemonLaunchEnv();
+			const launchEnv = collectFixtureLaunchEnv(agentDir);
 			const created = await createRecoverableOwnedSession(owner, {
 				requestId: randomUUID(),
 				correlationId,
@@ -1676,7 +1837,34 @@ describe("daemon supervisor resident workers", () => {
 				observerModule,
 				`const fs = require("node:fs");
 const path = process.env.PRIME_AGENT_TEST_ENV_OBSERVATION;
-if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER, hasA: process.env.PRIME_AGENT_TEST_ENV_A !== undefined, hasB: process.env.PRIME_AGENT_TEST_ENV_B !== undefined, hasC: process.env.PRIME_AGENT_TEST_SUPERVISOR_C !== undefined }) + "\\n");
+if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER, home: process.env.HOME, hasA: process.env.PRIME_AGENT_TEST_ENV_A !== undefined, hasB: process.env.PRIME_AGENT_TEST_ENV_B !== undefined, hasC: process.env.PRIME_AGENT_TEST_SUPERVISOR_C !== undefined }) + "\\n");
+// Corrupt one compact-delta JSON payload without changing framing, so the real
+// supervisor must perform its normal resync through attachClient.
+if (process.env.PRIME_AGENT_INTERNAL_DAEMON_WORKER === "1" && process.env.PRIME_AGENT_TEST_CORRUPT_COMPACT_DELTA) {
+  const Socket = require("node:net").Socket;
+  const write = Socket.prototype.write;
+  let pending;
+  let injected = false;
+  Socket.prototype.write = function(chunk, ...args) {
+    if (!injected && Buffer.isBuffer(chunk)) {
+      if (pending === this) {
+        const malformed = Buffer.from(chunk);
+        malformed[0] = 0x21;
+        injected = true;
+        pending = undefined;
+        fs.writeFileSync(process.env.PRIME_AGENT_TEST_CORRUPT_COMPACT_DELTA, "injected");
+        return write.call(this, malformed, ...args);
+      }
+      if (chunk.length >= 8 && chunk.readUInt32BE(0) === chunk.length - 8) {
+        try {
+          const header = JSON.parse(chunk.subarray(8).toString("utf8"));
+          if (header.kind === "outbound" && header.payloadEncoding === "assistant-delta") pending = this;
+        } catch {}
+      }
+    }
+    return write.call(this, chunk, ...args);
+  };
+}
 `,
 			);
 			const sessionDir = join(agentDir, "sessions");
@@ -1684,6 +1872,7 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 				A: createSnapshotSessionFile(agentDir, projectDir, "issue #33 owner A"),
 				B: createSnapshotSessionFile(agentDir, projectDir, "issue #33 owner B"),
 			};
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ compaction: { keepRecentTokens: 1 } }));
 			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
 			let replacementSupervisor: ChildProcess | undefined;
 			let daemonRecovery: Promise<void> | undefined;
@@ -1697,14 +1886,13 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 				})();
 				return daemonRecovery;
 			};
-			const safeBaseEnvironment = collectDaemonLaunchEnv(process.env);
+			const safeBaseEnvironment = collectFixtureLaunchEnv(agentDir);
 			for (const name of Object.keys(safeBaseEnvironment)) {
 				if (name.startsWith("RLM_") || /TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|AUTH|COOKIE/i.test(name)) {
 					delete safeBaseEnvironment[name];
 				}
 			}
 			Object.assign(safeBaseEnvironment, {
-				HOME: process.env.HOME ?? root,
 				PI_OFFLINE: "1",
 				TSX_TSCONFIG_PATH: resolve(__dirname, "../../../tsconfig.json"),
 				[ENV_AGENT_DIR]: agentDir,
@@ -1720,7 +1908,12 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 					...safeBaseEnvironment,
 					NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require=${observerModule}`.trim(),
 					PRIME_AGENT_TEST_ENV_OBSERVATION: observationPath,
-					...(label === "A" ? { PRIME_AGENT_TEST_ENV_A: canary } : { PRIME_AGENT_TEST_ENV_B: canary }),
+					...(label === "A"
+						? {
+								PRIME_AGENT_TEST_ENV_A: canary,
+								PRIME_AGENT_TEST_CORRUPT_COMPACT_DELTA: join(root, "compact-delta-injected"),
+							}
+						: { PRIME_AGENT_TEST_ENV_B: canary }),
 				};
 				const created = await client.request({
 					type: "create",
@@ -1728,7 +1921,16 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 					sessionPath: sessionFiles[label],
 					launchEnv,
 					launchEnvMode: "replace",
-					config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+					config: {
+						cwd: projectDir,
+						agentDir,
+						sessionDir,
+						noTools: true,
+						provider: "faux",
+						model: "faux",
+						apiKey: "faux-key",
+						extensions: [fauxExtensionPath],
+					},
 				});
 				if (!created.success) throw new Error(created.error);
 				const summary = requireSummary(created.data);
@@ -1743,7 +1945,8 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 						provider: "faux",
 						model: "faux",
 						noTools: true,
-						noExtensions: true,
+						apiKey: "faux-key",
+						extensions: [fauxExtensionPath],
 					},
 					recoverDaemon,
 					reconnectTimeoutMs: 30_000,
@@ -1755,6 +1958,22 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 			};
 			const ownerA = await createOwned("A");
 			const ownerB = await createOwned("B");
+			// A real prompt's malformed compact delta forces the supervisor's internal
+			// catch-up attach, which must retain this owner's exact launch contract.
+			const resynced = new Promise<void>((resolveResync) => {
+				const unsubscribe = ownerA.connection.subscribe((event) => {
+					if (event.type === "session_resynced") {
+						unsubscribe();
+						resolveResync();
+					}
+				});
+			});
+			await ownerA.connection.prompt("exercise caller-owned compact-delta catch-up");
+			await resynced;
+			expect(readFileSync(join(root, "compact-delta-injected"), "utf8")).toBe("injected");
+			expect(ownerA.connection.getOwnedSessionContractProof()).toBeDefined();
+			expect(readDaemonLogs(agentDir)).not.toContain("Client-owned session launch environment does not match");
+
 			const readObservations = (path: string) => {
 				try {
 					return readFileSync(path, "utf8")
@@ -1766,6 +1985,7 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 								JSON.parse(line) as {
 									pid: number;
 									role?: string;
+									home?: string;
 									hasA: boolean;
 									hasB: boolean;
 									hasC: boolean;
@@ -1786,12 +2006,12 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 			for (const entry of readObservations(ownerA.observationPath).filter(
 				(observation) => observation.role === "1",
 			)) {
-				expect(entry).toMatchObject({ hasA: true, hasB: false, hasC: false });
+				expect(entry).toMatchObject({ home: fixtureHomePath(agentDir), hasA: true, hasB: false, hasC: false });
 			}
 			for (const entry of readObservations(ownerB.observationPath).filter(
 				(observation) => observation.role === "1",
 			)) {
-				expect(entry).toMatchObject({ hasA: false, hasB: true, hasC: false });
+				expect(entry).toMatchObject({ home: fixtureHomePath(agentDir), hasA: false, hasB: true, hasC: false });
 			}
 
 			const activeA = ownerA.summary.activeSessionId ?? ownerA.summary.id;
@@ -1881,7 +2101,12 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 				await waitForCondition(
 					() =>
 						readObservations(ownerA.observationPath).filter(
-							(entry) => entry.role === "1" && entry.hasA && !entry.hasB && !entry.hasC,
+							(entry) =>
+								entry.role === "1" &&
+								entry.home === fixtureHomePath(agentDir) &&
+								entry.hasA &&
+								!entry.hasB &&
+								!entry.hasC,
 						).length >= 2,
 					"Recovered worker A did not retain its exact environment",
 					20_000,
@@ -2004,7 +2229,7 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 			mkdirSync(projectDir, { recursive: true });
 			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
 			const owner = await connectEventually(socketPath, supervisor);
-			const launchEnv = collectDaemonLaunchEnv(process.env);
+			const launchEnv = collectFixtureLaunchEnv(agentDir);
 			for (const name of Object.keys(launchEnv)) {
 				if (name.startsWith("RLM_") || /TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|AUTH|COOKIE/i.test(name)) {
 					delete launchEnv[name];
@@ -3064,12 +3289,25 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 		connection.subscribe((event) => {
 			connectionEvents.push(event.type === "connection_status" ? `${event.type}:${event.status}` : event.type);
 			if (event.type === "session_replaced") {
-				replacementMessageCounts.push(event.messages.length);
+				// Count conversation messages only; every session carries a harness digest.
+				replacementMessageCounts.push(
+					event.messages.filter(
+						(message) =>
+							!(
+								message.role === "custom" &&
+								(message as { customType?: string }).customType === "harness_digest"
+							),
+					).length,
+				);
 			}
 		});
 		const snapshot = await connection.getInitialSnapshot();
-		expect(snapshot.messages).toHaveLength(2);
-		expect(snapshot.messages[0]).toMatchObject({ role: "user", content: largePrompt });
+		const snapshotConversation = snapshot.messages.filter(
+			(message) =>
+				!(message.role === "custom" && (message as { customType?: string }).customType === "harness_digest"),
+		);
+		expect(snapshotConversation).toHaveLength(2);
+		expect(snapshotConversation[0]).toMatchObject({ role: "user", content: largePrompt });
 
 		const activeSessionId = createdSummary.activeSessionId ?? createdSummary.id;
 		const createdNew = await client.request({ type: "new_session", activeSessionId });
@@ -3096,7 +3334,8 @@ if (path) fs.appendFileSync(path, JSON.stringify({ pid: process.pid, role: proce
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 		}
 		expect(connectionEvents).toContain("connection_status:reconnecting");
-		expect(connectionEvents).toContain("session_resynced");
+		// The direct worker link held through the supervisor swap, so no resync is warranted.
+		expect(connectionEvents).not.toContain("session_resynced");
 		expect(connectionEvents).toContain("connection_status:connected");
 		expect(connectionEvents).not.toContain("closed");
 		await expect(connection.getState()).resolves.toMatchObject({

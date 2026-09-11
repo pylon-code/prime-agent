@@ -353,7 +353,6 @@ export type IdleEvictionMinutes = number | "off";
 export interface SessionEvictionSnapshot {
 	isSessionActive: boolean;
 	attachedClients: number;
-	hasRegisteredHeartbeat: boolean;
 	hasRegisteredCronJob: boolean;
 	lastActivityAt: number;
 }
@@ -370,6 +369,7 @@ export interface WorkerEvictionSnapshot {
 	isStopping: boolean;
 	hasOwnerClient: boolean;
 	isPreparingUpdateRestart: boolean;
+	hasWakeBlindSchedule: boolean;
 	sessions: readonly SessionEvictionSnapshot[];
 }
 
@@ -384,7 +384,6 @@ function isIdleEvictionThresholdMet(
 	return (
 		!session.isSessionActive &&
 		session.attachedClients === 0 &&
-		!session.hasRegisteredHeartbeat &&
 		!session.hasRegisteredCronJob &&
 		Number.isFinite(session.lastActivityAt) &&
 		now - session.lastActivityAt >= idleEvictionMinutes * 60_000
@@ -417,6 +416,7 @@ export function canEvictWorker(
 		worker.isStopping ||
 		worker.hasOwnerClient ||
 		worker.isPreparingUpdateRestart ||
+		worker.hasWakeBlindSchedule ||
 		worker.sessions.length === 0
 	) {
 		return false;

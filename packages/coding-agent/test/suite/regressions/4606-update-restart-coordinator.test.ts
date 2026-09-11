@@ -12,6 +12,7 @@ import { DaemonAgentConnection } from "../../../src/modes/agent-connection/daemo
 import { DaemonClient } from "../../../src/modes/daemon/daemon-client.js";
 import type { DaemonResponse } from "../../../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
+import { isProcessAlive } from "../../../src/utils/child-process.js";
 import { createHarness, type Harness } from "../harness.js";
 
 interface SupervisorHandle {
@@ -205,15 +206,6 @@ async function withSourceCliEntrypoint<T>(action: () => Promise<T>): Promise<T> 
 		} else {
 			process.env.TSX_TSCONFIG_PATH = previousTsconfigPath;
 		}
-	}
-}
-
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code !== "ESRCH";
 	}
 }
 
@@ -434,6 +426,7 @@ describe("ENG-4606 update restart coordinator", () => {
 			expect.objectContaining({
 				role: "custom",
 				customType: "prime-agent.update_complete",
+				content: expect.stringMatching(/^\[update-complete\]\n\nPrime Agent updated to v/),
 				display: true,
 			}),
 		);

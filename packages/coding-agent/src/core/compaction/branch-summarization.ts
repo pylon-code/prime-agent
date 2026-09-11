@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, Usage } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai";
 import type { ProviderPayloadHook } from "../extension-provider-hooks.js";
 import {
@@ -14,7 +14,9 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "../messages.js";
+import { completeWithProviderRetry, type ProviderRetryPolicy } from "../provider-retry.js";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.js";
 import { estimateTokens } from "./compaction.js";
 import {
@@ -32,6 +34,7 @@ export interface BranchSummaryResult {
 	modifiedFiles?: string[];
 	aborted?: boolean;
 	error?: string;
+	usage?: Usage;
 }
 
 /** Details stored in BranchSummaryEntry.details for file tracking */
@@ -71,6 +74,7 @@ export interface GenerateBranchSummaryOptions {
 	customInstructions?: string;
 	/** If true, customInstructions replaces the default prompt instead of being appended */
 	replaceInstructions?: boolean;
+	retry?: ProviderRetryPolicy;
 	/** Tokens reserved for prompt + LLM response (default 16384) */
 	reserveTokens?: number;
 	/**
@@ -133,6 +137,8 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 			return entry.message;
 
 		case "custom_message":
+			// Harness digests are regenerated at cold boundaries; never summarizer input.
+			if (entry.customType === HARNESS_DIGEST_CUSTOM_TYPE) return undefined;
 			return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
 
 		case "branch_summary":
@@ -262,6 +268,7 @@ export async function generateBranchSummary(
 		signal,
 		customInstructions,
 		replaceInstructions,
+		retry,
 		reserveTokens = 16384,
 		onPayload,
 	} = options;
@@ -294,10 +301,14 @@ export async function generateBranchSummary(
 			timestamp: Date.now(),
 		},
 	];
-	const response = await completeSimple(
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		{ apiKey, headers, signal, onPayload, maxTokens: 2048 },
+	const response = await completeWithProviderRetry(
+		() =>
+			completeSimple(
+				model,
+				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+				{ apiKey, headers, signal, onPayload, maxTokens: 2048 },
+			),
+		{ policy: retry, signal },
 	);
 	if (response.stopReason === "aborted") {
 		return { aborted: true };
@@ -318,5 +329,6 @@ export async function generateBranchSummary(
 		summary: summary || "No summary generated",
 		readFiles,
 		modifiedFiles,
+		usage: response.usage,
 	};
 }

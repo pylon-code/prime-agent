@@ -21,6 +21,7 @@ import {
 	type SnapshotTranscriptChunkSource,
 } from "../../../src/modes/daemon/snapshot-transcript-cache.js";
 import { type PrivateFrame, PrivateFrameDecoder } from "../../../src/modes/session-worker/private-framing.js";
+import { seedSupervisorRoster } from "../../fixtures/roster-seed.js";
 
 const activeSessionId = "active-4602";
 const snapshotId = "snapshot-4602";
@@ -191,8 +192,8 @@ function snapshotFrames(messages: AgentMessage[]) {
 }
 
 describe("ENG-4602 snapshot transfer containment", () => {
-	it("observes the deferred attach snapshot promise", async () => {
-		const daemon = new AgentDaemon("/tmp/eng-4602-worker.sock", {
+	function workerAttachHarness(socketPath: string, lastEventSequence: number) {
+		const daemon = new AgentDaemon(socketPath, {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
@@ -202,7 +203,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			activeSessionId,
 			clients: new Set<DaemonSocketClient>(),
 			eventGeneration: "generation-4602",
-			lastEventSequence: 1,
+			lastEventSequence,
 			runtime: { metadata: { kind: "top-level", createdAt: 1 }, session: { sessionId: "session-4602" } },
 		} as unknown as ActiveSessionState;
 		const socket = new PassThrough();
@@ -215,30 +216,37 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			supportsExtensionUi: false,
 			capabilities: new Set<string>(),
 		} as DaemonSocketClient;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAttachResult(): DaemonAttachResult;
+			streamWorkerSnapshot(): Promise<void>;
+			log(message: string): void;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(activeSessionId, state);
+		internals.createAttachResult = () => streamedResult([]);
+		const attach = () =>
+			internals.handleCommand(client, {
+				type: "attach",
+				activeSessionId,
+				capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+			});
+		return { internals, client, socket, attach };
+	}
+
+	it("observes the deferred attach snapshot promise", async () => {
+		const { internals, socket, attach } = workerAttachHarness("/tmp/eng-4602-worker.sock", 1);
 		const streamError = new Error("encoder failed after begin");
 		const log = vi.fn();
 		const streamWorkerSnapshot = vi.fn(async () => {
 			throw streamError;
 		});
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			createAttachResult(): DaemonAttachResult;
-			streamWorkerSnapshot: typeof streamWorkerSnapshot;
-			log: typeof log;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
-		};
-		internals.sessions.set(activeSessionId, state);
-		internals.createAttachResult = () => streamedResult([]);
 		internals.streamWorkerSnapshot = streamWorkerSnapshot;
 		internals.log = log;
 		const unhandled = vi.fn();
 		process.on("unhandledRejection", unhandled);
 		try {
-			await internals.handleCommand(client, {
-				type: "attach",
-				activeSessionId,
-				capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
-			});
+			await attach();
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		} finally {
@@ -650,6 +658,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		};
 		internals.clients.add(client);
 		internals.workers.set(worker.descriptor.workerId, worker);
+		seedSupervisorRoster(supervisor, worker);
 		internals.syncWorkerExtensionUi = vi.fn(async () => {});
 		internals.streamSnapshot = streamSnapshot;
 		const messages: AgentMessage[] = [{ role: "user", content: "stable", timestamp: 1 }];
@@ -762,6 +771,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		};
 		internals.clients.add(client);
 		internals.workers.set(worker.descriptor.workerId, worker);
+		seedSupervisorRoster(supervisor, worker);
 		internals.streamSnapshot = streamSnapshot;
 		const frames = snapshotFrames([{ role: "user", content: "stable", timestamp: 1 }]);
 		for (const message of [frames.begin, frames.chunk, frames.end]) {
@@ -832,6 +842,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		};
 		internals.clients.add(client);
 		internals.workers.set(worker.descriptor.workerId, worker);
+		seedSupervisorRoster(supervisor, worker);
 		internals.shuttingDown = true;
 		internals.streamSnapshot = streamSnapshot;
 		internals.persistWorker = persistWorker;

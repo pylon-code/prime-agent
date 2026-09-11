@@ -5,9 +5,7 @@ import {
 	classifyStreamFailure,
 	extractStreamFailureInfo,
 	formatStreamFailureMessage,
-	parseRetryAfterMs,
 	recordStreamFailure,
-	retryAfterMsFromHeaders,
 	StreamFailureError,
 	streamFailureFromStopReason,
 } from "../src/utils/stream-failure.js";
@@ -40,6 +38,8 @@ describe("classifyStreamFailure", () => {
 		["overloaded_error", undefined, "overloaded"],
 		[undefined, 529, "overloaded"],
 		["rate_limit_error", undefined, "rate_limit"],
+		["usage_limit_reached", undefined, "rate_limit"],
+		["usage_not_included", 403, "rate_limit"],
 		[undefined, 429, "rate_limit"],
 		["refusal", undefined, "refusal"],
 		["sensitive", undefined, "safety"],
@@ -48,6 +48,10 @@ describe("classifyStreamFailure", () => {
 		["content_filter", undefined, "safety"],
 		["guardrail_intervened", undefined, "safety"],
 		["authentication_error", undefined, "auth"],
+		[undefined, 401, "auth"],
+		["permission_error", 403, "permission"],
+		["PermissionDeniedError", 403, "permission"],
+		[undefined, 403, "permission"],
 		["invalid_request_error", undefined, "invalid_request"],
 		["api_error", undefined, "server_error"],
 		[undefined, 503, "server_error"],
@@ -104,61 +108,39 @@ describe("extractStreamFailureInfo", () => {
 		expect(extractStreamFailureInfo(awsError)).toMatchObject({ requestId: "aws_req" });
 	});
 
-	test("carries Retry-After from rate-limit response headers", () => {
-		const sdkError = Object.assign(new Error("429 rate limited"), {
-			status: 429,
-			headers: new Headers({ "retry-after": "30", "request-id": "req_429" }),
-		});
-		expect(extractStreamFailureInfo(sdkError)).toMatchObject({
-			kind: "rate_limit",
-			status: 429,
-			requestId: "req_429",
-			retryAfterMs: 30_000,
-		});
+	test.each([
+		["Headers seconds", new Headers({ "retry-after": "120" }), 120000],
+		["retry-after-ms precedence", { "retry-after-ms": "1500", "retry-after": "2" }, 1500],
+		["record with mixed case", { "Retry-After": "120" }, 120000],
+	] as const)("extracts the server-requested retry delay: %s", (_name, headers, expected) => {
+		const error = Object.assign(new Error("429"), { status: 429, headers });
+		expect(extractStreamFailureInfo(error)).toMatchObject({ kind: "rate_limit", retryAfterMs: expected });
 	});
 
-	test("leaves retryAfterMs unset when the provider sent no Retry-After", () => {
-		const sdkError = Object.assign(new Error("529 overloaded"), { status: 529 });
-		expect(extractStreamFailureInfo(sdkError).retryAfterMs).toBeUndefined();
+	test("parses an HTTP-date Retry-After relative to now", () => {
+		const withDate = Object.assign(new Error("429"), {
+			status: 429,
+			headers: new Headers({ "retry-after": new Date(Date.now() + 60000).toUTCString() }),
+		});
+		const dateMs = extractStreamFailureInfo(withDate).retryAfterMs;
+		expect(dateMs).toBeGreaterThan(0);
+		expect(dateMs).toBeLessThanOrEqual(60000);
 	});
 
 	test("falls back to classifying the message text", () => {
 		expect(extractStreamFailureInfo(new Error("provider overloaded, retry later")).kind).toBe("overloaded");
 		expect(extractStreamFailureInfo("not an error").kind).toBe("unknown");
 	});
-});
 
-describe("parseRetryAfterMs", () => {
-	test("reads delta-seconds", () => {
-		expect(parseRetryAfterMs("30")).toBe(30_000);
-		expect(parseRetryAfterMs(" 1.5 ")).toBe(1500);
-	});
-
-	test("clamps non-positive delta-seconds to zero", () => {
-		expect(parseRetryAfterMs("0")).toBe(0);
-		expect(parseRetryAfterMs("-5")).toBe(0);
-	});
-
-	test("reads an HTTP-date relative to now", () => {
-		const now = Date.parse("2026-01-01T00:00:00Z");
-		expect(parseRetryAfterMs("Thu, 01 Jan 2026 00:00:45 GMT", now)).toBe(45_000);
-		expect(parseRetryAfterMs("Wed, 31 Dec 2025 23:59:00 GMT", now)).toBe(0);
-	});
-
-	test("returns undefined for missing or unparseable values", () => {
-		expect(parseRetryAfterMs(undefined)).toBeUndefined();
-		expect(parseRetryAfterMs(null)).toBeUndefined();
-		expect(parseRetryAfterMs("   ")).toBeUndefined();
-		expect(parseRetryAfterMs("soon")).toBeUndefined();
-	});
-});
-
-describe("retryAfterMsFromHeaders", () => {
-	test("reads Headers objects and plain records", () => {
-		expect(retryAfterMsFromHeaders(new Headers({ "retry-after": "12" }))).toBe(12_000);
-		expect(retryAfterMsFromHeaders({ "Retry-After": "12" })).toBe(12_000);
-		expect(retryAfterMsFromHeaders({})).toBeUndefined();
-		expect(retryAfterMsFromHeaders(undefined)).toBeUndefined();
+	test.each([
+		["Unauthorized: authentication failed", undefined, "unknown"],
+		["permission denied by policy", undefined, "unknown"],
+		["upstream authentication failed", 500, "server_error"],
+		["Unauthorized", 401, "auth"],
+		["permission denied", 403, "permission"],
+	] as const)("auth/permission need more than message text: %s / %s -> %s", (message, status, expected) => {
+		// Without a structured error type, only the status may decide auth or permission.
+		expect(extractStreamFailureInfo(Object.assign(new Error(message), { status })).kind).toBe(expected);
 	});
 });
 
@@ -211,21 +193,6 @@ describe("recordStreamFailure", () => {
 			model: "claude-fable-5",
 			kind: "overloaded",
 			requestId: "req_9",
-		});
-	});
-
-	test("persists Retry-After in the diagnostic so session retry can honor it", () => {
-		setLogSink(() => {});
-		const output = makeOutput({ errorMessage: "Provider rate limit exceeded" });
-		recordStreamFailure(
-			model,
-			output,
-			new StreamFailureError("x", { kind: "rate_limit", status: 429, retryAfterMs: 30_000 }),
-		);
-
-		expect(output.diagnostics?.[0]).toMatchObject({
-			type: "provider_stream_failure",
-			details: { kind: "rate_limit", retryAfterMs: 30_000 },
 		});
 	});
 

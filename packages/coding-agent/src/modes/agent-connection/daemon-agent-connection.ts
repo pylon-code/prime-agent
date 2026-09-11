@@ -37,9 +37,11 @@ import {
 	PRIME_AGENT_SDK_FEATURES,
 	RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE,
 } from "../../sdk-features.js";
+import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "../agents-view/roster-store.js";
 import {
 	DaemonCapabilityUnavailableError,
 	type DaemonClient,
+	type DaemonTransportClient,
 	getDaemonSocketCloseReason,
 } from "../daemon/daemon-client.js";
 import { deserializeDaemonError } from "../daemon/daemon-errors.js";
@@ -67,6 +69,12 @@ import {
 	type DaemonSessionSnapshot,
 	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
+import {
+	createDaemonSessionTransport,
+	DaemonControlPlaneTransportError,
+	DaemonDirectTransportClosedError,
+	DaemonRoutedClient,
+} from "../daemon/daemon-routed-client.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
 import {
@@ -216,7 +224,7 @@ const PROMPT_LIFECYCLE_TERMINAL_RETENTION = 256;
 const PROMPT_LIFECYCLE_TOMBSTONE_RETENTION = 256;
 const OWNED_SESSION_DISPOSE_RECONNECT_WAIT_MS = 10_000;
 const OWNED_SESSION_DISPOSE_POLL_MS = 50;
-const updateTransportReconnects = new WeakMap<DaemonClient, Promise<void>>();
+const updateTransportReconnects = new WeakMap<DaemonTransportClient, Promise<void>>();
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -284,7 +292,7 @@ function isPromptLifecycleCancellationResult(
 	);
 }
 
-function delayUntilRetryOrOwnerClose(client: DaemonClient, timeoutMs: number): Promise<void> {
+function delayUntilRetryOrOwnerClose(client: DaemonTransportClient, timeoutMs: number): Promise<void> {
 	if (client.isClosed) return Promise.resolve();
 	return new Promise((resolve) => {
 		let settled = false;
@@ -304,7 +312,7 @@ function delayUntilRetryOrOwnerClose(client: DaemonClient, timeoutMs: number): P
 	});
 }
 
-function reconnectDaemonTransportAfterUpdate(client: DaemonClient): Promise<void> {
+function reconnectDaemonTransportAfterUpdate(client: DaemonTransportClient): Promise<void> {
 	const existing = updateTransportReconnects.get(client);
 	if (existing) {
 		return existing;
@@ -340,6 +348,8 @@ function reconnectDaemonTransportAfterUpdate(client: DaemonClient): Promise<void
 
 export interface DaemonAgentConnectionOptions {
 	closeClientOnDispose?: boolean;
+	/** Secondary watchers pass false to stay on the shared control-plane socket. */
+	directTransport?: boolean;
 	/** Restart/probe the detached supervisor after a transient socket loss. */
 	recoverDaemon?: () => Promise<void>;
 	/** Bound supervisor recovery before surfacing a fatal connection error. */
@@ -511,8 +521,8 @@ export function buildSessionTreeFromFlatNodes(
 	return roots;
 }
 
-const sharedAttachmentOwners = new WeakMap<DaemonClient, Map<string, DaemonAgentConnection>>();
-const sharedAttachmentMutationTails = new WeakMap<DaemonClient, Promise<void>>();
+const sharedAttachmentOwners = new WeakMap<DaemonTransportClient, Map<string, DaemonAgentConnection>>();
+const sharedAttachmentMutationTails = new WeakMap<DaemonTransportClient, Promise<void>>();
 const MAX_PENDING_NEGOTIATED_RUNTIME_FRAMES = 128;
 const MAX_PENDING_NEGOTIATED_RUNTIME_FRAME_WEIGHT = 256 * 1024;
 
@@ -580,7 +590,7 @@ function isCorrelatedPromptRuntimeFrame(message: DaemonOutbound): boolean {
 }
 
 export class DaemonAgentConnection implements AgentConnection {
-	private readonly client: DaemonClient;
+	private readonly client: DaemonTransportClient;
 	private activeSessionId: string;
 	private readonly options: DaemonAgentConnectionOptions;
 	private ownedSessionLaunchEnv: Readonly<Record<string, string>> | undefined;
@@ -639,7 +649,10 @@ export class DaemonAgentConnection implements AgentConnection {
 	private pendingNegotiatedRuntimeFrames: DaemonOutbound[] = [];
 	private pendingNegotiatedRuntimeFrameWeight = 0;
 	private sharedAttachmentActiveSessionId: string | undefined;
+	private rosterStore: AgentsViewRosterStore | undefined;
 	private reconnectPromise?: Promise<void>;
+	private initialAttachPending = false;
+	private initialControlPlaneClose?: Error;
 	private readonly definitiveRequestErrors = new WeakSet<Error>();
 	private transportCloseRetirementInProgress = false;
 	private sessionCloseRetirementInProgress = false;
@@ -752,7 +765,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
-	constructor(client: DaemonClient, activeSessionId: string, options: DaemonAgentConnectionOptions = {}) {
+	constructor(client: DaemonTransportClient, activeSessionId: string, options: DaemonAgentConnectionOptions = {}) {
 		const { ownedSessionLaunchEnv, ...connectionOptions } = options;
 		if (ownedSessionLaunchEnv !== undefined && options.ownedSession !== true) {
 			throw new Error("ownedSessionLaunchEnv requires ownedSession");
@@ -772,52 +785,65 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.dispatchDaemonMessage(message);
 		});
 		this.captureDaemonLogPath();
-		this.unsubscribeDaemonClose = this.client.onClose((error) => {
-			const closeReason = getDaemonSocketCloseReason(error);
-			if (closeReason === "update") this.updateRestartPending = true;
+		this.unsubscribeDaemonClose = this.client.onClose((error) => this.handleTransportClose(error));
+	}
+
+	private handleTransportClose(error: Error): void {
+		const directSessionSurvives =
+			this.client instanceof DaemonRoutedClient &&
+			this.client.hasDirectTransport &&
+			!(error instanceof DaemonDirectTransportClosedError);
+		if (this.client.isClosed) {
+			this.invalidateNegotiatedCapabilityProof();
+			this.emitOwnerClosedTerminal();
+			return;
+		}
+		const invalidatedInputPause = !directSessionSurvives && this.sessionInputPauses.size > 0;
+		if (!directSessionSurvives) {
 			this.transportCloseRetirementInProgress = true;
-			const invalidatedInputPause = this.sessionInputPauses.size > 0;
-			try {
-				this.retirePendingChunkedReplacement();
-				this.invalidateNegotiatedCapabilityProof();
-				this.sessionInputPauses.clear();
-				this.sessionInputPauseGeneration++;
-				this.rejectSnapshotAssemblies(error);
-			} finally {
-				this.transportCloseRetirementInProgress = false;
-			}
-			if (this.disposed || this.terminalCloseEmitted) {
-				return;
-			}
-			if (this.client.isClosed) {
-				this.emitOwnerClosedTerminal();
-				return;
-			}
-			if (invalidatedInputPause) {
-				this.terminalCloseEmitted = true;
-				void this.emit({
-					type: "closed",
-					error: "Daemon connection closed while session input was paused; the fence was invalidated.",
-				});
-				return;
-			}
-			if (closeReason === "shutdown") {
-				this.terminalCloseEmitted = true;
-				void this.emit({ type: "closed", error: this.formatDaemonSessionClosedError("shutdown") });
-				return;
-			}
-			if ((this.updateRestartPending || closeReason === "update") && !this.updateReconnectFailed) {
-				this.updateRestartPending = true;
-				void this.reconnectAfterUpdate();
-				return;
-			}
-			if (this.options.recoverDaemon) {
-				void this.reconnect(error);
-				return;
-			}
+			this.retirePendingChunkedReplacement();
+			this.invalidateNegotiatedCapabilityProof();
+			this.sessionInputPauses.clear();
+			this.sessionInputPauseGeneration++;
+			this.rejectSnapshotAssemblies(error);
+			this.transportCloseRetirementInProgress = false;
+		}
+		if (this.initialAttachPending) {
+			// attach() owns failure handling until the initial attach settles.
+			if (directSessionSurvives) this.initialControlPlaneClose = error;
+			return;
+		}
+		if (this.disposed || this.terminalCloseEmitted) {
+			return;
+		}
+		// A lost direct link invalidates the fence (holders learn via the generation bump) yet the session falls back.
+		if (invalidatedInputPause && !(error instanceof DaemonDirectTransportClosedError)) {
 			this.terminalCloseEmitted = true;
-			void this.emit({ type: "closed", error: this.formatDaemonConnectionClosedError(error) });
-		});
+			void this.emit({
+				type: "closed",
+				error: "Daemon connection closed while session input was paused; the fence was invalidated.",
+			});
+			return;
+		}
+		// An authoritative shutdown/update reason outranks the surviving direct link.
+		const closeReason = getDaemonSocketCloseReason(error);
+		if (closeReason === "shutdown") {
+			this.terminalCloseEmitted = true;
+			void this.emit({ type: "closed", error: this.formatDaemonSessionClosedError("shutdown") });
+			return;
+		}
+		if ((this.updateRestartPending || closeReason === "update") && !this.updateReconnectFailed) {
+			this.updateRestartPending = true;
+			void this.reconnectAfterUpdate();
+			return;
+		}
+		// A direct-transport loss is never itself a session loss: fall back through a supervisor re-attach.
+		if (directSessionSurvives || error instanceof DaemonDirectTransportClosedError || this.options.recoverDaemon) {
+			void this.reconnect(error);
+			return;
+		}
+		this.terminalCloseEmitted = true;
+		void this.emit({ type: "closed", error: this.formatDaemonConnectionClosedError(error) });
 	}
 
 	private hasCallerOwnedSessionEnvironmentContract(): boolean {
@@ -861,22 +887,51 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	static async attach(
-		client: DaemonClient,
+		client: DaemonTransportClient,
 		activeSessionId: string,
 		options?: DaemonAgentConnectionOptions,
 	): Promise<DaemonAgentConnection> {
-		const connection = new DaemonAgentConnection(client, activeSessionId, options);
+		const transport = await createDaemonSessionTransport(
+			client,
+			activeSessionId,
+			options?.ownedSession === true || options?.directTransport === false,
+		);
+		const connection = new DaemonAgentConnection(transport, activeSessionId, options);
+		connection.initialAttachPending = true;
 		try {
-			await connection.attach();
+			try {
+				await connection.attach();
+			} catch (error) {
+				if (!(transport instanceof DaemonRoutedClient)) throw error;
+				transport.fallbackToSupervisor();
+				try {
+					// This retry owns its failure; a parked request would pend the attach forever.
+					await connection.attach({ recoverable: false });
+				} catch (retryError) {
+					// A control-plane close saved during the window is the authoritative cause.
+					throw connection.initialControlPlaneClose ?? retryError;
+				}
+			}
+			connection.initialAttachPending = false;
+			const initialControlPlaneClose = connection.initialControlPlaneClose;
+			connection.initialControlPlaneClose = undefined;
+			if (initialControlPlaneClose) {
+				// No listeners exist yet: a terminal close rejects the attach; the rest replays through the one handler.
+				if (getDaemonSocketCloseReason(initialControlPlaneClose) === "shutdown") {
+					throw initialControlPlaneClose;
+				}
+				connection.handleTransportClose(initialControlPlaneClose);
+			}
 			return connection;
 		} catch (error) {
+			connection.initialAttachPending = false;
 			await connection.dispose();
 			throw error;
 		}
 	}
 
 	static async attachRecoverableOwnedSessionCreation(
-		client: DaemonClient,
+		client: DaemonTransportClient,
 		activeSessionId: string,
 		sessionId: string,
 		expectedSupervisorGeneration: string,
@@ -897,7 +952,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	static async adoptRecoverableOwnedSession(
-		client: DaemonClient,
+		client: DaemonTransportClient,
 		options: DaemonRecoverableOwnedSessionAdoptionOptions,
 	): Promise<DaemonRecoverableOwnedSessionAdoptionResult> {
 		await client.waitForHello();
@@ -1070,9 +1125,18 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
-	async attach(): Promise<void> {
+	async attach(options?: { recoverable?: boolean }): Promise<void> {
 		if (this.disposing || this.disposed) throw new Error("Daemon connection is disposing");
-		await this.attachSession(this.activeSessionId, this.lastEventCursor, false);
+		await this.attachSession(
+			this.activeSessionId,
+			this.lastEventCursor,
+			false,
+			options?.recoverable === false ? 1 : 2,
+			"attach",
+			false,
+			false,
+			options,
+		);
 	}
 
 	private attachSession(
@@ -1083,6 +1147,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		logicalPurpose: DaemonSnapshotPurpose = "attach",
 		allowWhileDisposing = false,
 		preserveRuntimeSnapshotAttempt = false,
+		requestOptions?: { recoverable?: boolean },
 	): Promise<void> {
 		const admissionRevision = ++this.attachmentAdmissionRevision;
 		this.attachmentAdmissionInFlight = true;
@@ -1104,6 +1169,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					logicalPurpose,
 					allowWhileDisposing,
 					admissionRevision,
+					requestOptions,
 				);
 			} catch (error) {
 				this.invalidateNegotiatedCapabilityProof();
@@ -1122,6 +1188,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		logicalPurpose: DaemonSnapshotPurpose,
 		allowWhileDisposing: boolean,
 		admissionRevision: number,
+		requestOptions?: { recoverable?: boolean },
 	): Promise<void> {
 		if (admissionRevision !== this.attachmentAdmissionRevision) {
 			throw new Error("Daemon connection attachment changed during attach");
@@ -1159,23 +1226,27 @@ export class DaemonAgentConnection implements AgentConnection {
 				"attach",
 			);
 			try {
-				result = await this.requestData<SessionSummary | DaemonAttachResult>({
-					type: "attach",
-					activeSessionId: requestedActiveSessionId,
-					expectedSupervisorGeneration: this.attachmentSupervisorGenerationFence,
-					...(this.supportsSnapshotGenerationNonce() ? { snapshotGenerationNonce: randomUUID() } : {}),
-					supportsExtensionUi,
-					clientId: this.clientId,
-					capabilities,
-					env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
-					...this.ownedSessionLaunchFields(),
-					...this.ownedSessionRecoveryFields(),
-					telemetryDisabled: this.options.telemetryDisabled,
-					resumeCursor:
-						resumeCursor === undefined
-							? undefined
-							: { activeSessionId: requestedActiveSessionId, ...resumeCursor },
-				});
+				result = await this.requestData<SessionSummary | DaemonAttachResult>(
+					{
+						type: "attach",
+						activeSessionId: requestedActiveSessionId,
+						expectedSupervisorGeneration: this.attachmentSupervisorGenerationFence,
+						...(this.supportsSnapshotGenerationNonce() ? { snapshotGenerationNonce: randomUUID() } : {}),
+						supportsExtensionUi,
+						clientId: this.clientId,
+						capabilities,
+						env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
+						...this.ownedSessionLaunchFields(),
+						...this.ownedSessionRecoveryFields(),
+						telemetryDisabled: this.options.telemetryDisabled,
+						resumeCursor:
+							resumeCursor === undefined
+								? undefined
+								: { activeSessionId: requestedActiveSessionId, ...resumeCursor },
+					},
+					undefined,
+					requestOptions,
+				);
 				this.assertAttachmentCommit(
 					requestedActiveSessionId,
 					attachmentEpoch,
@@ -1275,6 +1346,22 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.captureDaemonLogPath();
 		this.updateReconnectFailed = false;
 		this.terminalCloseEmitted = false;
+		if (this.rosterStore) await this.rosterStore.attach(this.client).catch(() => undefined);
+	}
+
+	async subscribeAgentRoster(
+		listener: () => void,
+	): Promise<{ summaries(): SessionSummary[]; dispose(): Promise<void> }> {
+		this.rosterStore ??= new AgentsViewRosterStore();
+		const store = this.rosterStore;
+		if (!(await store.attach(this.client))) {
+			throw new Error(STALE_ROSTER_DAEMON_MESSAGE);
+		}
+		const unsubscribe = store.onUpdate(listener);
+		return {
+			summaries: () => store.summaries(),
+			dispose: async () => unsubscribe(),
+		};
 	}
 
 	subscribe(listener: AgentConnectionEventListener): () => void {
@@ -1298,7 +1385,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
-	async getInitialSnapshot(): Promise<AgentConnectionSnapshot> {
+	async getInitialSnapshot(options?: { recoverable?: boolean }): Promise<AgentConnectionSnapshot> {
 		const snapshotRecovery = this.runtimeSnapshotAttempt?.recovery;
 		if (snapshotRecovery) await snapshotRecovery;
 		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
@@ -1310,18 +1397,21 @@ export class DaemonAgentConnection implements AgentConnection {
 		const snapshotCursor = this.lastEventCursor;
 		const snapshotSequence = this.lastEventSequence;
 		const [state, messagesData, sessionContextData, promptLifecycles] = await Promise.all([
-			this.requestData<AgentConnectionState>({
-				type: "get_connection_state",
-				activeSessionId: this.activeSessionId,
-			}),
-			this.requestData<{ messages: AgentMessage[] }>({
-				type: "get_messages",
-				activeSessionId: this.activeSessionId,
-			}),
-			this.requestData<{ context: AgentConnectionSessionContext }>({
-				type: "get_session_context",
-				activeSessionId: this.activeSessionId,
-			}),
+			this.requestData<AgentConnectionState>(
+				{ type: "get_connection_state", activeSessionId: this.activeSessionId },
+				undefined,
+				options,
+			),
+			this.requestData<{ messages: AgentMessage[] }>(
+				{ type: "get_messages", activeSessionId: this.activeSessionId },
+				undefined,
+				options,
+			),
+			this.requestData<{ context: AgentConnectionSessionContext }>(
+				{ type: "get_session_context", activeSessionId: this.activeSessionId },
+				undefined,
+				options,
+			),
 			this.supportsNegotiatedRuntimeCapability("correlated_prompt_lifecycle_v1")
 				? this.getPromptLifecycles()
 				: Promise.resolve(undefined),
@@ -2706,7 +2796,12 @@ export class DaemonAgentConnection implements AgentConnection {
 		// attach() rejects for an unknown/exited session — treat that as unreachable.
 		let connection: DaemonAgentConnection;
 		try {
-			connection = await DaemonAgentConnection.attach(this.client, activeSessionId, { closeClientOnDispose: false });
+			const watchClient =
+				this.client instanceof DaemonRoutedClient ? this.client.controlPlaneTransport : this.client;
+			connection = await DaemonAgentConnection.attach(watchClient, activeSessionId, {
+				closeClientOnDispose: false,
+				directTransport: false,
+			});
 		} catch {
 			return undefined;
 		}
@@ -2942,6 +3037,8 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.invalidateNegotiatedCapabilityProof();
 		this.updateRestartPending = false;
 		await Promise.allSettled([...this.activeSideQuestionIds].map((id) => this.abortSideQuestion(id)));
+		await this.rosterStore?.dispose().catch(() => undefined);
+		this.rosterStore = undefined;
 		this.unsubscribeDaemonMessages();
 		this.unsubscribeDaemonClose();
 		this.invalidateSharedAttachment(serverRoutedActiveSessionId);
@@ -2996,10 +3093,21 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		this.reconnectPromise = (async () => {
 			void this.emit({ type: "connection_status", status: "reconnecting", error: cause.message });
-			const deadline = Date.now() + (this.options.reconnectTimeoutMs ?? DAEMON_RECONNECT_TIMEOUT_MS);
+			const timeoutMs = this.options.reconnectTimeoutMs ?? DAEMON_RECONNECT_TIMEOUT_MS;
+			let deadline: number | undefined;
 			let attempt = 0;
 			let lastError: Error = cause;
-			while (!this.disposed && !this.terminalCloseEmitted && !this.client.isClosed && Date.now() < deadline) {
+			while (!this.disposed && !this.terminalCloseEmitted && !this.client.isClosed) {
+				// A held direct link owns session liveness: control-plane recovery retries unbounded,
+				// and the bounded session-plane deadline arms only once the direct link is gone.
+				const directSessionHeld = this.client instanceof DaemonRoutedClient && this.client.hasDirectTransport;
+				if (directSessionHeld) {
+					deadline = undefined;
+				} else {
+					deadline ??= Date.now() + timeoutMs;
+					if (Date.now() >= deadline) break;
+				}
+				let controlPlaneHandshakeComplete = false;
 				try {
 					await this.options.recoverDaemon?.();
 					if (this.client.isClosed) {
@@ -3013,6 +3121,16 @@ export class DaemonAgentConnection implements AgentConnection {
 						return;
 					}
 					await this.client.waitForHello(3000);
+					controlPlaneHandshakeComplete = true;
+					if (directSessionHeld && this.client instanceof DaemonRoutedClient && this.client.hasDirectTransport) {
+						if (this.rosterStore) await this.rosterStore.attach(this.client).catch(() => undefined);
+						if (this.disposed || this.terminalCloseEmitted || this.updateRestartPending) return;
+						if (this.client.hasDirectTransport) {
+							void this.emit({ type: "connection_status", status: "connected" });
+							return;
+						}
+						continue;
+					}
 					if (this.client.isClosed) {
 						this.emitOwnerClosedTerminal();
 						return;
@@ -3034,7 +3152,7 @@ export class DaemonAgentConnection implements AgentConnection {
 						return;
 					}
 					if (this.disposing || this.disposed || this.terminalCloseEmitted) return;
-					const snapshot = await this.getInitialSnapshot();
+					const snapshot = await this.getInitialSnapshot({ recoverable: false });
 					if (this.client.isClosed) {
 						this.emitOwnerClosedTerminal();
 						return;
@@ -3058,10 +3176,21 @@ export class DaemonAgentConnection implements AgentConnection {
 						return;
 					}
 					if (this.disposed || this.terminalCloseEmitted) return;
-					this.client.resetTransportForReconnect();
-					const remainingMs = deadline - Date.now();
-					if (remainingMs <= 0) break;
-					const delayMs = Math.min(remainingMs, 2000, 100 * 2 ** Math.min(attempt, 5));
+					// A direct-half failure must not tear down a control-plane socket with a completed handshake.
+					const shouldResetControlPlane =
+						!(this.client instanceof DaemonRoutedClient) ||
+						!controlPlaneHandshakeComplete ||
+						error instanceof DaemonControlPlaneTransportError ||
+						!this.client.isControlPlaneReady;
+					if (shouldResetControlPlane) this.client.resetTransportForReconnect();
+					if (deadline !== undefined && deadline - Date.now() <= 0) {
+						break;
+					}
+					const delayMs = Math.min(
+						...(deadline !== undefined ? [deadline - Date.now()] : []),
+						2000,
+						100 * 2 ** Math.min(attempt, 5),
+					);
 					attempt++;
 					await delayUntilRetryOrOwnerClose(this.client, delayMs);
 				}
@@ -3072,6 +3201,8 @@ export class DaemonAgentConnection implements AgentConnection {
 			}
 			if (!this.disposed && !this.terminalCloseEmitted) {
 				this.terminalCloseEmitted = true;
+				this.sessionInputPauses.clear();
+				this.sessionInputPauseGeneration++;
 				this.client.close();
 				await this.emit({ type: "closed", error: `Daemon reconnection failed: ${lastError.message}` });
 			}
@@ -3125,7 +3256,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private async requestData<T>(
 		command: DaemonCommandBody,
 		timeoutMs?: number,
-		options?: Parameters<DaemonClient["request"]>[2],
+		options?: Parameters<DaemonTransportClient["request"]>[2],
 	): Promise<T> {
 		const response = await this.requestDaemonCommandWithinOwnedSessionDeadline(command, timeoutMs, options);
 		if (!response.success) {
@@ -3669,7 +3800,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				await this.client.reconnect(1000);
 				if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
 				if (this.disposed || this.terminalCloseEmitted) return;
-				const response = await this.client.request({ type: "list" }, 30000);
+				const response = await this.client.request({ type: "list" }, 30000, { recoverable: false });
 				if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
 				if (this.disposed || this.terminalCloseEmitted) return;
 				if (!response.success) {

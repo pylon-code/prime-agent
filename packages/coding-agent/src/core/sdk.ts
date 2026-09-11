@@ -291,19 +291,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				throw new Error(auth.error);
 			}
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
-			// Exactly one layer owns retry policy. While the session-level loop is
-			// enabled, provider SDK retries stay off so a failed turn cannot fan out
-			// into sessionRetries x sdkRetries upstream attempts; an explicit
-			// `retry.provider.maxRetries` still wins.
-			const providerMaxRetries =
-				options?.maxRetries ??
-				providerRetrySettings.maxRetries ??
-				(settingsManager.getRetryEnabled() ? 0 : undefined);
 			return streamSimple(model, context, {
 				...options,
 				apiKey: auth.apiKey,
 				timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
-				maxRetries: providerMaxRetries,
 				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
 			});
 		},
@@ -358,6 +349,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		rlmSessionDir: options.rlmSessionDir,
 		rlmParentNodeId: options.rlmParentNodeId,
 		rlmParentAgent: options.rlmParentAgent,
+		semanticParentSessionId: options.semanticParentSessionId,
+		semanticSpawnedByRequestId: options.semanticSpawnedByRequestId,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,

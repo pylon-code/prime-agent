@@ -6,8 +6,8 @@ fork:
   mirror_branch: main
   product_branch: pylon
   tracking_issue: https://github.com/pylon-code/prime-agent/issues/1
-  reviewed_upstream_commit: a903d4b6768f484bd6d459b7b0aa7dee38e461e2
-  reviewed_at: 2026-08-30
+  reviewed_upstream_commit: 1eee2938b4eeb7a4d72e17035adda669a89b63de
+  reviewed_at: 2026-09-10
 
 decisions:
   managed-plan-daemon:
@@ -154,8 +154,8 @@ decisions:
   prime-inference-catalog-capabilities:
     area: model-catalog
     state: shipped
-    owner: shared
-    decision: hybridize
+    owner: upstream
+    decision: adopt
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/4
     upstream_refs:
@@ -163,11 +163,10 @@ decisions:
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1876
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1877
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1633
-    fork_change: route-specific-live-pricing-invariants
-    upstream_support: Prime refreshes the generated catalog from live providers and currently pins sampled vendor prices in tests.
+    fork_change: none
+    upstream_support: Prime v0.9.4 provides the current catalog, runtime refresh and deterministic ordinary builds; adopt the upstream catalog and its tests.
     revisit_when:
-      - Prime adopts deterministic catalog fixtures or repo-owned structural invariants.
-      - Prime stops regenerating vendor pricing before tests and releases.
+      - Upstream catalog generation or ordinary builds start depending on live vendor responses again.
 
   kernel-protocol-test-fixtures:
     area: runtime-reliability
@@ -277,25 +276,24 @@ decisions:
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/tree/a903d4b6768f484bd6d459b7b0aa7dee38e461e2
     fork_change: child-scoped-provider-identity-v1
-    upstream_support: Prime through a903d4b6768f constructs inline RLM children and side questions with the root session's onPayload/onResponse closures, and calls compaction, branch summarization, and refinement completeSimple with no payload hook. Every derived request therefore either claims the parent's provider session identity while sending a divergent history or arrives with no identity at all.
+    upstream_support: Prime v0.9.4 adds retry and summary-call identities, but derived calls still need the owning session extension payload hook. Preserve scoped identity for RLM children, side questions, both split compaction calls, branch summaries and refinement.
     revisit_when:
       - Prime routes subagent and derived-request provider hooks through the owning session's extension runner.
       - An upstream extension contract exposes per-agent provider identity that supersedes the scoped session-id view.
   kind-aware-provider-retry:
     area: runtime-reliability
     state: shipped
-    owner: pylon-prime-integration
-    decision: redesign
+    owner: upstream
+    decision: adopt
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/22
       - https://github.com/pylon-code/prime-agent/issues/24
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/tree/a903d4b6768f484bd6d459b7b0aa7dee38e461e2
-    fork_change: kind-aware-session-retry-v1
-    upstream_support: Prime through a903d4b6768f classifies provider stream failures but retries every one of them on the same fixed 2s/4s/8s ladder, stacks provider SDK retries underneath the session loop, never reads Retry-After, and threads maxRetryDelayMs through StreamOptions, Agent, and the proxy without any provider reading it.
+    fork_change: sse-retry-after-propagation-only
+    upstream_support: Prime v0.9.4 unifies provider retry policy, honors bounded Retry-After delays and removes stacked SDK retries. Retain only Anthropic SSE Retry-After extraction where the in-stream error supplies a more specific delay.
     revisit_when:
-      - Prime upstream makes the session retry loop failure-kind aware and honors Retry-After with a delay ceiling.
-      - Prime upstream makes exactly one retry layer own policy so provider SDK retries cannot multiply session retries.
+      - Upstream preserves an Anthropic SSE error Retry-After value with the same precedence as its transport headers.
 
   turn-scoped-subagent-cancellation:
     area: runtime-reliability
@@ -321,7 +319,7 @@ decisions:
     area: prompt-ownership
     state: shipped
     owner: shared
-    decision: retain
+    decision: hybridize
     pylon_refs:
       - https://github.com/pylon-code/prime-agent/issues/22
       - https://github.com/pylon-code/prime-agent/issues/26
@@ -331,7 +329,7 @@ decisions:
       - https://github.com/PrimeIntellect-ai/prime-agent/commit/f81acc6679ab214f1c40821588d9e5e97c47bdb1
       - https://github.com/PrimeIntellect-ai/prime-agent/tree/c382f09856d4a8c8d2b765179657047d58691f25
     fork_change: stable-prompt-cache-prefix-v1
-    upstream_support: Prime through c382f09856d4 reduced the system-prompt date to a day stamp for cache stability, but it still serializes mutable continual-harness state and that date into the cached system prompt, has no provider-neutral volatile-content channel, no per-model placement contract for session-cached proxy backends, and does not pin active tool order behind the `cache_control` marker on the last tool definition.
+    upstream_support: Prime v0.9.4 persists compact harness digests at cold context boundaries. Adopt that durable history model while retaining provider-neutral volatile date placement, appendOnlyHistory model parsing and append-only placement, plus stable active-tool order.
     revisit_when:
       - Prime upstream provides an equivalent provider-neutral channel that keeps mutable state and clock-derived content out of the cached tools/system/history prefix, including a declared constraint for append-only-history backends.
       - Pylon can drop the fork behavior without regressing measured cache-hit rates through a Claude-Max proxy or Meridian lineage continuation rates.

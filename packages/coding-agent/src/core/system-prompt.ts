@@ -7,6 +7,7 @@ import { formatHarnessStateForPrompt, type HarnessState, REFINE_SKILL_NAME } fro
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
 export interface BuildSystemPromptOptions {
+	harnessState?: HarnessState;
 	/** Custom system prompt (replaces default). */
 	customPrompt?: string;
 	/** Active tools. Tool schemas carry tool descriptions outside the prompt body. */
@@ -31,8 +32,6 @@ export interface BuildSystemPromptOptions {
 	rlmDepth?: number;
 	/** Human-readable parent name or id for child communication doctrine. */
 	rlmParentAgent?: string;
-	/** Global harness state to inject as compact persistent context. */
-	harnessState?: HarnessState;
 	/** Enabled user-configured servers available through the generic kernel MCP API. */
 	genericMcpServers?: string[];
 }
@@ -171,10 +170,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		parentAgent: options.rlmParentAgent,
 	});
 
-	// Appended AFTER the trained buildRlmPrompt prefix, so the model reads when/why to
-	// delegate before it reaches the concrete subagent specs it can match against — the
-	// same ordering as Claude Code's Agent tool. The specs themselves now arrive in the
-	// volatile block, which still follows this guidance in the assembled request.
+	// Appended AFTER the trained buildRlmPrompt prefix: delegation doctrine precedes the subagent specs delivered via the harness digest.
 	if ((allowRecursion ?? true) && hasIpython) {
 		const visiblePythonSkillNames = new Set(
 			getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName),

@@ -6,7 +6,11 @@ import type {
 	MessageParam,
 	RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages.js";
-import { getAnthropicCacheWriteCost, hasStandardAnthropicCachePricing } from "../cache-pricing.js";
+import {
+	type AnthropicCacheCreationUsage,
+	getAnthropicCacheWriteCost,
+	hasStandardAnthropicCachePricing,
+} from "../cache-pricing.js";
 import { getEnvApiKey } from "../env-api-keys.js";
 import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
@@ -35,8 +39,8 @@ import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import {
 	classifyStreamFailure,
 	formatStreamFailureMessage,
+	parseRetryAfterMs,
 	recordStreamFailure,
-	retryAfterMsFromHeaders,
 	StreamFailureError,
 	streamFailureFromStopReason,
 	streamFailureMessage,
@@ -46,6 +50,7 @@ import { resolveVolatileContext } from "../utils/volatile-context.js";
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import { withOpenCodeHeaders } from "./opencode-headers.js";
 import { adjustMaxTokensForThinking, buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -79,7 +84,7 @@ function getCacheControl(
 }
 
 // Stealth mode: Mimic Claude Code's tool naming exactly
-const claudeCodeVersion = "2.1.75";
+const claudeCodeVersion = "2.1.261";
 
 // Claude Code 2.x tool names (canonical casing)
 // Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
@@ -431,7 +436,7 @@ async function* iterateAnthropicEvents(
 	let sawMessageEnd = false;
 	// Overload/rate-limit SSE errors arrive on an otherwise-200 response, so the
 	// only Retry-After the caller ever sees is the one on the response headers.
-	const retryAfterMs = retryAfterMsFromHeaders(response.headers);
+	const retryAfterMs = parseRetryAfterMs(response.headers);
 
 	for await (const sse of iterateSseMessages(response.body, signal)) {
 		if (sse.event === "error") {
@@ -519,6 +524,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					shouldUseFineGrainedToolStreamingBeta(model, context),
 					options?.headers,
 					copilotDynamicHeaders,
+					options?.sessionId,
 				);
 				client = created.client;
 				isOAuth = created.isOAuthToken;
@@ -537,7 +543,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 			};
 			const response = await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -711,6 +716,16 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					if (event.usage.cache_creation_input_tokens != null) {
 						output.usage.cacheWrite = event.usage.cache_creation_input_tokens;
 					}
+					// The SDK's MessageDeltaUsage type omits cache_creation, but the wire carries it.
+					const deltaCacheCreation = (event.usage as { cache_creation?: AnthropicCacheCreationUsage | null })
+						.cache_creation;
+					if (cacheControl && usesAnthropicCachePricing && deltaCacheCreation) {
+						cacheWriteCost = getAnthropicCacheWriteCost(
+							model.cost.input,
+							cacheControl.ttl === "1h" ? "1h" : "5m",
+							deltaCacheCreation,
+						);
+					}
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 					calculateCost(
@@ -863,6 +878,7 @@ function createClient(
 	useFineGrainedToolStreamingBeta: boolean,
 	optionsHeaders?: Record<string, string>,
 	dynamicHeaders?: Record<string, string>,
+	sessionId?: string,
 ): { client: Anthropic; isOAuthToken: boolean } {
 	// Adaptive thinking models (Opus 4.6, Sonnet 4.6) have interleaved thinking built-in.
 	// The beta header is deprecated on Opus 4.6 and redundant on Sonnet 4.6, so skip it.
@@ -877,6 +893,7 @@ function createClient(
 
 	if (model.provider === "cloudflare-ai-gateway") {
 		const client = new Anthropic({
+			maxRetries: 0,
 			apiKey: null,
 			authToken: null,
 			baseURL: resolveCloudflareBaseUrl(model),
@@ -900,6 +917,7 @@ function createClient(
 
 	if (model.provider === "github-copilot") {
 		const client = new Anthropic({
+			maxRetries: 0,
 			apiKey: null,
 			authToken: apiKey,
 			baseURL: model.baseUrl,
@@ -921,6 +939,7 @@ function createClient(
 
 	if (isOAuthToken(apiKey)) {
 		const client = new Anthropic({
+			maxRetries: 0,
 			apiKey: null,
 			authToken: apiKey,
 			baseURL: model.baseUrl,
@@ -942,17 +961,22 @@ function createClient(
 	}
 
 	const client = new Anthropic({
+		maxRetries: 0,
 		apiKey,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
-		defaultHeaders: mergeHeaders(
-			{
-				accept: "application/json",
-				"anthropic-dangerous-direct-browser-access": "true",
-				...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
-			},
-			model.headers,
-			optionsHeaders,
+		defaultHeaders: withOpenCodeHeaders(
+			model.provider,
+			sessionId,
+			mergeHeaders(
+				{
+					accept: "application/json",
+					"anthropic-dangerous-direct-browser-access": "true",
+					...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
+				},
+				model.headers,
+				optionsHeaders,
+			),
 		),
 	});
 

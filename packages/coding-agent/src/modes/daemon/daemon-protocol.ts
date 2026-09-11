@@ -28,6 +28,7 @@ import type {
 import type { QueuedMessageLane, QueuedMessageMutation } from "../../core/session-action-store.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { SessionUsageSummary } from "../../core/usage.js";
 import {
 	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
 	type RECOVERABLE_OWNED_SESSION_ADOPTION_FEATURE,
@@ -49,6 +50,7 @@ import type {
 	AgentConnectionSideQuestionTurn,
 	AgentConnectionState,
 } from "../agent-connection/types.js";
+import type { AgentRosterEntry } from "./agent-roster.js";
 import type { SessionSummary } from "./daemon-session-list.js";
 
 /**
@@ -85,8 +87,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 28 negotiates fresh snapshot generations and adds private worker chunk routing metadata.
 // Revision 29 capability-gates exact caller-owned launch environments and observable cleanup results.
 // Revision 30 adds capability-gated same-supervisor recoverable owned-session adoption.
-export const DAEMON_SCHEMA_REVISION = 30;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-2e0904d3ad1a";
+// Revision 31 is reserved for the separate nonpersistent-worker candidate (#54).
+// Revision 32 integrates upstream roster/peer transport, usage/model metadata and session_recovering.
+export const DAEMON_SCHEMA_REVISION = 32;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-5b223a76a7e9";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -135,6 +139,7 @@ export type DaemonServerCapability =
 	// carry the transient marker and echoed runId so clients correlate runs by
 	// identity). Clients must check before sending.
 	| "transient_bash"
+	| "agent_roster"
 	| "session_input_admission"
 	| "prompt_admission_cancellation"
 	| "queue_message_mutation"
@@ -146,7 +151,8 @@ export type DaemonServerCapability =
 	| "acp_mcp_servers"
 	| "snapshot_generation_nonce_v1"
 	| "authoritative_owned_session_cleanup_v1"
-	| "daemon_recoverable_owned_session_adoption_v1";
+	| "daemon_recoverable_owned_session_adoption_v1"
+	| "direct_peer_transport";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -202,6 +208,8 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 /** Supervisor-only offers. Private session workers must not advertise these commands. */
 export const DAEMON_SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	"agent_roster",
+	"direct_peer_transport",
 	"authoritative_owned_session_cleanup_v1",
 	CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE,
 	"daemon_recoverable_owned_session_adoption_v1",
@@ -222,6 +230,19 @@ export function isDaemonRecoveryRequestId(value: unknown): value is string {
 	if (/^[0-9a-f]{32,}$/i.test(value) && value.length % 2 === 0) return true;
 	if (/^[A-Za-z0-9_-]{22,}$/.test(value)) return true;
 	return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+/** Single-use short-lived credential for one direct TUI connection to one worker process incarnation. */
+export interface DaemonPeerTransportTicket {
+	purpose: "session_client";
+	socketPath: string;
+	/** Filesystem identity of the worker socket at issue time; re-checked by the client before connecting. */
+	socketIdentity: { dev: number; ino: number };
+	workerInstanceId: string;
+	activeSessionId: string;
+	grantId: string;
+	token: string;
+	expiresAt: string;
 }
 
 export interface DaemonRuntimeIdentity {
@@ -532,6 +553,9 @@ export type DaemonCommand =
 	  }
 	| DaemonSavedSessionListCommand
 	| { id?: string; type: "list_agent_peers"; workerToken: string }
+	| { id?: string; type: "get_direct_worker_transport"; activeSessionId: string }
+	| { id?: string; type: "roster_subscribe" }
+	| { id?: string; type: "roster_unsubscribe" }
 	| ({
 			id?: string;
 			type: "create_recoverable_owned_session";
@@ -967,6 +991,11 @@ const SNAPSHOT_GENERATION_NONCE_COMMAND = {
 	minSchemaRevision: DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION,
 	capability: "snapshot_generation_nonce_v1",
 } as const;
+const DIRECT_PEER_TRANSPORT_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 25,
+	capability: "direct_peer_transport",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -977,6 +1006,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	prepare_recoverable_owned_session_adoption: RECOVERABLE_OWNED_SESSION_ADOPTION_COMMAND,
 	commit_recoverable_owned_session_adoption: RECOVERABLE_OWNED_SESSION_ADOPTION_COMMAND,
 	confirm_recoverable_owned_session_adoption: RECOVERABLE_OWNED_SESSION_ADOPTION_COMMAND,
+	get_direct_worker_transport: DIRECT_PEER_TRANSPORT_COMMAND,
 	create: LEGACY_DAEMON_COMMAND,
 	attach: LEGACY_DAEMON_COMMAND,
 	reattach: LEGACY_DAEMON_COMMAND,
@@ -1032,6 +1062,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	release_session_input_pause: SESSION_INPUT_PAUSE_COMMAND,
 	cron_list: LEGACY_DAEMON_COMMAND,
 	heartbeats_list: { minProtocol: 7, capability: "heartbeat_catalog" },
+	roster_subscribe: { minProtocol: 7, capability: "agent_roster" },
+	roster_unsubscribe: { minProtocol: 7, capability: "agent_roster" },
 	heartbeat_manage: { minProtocol: 7, capability: "heartbeat_management" },
 	cron_add: LEGACY_DAEMON_COMMAND,
 	cron_cancel: LEGACY_DAEMON_COMMAND,
@@ -1082,6 +1114,136 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	shutdown: LEGACY_DAEMON_COMMAND,
 } as const satisfies Record<DaemonCommandName, DaemonCommandCompatibility>;
 
+/**
+ * Which endpoint serves each command when a client holds both a supervisor
+ * (control-plane) and a direct worker (session-plane) connection. Session is
+ * the default for session-addressed commands; "control" marks supervisor
+ * semantics: worker lifecycle, cross-worker targeting, daemon-global
+ * registries, and names a worker resolves differently (a worker's "list" is
+ * only its own sessions). Total over DaemonCommand["type"], so an
+ * unclassified command is a compile error and never routes direct.
+ */
+export const DAEMON_COMMAND_PLANE = {
+	submit_correlated_prompt: "control",
+	cancel_correlated_prompt: "control",
+	get_prompt_lifecycles: "control",
+	get_owned_session_cleanup: "control",
+	create_recoverable_owned_session: "control",
+	prepare_recoverable_owned_session_adoption: "control",
+	commit_recoverable_owned_session_adoption: "control",
+	confirm_recoverable_owned_session_adoption: "control",
+	ack_result: "control",
+	list: "control",
+	list_saved_sessions: "control",
+	list_agent_peers: "control",
+	get_direct_worker_transport: "control",
+	create: "control",
+	attach: "session",
+	reattach: "control",
+	detach: "session",
+	complete_owned_session: "control",
+	promote_owned_session: "control",
+	kill: "control",
+	rename: "control",
+	prompt: "session",
+	cancel_prompt_admission: "session",
+	prompt_and_wait: "session",
+	steer: "session",
+	follow_up: "session",
+	restore_next_turn: "session",
+	restore_actions: "session",
+	append_custom_message: "session",
+	resume_queue: "session",
+	send_message: "control",
+	agent_messages_status: "control",
+	agent_messages_pause: "control",
+	agent_messages_resume: "control",
+	agent_messages_clear: "control",
+	abort: "session",
+	start_side_question: "session",
+	abort_side_question: "session",
+	execute_bash: "session",
+	abort_bash: "session",
+	cancel_rlm_child: "session",
+	delete_rlm_subagent: "session",
+	wait_for_idle: "session",
+	wait_for_headless_completion: "session",
+	get_session_header: "session",
+	get_state: "session",
+	get_connection_state: "session",
+	get_messages: "session",
+	get_rlm_children: "session",
+	get_session_stats: "session",
+	get_context_tree: "session",
+	get_commands: "session",
+	get_resource_snapshot: "session",
+	replace_acp_mcp_servers: "session",
+	get_model_catalog: "session",
+	get_available_models: "session",
+	get_queue: "session",
+	mutate_queued_message: "session",
+	clear_queue: "session",
+	abort_and_clear_queue: "session",
+	acquire_session_input_pause: "session",
+	release_session_input_pause: "session",
+	cron_list: "control",
+	heartbeats_list: "control",
+	roster_subscribe: "control",
+	roster_unsubscribe: "control",
+	heartbeat_manage: "control",
+	cron_add: "control",
+	cron_cancel: "control",
+	heartbeat_get: "control",
+	heartbeat_set: "control",
+	heartbeat_update: "control",
+	set_model: "session",
+	cycle_model: "session",
+	set_scoped_models: "session",
+	set_thinking_level: "session",
+	set_service_tier: "session",
+	cycle_thinking_level: "session",
+	set_transport: "session",
+	set_steering_mode: "session",
+	set_follow_up_mode: "session",
+	set_auto_compaction: "session",
+	set_auto_retry: "session",
+	compact: "session",
+	refine: "session",
+	abort_compaction: "session",
+	abort_branch_summary: "session",
+	abort_retry: "session",
+	execute_bash_and_wait: "session",
+	reload: "session",
+	new_session: "session",
+	switch_session: "session",
+	fork: "session",
+	navigate_tree: "session",
+	import_jsonl: "session",
+	export_html: "session",
+	export_jsonl: "session",
+	set_session_name: "control",
+	get_rlm_max_depth_status: "session",
+	set_rlm_max_depth: "session",
+	rename_saved_session: "control",
+	delete_saved_session: "control",
+	get_session_context: "session",
+	get_session_tree: "session",
+	get_user_messages_for_forking: "session",
+	get_last_assistant_text: "session",
+	get_system_prompt: "session",
+	get_tool_definition: "session",
+	set_session_entry_label: "session",
+	extension_ui_response: "session",
+	prepare_update_restart: "control",
+	retry_worker: "control",
+	restart: "control",
+	shutdown: "control",
+} as const satisfies Record<DaemonCommandName, "session" | "control">;
+
+export function isSessionPlaneDaemonCommand(type: string): boolean {
+	return (DAEMON_COMMAND_PLANE as Record<string, "session" | "control" | undefined>)[type] === "session";
+}
+
 export function getDaemonCommandCompatibilities(command: DaemonCommand): readonly DaemonCommandCompatibility[] {
 	const requirements: DaemonCommandCompatibility[] = [];
 	if ((command.type === "attach" || command.type === "reattach") && command.recoveryConfig !== undefined) {
@@ -1119,6 +1281,22 @@ export interface DaemonSubmitCorrelatedPromptResult {
 
 export type DaemonCancelCorrelatedPromptResult = PromptLifecycleCancellationResult;
 
+export function meetsDaemonCommandCompatibility(
+	hello: {
+		protocol: DaemonProtocolInfo;
+		schemaRevision?: number;
+		serverCapabilities?: readonly DaemonServerCapability[];
+	},
+	compatibility: DaemonCommandCompatibility,
+): boolean {
+	return (
+		hello.protocol.version >= compatibility.minProtocol &&
+		(compatibility.minSchemaRevision === undefined ||
+			(hello.schemaRevision ?? 0) >= compatibility.minSchemaRevision) &&
+		(compatibility.capability === undefined || hello.serverCapabilities?.includes(compatibility.capability) === true)
+	);
+}
+
 export type DaemonResponse =
 	| { id?: string; type: "response"; command: string; success: true; data?: unknown }
 	| {
@@ -1136,7 +1314,8 @@ export type DaemonErrorInfo =
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId }
 	| { code: "owned_session_owner_mismatch" }
-	| { code: "owned_session_adoption_unavailable" };
+	| { code: "owned_session_adoption_unavailable" }
+	| { code: "session_recovering"; activeSessionId: string };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 export type DaemonClosingReason = "shutdown" | "update";
@@ -1186,6 +1365,9 @@ export interface DaemonSavedSessionInfo {
 	firstMessage: string;
 	allMessagesText: string;
 	agentStatus?: AgentConnectionAgentStatus;
+	usage?: SessionUsageSummary;
+	/** Last recorded provider/model selector; absent for sessions that never ran a model. */
+	model?: { provider: string; modelId: string };
 }
 
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;
@@ -1241,6 +1423,7 @@ export type DaemonOutbound =
 			lifecycle: PromptLifecycleSnapshot;
 			meta?: DaemonEventMeta;
 	  }
+	| { type: "roster_update"; changed: AgentRosterEntry[]; removed?: string[]; resync?: true }
 	| { type: "side_question_event"; activeSessionId: string; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_status"; activeSessionId: string; recap?: string; meta?: DaemonEventMeta }
 	| {
@@ -1364,6 +1547,7 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	daemon_hello: LEGACY_DAEMON_COMMAND,
 	daemon_closing: LEGACY_DAEMON_COMMAND,
 	heartbeats_changed: { minProtocol: 7, capability: "heartbeat_catalog" },
+	roster_update: { minProtocol: 7, capability: "agent_roster" },
 	session_event: LEGACY_DAEMON_COMMAND,
 	prompt_lifecycle: CORRELATED_PROMPT_LIFECYCLE_COMMAND,
 	side_question_event: LEGACY_DAEMON_COMMAND,
@@ -1444,9 +1628,12 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"list",
 	"list_saved_sessions",
 	"list_agent_peers",
+	"get_direct_worker_transport",
 	"attach",
 	"reattach",
 	"get_owned_session_cleanup",
+	"roster_subscribe",
+	"roster_unsubscribe",
 	"agent_messages_status",
 	"wait_for_idle",
 	"get_session_header",

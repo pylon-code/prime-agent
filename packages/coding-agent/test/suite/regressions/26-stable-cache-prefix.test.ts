@@ -158,9 +158,10 @@ describe("issue 26: stable prompt-cache prefix", () => {
 		expect(first.prefix.systemPrompt).not.toContain("cache_note");
 		expect(second.prefix.systemPrompt).not.toContain("cache_note");
 		expect(second.prefix.history).not.toContain("cache_note");
-		expect(second.volatile).toContain("cache_note");
-		expect(second.volatile).toContain("Prompt caching needs a stable prefix.");
-		expect(second.volatile).not.toBe(first.volatile);
+		// Upstream delivers harness digests at cold boundaries, so an external disk edit
+		// cannot rewrite the current cached history or inject another payload-only block.
+		expect(second.volatile).toBe(first.volatile);
+		expect(first.prefix.history).toContain("Continual Harness State");
 	});
 
 	it("keeps the cached prefix byte-identical across a date flip", async () => {
@@ -208,8 +209,10 @@ describe("issue 26: stable prompt-cache prefix", () => {
 		expect(requests[1].prefix.tools).toBe(requests[0].prefix.tools);
 	});
 
-	it("keeps the history append-only and moves volatile content into the system prompt for an appendOnlyHistory model", async () => {
-		const { harness, requests } = await createRecordingHarness();
+	it("keeps persisted harness digests append-only and places the volatile date in the system prompt for an appendOnlyHistory model", async () => {
+		const { harness, requests } = await createRecordingHarness({
+			resourceLoader: { ...createTestResourceLoader(), getSystemPrompt: () => "You are a test assistant." },
+		});
 		harnesses.push(harness);
 		isolateGlobalHarnessState(harness);
 
@@ -236,8 +239,8 @@ describe("issue 26: stable prompt-cache prefix", () => {
 		expect(registered?.appendOnlyHistory).toBe(true);
 		await harness.session.setModel(registered!);
 
-		await harness.session.prompt("first");
 		seedLocalMemory(harness, "proxy_note", "Session-cached backends need an append-only history.");
+		await harness.session.prompt("first");
 		harness.session.setActiveToolsByName(harness.session.getActiveToolNames());
 		await harness.session.prompt("second");
 
@@ -248,13 +251,14 @@ describe("issue 26: stable prompt-cache prefix", () => {
 		expect(first.volatile).toBe("");
 		expect(second.volatile).toBe("");
 		expect(second.prefix.history.startsWith(first.prefix.history.slice(0, -1))).toBe(true);
-		expect(first.prefix.history).not.toContain("Continual Harness State");
-		expect(second.prefix.history).not.toContain("Continual Harness State");
+		expect(first.prefix.history).toContain("Continual Harness State");
+		expect(first.prefix.history).toContain("proxy_note");
+		expect(second.prefix.history).toContain("Session-cached backends need an append-only history.");
 
-		// The content still reaches the model, inside the system prompt.
-		expect(first.prefix.systemPrompt).toContain("# Continual Harness State");
-		expect(second.prefix.systemPrompt).toContain("proxy_note");
-		expect(second.prefix.systemPrompt).toContain("Session-cached backends need an append-only history.");
+		// Only the volatile date moves into the system prompt; the digest stays durable.
+		expect(first.prefix.systemPrompt).toContain(localDate());
+		expect(second.prefix.systemPrompt).toContain(localDate());
+		expect(second.prefix.systemPrompt).not.toContain("Continual Harness State");
 	});
 
 	it("pins tool order to first activation so reordering cannot move the cache marker", async () => {
