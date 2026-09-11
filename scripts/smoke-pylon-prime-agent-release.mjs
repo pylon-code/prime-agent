@@ -13,6 +13,7 @@ import {
 } from "./lib/pylon-release.mjs";
 import { verifyPylonPrimeAgentRelease } from "./verify-pylon-prime-agent-release.mjs";
 import { verifyPreviewPublication } from "./verify-pylon-preview-publication.mjs";
+import { extractRuntimeArchive } from "./lib/pylon-runtime-dependencies.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultArtifacts = join(root, ".npm", "pylon-release", "artifacts");
@@ -227,6 +228,7 @@ function cleanRuntimeEnv({ home, agentDir, sessionDir, packageDir }) {
 			name.startsWith("PRIME_AGENT_INTERNAL_DAEMON_") ||
 			name.startsWith("RLM_") ||
 			name === "FORCE_COLOR" ||
+			name === "NODE_PATH" ||
 			name === "NO_COLOR"
 		) {
 			delete env[name];
@@ -315,11 +317,16 @@ function staticSdkImport() {
 	return 'import * as sdk from "prime-agent";\n';
 }
 
-async function smokeSdkIdentity({ probesDir, cwd, env }) {
+async function smokeSdkIdentity({ probesDir, cwd, env, standalone }) {
 	const probePath = join(probesDir, "sdk-identity.mjs");
 	writeFileSync(
 		probePath,
 		`${staticSdkImport()}
+import { createRequire } from "node:module";
+const require = createRequire(new URL("../node_modules/prime-agent/package.json", import.meta.url));
+if (${JSON.stringify(standalone)}) {
+  for (const name of ["koffi", "@silvia-odwyer/photon-node", "@mariozechner/clipboard"]) require(name);
+}
 const expected = ${JSON.stringify(PYLON_RELEASE_EXPECTED_SDK_FEATURES)};
 if (!Object.isFrozen(sdk.PRIME_AGENT_SDK_FEATURES)) throw new Error("SDK feature tokens are not frozen.");
 if (JSON.stringify([...sdk.PRIME_AGENT_SDK_FEATURES]) !== JSON.stringify(expected)) throw new Error("Unexpected SDK feature tokens.");
@@ -646,38 +653,26 @@ export async function smokePylonPrimeAgentRelease(artifactsDir, { historical = f
 	try {
 		const prefix = join(tempRoot, "install");
 		mkdirSync(prefix, { recursive: true });
-		createLocalAssetConsumer(prefix, artifactsDir, manifest);
-		const npm = npmInvocation();
-		run(
-			npm.command,
-			[
-				...npm.prefixArgs,
-				"install",
-				"--ignore-scripts",
-				"--no-audit",
-				"--no-fund",
-				"--package-lock=false",
-				"--loglevel=verbose",
-			],
-			{
-				cwd: prefix,
-				env: process.env,
-				stdio: "inherit",
-				timeoutMs: releaseInstallTimeoutMs(),
-			},
-		);
 		const packageDir = join(prefix, "node_modules", "prime-agent");
+		if (manifest.build.recipeRevision === 1 && historical) {
+			createLocalAssetConsumer(prefix, artifactsDir, manifest);
+			const npm = npmInvocation();
+			run(npm.command, [...npm.prefixArgs, "install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", "--loglevel=verbose"], {
+				cwd: prefix, env: process.env, stdio: "inherit", timeoutMs: releaseInstallTimeoutMs(),
+			});
+		} else {
+			await extractRuntimeArchive(join(artifactsDir, releaseAssetFile("pylon-prime-agent", manifest.package.version)), packageDir);
+		}
 		const installedPackage = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));
 		const cliEntry = join(packageDir, installedPackage.bin["prime-agent"]);
 		const probesDir = join(prefix, "runtime-probes");
 		mkdirSync(probesDir, { recursive: true });
 		const fixture = writeRuntimeFixture(tempRoot, packageDir);
-		await smokeSdkIdentity({ probesDir, cwd: fixture.projectDir, env: fixture.env });
+		await smokeSdkIdentity({ probesDir, cwd: fixture.projectDir, env: fixture.env, standalone: manifest.build.recipeRevision >= 2 });
 
-		const installedNpm = npmInvocation(fixture.env);
 		const version = runCli(
-			installedNpm.command,
-			[...installedNpm.prefixArgs, "exec", "--offline", "--yes=false", "--", "prime-agent", "--version"],
+			process.execPath,
+			[cliEntry, "--version"],
 			{ cwd: prefix, env: fixture.env },
 		);
 		const versionOutput = `${version.stdout}${version.stderr}`.trim();

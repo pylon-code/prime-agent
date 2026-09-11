@@ -310,6 +310,7 @@ export function createReleasePackageJson({
 	delete packageJson.private;
 
 	if (releasePackage.publicPackage) {
+		packageJson.bundleDependencies = Object.keys({ ...packageJson.dependencies, ...packageJson.optionalDependencies }).sort();
 		packageJson.bin = { "prime-agent": "dist/bundle/cli.js" };
 		packageJson.piConfig = { ...(packageJson.piConfig || {}), name: "prime-agent", configDir: ".prime/agent" };
 	}

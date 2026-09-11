@@ -3,6 +3,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { verifyBundledRuntimeDependencies } from "./lib/pylon-runtime-dependencies.mjs";
 import {
 	assertCleanSource,
 	assertPylonRepository,
@@ -102,6 +103,7 @@ export function verifyPylonPrimeAgentRelease(artifactsDir) {
 	) {
 		throw new Error("Public package or command identity changed.");
 	}
+	verifyBundledRuntimeDependencies(root, join(artifactsDir, packageArtifacts.get("prime-agent").file));
 
 	const internalPackageNames = new Set([...packageArtifacts.keys()].filter((name) => name !== "prime-agent"));
 	for (const artifact of packageArtifacts.values()) {

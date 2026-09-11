@@ -1,0 +1,1 @@
+- Fixed Pylon managed builds to include their exact runtime dependencies for offline installation on Linux and macOS.

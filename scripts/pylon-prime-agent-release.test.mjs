@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import "./pylon-runtime-dependencies.test.mjs";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -113,10 +114,10 @@ function fakeArtifacts() {
 }
 
 test("uses channel-neutral immutable Pylon asset identity", () => {
-	assert.equal(releaseBuildId(source.commit), "pylon-build-g0123456789ab-r1");
+	assert.equal(releaseBuildId(source.commit), "pylon-build-g0123456789ab-r2");
 	assert.equal(
 		releaseAssetUrl(source.commit, "pylon-prime-agent-0.8.1.tgz"),
-		"https://github.com/pylon-code/prime-agent/releases/download/pylon-build-g0123456789ab-r1/pylon-prime-agent-0.8.1.tgz",
+		"https://github.com/pylon-code/prime-agent/releases/download/pylon-build-g0123456789ab-r2/pylon-prime-agent-0.8.1.tgz",
 	);
 	assert.throws(
 		() =>
@@ -353,4 +354,19 @@ test("offline release scripts cannot invoke live model generation", () => {
 		readFileSync(join(root, "packages", "ai", "scripts", "generate-models.ts"), "utf8"),
 		/PYLON_RELEASE_OFFLINE/,
 	);
+});
+
+test("both fresh pack workflows acquire locked runtime inputs before the offline namespace", () => {
+	for (const [file, start, end] of [
+		["ci.yml", "  pylon-artifact-pack:", "  pylon-artifact-reproducibility:"],
+		["pylon-preview-release.yml", "  pack:", "  reproducibility:"],
+	]) {
+		const source = readFileSync(join(root, ".github", "workflows", file), "utf8");
+		const job = source.slice(source.indexOf(start), source.indexOf(end));
+		const install = job.indexOf("npm ci");
+		const hydrate = job.indexOf("npm run release:pylon:hydrate-runtime");
+		const offline = job.indexOf("unshare --net -- npm run release:pylon:pack");
+		assert.ok(install > 0 && hydrate > install && offline > hydrate, file);
+		assert.equal(job.split("npm run release:pylon:hydrate-runtime").length, 2);
+	}
 });
