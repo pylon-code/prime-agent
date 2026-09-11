@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
+import { restoreSudoBuildIdentity } from "./lib/pylon-release-identity.mjs";
 import {
 	assertImmutableReleaseUrl,
 	createInternalShrinkwrap,
@@ -40,6 +41,66 @@ const source = {
 const version = "0.8.1";
 const toolchain = { node: PYLON_RELEASE_NODE_VERSION, npm: PYLON_RELEASE_NPM_VERSION };
 const lockfileSha256 = "a".repeat(64);
+
+function buildCredentials() {
+	let uid = 0;
+	let gid = 0;
+	let groups = [0, 27];
+	const changes = [];
+	return {
+		changes,
+		getuid: () => uid,
+		geteuid: () => uid,
+		getgid: () => gid,
+		getegid: () => gid,
+		getgroups: () => [...groups, gid],
+		setgroups: (value) => { changes.push("groups"); groups = value; },
+		setgid: (value) => { changes.push("gid"); gid = value; },
+		setuid: (value) => { changes.push("uid"); uid = value; },
+	};
+}
+
+test("sudo release builds restore the invoking owner without supplementary privileges", () => {
+	const credentials = buildCredentials();
+	restoreSudoBuildIdentity(credentials, { SUDO_UID: "1001", SUDO_GID: "1002" });
+	assert.equal(credentials.getuid(), 1001);
+	assert.equal(credentials.getgid(), 1002);
+	assert.deepEqual(credentials.getgroups(), [1002]);
+	assert.deepEqual(credentials.changes, ["groups", "gid", "uid"]);
+});
+
+test("malformed sudo identities fail before changing any credentials", () => {
+	for (const bad of [undefined, "", "0", "-1", "01", "1.0", "1e3", " 1000", "4294967295", "9007199254740992"]) {
+		for (const field of ["SUDO_UID", "SUDO_GID"]) {
+			const credentials = buildCredentials();
+			assert.throws(() => restoreSudoBuildIdentity(credentials, {
+				SUDO_UID: "1000", SUDO_GID: "1000", [field]: bad,
+			}), /Sudo release builds require/);
+			assert.deepEqual(credentials.changes, []);
+		}
+	}
+});
+
+test("ordinary release invocations retain their existing identity", () => {
+	const directRoot = buildCredentials();
+	restoreSudoBuildIdentity(directRoot, {});
+	assert.deepEqual(directRoot.changes, []);
+	const user = { ...buildCredentials(), getuid: () => 1000 };
+	restoreSudoBuildIdentity(user, { SUDO_UID: "invalid", SUDO_GID: "invalid" });
+	assert.deepEqual(user.changes, []);
+	assert.doesNotThrow(() => restoreSudoBuildIdentity({}, {}));
+});
+
+test("failed sudo identity restoration is terminal and preserves the original error", () => {
+	for (const operation of ["setgroups", "setgid", "setuid"]) {
+		const credentials = buildCredentials();
+		const error = Object.assign(new Error("denied"), { code: "EPERM" });
+		credentials[operation] = () => { throw error; };
+		assert.throws(() => restoreSudoBuildIdentity(credentials, { SUDO_UID: "1000", SUDO_GID: "1000" }), (actual) => actual === error);
+	}
+	const privileged = { ...buildCredentials(), geteuid: () => 0 };
+	assert.throws(() => restoreSudoBuildIdentity(privileged, { SUDO_UID: "1000", SUDO_GID: "1000" }), /did not restore/);
+});
 
 function fakeArtifacts() {
 	return PYLON_RELEASE_PACKAGES.map((releasePackage, index) => ({
