@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { fork } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { test } from "node:test";
-import { buildConsumerGeneration, discoverConsumerGenerations, prepareConsumerGeneration, recoverConsumerGenerationBuilder, rotateConsumerGeneration, withConsumerGenerationLock } from "./lib/pylon-consumer-lock.mjs";
+import { buildConsumerGeneration, discoverConsumerGenerations, prepareConsumerGeneration, publishConsumerGeneration, readConsumerGeneration, recoverConsumerGenerationBuilder, rotateConsumerGeneration, withConsumerGenerationLock } from "./lib/pylon-consumer-lock.mjs";
 
 async function fixture(t) {
 	const directory = await mkdtemp(join(tmpdir(), "pylon-generation-operations-"));
@@ -208,4 +209,255 @@ test("v3 operation cold discovery preserves injected ENOENT even when a successo
 		return lstat(path);
 	} }), (actual) => actual === error);
 	assert.ok(fired);
+});
+
+function generationWorker(t, root, mode, cut = "", builder = "") {
+	const child = fork(new URL("./fixtures/generation-operation/worker.mjs", import.meta.url), [root, mode, cut, builder], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
+	const events = [];
+	let stderr = "";
+	child.stderr.on("data", (data) => { stderr += data.toString(); });
+	let cutResolve;
+	let cutReject;
+	const atCut = new Promise((resolve, reject) => { cutResolve = resolve; cutReject = reject; });
+	const exited = new Promise((resolve) => child.once("exit", (code, signal) => {
+		if (cut && !events.some((event) => event.type === "cut")) cutReject(new Error(`Worker exited before cut: ${JSON.stringify(events)} ${stderr}`));
+		resolve({ code, signal });
+	}));
+	child.on("message", (event) => { events.push(event); if (event.type === "cut") cutResolve(event); });
+	child.on("error", cutReject);
+	t.after(async () => {
+		if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+		await exited;
+	});
+	return { child, atCut, exited, events };
+}
+
+test("v3 operation SIGKILL projection cuts recover owned staging without callback replay", async (t) => {
+	for (const cut of ["projection-created", "projection-synced", "projection-before-rename", "projection-after-rename"]) {
+		const f = await fixture(t);
+		const worker = generationWorker(t, f.root, "commit", cut);
+		const observation = await worker.atCut;
+		assert.equal(observation.pid, worker.child.pid);
+		worker.child.kill("SIGKILL");
+		assert.equal((await worker.exited).signal, "SIGKILL");
+		let callbacks = 0;
+		await withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => { callbacks++; assert.equal(tx.readStateBytes().toString(), "worker-state"); }, options);
+		assert.equal(callbacks, 1);
+		const current = await prepareConsumerGeneration(f.root, f.authority, options);
+		assert.equal(current.receiptEntries.filter((entry) => entry.temporary).length, 0);
+		assert.equal((await readFile(f.authority.genesis.statePath)).toString(), "worker-state");
+		assert.deepEqual((await readdir(f.directory)).sort(), ["journal", "state.json"]);
+	}
+});
+
+test("v3 operation projection rename joins only native loss of its own observed inode", async (t) => {
+	for (const replacement of [false, true]) {
+		const f = await fixture(t);
+		const run = withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => tx.commitState(Buffer.from("candidate")), { ...options, hooks: {
+			beforeProjectionRename: async ({ source, destination }) => {
+				if (replacement) { await writeFile(destination, await readFile(source), { mode: 0o600 }); await rm(source); }
+				else await rename(source, destination);
+			},
+		} });
+		if (replacement) await assert.rejects(run, (error) => error.code === "ENOENT");
+		else await run;
+	}
+});
+
+for (const code of ["ENOENT", "EIO", "EPERM"]) {
+	test(`v3 operation projection preserves injected ${code} after real rename`, async (t) => {
+		for (const injection of ["renameFile", "beforeProjectionRename", "afterProjectionRename"]) {
+			const f = await fixture(t);
+			const error = Object.assign(new Error(injection), { code });
+			const raw = injection === "renameFile" ? { renameFile: async (source, destination) => {
+				await rename(source, destination); if (destination === f.authority.genesis.statePath) throw error;
+			} } : { hooks: { [injection]: async (observation) => {
+				if (observation.source) await rename(observation.source, observation.destination);
+				throw error;
+			} } };
+			await assert.rejects(withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => tx.commitState(Buffer.from("candidate")), { ...options, ...raw }), (actual) => actual === error);
+			await withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => assert.equal(tx.readStateBytes().toString(), "candidate"), options);
+		}
+	});
+}
+
+test("v3 operation rotation cleans exact decided projection writers despite PID reuse and fences their delayed rename", async (t) => {
+	const f = await fixture(t);
+	let paused = false;
+	await assert.rejects(withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => tx.commitState(Buffer.from("first")), { ...options, hooks: {
+		afterProjectionFileSync: async () => {
+			if (paused) return;
+			paused = true;
+			await withConsumerGenerationLock(f.root, f.authority, async () => {}, options);
+			await rotateConsumerGeneration(f.root, f.authority, options);
+		},
+	} }));
+	assert.ok(paused);
+	const current = await prepareConsumerGeneration(f.root, f.authority, options);
+	assert.equal(current.checkpoint.epoch, 2);
+	assert.equal(current.receiptEntries.filter((entry) => entry.temporary).length, 0);
+	assert.equal((await readFile(f.authority.genesis.statePath)).toString(), "first");
+});
+
+test("v3 operation heartbeat growth stops before consuming rotation certificate headroom", async (t) => {
+	const f = await fixture(t);
+	let beat;
+	let now = 1;
+	let beats = 0;
+	await assert.rejects(withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => {
+		await tx.commitState(Buffer.from("must remain staged"));
+		for (let index = 0; index < 100; index++) {
+			now++;
+			try { await beat(); beats++; } catch (error) { assert.match(error.message, /headroom/); break; }
+		}
+	}, { ...options, now: () => now, startHeartbeat: ({ beat: callback }) => { beat = callback; return async () => {}; } }), /headroom/);
+	assert.ok(beats > 0 && beats < 100);
+	const rotated = await rotateConsumerGeneration(f.root, f.authority, options);
+	assert.equal(rotated.epoch, 2);
+	await withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => assert.equal(tx.readStateBytes(), null), options);
+});
+
+test("v3 operation two processes join one observed builder inode after native rename loss", async (t) => {
+	const f = await fixture(t);
+	const builder = await buildConsumerGeneration(f.root, f.authority, options);
+	const first = generationWorker(t, f.root, "builder", "builder-before-publish", builder.path);
+	await first.atCut;
+	const second = generationWorker(t, f.root, "builder", "builder-before-publish", builder.path);
+	await second.atCut;
+	first.child.send("continue");
+	assert.equal((await first.exited).code, 0, JSON.stringify(first.events));
+	second.child.send("continue");
+	assert.equal((await second.exited).code, 0, JSON.stringify(second.events));
+	const current = await prepareConsumerGeneration(f.root, f.authority, options);
+	assert.equal(current.identity.ino, builder.identity.ino);
+});
+
+test("v3 operation two preparation helpers join committed retirement completion at rename cuts", async (t) => {
+	for (const cut of ["retire-before-rename", "delete-before-rename"]) {
+		const f = await fixture(t);
+		await prepareConsumerGeneration(f.root, f.authority, options);
+		const stopped = new Error("two finals");
+		await assert.rejects(rotateConsumerGeneration(f.root, f.authority, { ...options, hooks: { afterGenerationRename: () => { throw stopped; } } }), (error) => error === stopped);
+		const first = generationWorker(t, f.root, "prepare", cut);
+		await first.atCut;
+		const second = generationWorker(t, f.root, "prepare", cut);
+		await second.atCut;
+		first.child.send("continue");
+		assert.equal((await first.exited).code, 0, JSON.stringify(first.events));
+		second.child.send("continue");
+		assert.equal((await second.exited).code, 0, JSON.stringify(second.events));
+		assert.equal((await readdir(f.root)).length, 1);
+	}
+});
+
+
+test("v3 operation exact decided owners clean partial receipts of every operation kind despite PID reuse", async (t) => {
+	const f = await fixture(t);
+	let owner;
+	await withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => tx.commitState(Buffer.from("committed")), { ...options, hooks: { afterClaim: ({ claim }) => { owner = claim; } } });
+	const snapshot = await prepareConsumerGeneration(f.root, f.authority, options);
+	const sha = createHash("sha256").update(`${JSON.stringify(owner)}\n`).digest("hex");
+	const targets = [`claim-0000000000000001-${sha}.json`, "claim-index-0000000000000001.json", `heartbeat-0000000000000001-${owner.token}-0000000000000001.json`, `terminal-0000000000000001-${owner.token}.json`, `applied-0000000000000001-${owner.token}.json`, `transition-${"0".repeat(64)}.json`];
+	for (const name of targets) {
+		const targetHash = createHash("sha256").update(`epoch/${name}`).digest("hex");
+		await writeFile(join(snapshot.path, "receipts", `.receipt-p${process.pid}-w${randomUUID()}-t${targetHash}-g0000000000000001-c${sha}.tmp`), Buffer.alloc(0), { mode: 0o600 });
+	}
+	const result = await rotateConsumerGeneration(f.root, f.authority, options);
+	assert.equal(result.epoch, 2);
+	assert.equal((await readdir(f.root)).length, 1);
+});
+
+test("v3 operation live unresolved projection writers block rotation until their exact claim is decided", async (t) => {
+	const f = await fixture(t);
+	let owner;
+	let temporary;
+	await withConsumerGenerationLock(f.root, f.authority, async () => {
+		const snapshot = await prepareConsumerGeneration(f.root, f.authority, options);
+		const sha = createHash("sha256").update(`${JSON.stringify(owner)}\n`).digest("hex");
+		temporary = join(snapshot.path, "receipts", `.projection-p${process.pid}-g0000000000000001-c${sha}-t${snapshot.checkpoint.statePathSha256}-a${randomUUID()}.tmp`);
+		await writeFile(temporary, Buffer.alloc(0), { mode: 0o600 });
+		await assert.rejects(rotateConsumerGeneration(f.root, f.authority, options), /live unresolved projection/);
+		assert.equal((await lstat(temporary)).size, 0);
+	}, { ...options, hooks: { afterClaim: ({ claim }) => { owner = claim; } } });
+	await rotateConsumerGeneration(f.root, f.authority, options);
+	await assert.rejects(lstat(temporary), (error) => error.code === "ENOENT");
+});
+
+test("v3 operation independently installed winner permits bounded losing-builder cleanup across its last proof", async (t) => {
+	const f = await fixture(t);
+	const first = await buildConsumerGeneration(f.root, f.authority, options);
+	const loser = await buildConsumerGeneration(f.root, f.authority, options);
+	await publishConsumerGeneration(first, options);
+	const cut = new Error("loser last proof");
+	await assert.rejects(prepareConsumerGeneration(f.root, f.authority, { ...options, hooks: { generationBoundary: ({ phase, operation, path }) => {
+		if (phase === "after" && operation === "unlink" && path.startsWith(loser.path) && basename(path).startsWith("receipt-")) throw cut;
+	} } }), (error) => error === cut);
+	assert.ok((await readdir(f.root)).includes(basename(loser.path)));
+	await prepareConsumerGeneration(f.root, f.authority, options);
+	assert.equal((await readdir(f.root)).length, 1);
+	await assert.rejects(publishConsumerGeneration(loser, options));
+});
+
+test("v3 operation every pinned canonical metadata read preserves hook errors across ancestor retirement", async (t) => {
+	for (const kind of ["checkpoint.json", "retirement.json", "claim-", "claim-index-", "heartbeat-", "terminal-", "transition-", "applied-"]) {
+		for (const code of ["ENOENT", "EIO", "EPERM", "native-loss"]) {
+			const f = await fixture(t);
+			await withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => tx.commitState(Buffer.from("committed")), options);
+			const stopped = new Error("two finals");
+			await assert.rejects(rotateConsumerGeneration(f.root, f.authority, { ...options, hooks: { afterGenerationRename: () => { throw stopped; } } }), (error) => error === stopped);
+			const names = (await readdir(f.root)).filter((name) => name.startsWith("generation-")).sort();
+			const predecessorPath = join(f.root, names[0]);
+			const injected = Object.assign(new Error(`${kind} ${code}`), { code });
+			let fired = false;
+			await assert.rejects(readConsumerGeneration(predecessorPath, f.authority, { ...options, hooks: { metadataRead: { afterInitialStat: async ({ path }) => {
+				const name = basename(path);
+				if (!fired && path.startsWith(predecessorPath) && (kind === "claim-" ? name.startsWith("claim-") && !name.startsWith("claim-index-") : name.startsWith(kind))) {
+					fired = true;
+					await rename(predecessorPath, join(f.root, `.retired-${names[0]}`));
+					if (code !== "native-loss") throw injected;
+				}
+			} } } }), code === "native-loss" ? /changed|disappeared|ENOENT/ : (error) => error === injected);
+			assert.ok(fired, `${kind} ${code}`);
+		}
+	}
+});
+
+test("v3 operation schedules callback heartbeats only after projection preparation", async (t) => {
+	const f = await fixture(t);
+	f.authority.genesis.stateBytes = Buffer.from("base");
+	let prepared = false;
+	let started = false;
+	let stopped = false;
+	await withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => {
+		assert.ok(started);
+		assert.equal(tx.readStateBytes().toString(), "base");
+	}, { ...options, hooks: { afterProjectionRename: () => { assert.equal(started, false); prepared = true; } }, startHeartbeat: () => {
+		assert.ok(prepared);
+		started = true;
+		return async () => { stopped = true; };
+	} });
+	assert.ok(stopped);
+});
+
+test("v3 operation slow preparation loses ownership before callback without replay", async (t) => {
+	const f = await fixture(t);
+	f.authority.genesis.stateBytes = Buffer.from("base");
+	let now = 1;
+	let handedOff = false;
+	let callbacks = 0;
+	let schedules = 0;
+	await assert.rejects(withConsumerGenerationLock(f.root, f.authority, async () => { callbacks++; }, {
+		...options, now: () => now, stale: 100,
+		startHeartbeat: () => { schedules++; return async () => {}; },
+		hooks: { afterProjectionFileSync: async () => {
+			if (handedOff) return;
+			handedOff = true;
+			now = 1000;
+			await withConsumerGenerationLock(f.root, f.authority, async (_path, tx) => tx.commitState(Buffer.from("successor")), { ...options, now: () => now, stale: 100 });
+		} },
+	}), /ownership|claim|terminal|decided/);
+	assert.ok(handedOff);
+	assert.equal(callbacks, 0);
+	assert.equal(schedules, 0);
+	assert.equal((await readFile(f.authority.genesis.statePath)).toString(), "successor");
 });
