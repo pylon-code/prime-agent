@@ -89,8 +89,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 30 adds capability-gated same-supervisor recoverable owned-session adoption.
 // Revision 31 is reserved for the separate nonpersistent-worker candidate (#54).
 // Revision 32 integrates upstream roster/peer transport, usage/model metadata and session_recovering.
-export const DAEMON_SCHEMA_REVISION = 32;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-5b223a76a7e9";
+// Revision 33 preserves optional worker replay metadata on runtime snapshots under event_sequence.
+export const DAEMON_SCHEMA_REVISION = 33;
+export const DAEMON_RUNTIME_SNAPSHOT_REPLAY_MIN_SCHEMA_REVISION = 33;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-33-5924c5b19b8b";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -385,6 +387,41 @@ export interface DaemonReplayInfo {
 	fromCursor?: DaemonEventCursor;
 	toCursor?: DaemonEventCursor;
 	reason?: string;
+}
+
+/** Validate replay against the exact snapshot cut before exposing worker continuity metadata. */
+export function validateDaemonSnapshotReplay(
+	replay: DaemonReplayInfo,
+	snapshot: Pick<DaemonSessionSnapshot, "lastEventSequence" | "lastEventCursor">,
+): void {
+	const validSequence = (value: unknown): value is number =>
+		typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+	const validCursor = (cursor: DaemonEventCursor | undefined): boolean =>
+		cursor !== null &&
+		typeof cursor === "object" &&
+		typeof cursor.generation === "string" &&
+		cursor.generation.length > 0 &&
+		validSequence(cursor.sequence);
+	if (
+		replay === null ||
+		typeof replay !== "object" ||
+		!["complete", "partial", "unavailable"].includes(replay.status) ||
+		!validSequence(replay.toSequence) ||
+		replay.toSequence !== snapshot.lastEventSequence ||
+		(replay.reason !== undefined && typeof replay.reason !== "string") ||
+		(replay.toCursor !== undefined &&
+			(!validCursor(replay.toCursor) ||
+				replay.toCursor.sequence !== replay.toSequence ||
+				replay.toCursor.generation !== snapshot.lastEventCursor?.generation)) ||
+		(replay.fromSequence !== undefined && !validSequence(replay.fromSequence)) ||
+		(replay.fromCursor !== undefined &&
+			(!validCursor(replay.fromCursor) || replay.fromCursor.sequence !== replay.fromSequence)) ||
+		(replay.status !== "unavailable" &&
+			((replay.fromSequence !== undefined && replay.fromSequence > replay.toSequence) ||
+				(replay.fromCursor !== undefined && replay.fromCursor.generation !== snapshot.lastEventCursor?.generation)))
+	) {
+		throw new Error("Daemon returned invalid runtime snapshot replay metadata");
+	}
 }
 
 export interface DaemonEventMeta {
@@ -1438,6 +1475,8 @@ export type DaemonOutbound =
 			type: "session_resynced";
 			activeSessionId: string;
 			snapshot: DaemonSessionSnapshot;
+			/** Optional event_sequence metadata; absent on pre-revision-33 peers. */
+			replay?: DaemonReplayInfo;
 			meta?: DaemonEventMeta;
 	  }
 	| {
@@ -1454,6 +1493,8 @@ export type DaemonOutbound =
 			activeSessionId: string;
 			snapshotId: string;
 			snapshot: Omit<DaemonSessionSnapshot, "messages">;
+			/** Optional event_sequence metadata; absent on pre-revision-33 peers. */
+			replay?: DaemonReplayInfo;
 			messageCount: number;
 			targetChunkBytes: number;
 			purpose?: "attach" | "replacement" | "resync";
@@ -1553,6 +1594,8 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	side_question_event: LEGACY_DAEMON_COMMAND,
 	session_status: LEGACY_DAEMON_COMMAND,
 	session_replaced: LEGACY_DAEMON_COMMAND,
+	// Revision 33 adds optional replay fields under the existing event_sequence capability.
+	// The legacy event itself stays available to peers that do not consume those fields.
 	session_resynced: LEGACY_DAEMON_COMMAND,
 	session_attached: LEGACY_DAEMON_COMMAND,
 	session_snapshot_begin: LEGACY_DAEMON_COMMAND,

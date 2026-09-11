@@ -5902,6 +5902,10 @@ export class AgentDaemon {
 			activeSessionId: result.activeSessionId,
 			snapshotId: stream.id,
 			snapshot,
+			...(daemonClientCapabilitiesForSession(client, result.activeSessionId).has("event_sequence") &&
+			result.replay !== undefined
+				? { replay: result.replay }
+				: {}),
 			messageCount: stream.messageCount,
 			targetChunkBytes: stream.targetChunkBytes,
 			purpose: purpose === "catchup" ? "resync" : purpose,
@@ -7988,7 +7992,16 @@ export class AgentDaemon {
 								messages: result.snapshot.messages,
 								meta,
 							}
-						: { type: "session_resynced", activeSessionId, snapshot: result.snapshot, meta };
+						: {
+								type: "session_resynced",
+								activeSessionId,
+								snapshot: result.snapshot,
+								...(daemonClientCapabilitiesForSession(client, activeSessionId).has("event_sequence") &&
+								result.replay !== undefined
+									? { replay: result.replay }
+									: {}),
+								meta,
+							};
 				if (!this.write(client, catchup)) {
 					for (const remaining of pending.slice(index + 1)) {
 						this.queueClientCatchup(client, remaining.activeSessionId, remaining.purpose);

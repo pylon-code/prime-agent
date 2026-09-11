@@ -51,6 +51,7 @@ import {
 	collectDaemonLaunchEnv,
 	DAEMON_PROTOCOL_NAME,
 	DAEMON_PROTOCOL_VERSION,
+	DAEMON_RUNTIME_SNAPSHOT_REPLAY_MIN_SCHEMA_REVISION,
 	DAEMON_SCHEMA_REVISION,
 	DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION,
 	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
@@ -68,6 +69,7 @@ import {
 	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
 	isUnknownDaemonCommandError,
+	validateDaemonSnapshotReplay,
 } from "../daemon/daemon-protocol.js";
 import {
 	createDaemonSessionTransport,
@@ -3539,6 +3541,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			try {
 				staged = this.stageSnapshotCommit(message.snapshot, {
 					purpose: "resync",
+					replay: this.runtimeSnapshotReplay(message.snapshot, message.replay),
 					envelopeActiveSessionId: message.activeSessionId,
 					expectedSessionId: this.attachedSessionId,
 					progress: [
@@ -4528,6 +4531,20 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 	}
 
+	private runtimeSnapshotReplay(
+		snapshot: DaemonSessionSnapshot,
+		replay: DaemonReplayInfo | undefined,
+	): DaemonReplayInfo | undefined {
+		if (
+			replay === undefined ||
+			!this.supportsNegotiatedRuntimeCapability("event_sequence") ||
+			(this.client.hello?.schemaRevision ?? 0) < DAEMON_RUNTIME_SNAPSHOT_REPLAY_MIN_SCHEMA_REVISION
+		)
+			return undefined;
+		validateDaemonSnapshotReplay(replay, snapshot);
+		return replay;
+	}
+
 	private stageSnapshotCommit(
 		snapshot: DaemonSessionSnapshot,
 		options: {
@@ -4779,6 +4796,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				envelopeActiveSessionId: message.activeSessionId,
 				expectedSessionId: purpose === "resync" ? this.attachedSessionId : undefined,
 				expectedState: pendingReplacement?.header.state,
+				replay: this.runtimeSnapshotReplay(snapshot, assembly.begin.replay),
 				progress: [
 					...(pendingReplacement
 						? [

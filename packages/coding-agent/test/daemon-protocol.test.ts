@@ -403,7 +403,7 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("capability- and schema-gates fresh snapshot generation nonces", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(32);
+		expect(DAEMON_SCHEMA_REVISION).toBe(33);
 		expect(DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION).toBe(28);
 		expect(
 			getDaemonCommandCompatibilities({

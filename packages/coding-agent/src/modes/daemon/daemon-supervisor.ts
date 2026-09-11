@@ -122,6 +122,7 @@ import {
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
+	validateDaemonSnapshotReplay,
 	withoutCorrelatedPromptLifecycleSnapshot,
 } from "./daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
@@ -8068,6 +8069,9 @@ export class DaemonSupervisor {
 						activeSessionId: result.activeSessionId,
 						snapshotId: stream.id,
 						snapshot: snapshotHeader,
+						...(client.capabilities.has("event_sequence") && result.replay !== undefined
+							? { replay: result.replay }
+							: {}),
 						messageCount: stream.messageCount,
 						targetChunkBytes: stream.targetChunkBytes,
 						purpose,
@@ -8422,6 +8426,7 @@ export class DaemonSupervisor {
 				) {
 					throw new Error("Worker returned an invalid snapshot begin frame");
 				}
+				if (begin.replay !== undefined) validateDaemonSnapshotReplay(begin.replay, begin.snapshot);
 				const publicSummary = this.publicSummary(worker, begin.snapshot.summary);
 				const snapshot = {
 					...begin.snapshot,
@@ -8432,10 +8437,11 @@ export class DaemonSupervisor {
 					protocol: DAEMON_PROTOCOL_INFO,
 					activeSessionId,
 					snapshot,
-					replay: {
-						status: "complete",
+					replay: begin.replay ?? {
+						status: "unavailable",
 						toSequence: snapshot.lastEventSequence,
 						...(snapshot.lastEventCursor ? { toCursor: snapshot.lastEventCursor } : {}),
+						reason: "worker_snapshot_replay_not_reported",
 					},
 					lastEventSequence: snapshot.lastEventSequence,
 					...(snapshot.lastEventCursor ? { lastEventCursor: snapshot.lastEventCursor } : {}),
@@ -9157,7 +9163,15 @@ export class DaemonSupervisor {
 								messages: attached.result.snapshot.messages,
 								meta,
 							}
-						: { type: "session_resynced", activeSessionId, snapshot: attached.result.snapshot, meta };
+						: {
+								type: "session_resynced",
+								activeSessionId,
+								snapshot: attached.result.snapshot,
+								...(client.capabilities.has("event_sequence") && attached.result.replay !== undefined
+									? { replay: attached.result.replay }
+									: {}),
+								meta,
+							};
 				if (!this.write(client, catchup)) {
 					for (const remaining of pending.slice(index + 1)) {
 						this.queueCatchup(client, remaining.activeSessionId, remaining.purpose);

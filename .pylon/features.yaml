@@ -201,8 +201,10 @@ decisions:
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1847
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1756
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1864
+      - https://github.com/PrimeIntellect-ai/prime-agent/issues/1940
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2044
     fork_change: immutable-snapshot-transfer-isolated-retry-and-fresh-generation-v1
-    upstream_support: Prime through c382f09856d4 still lacks a capability-gated fresh snapshot-generation identity, attachment-local retry containment, and bounded large-transcript framing that preserve a healthy resident worker across mixed-version catch-up failures.
+    upstream_support: Prime v0.9.4 supplies snapshot catch-up, but runtime resync envelopes lose worker replay metadata. Preserve immutable transfer identities and isolated retries while carrying the actual worker replay through supervisor caching, inline resync and streamed snapshots under existing event_sequence negotiation; missing worker metadata remains unavailable.
     revisit_when:
       - Prime gives every mixed-version transfer immutable bytes and a unique generation identity while preserving the event cursor as ordering metadata.
       - Prime isolates one malformed or changing snapshot generation without recycling the healthy worker and bounds preparation, framing, drain waits, and spill ownership.

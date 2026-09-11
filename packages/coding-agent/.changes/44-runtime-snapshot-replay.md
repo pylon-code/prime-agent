@@ -1,0 +1,1 @@
+- Fixed native session catch-up losing worker replay metadata, so integrations can verify transcript continuity without accepting incomplete or mismatched snapshots.
