@@ -3834,27 +3834,54 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 		const source = `
 			import { rotateConsumerStateJournal } from ${JSON.stringify(pathToFileURL(resolve("scripts/fixtures/retained-publication-v2/pylon-consumer-lock.mjs")).href)};
 			try {
-				const result = await rotateConsumerStateJournal(process.argv[1]);
+				let admitted = false;
+				const result = await rotateConsumerStateJournal(process.argv[1], { hooks: { afterRotationEpochSync: async () => {
+					if (admitted) return;
+					admitted = true;
+					await new Promise((resolveRelease, rejectRelease) => {
+						process.once("message", (message) => {
+							if (message?.type !== "release-rotation") rejectRelease(new Error("Unexpected rotation barrier release"));
+							else resolveRelease();
+						});
+						process.send({ type: "rotation-admitted", pid: process.pid }, (error) => { if (error) rejectRelease(error); });
+					});
+				} } });
 				process.stdout.write(JSON.stringify(result));
 			} catch (error) {
 				console.error(error.stack);
 				process.exitCode = 1;
 			}
+			process.disconnect();
 		`;
 		const captured = captureChild(
 			["--input-type=module", "--eval", source, statePath],
-			{ cwd: resolve("."), stdio: ["ignore", "pipe", "pipe"] },
+			{ cwd: resolve("."), stdio: ["ignore", "pipe", "pipe", "ipc"] },
 		);
+		const ready = deferred();
+		let admitted = false;
+		let protocolError = null;
+		captured.child.on("message", (message) => {
+			if (admitted || message?.type !== "rotation-admitted" || message.pid !== captured.child.pid) {
+				protocolError = new Error("Rotation admission must identify its captured child exactly once.");
+				ready.reject(protocolError);
+				return;
+			}
+			admitted = true;
+			ready.resolve();
+		});
 		let stdout = "";
 		let stderr = "";
 		captured.child.stdout.setEncoding("utf8");
 		captured.child.stderr.setEncoding("utf8");
 		captured.child.stdout.on("data", (chunk) => { stdout += chunk; });
 		captured.child.stderr.on("data", (chunk) => { stderr += chunk; });
-		return captured.closed.then((status) => {
-			if (status.code === 0 && status.spawnError === null) return JSON.parse(stdout);
-			throw closedChildError("rotation child", status, stderr);
+		const result = captured.closed.then((status) => {
+			if (status.code === 0 && status.spawnError === null && admitted && protocolError === null) return JSON.parse(stdout);
+			const error = protocolError ?? closedChildError("rotation child", status, stderr);
+			ready.reject(error);
+			throw error;
 		});
+		return { ready: ready.promise, result, release: () => captured.child.send({ type: "release-rotation" }) };
 	};
 	const startLegacyLockChild = async (statePath, afterReleasePath = "") => {
 		const source = `
@@ -5972,15 +5999,23 @@ test("consumer state locking, recovery, transaction fencing, durability, and pat
 			await transaction.commitState(bytes("concurrent-after-rotation"));
 		}, { ...manualRuntime({ value: 3 }), maxLockGenerations: 2 });
 
-		const rotationWavePath = join(fixture, "concurrent-rotation-process-wave.json");
-		await withConsumerStateLock(rotationWavePath, async (_path, transaction) => {
-			await transaction.commitState(bytes("wave-anchor"));
-		}, manualRuntime({ value: 1 }));
-		const rotationWave = await Promise.all(Array.from({ length: 12 }, () => runRotationChild(rotationWavePath)));
-		assert.equal(rotationWave.every((result) => result.epoch === 2), true);
-		assert.deepEqual(rotationWave, Array.from({ length: 12 }, () => rotationWave[0]));
-		assert.equal(readdirSync(`${rotationWavePath}.journal`).filter((name) => name.startsWith("checkpoint-")).length, 1);
-		assert.equal(readdirSync(`${rotationWavePath}.journal`).filter((name) => name.startsWith("epoch-")).length, 1);
+		// The retained v2 oracle covers anchored convergence. Its unsupported cold
+		// discovery race is covered by the current v3 root-handoff and stress suites.
+		for (let round = 0; round < 3; round++) {
+			const rotationWavePath = join(fixture, `concurrent-rotation-process-wave-${round}.json`);
+			await withConsumerStateLock(rotationWavePath, async (_path, transaction) => {
+				await transaction.commitState(bytes("wave-anchor"));
+			}, manualRuntime({ value: 1 }));
+			const children = Array.from({ length: 12 }, () => runRotationChild(rotationWavePath));
+			const [, rotationWave] = await Promise.all([
+				Promise.all(children.map((child) => child.ready)).then(() => { for (const child of children) child.release(); }),
+				Promise.all(children.map((child) => child.result)),
+			]);
+			assert.equal(rotationWave.every((result) => result.epoch === 2), true);
+			assert.deepEqual(rotationWave, Array.from({ length: 12 }, () => rotationWave[0]));
+			assert.equal(readdirSync(`${rotationWavePath}.journal`).filter((name) => name.startsWith("checkpoint-")).length, 1);
+			assert.equal(readdirSync(`${rotationWavePath}.journal`).filter((name) => name.startsWith("epoch-")).length, 1);
+		}
 
 		for (const competitorHook of ["afterRotationEpochSync", "afterMetadataLink"]) {
 			const competingRotationPath = join(fixture, `competing-rotation-${competitorHook}.json`);
