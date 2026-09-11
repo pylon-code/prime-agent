@@ -383,7 +383,7 @@ test("preview manifest binds the full source tree, build, recipe, and build-mani
 	]) assert.throws(() => createPreviewManifest(release, releaseBytes, invalid), /sequence identity/);
 	for (const invalid of [
 		{ ...invocation, publicationPolicyRevision: 0 },
-		{ ...invocation, publicationPolicyRevision: 3 },
+		{ ...invocation, publicationPolicyRevision: 999 },
 		{ sequenceEpoch: 1, sequence: 17, workflowRunId: "33428882721" },
 	]) assert.throws(() => createPreviewManifest(release, releaseBytes, invalid), /policy revision/);
 	for (const mutate of [
@@ -3135,7 +3135,7 @@ test("stable manifest nested schema rejects extras, malformed identities, unsafe
 		(value) => (value.build.source.tree = "abc"),
 		(value) => (value.build.recipeRevision = 2),
 		(value) => delete value.build.publicationPolicyRevision,
-		(value) => (value.build.publicationPolicyRevision = 3),
+		(value) => (value.build.publicationPolicyRevision = 999),
 		(value) => (value.build.releaseManifest.file = "other.json"),
 		(value) => (value.build.previewManifest.file = "other.json"),
 		(value) => (value.build.assets[0].file = "../escape.tgz"),
@@ -3145,7 +3145,7 @@ test("stable manifest nested schema rejects extras, malformed identities, unsafe
 		(value) => value.build.assets.reverse(),
 		(value) => (value.promotion.policyTree = "abc"),
 		(value) => delete value.promotion.publicationPolicyRevision,
-		(value) => (value.promotion.publicationPolicyRevision = 3),
+		(value) => (value.promotion.publicationPolicyRevision = 999),
 	]) {
 		const changed = structuredClone(stable);
 		mutate(changed);
@@ -3595,7 +3595,7 @@ test("recipe and publication policy registries close independent immutable ident
 	const policies = registry.publicationPolicies;
 	const historicalPolicy = policies[0];
 	const policy = policies.at(-1);
-	assert.deepEqual(policies.map((candidate) => candidate.publicationPolicyRevision), [1, 2]);
+	assert.deepEqual(policies.map((candidate) => candidate.publicationPolicyRevision), [1, 2, 3]);
 	assert.equal(historicalPolicy.previewWorkflowSha256, "e790a5da7063bd40fbd886e84945c3200291194fdbd5b002079349e45356a41d");
 	assert.equal(historicalPolicy.stableWorkflowSha256, "dfcecdf6b58f143f9b7a543eadd124c190350ae29ac9eadccb907f1398b0958a");
 	const preview = readFileSync(join(root, policy.previewWorkflowPath), "utf8");
@@ -3676,11 +3676,11 @@ test("recipe and publication policy registries close independent immutable ident
 		/Administration-gated branch-protection read/,
 	);
 
-	assert.match(preview, /--publication-policy-revision 2/);
-	assert.match(preview, /preview(?:Manifest)?\.publicationPolicyRevision !== 2/);
-	assert.match(stable, /--publication-policy-revision 2/);
-	assert.match(stable, /promotion\?\.publicationPolicyRevision !== 2/);
-	assert.match(stable, /!\[1, 2\]\.includes\(manifest\.build\.publicationPolicyRevision\)/);
+	assert.match(preview, /--publication-policy-revision 3/);
+	assert.match(preview, /preview(?:Manifest)?\.publicationPolicyRevision !== 3/);
+	assert.match(stable, /--publication-policy-revision 3/);
+	assert.match(stable, /promotion\?\.publicationPolicyRevision !== 3/);
+	assert.match(stable, /!\[1, 2, 3\]\.includes\(manifest\.build\.publicationPolicyRevision\)/);
 	assert.throws(
 		() => validateApprovedWorkflowBytes(historicalPolicy.previewWorkflowPath, preview, "preview", 1, policies),
 		/bytes differ/,
@@ -3695,6 +3695,15 @@ test("recipe and publication policy registries close independent immutable ident
 	assert.equal(promotedByR2.build.recipeRevision, 1);
 	assert.equal(promotedByR2.build.publicationPolicyRevision, 1);
 	assert.equal(promotedByR2.promotion.publicationPolicyRevision, 2);
+	assert.equal(policies[1].previewWorkflowSha256, "9f4e3f38fb0bdb9c11662310c5369fb792765a3090e0f74b0ec0b34127b43ed8");
+	assert.equal(policies[1].stableWorkflowSha256, "0f04d1f55f54312d933087d88de6883e8408bb0cd9f060d3b5851d710698b1af");
+	for (const buildPolicy of [1, 2, 3]) {
+		const promotedByR3 = structuredClone(promotedByR2);
+		promotedByR3.build.publicationPolicyRevision = buildPolicy;
+		promotedByR3.promotion.publicationPolicyRevision = 3;
+		assert.equal(validateStableManifest(promotedByR3, registry.recipes, policies), promotedByR3);
+		assert.equal(promotedByR3.build.recipeRevision, 1);
+	}
 	const stableVerifier = readFileSync(join(root, "scripts/verify-pylon-stable-attestation.mjs"), "utf8");
 	assert.match(stableVerifier, /manifest\.promotion\.publicationPolicyRevision/);
 	assert.doesNotMatch(stableVerifier, /"stable",\s*manifest\.build\.recipeRevision/);
@@ -3702,7 +3711,7 @@ test("recipe and publication policy registries close independent immutable ident
 	assert.match(previewVerifier, /verified\.previewManifest\.publicationPolicyRevision/);
 	for (const mutate of [
 		(value) => delete value.promotion.publicationPolicyRevision,
-		(value) => (value.promotion.publicationPolicyRevision = 3),
+		(value) => (value.promotion.publicationPolicyRevision = 999),
 		(value) => (value.promotion.publicationPolicyRevision = 0),
 		(value) => delete value.build.publicationPolicyRevision,
 	]) {
@@ -6445,7 +6454,7 @@ test("stable stage survives a crash after createRelease by recovering its exact 
 	const oldManifest = process.env.STABLE_MANIFEST;
 	try {
 		const manifest = firstStable();
-		manifest.promotion.publicationPolicyRevision = 2;
+		manifest.promotion.publicationPolicyRevision = parseSupportedReleaseRecipeRegistry(readFileSync(join(root, "scripts/pylon-prime-supported-release-recipes-v1.json"), "utf8")).publicationPolicies.at(-1).publicationPolicyRevision;
 		const bytes = Buffer.from(canonicalJson(manifest));
 		const manifestPath = join(fixture, PYLON_STABLE_MANIFEST);
 		writeFileSync(manifestPath, bytes);
@@ -6467,13 +6476,20 @@ test("stable stage survives a crash after createRelease by recovering its exact 
 						return { data: draft };
 					},
 					getRelease: async () => ({ data: draft }),
+					uploadReleaseAsset: async (request) => {
+						assert.deepEqual(request, {
+							owner: "pylon-code", repo: "prime-agent", release_id: 51,
+							name: PYLON_STABLE_MANIFEST, data: bytes,
+							headers: { "content-type": "application/json", "content-length": bytes.length },
+						});
+						draft.assets = [{ id: 9, name: request.name, size: request.data.length, digest: `sha256:${sha256Bytes(request.data)}` }];
+						return { data: draft.assets[0] };
+					},
 				},
 			},
 			request: async (route, request) => {
-				if (route.startsWith("POST ")) {
-					draft.assets = [{ id: 9, name: request.name, size: request.data.length, digest: `sha256:${sha256Bytes(request.data)}` }];
-					return { data: draft.assets[0] };
-				}
+				assert.equal(route, "GET /repos/{owner}/{repo}/releases/assets/{asset_id}");
+				assert.deepEqual(request, { owner: "pylon-code", repo: "prime-agent", asset_id: 9, headers: { accept: "application/octet-stream" } });
 				return { data: bytes };
 			},
 		};
@@ -6527,7 +6543,8 @@ test("final tag CAS models reject squats and preserve reservation-tag-publish or
 	const reservationCas = publish.indexOf("- name: Create the exact protected stable reservation ref");
 	const stableTagCas = publish.indexOf("- name: Create or refetch the exact protected stable tag");
 	const immutablePublish = publish.indexOf("- name: Publish only the exact protected stable draft");
-	assert.ok(publish.indexOf('POST /repos/{owner}/{repo}/releases/{release_id}/assets') < reservationCas);
+	assert.ok(publish.indexOf("github.rest.repos.uploadReleaseAsset(") >= 0);
+	assert.ok(publish.indexOf("github.rest.repos.uploadReleaseAsset(") < reservationCas);
 	assert.ok(publish.indexOf("downloadedBytes.equals(bytes)") < reservationCas);
 	assert.ok(reservationCas >= 0 && reservationCas < stableTagCas);
 	assert.ok(stableTagCas < immutablePublish);
@@ -6695,4 +6712,166 @@ test("workflow static policy proves direct approvals and every contents-write gr
 		assert.match(attestationVerifier, new RegExp(flag));
 	}
 	assert.match(attestationVerifier, /verifyApprovedWorkflowAtSignerDigest/);
+});
+
+test("preview draft uploads six exact subjects through the release asset method and joins existing assets", async () => {
+	const fixture = mkdtempSync(join(tmpdir(), "pylon-preview-upload-"));
+	const saved = Object.fromEntries(["ARTIFACT_DIR", "GITHUB_RUN_NUMBER", "GITHUB_RUN_ID"].map((key) => [key, process.env[key]]));
+	try {
+		const release = fakeReleaseManifest();
+		for (const asset of release.assets) {
+			const bytes = Buffer.from([0, 255, 13, 10, asset.file.length]);
+			writeFileSync(join(fixture, asset.file), bytes);
+			asset.size = bytes.length;
+			asset.sha256 = sha256Bytes(bytes);
+			asset.sha512 = createHash("sha512").update(bytes).digest("hex");
+		}
+		release.attestationSubjects = release.assets.map((asset) => ({ name: asset.file, digest: { sha256: asset.sha256, sha512: asset.sha512 } }));
+		const releaseBytes = Buffer.from(JSON.stringify(release));
+		const policy = parseSupportedReleaseRecipeRegistry(readFileSync(join(root, "scripts/pylon-prime-supported-release-recipes-v1.json"), "utf8")).publicationPolicies.at(-1).publicationPolicyRevision;
+		const preview = createPreviewManifest(release, releaseBytes, { ...invocation, publicationPolicyRevision: policy });
+		writeFileSync(join(fixture, PYLON_RELEASE_MANIFEST), releaseBytes);
+		writeFileSync(join(fixture, PYLON_PREVIEW_MANIFEST), canonicalJson(preview));
+		Object.assign(process.env, { ARTIFACT_DIR: fixture, GITHUB_RUN_NUMBER: String(invocation.sequence), GITHUB_RUN_ID: invocation.workflowRunId });
+		const expected = new Map(readdirSync(fixture).map((name) => [name, readFileSync(join(fixture, name))]));
+		const uploads = [];
+		let draft;
+		let corruptReadback = false;
+		const listReleases = async () => {};
+		const github = {
+			paginate: async (method) => {
+				assert.equal(method, listReleases);
+				return [...(draft ? [draft] : []), { id: 50, tag_name: "pylon-build-gffffffffffff-r1", draft: true, assets: [] }];
+			},
+			request: async () => { throw new Error("Generic API requests cannot upload release assets"); },
+			rest: {
+				git: { getRef: async ({ ref }) => {
+					assert.ok(["heads/pylon", `tags/${release.build.id}`].includes(ref));
+					return { data: { object: { type: "commit", sha: source.commit } } };
+				} },
+				repos: {
+					listReleases,
+					createRelease: async (request) => {
+						draft = { ...request, id: 51, immutable: false, assets: [] };
+						return { data: structuredClone(draft) };
+					},
+					uploadReleaseAsset: async (request) => {
+						const bytes = expected.get(request.name);
+						assert.ok(bytes);
+						assert.ok(Buffer.isBuffer(request.data));
+						assert.deepEqual(request, {
+							owner: "pylon-code", repo: "prime-agent", release_id: 51, name: request.name, data: bytes,
+							headers: { "content-type": "application/octet-stream", "content-length": bytes.length },
+						});
+						assert.ok(!draft.assets.some((asset) => asset.name === request.name));
+						uploads.push(request.name);
+						const asset = { id: uploads.length, name: request.name, size: bytes.length, digest: `sha256:${sha256Bytes(bytes)}` };
+						draft.assets.push(asset);
+						return { data: asset };
+					},
+					getRelease: async ({ release_id }) => {
+						assert.equal(release_id, 51);
+						const readback = structuredClone(draft);
+						if (corruptReadback) readback.assets[0].digest = `sha256:${"f".repeat(64)}`;
+						return { data: readback };
+					},
+				},
+			},
+		};
+		const context = { repo: { owner: "pylon-code", repo: "prime-agent" }, eventName: "push", ref: PYLON_PUBLICATION_REF, sha: source.commit };
+		const execute = new AsyncFunction("github", "context", "core", "require", githubScriptForStep(PYLON_PREVIEW_WORKFLOW, "Create or finish the exact durable draft"));
+		assert.equal(await execute(github, context, {}, nodeRequire), 51);
+		assert.deepEqual(uploads, [...expected.keys()].sort());
+		assert.equal(await execute(github, context, {}, nodeRequire), 51);
+		assert.equal(uploads.length, 6, "joining a complete draft must not upload again");
+		draft.assets = draft.assets.slice(0, 1);
+		assert.equal(await execute(github, context, {}, nodeRequire), 51);
+		assert.equal(uploads.length, 11, "a partial draft uploads only its five missing subjects");
+		corruptReadback = true;
+		await assert.rejects(() => execute(github, context, {}, nodeRequire), /Staged preview asset differs/);
+		assert.equal(uploads.length, 11);
+	} finally {
+		for (const [key, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		rmSync(fixture, { recursive: true, force: true });
+	}
+});
+
+test("stable zero-asset recovery uploads and verifies body bytes before policy checks or reservation", async () => {
+	const script = githubScriptForStep(PYLON_STABLE_WORKFLOW, "Re-download and validate the exact stable transaction");
+	const execute = new AsyncFunction("github", "context", "core", "require", script);
+	const policyRead = new Error("reached post-upload policy proof");
+	const currentPolicy = parseSupportedReleaseRecipeRegistry(readFileSync(join(root, "scripts/pylon-prime-supported-release-recipes-v1.json"), "utf8")).publicationPolicies.at(-1).publicationPolicyRevision;
+	for (const policy of [1, 2, currentPolicy]) {
+		for (const corruption of [null, "metadata", "download"]) {
+			const manifest = firstStable();
+			manifest.promotion.publicationPolicyRevision = policy;
+			const bytes = Buffer.from(canonicalJson(manifest));
+			const values = {
+				DRAFT_ID: "51", MODE: "resume", OPERATION: "resume-promote", POLICY_SHA: source.commit, POLICY_TREE: source.tree,
+				PREVIEW_TAG: manifest.build.previewTag, RESERVATION_PRESENT: "false", REVOKE_STABLE_TAG: "", REASON: "",
+				EXPECTED_MANIFEST_SHA256: sha256Bytes(bytes),
+			};
+			const saved = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
+			Object.assign(process.env, values);
+			try {
+				const draft = {
+					id: 51, draft: true, immutable: false, assets: [],
+					body: publicationReleaseBody({ channel: "stable", tag: manifest.tag, source: source.commit, tree: source.tree,
+						recipeRevision: 1, policyCommit: source.commit, policyTree: source.tree, stableManifestBytes: bytes }),
+				};
+				const order = [];
+				const github = {
+					rest: {
+						git: {
+							getRef: async ({ ref }) => {
+								assert.equal(ref, "heads/pylon");
+								return { data: { object: { type: "commit", sha: source.commit } } };
+							},
+							getCommit: async () => { order.push("policy-proof"); throw policyRead; },
+							createTag: async () => { assert.fail("reservation must wait for policy proof"); },
+							createRef: async () => { assert.fail("tag CAS must wait for policy proof"); },
+						},
+						repos: {
+							getRelease: async ({ release_id }) => {
+								assert.equal(release_id, 51);
+								order.push("metadata");
+								return { data: structuredClone(draft) };
+							},
+							uploadReleaseAsset: async (request) => {
+								assert.ok(Buffer.isBuffer(request.data));
+								assert.deepEqual(request, {
+									owner: "pylon-code", repo: "prime-agent", release_id: 51, name: PYLON_STABLE_MANIFEST, data: bytes,
+									headers: { "content-type": "application/json", "content-length": bytes.length },
+								});
+								assert.equal(draft.assets.length, 0);
+								order.push("upload");
+								draft.assets.push({ id: 9, name: PYLON_STABLE_MANIFEST, size: bytes.length,
+									digest: `sha256:${corruption === "metadata" ? "f".repeat(64) : sha256Bytes(bytes)}` });
+								return { data: draft.assets[0] };
+							},
+							updateRelease: async () => { assert.fail("publication must wait for policy proof"); },
+						},
+					},
+					request: async (route, request) => {
+						assert.equal(route, "GET /repos/{owner}/{repo}/releases/assets/{asset_id}");
+						assert.deepEqual(request, { owner: "pylon-code", repo: "prime-agent", asset_id: 9, headers: { accept: "application/octet-stream" } });
+						order.push("download");
+						return { data: corruption === "download" ? Buffer.from("altered") : bytes };
+					},
+				};
+				const context = { repo: { owner: "pylon-code", repo: "prime-agent" }, eventName: "workflow_dispatch", ref: PYLON_PUBLICATION_REF, sha: source.commit };
+				const core = { setOutput: () => { assert.fail("no authority outputs before policy proof"); } };
+				await assert.rejects(() => execute(github, context, core, nodeRequire), corruption ? /singleton differs/ : (error) => error === policyRead);
+				assert.deepEqual(order, ["metadata", "upload", "metadata", "download", ...(corruption ? [] : ["policy-proof"])]);
+			} finally {
+				for (const [key, value] of Object.entries(saved)) {
+					if (value === undefined) delete process.env[key];
+					else process.env[key] = value;
+				}
+			}
+		}
+	}
 });

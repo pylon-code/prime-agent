@@ -410,7 +410,7 @@ decisions:
       - https://github.com/pylon-code/prime-agent/issues/53
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/32
-    fork_change: protected-publication-with-inode-bound-consumer-generations-v3
+    fork_change: protected-publication-with-inode-bound-consumer-generations-v3-and-upload-policy-3
     upstream_support: Prime's inherited publication path targets upstream R2 and npm channels and does not provide canonical Pylon-only exact-SHA admission, six immutable preview subjects, byte-preserving manual promotion, signed monotonic stable history, or append-only withdrawal.
     revisit_when:
       - Prime ships a repository-neutral immutable release and promotion primitive that preserves Pylon's exact source, workflow, attestation, stable-history, and withdrawal policy without upstream credentials or channel names.

@@ -88,7 +88,7 @@ The canonical preview manifest binds the full source commit/tree, artifact recip
 
 ```json
 {
-  "publicationPolicyRevision": 2,
+  "publicationPolicyRevision": 3,
   "sequenceEpoch": 1,
   "sequence": 123,
   "workflowRunId": "33428882721"
@@ -102,6 +102,10 @@ The canonical preview manifest binds the full source commit/tree, artifact recip
 The approved attester signs exactly six subjects with pinned `actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8`, whose reviewed pinned chain delegates to `actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d`. A read-only job verifies the exact subject set, SLSA v1 workflow predicate, GitHub OIDC issuer, signer digest/ref, public Rekor entry, and run invocation. Only then can checkout-free contents jobs fully stage and publish the exact draft.
 
 The directly `pylon-preview`-gated staging job re-reads live `pylon`, then a dedicated App-authenticated step performs the exact combined REST/GraphQL audit immediately before the separate `GITHUB_TOKEN` preview-tag CAS step. The directly gated publisher repeats live branch/tag checks and a fresh combined audit immediately before the separate immutable-release update. GraphQL is the final authoritative read in each audit. A stale admission or earlier audit is irrelevant. GitHub does not offer an atomic transaction across branch reads, tag creation, and release publication. Each read and compare-and-set is a separate fail-closed point-in-time check; this design does not claim cross-resource atomicity.
+
+All preview and stable asset uploads use the pinned GitHub client's `repos.uploadReleaseAsset` method. It selects `uploads.github.com`, encodes the required `name` query parameter, and sends the exact binary body and content length. A generic API-host POST does not supply that transport contract. Preview staging checks every returned asset receipt; stable staging and zero-asset recovery also download and hash the singleton before reservation or publication.
+
+Policy revision 3 binds these upload workflow bytes. Revisions 1 and 2 retain their original digests for historical verification and explicit stable recovery. A failed preview's valid source tag and empty draft remain attached to that source; a correction on a new source commit uses its own source-derived preview tag. Do not retarget the old tag or attach new-source bytes to its draft.
 
 ## Preview consumer high-water
 
