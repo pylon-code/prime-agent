@@ -7,7 +7,7 @@ const config = JSON.parse(encoded);
 const recoveryScenarios = { "recover-builder-checkpoint": "builder", "recover-dead-receipt": "commit", "recover-commit-receipt": "commit", "recover-migration-intent": "migrate-v2", "recover-projection": "commit" };
 const scenario = recoveryScenarios[requestedScenario] ?? requestedScenario;
 if (recoveryScenarios[requestedScenario]) config.recover = true;
-const state = join(directory, "state.json");
+const state = join(directory, config.stateRelative ?? "state.json");
 const lowRoot = join(directory, "journal");
 const authority = { genesis: { statePath: state, stateBytes: null } };
 const send = (message) => new Promise((resolve, reject) => process.send(message, (error) => error ? reject(error) : resolve()));

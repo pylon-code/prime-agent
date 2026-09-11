@@ -159,7 +159,7 @@ export async function readBoundedRegularFile(
 		handle = await openFile(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
 	} catch (error) {
 		if (openFile === open && error?.code === "ENOENT") return null;
-		if (["ELOOP", "EISDIR"].includes(error?.code)) {
+		if (openFile === open && ["ELOOP", "EISDIR"].includes(error?.code)) {
 			throw new Error(`${description} is not one regular non-symlink file.`);
 		}
 		throw error;
@@ -288,7 +288,7 @@ export function readBoundedRegularFileSync(
 		descriptor = openFile(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
 	} catch (error) {
 		if (openFile === openSync && error?.code === "ENOENT") return null;
-		if (["ELOOP", "EISDIR"].includes(error?.code)) throw new Error(`${description} is not one regular non-symlink file.`);
+		if (openFile === openSync && ["ELOOP", "EISDIR"].includes(error?.code)) throw new Error(`${description} is not one regular non-symlink file.`);
 		throw error;
 	}
 	try {

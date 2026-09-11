@@ -3,7 +3,7 @@ import { fork } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import * as old from "../protected-publication-v2/pylon-consumer-lock.mjs";
 import { withConsumerStateLock, buildConsumerGeneration, publishConsumerGeneration } from "../../lib/pylon-consumer-lock.mjs";
 import { generationBytes as bytes, generationDigest as digest, GENERATION_ZERO as ZERO } from "../../lib/pylon-generation-format.mjs";
@@ -18,7 +18,7 @@ export const recoveries = {
  "recover-migration-intent": { scenario: "migrate-v2", match: { hook: "migration", phase: "after", operation: "immutable-link", path: "state.json.journal-v3/intent.json" } },
  "recover-projection": { scenario: "commit", match: { hook: "generation", phase: "after", operation: "create-projection" } },
 };
-export const scenarios = [...Object.keys(recoveries), "fresh", "commit", "rotate", "builder", "loser-cleanup", ...families.map((family) => `migrate-${family}`), "migrate-v2-incomplete", "migrate-v2-retained"];
+export const scenarios = [...Object.keys(recoveries), "fresh", "fresh-nested", "commit", "rotate", "builder", "loser-cleanup", ...families.map((family) => `migrate-${family}`), "migrate-v2-incomplete", "migrate-v2-retained"];
 export async function fixture(scenario) {
  if (recoveries[scenario]) {
   const setup = recoveries[scenario]; const f = await fixture(setup.scenario); const owner = child(f, setup.scenario, { cutMatch: setup.match, marker: "setup-owner" });
@@ -28,7 +28,7 @@ export async function fixture(scenario) {
  }
  const directory = await realpath(await mkdtemp(join(tmpdir(), "pylon-publication-crash-")));
  await chmod(directory, 0o700);
- const state = join(directory, "state.json");
+ const state = join(directory, ...(scenario === "fresh-nested" ? ["one", "two"] : []), "state.json");
  const root = join(directory, "journal");
  const authority = { genesis: { statePath: state, stateBytes: null } };
  if (["builder", "loser-cleanup"].includes(scenario)) {
@@ -79,7 +79,7 @@ export async function cleanup(f) {
  await rm(f.directory, { recursive: true, force: true });
 }
 export function child(f, scenario, configuration = {}) {
- const process = fork(new URL("./worker.mjs", import.meta.url), [f.directory, scenario, JSON.stringify(configuration)], { stdio: ["ignore", "pipe", "pipe", "ipc"], execArgv: [] });
+ const process = fork(new URL("./worker.mjs", import.meta.url), [f.directory, scenario, JSON.stringify({ ...configuration, stateRelative: relative(f.directory, f.state) })], { stdio: ["ignore", "pipe", "pipe", "ipc"], execArgv: [] });
  const messages = []; const waiters = [];
  let output = ""; let ended = false;
  process.stdout.on("data", (data) => { output += data; }); process.stderr.on("data", (data) => { output += data; });

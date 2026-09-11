@@ -1,4 +1,5 @@
 import "./pylon-generation-migration.test.mjs";
+import "./pylon-publication-durability.test.mjs";
 import "./pylon-public-state.test.mjs";
 import "./pylon-generation-operations.test.mjs";
 import "./pylon-generation.test.mjs";

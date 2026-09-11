@@ -122,7 +122,11 @@ async function canonicalAncestors(state, options, create = false) {
    await boundary(options, "after", "mkdir", path);
    await sync(path, options);
    const parentHandle = await options.openFile(dirname(path), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-   try { await parentHandle.sync(); } finally { await parentHandle.close(); }
+   try {
+    await boundary(options, "before", "directory-sync", dirname(path));
+    await parentHandle.sync();
+    await boundary(options, "after", "directory-sync", dirname(path));
+   } finally { await parentHandle.close(); }
    stat = await options.lstatEntry(path);
   }
   if (!stat?.isDirectory() || stat.isSymbolicLink()) throw new Error("Migration ancestor must be a canonical real directory.");
@@ -140,6 +144,8 @@ async function receiptFor(meta, logical, target, expected, options, { publish = 
  const wanted = await absent(target, options);
  if (wanted !== null) {
   if (!sameBytes(await file(target, options), expected)) throw new Error("Migration immutable target has conflicting exact bytes.");
+  await sync(dirname(target), options, true);
+  if (!same(wanted, await options.lstatEntry(target))) throw new Error("Migration canonical target changed inode during durability join.");
   let proof = await absent(fixed, options);
   if (proof === null) {
    if (!repair) throw new Error("Interrupted legacy migration receipt requires explicitly acknowledged migration.");
@@ -157,6 +163,8 @@ async function receiptFor(meta, logical, target, expected, options, { publish = 
   }
   if (proof === null || !same(proof, wanted) || ![2, ...(logical === "guard.json" ? [3, 4] : [])].includes(wanted.nlink) || proof.nlink !== wanted.nlink) throw new Error("Migration immutable record lacks its exact durable receipt inode.");
   if (!sameBytes(await file(fixed, options), expected)) throw new Error("Migration receipt bytes changed.");
+  await sync(receipts, options);
+  if (!same(wanted, await options.lstatEntry(target)) || !same(proof, await options.lstatEntry(fixed))) throw new Error("Migration receipt changed inode during durability join.");
   return identity(wanted);
  }
  if (!publish) throw new Error("Migration required immutable record is absent.");
@@ -501,9 +509,14 @@ export function createConsumerMigrationApi(format) {
   const proofPath = join(meta, "guard.json");
   await immutable(meta, "guard.json", guardFor(intent), options);
   const sourceIdentity = identity(await options.lstatEntry(proofPath));
+  const synchronizeGuard = async () => {
+   await sync(meta, options); await sync(dirname(target), options);
+   if (!same(sourceIdentity, await options.lstatEntry(proofPath)) || !same(sourceIdentity, await options.lstatEntry(target)) || !sameBytes(await file(target, options), guard)) throw new Error("Migration guard durability join changed its exact proof-backed inode.");
+  };
   // guard.json and its receipt are immutable; the third link is the downgrade fence.
   if (sameBytes(current, guard)) {
    if (!same(sourceIdentity, await options.lstatEntry(target))) throw new Error("Migration v3 guard is a different inode from its proof.");
+   await synchronizeGuard();
    return;
   }
   const oldGuard = { schemaVersion: 1, kind: "pylon-consumer-legacy-lock-guard", statePathSha256: intent.statePathSha256 };
@@ -518,6 +531,7 @@ export function createConsumerMigrationApi(format) {
   if (same(sourceIdentity, before)) {
    const pending = await absent(temporary, options);
    if (pending !== null) { if (!same(sourceIdentity, pending)) throw new Error("Migration guard link was replaced."); await options.removeFile(temporary); await sync(meta, options); }
+   await synchronizeGuard();
    return;
   }
   if (previousIdentity === null ? before !== null : !same(previousIdentity, before)) throw new Error("Migration guard changed inode before replacement.");
@@ -526,7 +540,7 @@ export function createConsumerMigrationApi(format) {
   catch (error) { if (options.renameFile !== rename || error?.code !== "ENOENT" || !same(sourceIdentity, await absent(target, options))) throw error; }
   await boundary(options, "after", "guard-rename", target);
   if (!same(sourceIdentity, await options.lstatEntry(target)) || !sameBytes(await file(target, options), guard)) throw new Error("Migration guard replacement differs from its exact receipt-backed inode.");
-  await sync(meta, options); await sync(dirname(target), options);
+  await synchronizeGuard();
  }
  async function finalAuthority(state, meta, intent, options) {
   const observed = await historicalFromIntent(state, intent, options, { final: true });
@@ -613,11 +627,14 @@ export function createConsumerMigrationApi(format) {
    await file(path, options, options.metadataMaxBytes, true, 0);
    if (stat.nlink === 2) {
     if (!same(stat, canonicalStat)) throw new Error("Migration linked temporary lost its canonical inode.");
+    await sync(dirname(target), options, true);
+    if (!same(canonicalStat, await options.lstatEntry(target))) throw new Error("Migration cleanup canonical target changed inode during durability join.");
     await boundary(options, "before", "receipt-rename", fixed);
     if (!same(stat, await options.lstatEntry(path)) || !same(directoryIdentity, await directory(receipts, options))) throw new Error("Migration receipt cleanup was fenced by inode replacement.");
     try { await options.renameFile(path, fixed); }
     catch (error) { if (options.renameFile !== rename || error?.code !== "ENOENT" || !same(stat, await absent(fixed, options))) throw error; }
     await boundary(options, "after", "receipt-rename", fixed); await sync(receipts, options);
+    if (!same(stat, await options.lstatEntry(fixed)) || !same(canonicalStat, await options.lstatEntry(target))) throw new Error("Migration repaired receipt changed inode during durability join.");
    } else {
     const decided = canonicalStat !== null && same(canonicalStat, await absent(fixed, options));
     if (!decided && !dead(Number(match[1]), options)) throw new Error("Migration has a live unresolved receipt writer.");

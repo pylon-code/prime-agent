@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { closeSync, lstatSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,8 +13,8 @@ const readers = [
 ];
 
 for (const reader of readers) {
-	for (const code of ["ENOENT", "EIO", "EPERM"]) {
-		for (const stage of ["initial lstat", "open", "final lstat", "afterInitialPathStat", "afterInitialStat", "beforeFinalStat", "afterFinalStat", "stat", "read", "close"]) {
+	for (const code of ["ENOENT", "EIO", "EPERM", "ELOOP", "EISDIR"]) {
+		for (const stage of ["ELOOP", "EISDIR"].includes(code) ? ["open"] : ["initial lstat", "open", "final lstat", "afterInitialPathStat", "afterInitialStat", "beforeFinalStat", "afterFinalStat", "stat", "read", "close"]) {
 			test(`bounded ${reader.name} retains injected ${code} identity at ${stage}`, async () => {
 				const fixture = mkdtempSync(join(tmpdir(), "pylon-bounded-identity-"));
 				const path = join(fixture, "input");
@@ -59,6 +59,16 @@ for (const reader of readers) {
 			});
 		}
 	}
+	for (const replacement of ["symlink", "directory"]) test(`bounded ${reader.name} rejects native ${replacement} replacement before open`, async () => {
+		const fixture = mkdtempSync(join(tmpdir(), "pylon-bounded-unsafe-")); const path = join(fixture, "input");
+		try {
+			writeFileSync(path, "input");
+			await assert.rejects(async () => reader.read(path, { maxBytes: 1024, hooks: { afterInitialPathStat() {
+				renameSync(path, `${path}.original`);
+				if (replacement === "symlink") symlinkSync(`${path}.original`, path); else mkdirSync(path);
+			} } }), /not one regular non-symlink file/);
+		} finally { rmSync(fixture, { recursive: true, force: true }); }
+	});
 	test(`bounded ${reader.name} classifies only native initial and open absence`, async () => {
 		const fixture = mkdtempSync(join(tmpdir(), "pylon-bounded-native-"));
 		const path = join(fixture, "input");

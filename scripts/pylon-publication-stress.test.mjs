@@ -6,7 +6,7 @@ import { child, cleanup, fixture, families, projection } from "./fixtures/public
 
 const rounds = 10;
 const refusals = /actively locked|changed|disappeared|ENOENT|EEXIST|inode|receipt|publication|authority|conflicting|writer|ownership|claim|checkpoint|namespace|unfinished|incomplete|unsafe type, owner or exact permissions/;
-async function competition(t, f, scenarios, round) {
+async function competition(t, f, scenarios, round, historyProof) {
  const controlled = !scenarios[0].startsWith("migrate-") && round % 2 === 0;
  const workers = scenarios.map((scenario, index) => child(f, scenario, { pause: controlled && index === 0 ? "callback:after:stage:state.json" : undefined, append: true, stateMaxBytes: 8192, ready: true, marker: `round-${round}-${index}`, value: `value-${round}-${index}` }));
  try {
@@ -35,11 +35,14 @@ async function competition(t, f, scenarios, round) {
   if (!scenarios[0].startsWith("migrate-")) {
    const value = await projection(f); const history = value === "base" ? [] : JSON.parse(value);
    assert.equal(new Set(history).size, history.length, "Each admitted value appears exactly once");
-   for (const [index, result] of results.entries()) if (result.type === "done" && scenarios[index] === "commit") assert.ok(history.includes(`value-${round}-${index}`));
-   for (const entry of history.filter((entry) => entry.startsWith(`value-${round}-`))) {
-    const index = Number(entry.split("-").at(-1));
-    assert.equal(await readFile(join(f.directory, `round-${round}-${index}.callbacks`), "utf8"), "entered\nreturned\n");
+   assert.deepEqual(history.slice(0, historyProof.previous.length), historyProof.previous, "Every prior recovered value remains an exact prefix across later competition");
+   for (const [index, result] of results.entries()) if (result.type === "done" && scenarios[index] === "commit") historyProof.acknowledged.add(`value-${round}-${index}`);
+   for (const entry of historyProof.acknowledged) assert.ok(history.includes(entry), "Every acknowledged commit survives all later rounds");
+   for (const entry of history) {
+    const match = /^value-([0-9]+)-([0-9]+)$/.exec(entry); assert.ok(match);
+    assert.equal(await readFile(join(f.directory, `round-${match[1]}-${match[2]}.callbacks`), "utf8"), "entered\nreturned\n");
    }
+   historyProof.previous = history;
   }
   for (const result of results.filter((result) => result.type === "done")) assert.deepEqual(result.root, resumed.root);
   t.diagnostic(JSON.stringify({ round, scenarios, controlled, pids: workers.map((worker) => worker.process.pid), admitted: results.filter((result) => result.type === "done").length, refusals: results.filter((result) => result.type === "error").map((result) => result.message), root: resumed.root }));
@@ -48,9 +51,10 @@ async function competition(t, f, scenarios, round) {
 
 test("publication repeated four-process normal and rotation competition", { timeout: 600000 }, async (t) => {
  const f = await fixture("commit");
+ const historyProof = { previous: [], acknowledged: new Set() };
  try {
-  for (let round = 0; round < rounds; round++) await competition(t, f, round % 2 ? ["commit", "commit", "rotate", "rotate"] : ["commit", "commit", "commit", "commit"], round);
-  assert.ok((await projection(f)) === "base" || Array.isArray(JSON.parse(await projection(f))));
+  for (let round = 0; round < rounds; round++) await competition(t, f, round % 2 ? ["commit", "commit", "rotate", "rotate"] : ["commit", "commit", "commit", "commit"], round, historyProof);
+  assert.deepEqual(JSON.parse(await projection(f)), historyProof.previous);
  } finally { await cleanup(f); }
 });
 for (const family of families) test(`publication repeated four-process migration ${family}`, { timeout: 600000 }, async (t) => {
@@ -91,7 +95,7 @@ test("publication killed staged owner excludes peers and never replays its callb
 });
 
 test("publication recovers the linked rotation claim before its index CAS", { timeout: 60000 }, async () => {
- const f = await fixture("rotate"); const owner = child(f, "rotate", { cut: 17 }); let recovery;
+ const f = await fixture("rotate"); const owner = child(f, "rotate", { cutMatch: { hook: "generation", phase: "after", operation: "link", path: "state.json.journal-v3/journal-HASH-UUID/generation-0000000000000001-HASH/epoch/claim-0000000000000002-HASH.json" } }); let recovery;
  try {
   const cut = await owner.wait("cut"); assert.equal(cut.pid, owner.process.pid);
   assert.equal(cut.event.operation, "link"); assert.equal(cut.event.phase, "after"); assert.match(cut.event.path, /epoch\/claim-0000000000000002-HASH.json$/);
@@ -135,7 +139,7 @@ for (const replacement of ["same-byte-inode", "unknown-entry"]) test(`publicatio
 });
 
 test("publication recovery rotates a claim that consumes heartbeat headroom before callback", { timeout: 60000 }, async () => {
- const f = await fixture("recover-projection"); const owner = child(f, "recover-projection", { cut: 54 }); let recovery;
+ const f = await fixture("recover-projection"); const owner = child(f, "recover-projection", { cutMatch: { hook: "generation", phase: "after", operation: "link", path: "state.json.journal-v3/journal-HASH-UUID/generation-0000000000000001-HASH/epoch/claim-index-0000000000000003.json" } }); let recovery;
  try {
   const cut = await owner.wait("cut"); assert.equal(cut.pid, owner.process.pid); assert.equal(cut.event.operation, "link");
   assert.equal(cut.event.phase, "after"); assert.match(cut.event.path, /claim-index-0000000000000003.json$/);

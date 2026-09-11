@@ -35,12 +35,12 @@ for (const scenario of scenarios) test(`publication crash boundary inventory ${s
     if (scenario.startsWith("recover-")) assert.equal(value, scenario === "recover-projection" ? "candidate" : scenario === "recover-builder-checkpoint" ? null : "base");
     else if (scenario.startsWith("migrate-")) assert.equal(value, scenario.endsWith("incomplete") ? "base-advanced" : "base");
     else if (scenario === "rotate") assert.equal(value, "base");
-    else if (["fresh", "commit"].includes(scenario)) {
+    else if (["fresh", "fresh-nested", "commit"].includes(scenario)) {
      const markers = await readFile(join(f.directory, "owner.callbacks"), "utf8").catch((error) => { if (error.code === "ENOENT") return ""; throw error; });
      assert.ok(["", "entered\n", "entered\nreturned\n"].includes(markers), "Original callback never replayed");
      const returned = markers.endsWith("returned\n");
      const committed = observed.events.some((event) => event.hook === "generation" && event.operation === "link" && event.phase === "after" && event.path.includes("/terminal-"));
-     assert.equal(value, returned && committed ? "candidate" : scenario === "fresh" ? null : "base");
+     assert.equal(value, returned && committed ? "candidate" : scenario.startsWith("fresh") ? null : "base");
     }
     t.diagnostic(JSON.stringify({ scenario, index, ...expected, pid: observed.pid, signal: "SIGKILL", recoveryPid: result.pid, root: result.root, preservedEntries: beforeRecovery.length, projection: value, elapsedMs: Math.round(performance.now() - start) }));
    } finally { await owner.stop(); if (recovery) await recovery.stop(); await cleanup(f); }
