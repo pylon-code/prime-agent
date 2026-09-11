@@ -15,6 +15,7 @@ export type StreamFailureKind =
 	| "rate_limit"
 	| "server_error"
 	| "auth"
+	| "permission"
 	| "invalid_request"
 	| "malformed_response"
 	| "unknown";
@@ -25,7 +26,7 @@ export interface StreamFailureInfo {
 	providerErrorType?: string;
 	status?: number;
 	requestId?: string;
-	/** Upstream `Retry-After` translated to milliseconds, when the provider sent one. */
+	/** Server-requested wait before retrying (Retry-After header or reset info), in milliseconds. */
 	retryAfterMs?: number;
 	/** Truncated raw provider payload for post-mortems. */
 	raw?: string;
@@ -48,6 +49,7 @@ const KIND_MESSAGES: Record<StreamFailureKind, string> = {
 	rate_limit: "Provider rate limit exceeded",
 	server_error: "Provider server error",
 	auth: "Provider authentication failed",
+	permission: "Provider denied access to the requested resource",
 	invalid_request: "Provider rejected the request",
 	malformed_response: "Provider returned a malformed response",
 	unknown: "Provider stream failed",
@@ -72,8 +74,13 @@ export function classifyStreamFailure(providerErrorType?: string, status?: numbe
 		return "safety";
 	}
 	if (type.includes("overloaded") || status === 529) return "overloaded";
-	if (type.includes("rate_limit") || type.includes("throttl") || status === 429) return "rate_limit";
-	if (/authentication|permission|unauthorized/.test(type) || status === 401 || status === 403) return "auth";
+	// usage_not_included is Codex's plan-entitlement rejection, not bad credentials.
+	if (/rate_limit|usage_limit|usage_not_included|throttl/.test(type) || status === 429) {
+		return "rate_limit";
+	}
+	// Permission/403 shapes are entitlement or policy denials, not bad credentials: never auth-stale.
+	if (/authentication|unauthorized/.test(type) || status === 401) return "auth";
+	if (/permission|forbidden|access.?denied/.test(type) || status === 403) return "permission";
 	if (type.includes("invalid_request") || type.includes("not_found_error") || status === 400 || status === 404) {
 		return "invalid_request";
 	}
@@ -116,39 +123,6 @@ export function truncateRawPayload(raw: string): string {
 	return raw.length > MAX_RAW_LENGTH ? `${raw.slice(0, MAX_RAW_LENGTH)}…` : raw;
 }
 
-/**
- * Translate an HTTP `Retry-After` value (delta-seconds or HTTP-date) into a
- * non-negative millisecond wait. Returns undefined when the header is absent or
- * unparseable so callers fall back to their own backoff.
- */
-export function parseRetryAfterMs(value: string | null | undefined, now = Date.now()): number | undefined {
-	const raw = value?.trim();
-	if (!raw) return undefined;
-	const seconds = Number(raw);
-	if (Number.isFinite(seconds)) return seconds > 0 ? Math.round(seconds * 1000) : 0;
-	const retryAt = Date.parse(raw);
-	return Number.isFinite(retryAt) ? Math.max(0, retryAt - now) : undefined;
-}
-
-type HeaderSource = Headers | Record<string, unknown>;
-
-function readHeader(headers: unknown, name: string): string | undefined {
-	if (!headers || typeof headers !== "object") return undefined;
-	const source = headers as HeaderSource;
-	if (typeof (source as Headers).get === "function") {
-		return (source as Headers).get(name) ?? undefined;
-	}
-	const record = source as Record<string, unknown>;
-	const key = Object.keys(record).find((candidate) => candidate.toLowerCase() === name);
-	const value = key === undefined ? undefined : record[key];
-	return typeof value === "string" ? value : undefined;
-}
-
-/** Read `Retry-After` off any header carrier a provider SDK error might expose. */
-export function retryAfterMsFromHeaders(headers: unknown, now = Date.now()): number | undefined {
-	return parseRetryAfterMs(readHeader(headers, "retry-after"), now);
-}
-
 function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; detail?: string } {
 	if (error instanceof StreamFailureError) return { info: error.info };
 	if (!(error instanceof Error)) return { info: { kind: "unknown" } };
@@ -161,6 +135,7 @@ function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; d
 		request_id?: unknown;
 		headers?: unknown;
 		error?: unknown;
+		retryAfterMs?: unknown;
 		$metadata?: { requestId?: unknown };
 	};
 
@@ -185,20 +160,54 @@ function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; d
 					: undefined;
 
 	const headers = err.headers;
-	const headerRequestId = readHeader(headers, "request-id") ?? readHeader(headers, "x-request-id");
+	const headerRequestId = headerValue(headers, "request-id") ?? headerValue(headers, "x-request-id");
 	const rawRequestId = err.requestID ?? err.request_id ?? err.$metadata?.requestId ?? headerRequestId;
 	const requestId = typeof rawRequestId === "string" ? rawRequestId : undefined;
+	const retryAfterMs =
+		typeof err.retryAfterMs === "number" && err.retryAfterMs >= 0 ? err.retryAfterMs : parseRetryAfterMs(headers);
+
+	let kind = classifyStreamFailure(providerErrorType ?? error.message, status);
+	// Message text is too weak for these verdicts: without a structured type, only the status decides.
+	if ((kind === "auth" || kind === "permission") && providerErrorType === undefined) {
+		kind = classifyStreamFailure(undefined, status);
+	}
 
 	return {
 		info: {
-			kind: classifyStreamFailure(providerErrorType ?? error.message, status),
+			kind,
 			providerErrorType,
 			status,
 			requestId,
-			retryAfterMs: retryAfterMsFromHeaders(headers),
+			...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
 		},
 		detail: typeof bodyMessage === "string" ? bodyMessage : undefined,
 	};
+}
+
+function headerValue(headers: unknown, name: string): string | undefined {
+	if (!headers || typeof headers !== "object") return undefined;
+	if (typeof (headers as Headers).get === "function") {
+		return (headers as Headers).get(name) ?? undefined;
+	}
+	// Record-shaped headers must match case-insensitively, like real Headers.
+	for (const [key, value] of Object.entries(headers as Record<string, unknown>)) {
+		if (key.toLowerCase() === name && typeof value === "string") {
+			return value;
+		}
+	}
+	return undefined;
+}
+
+/** Parse Retry-After / Retry-After-Ms headers into a millisecond wait. */
+export function parseRetryAfterMs(headers: unknown): number | undefined {
+	const ms = Number(headerValue(headers, "retry-after-ms"));
+	if (Number.isFinite(ms) && ms >= 0) return ms;
+	const raw = headerValue(headers, "retry-after");
+	if (!raw) return undefined;
+	const seconds = Number(raw);
+	if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+	const date = Date.parse(raw);
+	return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
 }
 
 /**

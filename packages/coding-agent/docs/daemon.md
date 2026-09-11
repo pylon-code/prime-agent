@@ -120,6 +120,8 @@ Every sequenced event belongs to a worker generation. Clients retain the last `{
 
 A generation change invalidates comparison with the old sequence. Missing replay is not fatal: the attach snapshot is the durable recovery baseline. `DaemonAgentConnection` applies the snapshot, ignores duplicate or retired-generation events, and reports a resynchronized session to the UI.
 
+Schema revision 33 carries the worker's replay metadata on optional `session_resynced.replay` and `session_snapshot_begin.replay` fields for clients negotiating `event_sequence`. The SDK exposes runtime replay only after that capability is established for the current attachment and the peer reports revision 33 or later. It validates replay coordinates against the snapshot before committing. Missing metadata remains unknown; a cached snapshot from an older worker reports `unavailable` instead of inventing `complete`. Partial and unavailable worker results remain unchanged. Existing session, generation, transfer, and ownership checks still apply. These fields add no command, capability, or startup requirement; older clients can ignore them.
+
 Large snapshots are encoded in the worker and streamed as opaque chunks through a bounded supervisor cache. The supervisor never constructs a history-sized object.
 
 ## Private Worker Transport

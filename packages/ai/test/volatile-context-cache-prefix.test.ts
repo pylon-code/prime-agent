@@ -115,7 +115,7 @@ async function captureAnthropicPayload(volatileContext?: string): Promise<Captur
 	let captured: CapturedPayload | undefined;
 	await streamAnthropic(model, baseContext(volatileContext), {
 		apiKey: "fake-key",
-		maxRetries: 0,
+
 		onPayload: (payload) => {
 			captured = payload as CapturedPayload;
 			return payload;
@@ -245,7 +245,7 @@ describe("Anthropic volatile context placement", () => {
 		let captured: CapturedPayload | undefined;
 		await streamAnthropic(model, context, {
 			apiKey: "fake-key",
-			maxRetries: 0,
+
 			onPayload: (payload) => {
 				captured = payload as CapturedPayload;
 				return payload;
@@ -275,7 +275,7 @@ describe("Anthropic volatile context placement", () => {
 		// Routed through the registry, which owns the placement decision.
 		await streamSimple(model, source, {
 			apiKey: "fake-key",
-			maxRetries: 0,
+
 			onPayload: (payload) => {
 				captured = payload as CapturedPayload;
 				return payload;

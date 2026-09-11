@@ -41,6 +41,7 @@ describe("ENG-4509 side questions", () => {
 					expect(context.systemPrompt).toBe(systemPromptBefore);
 					expect(context.tools).toEqual([]);
 					expect(context.messages.map(getMessageText)).toEqual([
+						expect.stringContaining("The persistent memories produced across this session so far:"),
 						"The project codename is kestrel.",
 						"The codename is kestrel.",
 						expect.stringContaining("What is the project codename?"),
@@ -78,6 +79,7 @@ describe("ENG-4509 side questions", () => {
 				(context) => {
 					const texts = context.messages.map(getMessageText);
 					expect(texts).toEqual([
+						expect.stringContaining("The persistent memories produced across this session so far:"),
 						"Main context message.",
 						"main answer",
 						expect.stringContaining("First side question?"),
@@ -86,8 +88,8 @@ describe("ENG-4509 side questions", () => {
 					]);
 					expect(context.tools).toEqual([]);
 					// The instruction is repeated only on the first side turn.
-					expect(texts[2]).toContain("Answer this side question");
-					expect(texts[4]).not.toContain("Answer this side question");
+					expect(texts[3]).toContain("Answer this side question");
+					expect(texts[5]).not.toContain("Answer this side question");
 					return fauxAssistantMessage("second side answer");
 				},
 			]);
@@ -110,6 +112,38 @@ describe("ENG-4509 side questions", () => {
 		}
 	});
 
+	it("retries a transient provider error once and completes", async () => {
+		const harness = await createHarness();
+		try {
+			harness.setResponses([fauxAssistantMessage("main answer")]);
+			await harness.session.prompt("Main context message.");
+
+			harness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "500 Internal Server Error" }),
+				fauxAssistantMessage("recovered side answer"),
+			]);
+			const callsBefore = harness.faux.state.callCount;
+
+			const events: SideQuestionEvent[] = [];
+			const run = startSideQuestion(
+				harness.session,
+				"retry-1",
+				"Does this survive a transient failure?",
+				(event) => {
+					events.push(event);
+				},
+				[],
+				{ enabled: true, maxRetries: 3, baseDelayMs: 1, maxRetryDelayMs: 60_000 },
+			);
+			await run.done;
+
+			expect(harness.faux.state.callCount - callsBefore).toBe(2);
+			expect(events.at(-1)).toMatchObject({ status: "complete", answer: "recovered side answer" });
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("can finish while the main agent is still working", async () => {
 		const harness = await createHarness();
 		const mainStarted = deferred();
@@ -124,6 +158,7 @@ describe("ENG-4509 side questions", () => {
 				(context) => {
 					expect(context.tools).toEqual([]);
 					expect(context.messages.map(getMessageText)).toEqual([
+						expect.stringContaining("The persistent memories produced across this session so far:"),
 						"Run the main task.",
 						expect.stringContaining("Can I ask this concurrently?"),
 					]);

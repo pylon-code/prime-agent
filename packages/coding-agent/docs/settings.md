@@ -141,14 +141,9 @@ prime-agent --offline
 | `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts |
 | `retry.baseDelayMs` | number | `2000` | Base delay for agent-level exponential backoff (2s, 4s, 8s) |
 | `retry.provider.timeoutMs` | number | SDK default | Provider/SDK request timeout in milliseconds |
-| `retry.provider.maxRetries` | number | `0` while `retry.enabled` | Provider/SDK retry attempts |
-| `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
+| `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested retry delay before failing (60s) |
 
-Exactly one layer retries. While `retry.enabled` is true, provider/SDK retries default to `0` so a failed turn cannot fan out into `agent retries x SDK retries` upstream requests. Set `retry.provider.maxRetries` explicitly to override.
-
-Rate-limit and overload failures do not use the plain `retry.baseDelayMs` ladder. They back off from a longer base (15s for rate limits, 10s for overloads), apply jitter so concurrent agents do not resume in lockstep, and honor an upstream `Retry-After` when the provider sends one. Failures the provider did not classify keep the plain ladder.
-
-When a provider asks for a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g., Google's "quota will reset after 5h"), the turn fails immediately with an informative error instead of waiting silently. Set to `0` to disable the cap. Authentication failures never retry: waiting cannot fix an expired or rejected credential.
+When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g. a usage-limit reset hours away), auto-retry stops immediately with an informative error instead of waiting. Set to `0` to disable the cap.
 
 ```json
 {
@@ -158,7 +153,6 @@ When a provider asks for a retry delay longer than `retry.provider.maxRetryDelay
     "baseDelayMs": 2000,
     "provider": {
       "timeoutMs": 3600000,
-      "maxRetries": 0,
       "maxRetryDelayMs": 60000
     }
   }

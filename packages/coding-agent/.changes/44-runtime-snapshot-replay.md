@@ -1,0 +1,4 @@
+- Fixed native session catch-up losing worker replay metadata, so integrations can verify transcript continuity without accepting incomplete or mismatched snapshots.
+- Fixed reconnects stalling after a connection loss during attachment or snapshot loading.
+- Fixed daemon shutdown closing the client connection before acknowledging the request.
+- Fixed the agent roster staying stale after a direct session attachment.

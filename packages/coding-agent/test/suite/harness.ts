@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 /**
  * Local test harness for the new coding-agent test suite.
  */
@@ -16,7 +17,7 @@ import { AuthStorage } from "../../src/core/auth-storage.js";
 import type { AgentAutonomousConfig } from "../../src/core/autonomous.js";
 import { createExtensionProviderHooks } from "../../src/core/extension-provider-hooks.js";
 import type { ExtensionRunner } from "../../src/core/extensions/index.js";
-import { convertToLlm } from "../../src/core/messages.js";
+import { convertToLlm, HARNESS_DIGEST_CUSTOM_TYPE } from "../../src/core/messages.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
 import type { SubagentRuntimeHost } from "../../src/core/rlm-runtime.js";
 import { SessionManager } from "../../src/core/session-manager.js";
@@ -48,6 +49,13 @@ export function getMessageText(message: unknown): string {
 		.join("\n");
 }
 
+/** Session messages without the session-start harness digest injected at construction. */
+export function conversationMessages(source: { messages: AgentMessage[] }): AgentMessage[] {
+	return source.messages.filter(
+		(message) => !(message.role === "custom" && message.customType === HARNESS_DIGEST_CUSTOM_TYPE),
+	);
+}
+
 export function getUserTexts(harness: Harness): string[] {
 	return harness.session.messages
 		.filter((message) => message.role === "user")
@@ -74,6 +82,8 @@ export interface HarnessOptions {
 	agentMessageController?: AgentSessionMessageController;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	persistSession?: boolean;
+	/** Resume over an existing session file, mirroring production rehydration. */
+	existingSessionFile?: string;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
 	autonomous?: AgentAutonomousConfig;
@@ -119,9 +129,11 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	const sessionManager = options.persistSession
-		? SessionManager.create(tempDir, join(tempDir, "sessions"))
-		: SessionManager.inMemory();
+	const sessionManager = options.existingSessionFile
+		? SessionManager.open(options.existingSessionFile)
+		: options.persistSession
+			? SessionManager.create(tempDir, join(tempDir, "sessions"))
+			: SessionManager.inMemory();
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -161,6 +173,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		onResponse: providerHooks.onResponse,
 		transformContext: providerHooks.transformContext,
 	});
+	if (options.existingSessionFile) {
+		agent.state.messages = sessionManager.buildSessionContext().messages;
+	}
 	const extensionsResult = options.extensionFactories
 		? await createTestExtensionsResult(options.extensionFactories, tempDir)
 		: undefined;

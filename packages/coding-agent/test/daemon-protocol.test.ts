@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { isDaemonSessionSummary } from "../src/cli/daemon-launch.js";
 import {
 	cloneCallerOwnedSessionLaunchEnv,
 	collectDaemonLaunchEnv,
@@ -10,6 +11,7 @@ import {
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
 	DAEMON_COMMAND_COMPATIBILITY,
+	DAEMON_COMMAND_PLANE,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_OUTBOUND_COMPATIBILITY,
@@ -27,6 +29,7 @@ import {
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
+	isSessionPlaneDaemonCommand,
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
@@ -102,6 +105,7 @@ describe("daemon protocol helpers", () => {
 			orphanProcessJournalPath: "/state/orphans.jsonl",
 			supervisorSocketPath: "/tmp/supervisor.sock",
 			authenticationToken: "local-worker-token",
+			workerInstanceId: "instance-1",
 			rootActiveSessionId: "active",
 			callerOwnedEnvironmentContract: true,
 			sessionFile: "/sessions/root.jsonl",
@@ -133,6 +137,7 @@ describe("daemon protocol helpers", () => {
 		expect(durable).toMatchObject({
 			workerId: "worker",
 			callerOwnedEnvironmentContract: true,
+			workerInstanceId: "instance-1",
 			sessionFile: "/sessions/root.jsonl",
 			sessionDir: "/legacy/sessions",
 			telemetryDisabled: true,
@@ -285,7 +290,7 @@ describe("daemon protocol helpers", () => {
 		const workerSource = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-worker-protocol.ts"), "utf8");
 		const baseline = daemonSchemaDigest(daemonSource, workerSource);
 		const daemonMutations = [
-			['| "daemon_recoverable_owned_session_adoption_v1";', '| "daemon_recoverable_owned_session_adoption_v2";'],
+			['| "daemon_recoverable_owned_session_adoption_v1"', '| "daemon_recoverable_owned_session_adoption_v2"'],
 			['type: "create_recoverable_owned_session";', 'type: "create_recoverable_owned_session_v2";'],
 			[
 				'type: "commit_recoverable_owned_session_adoption";',
@@ -398,7 +403,7 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("capability- and schema-gates fresh snapshot generation nonces", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(30);
+		expect(DAEMON_SCHEMA_REVISION).toBe(33);
 		expect(DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION).toBe(28);
 		expect(
 			getDaemonCommandCompatibilities({
@@ -670,8 +675,48 @@ describe("daemon protocol helpers", () => {
 	it("keeps attachment routing out of the durable mutation journal", () => {
 		expect(isDaemonMutatingCommand({ type: "attach" })).toBe(false);
 		expect(isDaemonMutatingCommand({ type: "reattach" })).toBe(false);
+		// Journal replays after a reconnect would skip re-subscribing the new socket.
+		expect(isDaemonMutatingCommand({ type: "roster_subscribe" })).toBe(false);
+		expect(isDaemonMutatingCommand({ type: "roster_unsubscribe" })).toBe(false);
 		expect(isDaemonMutatingCommand({ type: "wait_for_headless_completion" })).toBe(true);
 		expect(isDaemonMutatingCommand({ type: "switch_session" })).toBe(true);
+	});
+
+	it("keeps the roster push additive for pre-roster clients", () => {
+		// Subscription commands and the push are capability-gated; a client that
+		// never sends roster_subscribe is never written a roster_update.
+		expect(DAEMON_COMMAND_COMPATIBILITY.roster_subscribe).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		expect(DAEMON_COMMAND_COMPATIBILITY.roster_unsubscribe).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.roster_update).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		// list responses now carry rosterStatus/statusLabel/lastHeardFromAt; the
+		// summary validator pre-roster clients shipped stays open to additive fields.
+		expect(
+			isDaemonSessionSummary({
+				id: "session-1",
+				activeSessionId: "active-1",
+				rosterStatus: "running",
+				statusLabel: "queued",
+				lastHeardFromAt: "2026-08-01T12:00:00.000Z",
+			}),
+		).toBe(true);
+	});
+
+	it("capability-gates direct worker transport discovery as a supervisor-only surface", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_direct_worker_transport).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 25,
+			capability: "direct_peer_transport",
+		});
+		// Only the supervisor issues tickets; workers and standalone daemons must not advertise it.
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain("direct_peer_transport");
+		expect(isDaemonMutatingCommand({ type: "get_direct_worker_transport" })).toBe(false);
+	});
+
+	it("classifies every command plane and never defaults unknown commands to the session plane", () => {
+		// A worker "list" means only that worker's sessions; the supervisor list is authoritative.
+		expect(DAEMON_COMMAND_PLANE.list).toBe("control");
+		expect(DAEMON_COMMAND_PLANE.prompt).toBe("session");
+		expect(isSessionPlaneDaemonCommand("no_such_command")).toBe(false);
 	});
 
 	it("reports replay availability from resume cursors", () => {
