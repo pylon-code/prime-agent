@@ -1,0 +1,70 @@
+{
+  "recover-builder-checkpoint": {
+    "count": 76,
+    "sha256": "f03c819ecf4e5cc6b4486326782cc2acdaea2c5dd5e18f2ef5137ad0a9b9c128"
+  },
+  "recover-commit-receipt": {
+    "count": 62,
+    "sha256": "3b12d0d6cec5e7bbe099ca4ec585d1365070943b379caba298c1ef5092ba9093"
+  },
+  "recover-migration-intent": {
+    "count": 171,
+    "sha256": "580a32a420f41f8203b87c013264aa4dbbd76d42006ae6c4447f00d37a23becb"
+  },
+  "recover-projection": {
+    "count": 95,
+    "sha256": "8c53c6c524b603e3e54c1f22e6c611d4bd0a2db7b62f8fea8129221daa048a5c"
+  },
+  "fresh": {
+    "count": 200,
+    "sha256": "3fecb7e88d67f631d1eb04d0aeb749c43234a6d877380bebe1aa541260c37825"
+  },
+  "commit": {
+    "count": 96,
+    "sha256": "681403b469c5ad85525886658dcb5539b75960977f2e26729ebf9e7a5c93047d"
+  },
+  "rotate": {
+    "count": 220,
+    "sha256": "51583d4f3d418c2d876aed13e5f5d2b560df22aee8916134ee0d82c37a1eec30"
+  },
+  "builder": {
+    "count": 26,
+    "sha256": "40dc44c30a950465f31b359bacf21443aed3b050326c248a4ad6c54db54ef463"
+  },
+  "loser-cleanup": {
+    "count": 20,
+    "sha256": "a8a77cefd6c48155f92f86880505791de3e6325eb31e73b1e0c598e2d155f2e0"
+  },
+  "migrate-v1": {
+    "count": 192,
+    "sha256": "11e5dcc90f0a6129a553c79b0fd777c89a92cd4abbf71fee830660542db94b93"
+  },
+  "migrate-prior-retired-v1": {
+    "count": 213,
+    "sha256": "583c44f3b52dbe855815189a19be1278abcac4c8062b727ad1609dfa9c2f4139"
+  },
+  "migrate-v2": {
+    "count": 192,
+    "sha256": "fc123fb9de7314ad5abafcc4ad50d1961656eb5674a7a89769ab5c6a81caf464"
+  },
+  "migrate-v1-v2": {
+    "count": 196,
+    "sha256": "5bd646380aab12e87493d82812cba42fb205b2627e51c3dd285b7905846a266e"
+  },
+  "migrate-prior-retired-v1-v2": {
+    "count": 217,
+    "sha256": "ca8f82d69210565d947a33ab0a1cf7701b45aad434fbd7ca6e613fc9a24f61a6"
+  },
+  "migrate-v2-incomplete": {
+    "count": 203,
+    "sha256": "3b0da45c87fc68a5c56c0aefb2d434941348cd5ebde220e275fc172fe7c91ff2"
+  },
+  "migrate-v2-retained": {
+    "count": 205,
+    "sha256": "ab1b5d33dd6ca0c58aa708ee454f6086d74867c6123b643d6af831c3783d677d"
+  },
+  "recover-dead-receipt": {
+    "count": 62,
+    "sha256": "1779428bb04a7a88567cb919b9f03065f004d2aa1f33bbc17b2518a040d7ebef"
+  }
+}

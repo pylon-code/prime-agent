@@ -4231,6 +4231,18 @@ function generationRetirementCertificate(snapshot, slot) {
 		epochIdentity: snapshot.epochIdentity, receiptsIdentity: snapshot.receiptsIdentity, slot,
 		entries: snapshot.canonicalEntries.filter((entry) => entry.name !== "retirement.json").map((entry) => generationCertificateEntry(snapshot, entry)).sort((a, b) => a.name.localeCompare(b.name)) };
 }
+function generationPendingRotation(snapshot, slot, scan, options) {
+ const certificateBytes = snapshot.retirementCertificate ?? metadataBytes(generationRetirementCertificate(snapshot, slot));
+ const wanted = consumerGenerationRotationClaim(snapshot.checkpoint, slot, { ...scan.tip, previousGenerationIdentity: snapshot.identity, retirementAuthoritySha256: generationRetirementDigest(certificateBytes) }, options.stateMaxBytes);
+ const name = basename(claimPath({ epochDirectory: "" }, wanted));
+ const pending = snapshot.epochRecords.get(name);
+ if (pending && !pending.equals(metadataBytes(wanted))) throw new Error("Generation pending rotation differs from its exact deterministic claim.");
+ // The durable certificate precedes this claim's canonical link and index CAS.
+ // Exclude only that exact claim while reconstructing its pre-publication source.
+ const prior = pending ? { ...snapshot, canonicalEntries: snapshot.canonicalEntries.filter((entry) => entry.name !== `epoch/${name}`) } : snapshot;
+ if (!metadataBytes(generationRetirementCertificate(prior, slot)).equals(certificateBytes)) throw new Error("Generation pending rotation certificate differs from its exact predecessor authority.");
+ return { certificateBytes, wanted };
+}
 function validateGenerationRetirementCertificate(snapshot, successor, options) {
 	const bytes = snapshot.retirementCertificate;
 	if (!Buffer.isBuffer(bytes) || generationRetirementDigest(bytes) !== successor.retirementAuthoritySha256 || !generationSameInode(snapshot.identity, successor.previousGenerationIdentity)) throw new Error("Generation retirement certificate does not bind the exact predecessor inode.");
@@ -4504,7 +4516,9 @@ async function generationQuiesce(snapshot, options, ownTemporary = null, require
 		if (receipt.target === null && !decided && temporaryProcessIsAlive({ pid: receipt.pid }, options)) throw new Error("Generation rotation is pending until its live unresolved receipt writer quiesces.");
 		if (!sameRetiredLinkStat(receipt.stat, await options.lstatEntry(path))) throw new Error("Generation receipt temporary inode changed before recovery.");
 		if (receipt.target === null) {
+			await generationBoundary(options, "before", "unlink", path);
 			await options.removeFile(path);
+			await generationBoundary(options, "after", "unlink", path);
 		} else {
 			const fixed = join(snapshot.path, "receipts", `receipt-${digest(Buffer.from(receipt.target))}.json`);
 			await generationBoundary(options, "before", "rename", fixed);
@@ -4832,12 +4846,16 @@ async function generationCleanupInstalledBuilders(root, current, options) {
 		for (const directory of ["epoch", "receipts"]) {
 			if (!names.includes(directory)) continue;
 			await generationNames(join(path, directory), 0, options);
+			await generationBoundary(options, "before", "remove-directory", join(path, directory));
 			await options.removeFile(join(path, directory), { recursive: true });
+			await generationBoundary(options, "after", "remove-directory", join(path, directory));
 			await generationSync(path, options);
 		}
 		if (!generationSameInode(identity, await generationDirectory(path, options))) throw new Error("Generation losing builder container was replaced.");
 		await generationNames(path, 0, options);
+		await generationBoundary(options, "before", "remove-directory", path);
 		await options.removeFile(path, { recursive: true });
+		await generationBoundary(options, "after", "remove-directory", path);
 		await generationSync(root, options);
 	}
 }
@@ -4870,14 +4888,13 @@ export async function rotateConsumerGeneration(root, authority, rawOptions = {})
 	if (latest?.type === "normal" && (!scan.terminals.has(`${latest.generation}:${latest.token}`) || (scan.terminals.get(`${latest.generation}:${latest.token}`).outcome === "commit" && !scan.applied.has(`${latest.generation}:${latest.token}`)))) throw new Error("Generation rotation requires a resolved normal operation frontier.");
 	if (latest?.type !== "rotation") {
 		const slot = (latest?.generation ?? 0) + 1;
-		const certificateBytes = metadataBytes(generationRetirementCertificate(snapshot, slot));
-		const wanted = consumerGenerationRotationClaim(snapshot.checkpoint, slot, { ...scan.tip, previousGenerationIdentity: snapshot.identity, retirementAuthoritySha256: generationRetirementDigest(certificateBytes) }, options.stateMaxBytes);
+		const { certificateBytes, wanted } = generationPendingRotation(snapshot, slot, scan, options);
 		const headroom = 2 * certificateBytes.length + 2 * metadataBytes(wanted).length + 2 * metadataBytes(claimIndexFor(wanted)).length + 2 * metadataBytes(wanted.intent.checkpoint).length;
 		if (await generationRootPreflight(root, options) + headroom > options.maxJournalBytes) throw new Error("Generation lacks reserved rotation headroom.");
 		await options.hooks?.beforeRotationDecision?.({ claim: wanted, intent: wanted.intent });
 		const result = await generationWriteReceipt(snapshot, "retirement.json", certificateBytes, options, async () => {
 			const current = await generationReadPinned(snapshot, options);
-			if (!metadataBytes(generationRetirementCertificate(current, slot)).equals(certificateBytes)) throw new Error("Generation retirement authority changed before certificate publication.");
+			if (!generationPendingRotation(current, slot, generationEpochAuthority(current, options), options).certificateBytes.equals(certificateBytes)) throw new Error("Generation retirement authority changed before certificate publication.");
 		});
 		if (!result.bytes?.equals(certificateBytes)) throw new Error("Generation retirement certificate lost its immutable publication.");
 		snapshot = await generationReadPinned(snapshot, options);
