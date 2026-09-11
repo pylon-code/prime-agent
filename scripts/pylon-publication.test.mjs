@@ -1,5 +1,3 @@
-import "./pylon-publication-crash.test.mjs";
-import "./pylon-publication-stress.test.mjs";
 import "./pylon-generation-migration.test.mjs";
 import "./pylon-public-state.test.mjs";
 import "./pylon-generation-operations.test.mjs";

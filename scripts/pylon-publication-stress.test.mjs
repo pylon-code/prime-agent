@@ -133,3 +133,16 @@ for (const replacement of ["same-byte-inode", "unknown-entry"]) test(`publicatio
   assert.equal(await projection(f), "base");
  } finally { await owner.stop(); if (recovery) await recovery.stop(); await cleanup(f); }
 });
+
+test("publication recovery rotates a claim that consumes heartbeat headroom before callback", { timeout: 60000 }, async () => {
+ const f = await fixture("recover-projection"); const owner = child(f, "recover-projection", { cut: 54 }); let recovery;
+ try {
+  const cut = await owner.wait("cut"); assert.equal(cut.pid, owner.process.pid); assert.equal(cut.event.operation, "link");
+  assert.equal(cut.event.phase, "after"); assert.match(cut.event.path, /claim-index-0000000000000003.json$/);
+  owner.process.kill("SIGKILL"); assert.equal((await owner.exit).signal, "SIGKILL");
+  recovery = child(f, "recover-projection", { recover: true, now: 1000000, marker: "capacity-recovery" });
+  const result = await recovery.finish(); assert.equal(result.finals.length, 1); assert.match(result.finals[0], /^generation-0000000000000002-/);
+  assert.equal(await projection(f), "candidate");
+  assert.equal(await readFile(join(f.directory, "capacity-recovery.callbacks"), "utf8"), "entered\n");
+ } finally { await owner.stop(); if (recovery) await recovery.stop(); await cleanup(f); }
+});

@@ -101,7 +101,10 @@ export function child(f, scenario, configuration = {}) {
   async finish() {
    const result = await exit;
    assert.deepEqual(result, { code: 0, signal: null }, `${JSON.stringify(messages.slice(-2))} ${output}`);
-   return messages.find((message) => message.type === "done");
+   const done = messages.find((message) => message.type === "done");
+   assert.ok(done, "Successful exit requires the complete terminal IPC proof");
+   assert.equal(done.pid, process.pid);
+   return done;
   },
   async stop() { if (!ended) process.kill("SIGKILL"); await exit; },
  };

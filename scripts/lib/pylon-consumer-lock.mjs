@@ -4961,7 +4961,17 @@ export async function withConsumerGenerationLock(root, authority, action, rawOpt
 		}
 		claim = { schemaVersion: 2, generation: slot, token: randomUUID(), type: "normal", ownerPid: process.pid, createdAtMs: options.now() };
 		if (!(await generationPublishClaim(snapshot, claim, options))) continue;
-		await generationOwnsClaim(snapshot, claim, options);
+		const owned = await generationOwnsClaim(snapshot, claim, options);
+		if (!(await generationHasOperationCapacity(owned.snapshot, options))) {
+			// Claim/index publication can consume the remaining admission margin.
+			// Release and rotate before heartbeat scheduling or callback entry.
+			const released = { schemaVersion: 2, generation: claim.generation, token: claim.token, outcome: "released" };
+			const result = await generationWriteReceipt(owned.snapshot, `epoch/terminal-${generationName(claim.generation)}-${claim.token}.json`, metadataBytes(released), options,
+				async (temporary) => generationOwnsClaim(owned.snapshot, claim, options, temporary));
+			if (!result.bytes.equals(metadataBytes(released))) throw new Error("Generation capacity release lost its exact claim ownership.");
+			await rotateConsumerGeneration(root, authority, options);
+			continue;
+		}
 		acquired = true;
 		break;
 	}
