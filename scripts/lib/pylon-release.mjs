@@ -7,6 +7,7 @@ import {
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
@@ -481,7 +482,8 @@ export function prepareOutputDirectory(outDir) {
 }
 
 export function packStagingPackage({ root, stagingDir, artifactsDir, assetFile, environment }) {
-	const output = runNpm(["pack", stagingDir, "--pack-destination", artifactsDir, "--silent"], {
+	// npm omits bundled dependencies when an ancestor of the package path is a symlink.
+	const output = runNpm(["pack", realpathSync(stagingDir), "--pack-destination", artifactsDir, "--silent"], {
 		cwd: root,
 		env: environment,
 		forwardStderr: true,

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import "./pylon-runtime-dependencies.test.mjs";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -12,6 +12,8 @@ import {
 	createReleasePackageJson,
 	isCanonicalSha512Integrity,
 	npmInvocation,
+	packStagingPackage,
+	readTarJson,
 	pylonDistribution,
 	PYLON_RELEASE_MANIFEST,
 	PYLON_RELEASE_NPM_VERSION,
@@ -368,5 +370,29 @@ test("both fresh pack workflows acquire locked runtime inputs before the offline
 		const offline = job.indexOf("unshare --net -- npm run release:pylon:pack");
 		assert.ok(install > 0 && hydrate > install && offline > hydrate, file);
 		assert.equal(job.split("npm run release:pylon:hydrate-runtime").length, 2);
+	}
+});
+
+test("packing through a symlinked staging parent retains bundled runtime files", () => {
+	const fixture = mkdtempSync(join(tmpdir(), "pylon-release-pack-link-"));
+	try {
+		const stage = join(fixture, "actual", "package");
+		const artifactsDir = join(fixture, "artifacts");
+		mkdirSync(join(stage, "node_modules", "runtime-fixture"), { recursive: true });
+		mkdirSync(artifactsDir);
+		writeFileSync(join(stage, "package.json"), JSON.stringify({
+			name: "pylon-pack-fixture", version: "1.0.0",
+			dependencies: { "runtime-fixture": "1.0.0" }, bundleDependencies: ["runtime-fixture"],
+		}));
+		const dependency = { name: "runtime-fixture", version: "1.0.0" };
+		writeFileSync(join(stage, "node_modules", "runtime-fixture", "package.json"), JSON.stringify(dependency));
+		symlinkSync(join(fixture, "actual"), join(fixture, "linked"), "dir");
+		const packed = packStagingPackage({
+			root: fixture, stagingDir: join(fixture, "linked", "package"), artifactsDir, assetFile: "fixture.tgz",
+			environment: { ...process.env, npm_config_offline: "true" },
+		});
+		assert.deepEqual(readTarJson(packed.path, "package/node_modules/runtime-fixture/package.json"), dependency);
+	} finally {
+		rmSync(fixture, { recursive: true, force: true });
 	}
 });
