@@ -147,10 +147,9 @@ export async function readBoundedRegularFile(
 	try {
 		pathEntry = await lstatEntry(path);
 	} catch (error) {
-		if (lstatEntry === lstat && error?.code === "ENOENT") return null;
+		if (error?.code === "ENOENT") return null;
 		throw error;
 	}
-	await hooks?.afterInitialPathStat?.({ path, stat: pathEntry });
 	if (pathEntry.isSymbolicLink?.() || !pathEntry.isFile()) {
 		throw new Error(`${description} is not one regular non-symlink file.`);
 	}
@@ -158,7 +157,7 @@ export async function readBoundedRegularFile(
 	try {
 		handle = await openFile(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
 	} catch (error) {
-		if (openFile === open && error?.code === "ENOENT") return null;
+		if (error?.code === "ENOENT") return null;
 		if (["ELOOP", "EISDIR"].includes(error?.code)) {
 			throw new Error(`${description} is not one regular non-symlink file.`);
 		}
@@ -190,7 +189,7 @@ export async function readBoundedRegularFile(
 		try {
 			finalPathEntry = await lstatEntry(path);
 		} catch (error) {
-			if (lstatEntry !== lstat || error?.code !== "ENOENT") throw error;
+			if (error?.code !== "ENOENT") throw error;
 			finalPathMissing = true;
 		}
 		let confirmedHandle = null;
@@ -276,10 +275,9 @@ export function readBoundedRegularFileSync(
 	try {
 		pathEntry = lstatEntry(path);
 	} catch (error) {
-		if (lstatEntry === lstatSync && error?.code === "ENOENT") return null;
+		if (error?.code === "ENOENT") return null;
 		throw error;
 	}
-	hooks?.afterInitialPathStat?.({ path, stat: pathEntry });
 	if (pathEntry.isSymbolicLink?.() || !pathEntry.isFile()) {
 		throw new Error(`${description} is not one regular non-symlink file.`);
 	}
@@ -287,7 +285,7 @@ export function readBoundedRegularFileSync(
 	try {
 		descriptor = openFile(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
 	} catch (error) {
-		if (openFile === openSync && error?.code === "ENOENT") return null;
+		if (error?.code === "ENOENT") return null;
 		if (["ELOOP", "EISDIR"].includes(error?.code)) throw new Error(`${description} is not one regular non-symlink file.`);
 		throw error;
 	}
@@ -316,7 +314,7 @@ export function readBoundedRegularFileSync(
 		try {
 			finalPathEntry = lstatEntry(path);
 		} catch (error) {
-			if (lstatEntry !== lstatSync || error?.code !== "ENOENT") throw error;
+			if (error?.code !== "ENOENT") throw error;
 			finalPathMissing = true;
 		}
 		let confirmedHandle = null;

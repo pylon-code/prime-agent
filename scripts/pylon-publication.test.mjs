@@ -1,3 +1,4 @@
+import "./pylon-bounded-file.test.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -1521,23 +1522,18 @@ test("bounded reads authenticate every exact monotone retirement cut and confirm
 			writeFileSync(path, exactBytes);
 			const base = lstatSync(path);
 			const pathEntry = preciseStat(base, transition === "link" ? 2 : 1, 10);
-			const before = preciseStat(base, transition === "link" ? 2 : 1, 10);
+			const before = transition === "unlink" ? base : preciseStat(base, 2, 10);
 			const after = preciseStat(base, transition === "link" ? 1 : 0, 20);
 			const finalPathEntry = preciseStat(base, 1, 20);
 			let lstats = 0;
 			await rejectGenericAsync(() => readBoundedRegularFile(path, {
 				maxBytes: 1024,
 				expectedSha256: exactDigest,
-				lstatEntry: async () => {
+				lstatEntry: transition === "unlink" ? lstatFile : async () => {
 					lstats += 1;
-					if (lstats === 1) return pathEntry;
-					if (transition === "unlink") {
-						const missing = new Error("precise final path is absent");
-						missing.code = "ENOENT";
-						throw missing;
-					}
-					return finalPathEntry;
+					return lstats === 1 ? pathEntry : finalPathEntry;
 				},
+				hooks: transition === "unlink" ? { afterFinalStat: () => rmSync(path) } : {},
 				openFile: async (openedPath, flags) => {
 					const handle = await openFileHandle(openedPath, flags);
 					let stats = 0;
@@ -1551,7 +1547,7 @@ test("bounded reads authenticate every exact monotone retirement cut and confirm
 					};
 				},
 			}));
-			assert.equal(lstats, 2);
+			assert.equal(lstats, transition === "unlink" ? 0 : 2);
 		};
 		await asyncExtraTransition("eligible-link", "link");
 		await asyncExtraTransition("eligible-unlink", "unlink");
@@ -2611,6 +2607,13 @@ test("stable checkpoint proof consumes exact retirements and fences namespace ch
 					await releaseProof.promise;
 				},
 				metadataRead: {
+					afterInitialPathStat: ({ path }) => {
+						if (removeBeforeScanOpen && path === original.checkpoint) {
+							assert.equal(scanRootCaptured, true);
+							removeBeforeScanOpen = false;
+							rmSync(path);
+						}
+					},
 					afterInitialStat: async ({ path }) => {
 						if (!phaseArmed || phase !== "afterInitialStat" || path !== proofPath) return;
 						phaseArmed = false;
@@ -2632,14 +2635,6 @@ test("stable checkpoint proof consumes exact retirements and fences namespace ch
 						scanRootCaptured = true;
 					}
 					return names;
-				},
-				openFile: async (path, flags, mode) => {
-					if (removeBeforeScanOpen && path === original.checkpoint) {
-						assert.equal(scanRootCaptured, true);
-						removeBeforeScanOpen = false;
-						rmSync(path);
-					}
-					return openFileHandle(path, flags, mode);
 				},
 			}));
 			const readerOutcome = outcome(reader);
@@ -3025,13 +3020,14 @@ test("stable checkpoint proof consumes exact retirements and fences namespace ch
 		const noHigherEpochBefore = directoryBytes(noHigherJournal.epoch);
 		let removeNoHigher = true;
 		await assert.rejects(
-			() => rotateConsumerStateJournal(noHigherPath, runtime({}, {
-				openFile: async (path, flags, mode) => {
-					if (removeNoHigher && path === noHigherJournal.checkpoint) {
-						removeNoHigher = false;
-						rmSync(path);
-					}
-					return openFileHandle(path, flags, mode);
+			() => rotateConsumerStateJournal(noHigherPath, runtime({
+				metadataRead: {
+					afterInitialPathStat: ({ path }) => {
+						if (removeNoHigher && path === noHigherJournal.checkpoint) {
+							removeNoHigher = false;
+							rmSync(path);
+						}
+					},
 				},
 			})),
 			/lost its current checkpoint/,

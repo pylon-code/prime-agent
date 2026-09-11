@@ -474,13 +474,7 @@ async function readSecureFile(path, maxBytes, description, options, minBytes = 1
 		description,
 		openFile: options.openFile,
 		lstatEntry: options.lstatEntry,
-		hooks: {
-			...hooks,
-			afterInitialPathStat: async (observation) => {
-				await options.afterInitialPathStat?.(observation);
-				await hooks?.afterInitialPathStat?.(observation);
-			},
-		},
+		hooks,
 		expectedSha256,
 		validateHandle: (handle, stat) => secureHandle(handle, stat, description, "file", options),
 	});
@@ -794,12 +788,13 @@ function checkpointProofOptions(entry, options, invalidRoot) {
 	let initialPathStat = true;
 	return {
 		...options,
-		afterInitialPathStat: async ({ path, stat }) => {
-			await options.afterInitialPathStat?.({ path, stat });
+		lstatEntry: async (path) => {
+			const stat = await options.lstatEntry(path);
 			if (path === entry.path && initialPathStat) {
 				initialPathStat = false;
 				if (!sameRetiredLinkStat(stat, entry.checkpointStat)) throw invalidRoot();
 			}
+			return stat;
 		},
 	};
 }
