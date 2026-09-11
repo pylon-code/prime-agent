@@ -69,6 +69,8 @@ A missing protected-environment variable, omitted secret, unavailable installati
 
 `.github/workflows/pylon-preview-release.yml` runs only for an exact canonical push to `refs/heads/pylon`. It uses Node `22.23.2` and npm `11.10.1`, packs twice with build networking disabled, compares all subjects byte for byte, and installs the first pack on Ubuntu Linux and macOS. Ubuntu is the supported gate for Linux and WSL2; native Windows publication support is deferred.
 
+The offline build enters its network namespace through `sudo unshare`. Before writing its receipt or spawning build commands, the release entrypoint restores the invoking non-root `SUDO_UID` and `SUDO_GID`, clearing supplementary groups first. It verifies the resulting real and effective identities; malformed sudo identities or failed credential changes stop the build. The build and its children keep the isolated network namespace, while output directories and artifacts belong to the runner that prepares the preview manifest afterward. Ordinary non-sudo builds retain their caller identity.
+
 The preview identity is:
 
 ```text

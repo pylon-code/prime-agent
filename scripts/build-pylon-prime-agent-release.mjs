@@ -3,6 +3,7 @@
 import { rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { restoreSudoBuildIdentity } from "./lib/pylon-release-identity.mjs";
 import {
 	assertCleanSource,
 	assertPinnedToolchain,
@@ -54,6 +55,7 @@ function buildOffline(environment) {
 }
 
 try {
+	restoreSudoBuildIdentity();
 	const args = parseArgs(process.argv.slice(2));
 	rmSync(join(root, PYLON_RELEASE_BUILD_RECEIPT), { force: true });
 	assertCleanSource(root, { rejectIgnoredInputs: true });
