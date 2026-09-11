@@ -78,7 +78,7 @@ try {
 	assertCleanSource(root, { rejectIgnoredInputs: true });
 	writeReleaseBuildReceipt(root, source, toolchain, lockfileSha256);
 	if (args.pack) {
-		packPylonPrimeAgentRelease(args.outDir ? ["--out-dir", args.outDir] : [], environment);
+		await packPylonPrimeAgentRelease(args.outDir ? ["--out-dir", args.outDir] : [], environment);
 	}
 } catch (error) {
 	console.error(error instanceof Error ? error.message : String(error));

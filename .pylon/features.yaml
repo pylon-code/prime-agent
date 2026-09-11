@@ -394,7 +394,7 @@ decisions:
       - https://github.com/pylon-code/pylon/issues/114
       - https://github.com/pylon-code/pylon/issues/193
       - https://github.com/pylon-code/pylon/issues/194
-    fork_change: deterministic-pylon-release-artifacts-v1
+    fork_change: deterministic-self-contained-pylon-release-artifacts-v2
     upstream_support: Prime's R2 packer accepts mutable channel and archive inputs, refreshes live model catalogs during normal builds, retains upstream package provenance, and does not produce a Pylon-owned deterministic manifest or integrity-complete internal artifact graph.
     revisit_when:
       - Pylon no longer maintains a Prime distribution or the upstream artifact recipe can emit the exact fork-owned deterministic contract without publication side effects.

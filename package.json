@@ -30,6 +30,7 @@
 		"release:pack": "node scripts/pack-prime-agent-release.mjs",
 		"release:pylon:build": "node scripts/build-pylon-prime-agent-release.mjs",
 		"release:pylon:hydrate-lock": "node scripts/hydrate-pylon-release-lock.mjs",
+		"release:pylon:hydrate-runtime": "node scripts/hydrate-pylon-runtime-inputs.mjs",
 		"release:pylon:pack": "node scripts/build-pylon-prime-agent-release.mjs --pack",
 		"release:pylon:verify": "node scripts/verify-pylon-prime-agent-release.mjs",
 		"release:pylon:preview": "node scripts/prepare-pylon-preview-manifest.mjs",

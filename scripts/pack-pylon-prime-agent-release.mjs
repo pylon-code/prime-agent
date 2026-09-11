@@ -3,6 +3,7 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { materializeRuntimeDependencies } from "./lib/pylon-runtime-dependencies.mjs";
 import {
 	assertCleanSource,
 	assertPinnedToolchain,
@@ -58,7 +59,7 @@ function requireBuiltPackages() {
 	}
 }
 
-export function packPylonPrimeAgentRelease(args = process.argv.slice(2), environment = process.env) {
+export async function packPylonPrimeAgentRelease(args = process.argv.slice(2), environment = process.env) {
 	const { outDir } = parseArgs(args);
 	assertCleanSource(root, { rejectIgnoredInputs: true });
 	assertPylonRepository(root);
@@ -78,6 +79,7 @@ export function packPylonPrimeAgentRelease(args = process.argv.slice(2), environ
 	const stagingRoot = join(output, "staging");
 	const artifactsDir = join(output, "artifacts");
 	const internalArtifacts = new Map();
+	const internalStaging = new Map();
 	const artifacts = [];
 
 	for (const releasePackage of PYLON_RELEASE_PACKAGES) {
@@ -96,10 +98,14 @@ export function packPylonPrimeAgentRelease(args = process.argv.slice(2), environ
 		validateLockedRegistryGraph(shrinkwrap, packageLock.packages, internalArtifacts);
 		const stagingDir = join(stagingRoot, releasePackage.packageDir);
 		copyReleasePackage(packageDirectory(root, releasePackage.packageDir), stagingDir, packageJson, shrinkwrap);
+		if (releasePackage.publicPackage) {
+			await materializeRuntimeDependencies({ root, stagingDir, internalStaging, environment });
+		}
 		const file = releaseAssetFile(releasePackage.assetStem, version);
 		const packed = packStagingPackage({ root, stagingDir, artifactsDir, assetFile: file, environment });
 		const artifact = { package: packageJson.name, file, version, ...packed };
 		artifacts.push(artifact);
+		internalStaging.set(sourcePackage.name, packed.path);
 		internalArtifacts.set(sourcePackage.name, {
 			packageName: packageJson.name,
 			file,
@@ -121,7 +127,7 @@ export function packPylonPrimeAgentRelease(args = process.argv.slice(2), environ
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
 	try {
-		packPylonPrimeAgentRelease();
+		await packPylonPrimeAgentRelease();
 	} catch (error) {
 		console.error(error instanceof Error ? error.message : String(error));
 		process.exit(1);

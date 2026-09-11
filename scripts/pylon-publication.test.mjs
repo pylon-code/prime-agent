@@ -389,7 +389,7 @@ test("preview manifest binds the full source tree, build, recipe, and build-mani
 	for (const mutate of [
 		(value) => (value.build.source.commit = "f".repeat(40)),
 		(value) => (value.build.source.tree = "f".repeat(40)),
-		(value) => (value.build.recipeRevision = 2),
+		(value) => (value.build.recipeRevision = 3),
 		(value) => (value.build.releaseManifest.sha256 = "f".repeat(64)),
 	]) {
 		const changed = structuredClone(preview);
@@ -3133,7 +3133,7 @@ test("stable manifest nested schema rejects extras, malformed identities, unsafe
 		(value) => (value.build.source.repository = "https://github.com/fork/prime-agent"),
 		(value) => (value.build.source.commit = "abc"),
 		(value) => (value.build.source.tree = "abc"),
-		(value) => (value.build.recipeRevision = 2),
+		(value) => (value.build.recipeRevision = 3),
 		(value) => delete value.build.publicationPolicyRevision,
 		(value) => (value.build.publicationPolicyRevision = 999),
 		(value) => (value.build.releaseManifest.file = "other.json"),
@@ -3595,7 +3595,7 @@ test("recipe and publication policy registries close independent immutable ident
 	const policies = registry.publicationPolicies;
 	const historicalPolicy = policies[0];
 	const policy = policies.at(-1);
-	assert.deepEqual(policies.map((candidate) => candidate.publicationPolicyRevision), [1, 2, 3]);
+	assert.deepEqual(policies.map((candidate) => candidate.publicationPolicyRevision), [1, 2, 3, 4]);
 	assert.equal(historicalPolicy.previewWorkflowSha256, "e790a5da7063bd40fbd886e84945c3200291194fdbd5b002079349e45356a41d");
 	assert.equal(historicalPolicy.stableWorkflowSha256, "dfcecdf6b58f143f9b7a543eadd124c190350ae29ac9eadccb907f1398b0958a");
 	const preview = readFileSync(join(root, policy.previewWorkflowPath), "utf8");
@@ -3676,11 +3676,11 @@ test("recipe and publication policy registries close independent immutable ident
 		/Administration-gated branch-protection read/,
 	);
 
-	assert.match(preview, /--publication-policy-revision 3/);
-	assert.match(preview, /preview(?:Manifest)?\.publicationPolicyRevision !== 3/);
-	assert.match(stable, /--publication-policy-revision 3/);
-	assert.match(stable, /promotion\?\.publicationPolicyRevision !== 3/);
-	assert.match(stable, /!\[1, 2, 3\]\.includes\(manifest\.build\.publicationPolicyRevision\)/);
+	assert.match(preview, /--publication-policy-revision 4/);
+	assert.match(preview, /preview(?:Manifest)?\.publicationPolicyRevision !== 4/);
+	assert.match(stable, /--publication-policy-revision 4/);
+	assert.match(stable, /promotion\?\.publicationPolicyRevision !== 4/);
+	assert.match(stable, /!\[1, 2, 3, 4\]\.includes\(manifest\.build\.publicationPolicyRevision\)/);
 	assert.throws(
 		() => validateApprovedWorkflowBytes(historicalPolicy.previewWorkflowPath, preview, "preview", 1, policies),
 		/bytes differ/,
@@ -3692,7 +3692,7 @@ test("recipe and publication policy registries close independent immutable ident
 	const promotedByR2 = firstStable();
 	promotedByR2.promotion.publicationPolicyRevision = 2;
 	assert.equal(validateStableManifest(promotedByR2, registry.recipes, policies), promotedByR2);
-	assert.equal(promotedByR2.build.recipeRevision, 1);
+	assert.equal(promotedByR2.build.recipeRevision, 2);
 	assert.equal(promotedByR2.build.publicationPolicyRevision, 1);
 	assert.equal(promotedByR2.promotion.publicationPolicyRevision, 2);
 	assert.equal(policies[1].previewWorkflowSha256, "9f4e3f38fb0bdb9c11662310c5369fb792765a3090e0f74b0ec0b34127b43ed8");
@@ -3702,8 +3702,23 @@ test("recipe and publication policy registries close independent immutable ident
 		promotedByR3.build.publicationPolicyRevision = buildPolicy;
 		promotedByR3.promotion.publicationPolicyRevision = 3;
 		assert.equal(validateStableManifest(promotedByR3, registry.recipes, policies), promotedByR3);
-		assert.equal(promotedByR3.build.recipeRevision, 1);
+		assert.equal(promotedByR3.build.recipeRevision, 2);
 	}
+	const promotedByR4 = firstStable();
+	promotedByR4.promotion.publicationPolicyRevision = 4;
+	for (const recipeRevision of [1, 2]) {
+		const historical = structuredClone(promotedByR4);
+		historical.build.recipeRevision = recipeRevision;
+		historical.build.id = historical.build.id.replace(/-r[0-9]+$/, `-r${recipeRevision}`);
+		historical.build.previewTag = historical.build.id;
+		historical.tag = historical.tag.replace(/-r[0-9]+$/, `-r${recipeRevision}`);
+		for (const buildPolicy of [1, 2, 3, 4]) {
+			historical.build.publicationPolicyRevision = buildPolicy;
+			assert.equal(validateStableManifest(historical, registry.recipes, policies), historical);
+		}
+	}
+	assert.equal((stable.match(/!\[1, 2, 3, 4\]\.includes\(manifest\.build\.publicationPolicyRevision\)/g) ?? []).length, 2);
+	assert.match(stable, /!\[1, 2, 3, 4\]\.includes\(manifest\.promotion\?\.publicationPolicyRevision\)/);
 	const stableVerifier = readFileSync(join(root, "scripts/verify-pylon-stable-attestation.mjs"), "utf8");
 	assert.match(stableVerifier, /manifest\.promotion\.publicationPolicyRevision/);
 	assert.doesNotMatch(stableVerifier, /"stable",\s*manifest\.build\.recipeRevision/);
@@ -6820,7 +6835,7 @@ test("stable zero-asset recovery uploads and verifies body bytes before policy c
 				const draft = {
 					id: 51, draft: true, immutable: false, assets: [],
 					body: publicationReleaseBody({ channel: "stable", tag: manifest.tag, source: source.commit, tree: source.tree,
-						recipeRevision: 1, policyCommit: source.commit, policyTree: source.tree, stableManifestBytes: bytes }),
+						recipeRevision: manifest.build.recipeRevision, policyCommit: source.commit, policyTree: source.tree, stableManifestBytes: bytes }),
 				};
 				const order = [];
 				const github = {

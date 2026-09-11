@@ -7,6 +7,7 @@ import {
 	mkdirSync,
 	readFileSync,
 	readdirSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
@@ -310,6 +311,7 @@ export function createReleasePackageJson({
 	delete packageJson.private;
 
 	if (releasePackage.publicPackage) {
+		packageJson.bundleDependencies = Object.keys({ ...packageJson.dependencies, ...packageJson.optionalDependencies }).sort();
 		packageJson.bin = { "prime-agent": "dist/bundle/cli.js" };
 		packageJson.piConfig = { ...(packageJson.piConfig || {}), name: "prime-agent", configDir: ".prime/agent" };
 	}
@@ -480,7 +482,8 @@ export function prepareOutputDirectory(outDir) {
 }
 
 export function packStagingPackage({ root, stagingDir, artifactsDir, assetFile, environment }) {
-	const output = runNpm(["pack", stagingDir, "--pack-destination", artifactsDir, "--silent"], {
+	// npm omits bundled dependencies when an ancestor of the package path is a symlink.
+	const output = runNpm(["pack", realpathSync(stagingDir), "--pack-destination", artifactsDir, "--silent"], {
 		cwd: root,
 		env: environment,
 		forwardStderr: true,

@@ -473,7 +473,7 @@ jobs:
               --operation "$OPERATION"
               --policy-sha "${{ github.sha }}"
               --policy-tree "$policy_tree"
-              --publication-policy-revision 3
+              --publication-policy-revision 4
             )
             if [ "$OPERATION" = withdraw ]; then
               args+=(--revoke-tag "$REVOKE_STABLE_TAG" --reason "$REASON")
@@ -557,7 +557,7 @@ jobs:
           if (
             manifest.schemaVersion !== 1 || manifest.channel !== "stable" ||
             manifest.repository !== "https://github.com/pylon-code/prime-agent" ||
-            manifest.promotion?.publicationPolicyRevision !== 3 ||
+            manifest.promotion?.publicationPolicyRevision !== 4 ||
             !/^pylon-stable-[0-9]{6}-g[0-9a-f]{12}-r[1-9][0-9]*$/.test(manifest.tag)
           ) throw new Error("Stable manifest identity is malformed.");
           NODE
@@ -663,8 +663,8 @@ jobs:
             if (
               !parsed || !preview || Number(parsed[1]) !== manifest.sequence || parsed[2] !== manifest.build.source?.commit?.slice(0, 12) ||
               Number(parsed[3]) !== manifest.build.recipeRevision || preview[1] !== parsed[2] || Number(preview[2]) !== manifest.build.recipeRevision ||
-              manifest.build.previewTag !== manifest.build.id || ![1, 2, 3].includes(manifest.build.publicationPolicyRevision) ||
-              manifest.promotion?.policyCommit !== context.sha || manifest.promotion?.publicationPolicyRevision !== 3
+              manifest.build.previewTag !== manifest.build.id || ![1, 2, 3, 4].includes(manifest.build.publicationPolicyRevision) ||
+              manifest.promotion?.policyCommit !== context.sha || manifest.promotion?.publicationPolicyRevision !== 4
             ) throw new Error("Stable draft identity is malformed or not signed by this policy commit.");
             const name = `Pylon Prime stable ${tag}`;
             const encoded = bytes.toString("base64");
@@ -840,10 +840,10 @@ jobs:
               Number(previewMatch[2]) !== manifest.build?.recipeRevision || manifest.build.previewTag !== manifest.build.id ||
               manifest.build.previewSequence?.sequenceEpoch !== 1 || !Number.isSafeInteger(manifest.build.previewSequence?.sequence) ||
               manifest.build.previewSequence.sequence < 1 || !/^[1-9][0-9]*$/.test(manifest.build.previewSequence?.workflowRunId ?? "") ||
-              manifest.build.previewTag !== process.env.PREVIEW_TAG || ![1, 2, 3].includes(manifest.build.publicationPolicyRevision) ||
+              manifest.build.previewTag !== process.env.PREVIEW_TAG || ![1, 2, 3, 4].includes(manifest.build.publicationPolicyRevision) ||
               manifest.promotion?.kind !== operation ||
-              (mode === "normal" ? manifest.promotion?.publicationPolicyRevision !== 3 :
-                ![1, 2, 3].includes(manifest.promotion?.publicationPolicyRevision)) ||
+              (mode === "normal" ? manifest.promotion?.publicationPolicyRevision !== 4 :
+                ![1, 2, 3, 4].includes(manifest.promotion?.publicationPolicyRevision)) ||
               manifest.promotion?.policyCommit !== process.env.POLICY_SHA || manifest.promotion?.policyTree !== process.env.POLICY_TREE
             ) throw new Error("Stable manifest, preview recipe, operator request, or policy identity differs.");
             if (operation === "withdraw") {

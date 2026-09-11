@@ -254,6 +254,7 @@ jobs:
           test "$(node --version)" = "v${PYLON_RELEASE_NODE}"
           test "$(npm --version)" = "${PYLON_RELEASE_NPM}"
           npm ci
+          npm run release:pylon:hydrate-runtime
 
       - name: Test release contract
         run: npm run test:pylon-release
