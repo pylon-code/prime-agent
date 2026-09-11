@@ -53,6 +53,7 @@ function makeWorkerReporter(connected = true): WorkerReporterFixture {
 		cronStore: { list: () => [], cancelJobsForSession: () => [] },
 		summarizer: { forget: () => {} },
 		acpMcpOwners: new Map(),
+		snapshotPayloadGenerations: new Map(),
 		rosterReporter: {
 			lastComposed: new Map<string, WorkerRosterEntry>(),
 			lastComposedJson: new Map<string, string>(),

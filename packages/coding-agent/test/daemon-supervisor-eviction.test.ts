@@ -1149,7 +1149,9 @@ describe("daemon supervisor scheduled-session wake", () => {
 		stopping.workers.set("owned-worker", owned);
 		vi.spyOn(stopping, "cancelScheduledJobsForSessionTree").mockRejectedValue(new Error("store busy"));
 
-		await stopping.stopWorkerUntracked(owned, true, true);
+		await expect(stopping.stopWorkerUntracked(owned, true, true)).rejects.toThrow(
+			"Owned worker scheduled cleanup is incomplete",
+		);
 		await stopping.scheduledWakeRecompute;
 
 		// The stop tombstone survives the failed cancel as the durable intent.

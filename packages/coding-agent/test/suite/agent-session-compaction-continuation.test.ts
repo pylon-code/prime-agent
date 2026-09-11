@@ -14,7 +14,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentSession } from "../../src/core/agent-session.js";
+import { type AgentSession, CompactionSkippedError } from "../../src/core/agent-session.js";
 import { createHarness, type Harness } from "./harness.js";
 import { gatedHook } from "./scheduling.js";
 
@@ -399,66 +399,84 @@ describe("compaction continuation", () => {
 		await harness.session.waitForHeadlessIdle();
 	});
 
-	it("adopts an older settlement when a skipped compaction schedules recovery", async () => {
-		let markBackgroundStarted = () => {};
-		const backgroundStarted = new Promise<void>((resolve) => {
-			markBackgroundStarted = resolve;
-		});
-		let releaseBackground = () => {};
-		const backgroundGate = new Promise<void>((resolve) => {
-			releaseBackground = resolve;
-		});
-		const harness = await createHarness({
-			tools: [createBigTool()],
-			settings: { compaction: { enabled: true, reserveTokens: 500, keepRecentTokens: 1 } },
-			models: [{ id: "faux-1", contextWindow: 6_000 }],
-			persistSession: true,
-			extensionFactories: [
-				(pi) => {
-					pi.on("session_before_compact", async () => ({ cancel: true }));
+	it.each(["skipped", "cancelled"] as const)(
+		"preserves older settlement ownership for %s compaction",
+		async (outcome) => {
+			let markBackgroundStarted = () => {};
+			const backgroundStarted = new Promise<void>((resolve) => {
+				markBackgroundStarted = resolve;
+			});
+			let releaseBackground = () => {};
+			const backgroundGate = new Promise<void>((resolve) => {
+				releaseBackground = resolve;
+			});
+			const harness = await createHarness({
+				tools: [createBigTool()],
+				settings: { compaction: { enabled: true, reserveTokens: 500, keepRecentTokens: 1 } },
+				models: [{ id: "faux-1", contextWindow: 6_000 }],
+				persistSession: true,
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_compact", async () => ({ cancel: true }));
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					markBackgroundStarted();
+					await backgroundGate;
+					return fauxAssistantMessage("background complete");
 				},
-			],
-		});
-		harnesses.push(harness);
-		harness.setResponses([
-			async () => {
-				markBackgroundStarted();
-				await backgroundGate;
-				return fauxAssistantMessage("background complete");
-			},
-			fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" }),
-		]);
+				fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" }),
+			]);
 
-		const background = harness.session.prompt("background");
-		await backgroundStarted;
-		const internals = harness.session as unknown as {
-			_schedulePostCompactionContinue(): void;
-			_postCompactionContinuationSettlement?: object;
-			_postCompactionPromptOwners: WeakMap<object, string>;
-		};
-		internals._schedulePostCompactionContinue();
-		const olderSettlement = internals._postCompactionContinuationSettlement;
-		expect(olderSettlement).toBeDefined();
-		let releaseOlderContinuation = () => {};
-		const olderContinuation = new Promise<void>((resolve) => {
-			releaseOlderContinuation = resolve;
-		});
-		vi.spyOn(harness.session.agent, "continue").mockReturnValue(olderContinuation);
-		await harness.session.prompt("foreground", {
-			streamingBehavior: "followUp",
-			queueIfBusy: true,
-			promptCorrelationId: "cancelled-compaction",
-		});
-		releaseBackground();
-		await background;
-		await harness.session.waitForIdle();
+			const background = harness.session.prompt("background");
+			await backgroundStarted;
+			const internals = harness.session as unknown as Pick<SessionInternals, "_performCompaction"> & {
+				_schedulePostCompactionContinue(): void;
+				_postCompactionContinuationSettlement?: object;
+				_postCompactionPromptOwners: WeakMap<object, string>;
+			};
+			if (outcome === "skipped") {
+				vi.spyOn(internals, "_performCompaction").mockRejectedValue(
+					new CompactionSkippedError("fixture compaction skip"),
+				);
+			}
+			internals._schedulePostCompactionContinue();
+			const olderSettlement = internals._postCompactionContinuationSettlement;
+			expect(olderSettlement).toBeDefined();
+			let releaseOlderContinuation = () => {};
+			const olderContinuation = new Promise<void>((resolve) => {
+				releaseOlderContinuation = resolve;
+			});
+			const continueSpy = vi.spyOn(harness.session.agent, "continue").mockReturnValue(olderContinuation);
+			await harness.session.prompt("foreground", {
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+				promptCorrelationId: "foreground-compaction",
+			});
+			releaseBackground();
+			await background;
+			await harness.session.waitForIdle();
 
-		expect(internals._postCompactionPromptOwners.get(olderSettlement!)).toBe("cancelled-compaction");
-		expect(harness.session.getPromptLifecycle("cancelled-compaction")).toMatchObject({ phase: "delivered" });
-		releaseOlderContinuation();
-		await harness.session.waitForHeadlessIdle();
-		expect(harness.session.getPromptLifecycle("cancelled-compaction")).toMatchObject({ phase: "completed" });
-	});
+			const end = harness.eventsOfType("compaction_end").at(-1);
+			expect(end).toMatchObject({ reason: "threshold", aborted: outcome === "cancelled" });
+			if (outcome === "skipped") {
+				expect(end?.errorMessage).toContain("skipped");
+				expect(internals._postCompactionContinuationSettlement).toBe(olderSettlement);
+				expect(internals._postCompactionPromptOwners.get(olderSettlement!)).toBe("foreground-compaction");
+				expect(harness.session.getPromptLifecycle("foreground-compaction")).toMatchObject({ phase: "delivered" });
+			} else {
+				expect(internals._postCompactionPromptOwners.get(olderSettlement!)).toBeUndefined();
+				expect(continueSpy).not.toHaveBeenCalled();
+			}
+			releaseOlderContinuation();
+			await harness.session.waitForHeadlessIdle();
+			expect(continueSpy).toHaveBeenCalledTimes(outcome === "skipped" ? 1 : 0);
+			expect(harness.session.getPromptLifecycle("foreground-compaction")).toMatchObject({ phase: "completed" });
+		},
+	);
 
 	it("transfers correlated ownership across queued manual compaction", async () => {
 		let markProviderStarted = () => {};

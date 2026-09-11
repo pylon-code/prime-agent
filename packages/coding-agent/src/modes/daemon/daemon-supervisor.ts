@@ -2582,6 +2582,11 @@ export class DaemonSupervisor {
 					correlatedJournalRun.resolve(response);
 				}
 				this.write(client, response);
+				if (command.type === "shutdown" && response.success) {
+					// The ownership-checked journal result and socket write precede
+					// shutdown's closing notice and end(), which flushes queued writes.
+					void this.shutdown(0, true, false, command.force === true, "shutdown");
+				}
 			}
 		} catch (error) {
 			this.log(`Supervisor command ${command.type} failed: ${error instanceof Error ? error.stack : String(error)}`);
@@ -3030,7 +3035,8 @@ export class DaemonSupervisor {
 				setImmediate(() => void this.shutdown(0, false, true, false, "update"));
 				return success(command.id, command.type);
 			case "shutdown":
-				void this.shutdown(0, true, false, command.force === true, "shutdown");
+				// Fence new admission while handleLine commits the acknowledgment.
+				this.shuttingDown = true;
 				return success(command.id, "shutdown");
 			case "prepare_update_restart": {
 				const manifest = await this.prepareUpdateRestart();

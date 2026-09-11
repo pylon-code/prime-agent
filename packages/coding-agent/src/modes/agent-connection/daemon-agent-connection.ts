@@ -3148,6 +3148,8 @@ export class DaemonAgentConnection implements AgentConnection {
 						2,
 						"attach",
 						this.disposing && this.options.ownedSession === true,
+						false,
+						{ recoverable: false },
 					);
 					if (this.client.isClosed) {
 						this.emitOwnerClosedTerminal();
@@ -3820,13 +3822,15 @@ export class DaemonAgentConnection implements AgentConnection {
 					if (this.disposed || this.terminalCloseEmitted) return;
 					this.pendingReattachActiveSessionIds.add(restored.activeSessionId);
 					try {
-						await this.attachSession(restored.activeSessionId, undefined, true);
+						await this.attachSession(restored.activeSessionId, undefined, true, 2, "attach", false, false, {
+							recoverable: false,
+						});
 					} finally {
 						this.pendingReattachActiveSessionIds.delete(restored.activeSessionId);
 					}
 					if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
 					if (this.disposed || this.terminalCloseEmitted) return;
-					const snapshot = await this.getInitialSnapshot();
+					const snapshot = await this.getInitialSnapshot({ recoverable: false });
 					if (this.client.isClosed) throw new Error("the daemon client was closed by its owner");
 					if (this.disposed || this.terminalCloseEmitted) return;
 					this.updateRestartPending = false;

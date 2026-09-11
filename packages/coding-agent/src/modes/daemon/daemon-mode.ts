@@ -4441,6 +4441,8 @@ export class AgentDaemon {
 				} finally {
 					state.pendingAttaches--;
 				}
+				// A direct viewer changes the roster's attachment count without a session event.
+				if (client.authenticationRole === "session_client") this.scheduleRosterFlush();
 				if (deferClientEnv && clientEnv) {
 					this.updateRestart?.deferredClientEnv.push({
 						client,

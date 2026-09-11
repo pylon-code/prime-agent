@@ -54,6 +54,8 @@ type FakeClient = {
 	supportsServerCapability: (capability: string) => boolean;
 	isConnected: boolean;
 	hello: object;
+	getTransportGeneration: () => number;
+	onClose: () => () => void;
 	onMessage: (listener: (message: DaemonOutbound) => void) => () => void;
 	request: ReturnType<typeof vi.fn>;
 	emit: (message: DaemonOutbound) => void;
@@ -65,6 +67,8 @@ function fakeRosterClient(roster: AgentRosterEntry[], supported = true): FakeCli
 		supportsServerCapability: () => supported,
 		isConnected: true,
 		hello: { type: "daemon_hello" },
+		getTransportGeneration: () => 1,
+		onClose: () => () => {},
 		onMessage: (listener) => {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
@@ -170,15 +174,8 @@ describe("agents-view roster store", () => {
 			};
 		});
 		const store = new AgentsViewRosterStore();
-		const connection = Object.assign(Object.create(DaemonAgentConnection.prototype), {
-			options: {},
-			client,
-			rosterStore: store,
-			activeSessionId: "root-active",
-			lastEventSequence: undefined,
-			lastEventCursor: undefined,
-			requestData: vi.fn(async () => ({ id: "root-active", sessionId: "root", activeSessionId: "root-active" })),
-		}) as DaemonAgentConnection;
+		const connection = new DaemonAgentConnection(client as never, "root-active");
+		Object.assign(connection, { rosterStore: store });
 
 		// The bar is an accessory: the session recovery must not fail with it.
 		await expect(connection.attach()).resolves.toBeUndefined();

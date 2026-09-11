@@ -1,0 +1,1 @@
+- Fixed multiline paste handling, file links, and source-aware editor layout in the Prime 0.9.4 integration.

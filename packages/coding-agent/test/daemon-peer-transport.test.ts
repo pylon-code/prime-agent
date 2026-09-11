@@ -315,7 +315,11 @@ describe("daemon worker peer transport", () => {
 		internals.scheduleRosterFlush = vi.fn();
 		internals.createAttachResult = vi.fn(async () => ({
 			activeSessionId: "active-1",
-			snapshot: {},
+			snapshot: {
+				state: { sessionId: "session-1" },
+				lastEventSequence: 0,
+				lastEventCursor: { generation: "generation-1", sequence: 0 },
+			},
 			lastEventSequence: 0,
 		}));
 		const state = {
@@ -323,8 +327,9 @@ describe("daemon worker peer transport", () => {
 			clients: new Set(),
 			pendingAttaches: 0,
 			lastEventSequence: 0,
+			eventGeneration: "generation-1",
 			extensionUiRequests: new Map(),
-			runtime: { metadata: { kind: "top-level", createdAt: 1 } },
+			runtime: { session: { sessionId: "session-1" }, metadata: { kind: "top-level", createdAt: 1 } },
 		} as unknown as ActiveSessionState;
 		internals.sessions.set("active-1", state);
 		const peer = makeSocketClient("peer-1", true);
