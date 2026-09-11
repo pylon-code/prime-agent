@@ -1218,15 +1218,24 @@ test("bounded reads authenticate only exact pre-read link retirement transitions
 		const symlinkMoved = join(fixture, "symlink-moved");
 		writeFileSync(symlinkSource, exactBytes);
 		writeFileSync(symlinkTarget, exactBytes);
-		await rejectGenericChange(() => readBoundedRegularFile(symlinkSource, {
+		let symlinkOpenError;
+		await assert.rejects(() => readBoundedRegularFile(symlinkSource, {
 			maxBytes: 1024,
 			expectedSha256: exactDigest,
 			openFile: async (path, flags) => {
 				renameSync(path, symlinkMoved);
 				symlinkSync(symlinkTarget, path);
-				return openFileHandle(path, flags);
+				try { return await openFileHandle(path, flags); }
+				catch (error) { symlinkOpenError = error; throw error; }
 			},
-		}));
+		}), (error) => {
+			assert.ok(symlinkOpenError);
+			assert.equal(error, symlinkOpenError);
+			assert.equal(error.code, "ELOOP");
+			assert.equal(error instanceof BoundedFileLinkRetiredBeforeReadError, false);
+			assert.equal(error instanceof BoundedFileUnlinkedDuringReadError, false);
+			return true;
+		});
 
 		const ioCases = [
 			["initial lstat", (_path, failure) => ({ lstatEntry: async () => { throw failure; } })],
