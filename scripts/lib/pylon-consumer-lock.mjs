@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createConsumerMigrationApi } from "./pylon-consumer-migration.mjs";
 import { constants } from "node:fs";
 import { link, lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
@@ -196,7 +197,7 @@ function validateTransaction(value, expectedBaseDigest, stateMaxBytes) {
 		!exactKeys(value, ["schemaVersion", "baseDigest", "candidateDigest", "candidateBase64"]) ||
 		value.schemaVersion !== TRANSACTION_SCHEMA_VERSION || value.baseDigest !== expectedBaseDigest ||
 		!/^[0-9a-f]{64}$/.test(value.candidateDigest ?? "") || typeof value.candidateBase64 !== "string" ||
-		!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value.candidateBase64)
+		value.candidateBase64.length > 4 * Math.ceil(stateMaxBytes / 3)
 	) throw new Error("Consumer high-water transaction is malformed.");
 	const candidateBytes = Buffer.from(value.candidateBase64, "base64");
 	if (
@@ -224,7 +225,7 @@ function validateCheckpoint(value, stateMaxBytes) {
 	) throw new Error("Consumer high-water journal checkpoint is malformed.");
 	let anchorBytes = null;
 	if (value.anchorBase64 !== null) {
-		if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value.anchorBase64)) {
+		if (value.anchorBase64.length > 4 * Math.ceil(stateMaxBytes / 3)) {
 			throw new Error("Consumer high-water journal checkpoint is malformed.");
 		}
 		anchorBytes = Buffer.from(value.anchorBase64, "base64");
@@ -240,7 +241,7 @@ function validateCheckpoint(value, stateMaxBytes) {
 			throw new Error("Consumer high-water checkpoint source-authority tip is malformed.");
 		}
 	} else {
-		if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value.sourceAuthorityTipBase64)) {
+		if (value.sourceAuthorityTipBase64.length > 4 * Math.ceil(stateMaxBytes / 3)) {
 			throw new Error("Consumer high-water checkpoint source-authority tip is malformed.");
 		}
 		const sourceTip = Buffer.from(value.sourceAuthorityTipBase64, "base64");
@@ -3805,19 +3806,20 @@ function validateGenerationTransaction(value, expectedBaseDigest, stateMaxBytes)
 		digest(candidateBytes) !== value.candidateDigest || value.candidateDigest === value.baseDigest) throw new Error("Generation transaction payload is malformed.");
 	return { value, candidateBytes };
 }
-function generationEpochAuthority(snapshot, options) {
-	const checkpoint = validateGenerationCheckpoint(snapshot.checkpoint, options.stateMaxBytes).checkpoint;
-	if (!Buffer.isBuffer(snapshot.checkpointBytes) || !metadataBytes(checkpoint).equals(snapshot.checkpointBytes) || snapshot.name !== consumerGenerationName(checkpoint)) throw new Error("Generation predecessor checkpoint authority is not exact.");
+function generationEpochAuthority(snapshot, options, historical = false) {
+	const checkpoint = historical ? validateCheckpoint(snapshot.checkpoint, options.stateMaxBytes).value : validateGenerationCheckpoint(snapshot.checkpoint, options.stateMaxBytes).checkpoint;
+	if (!Buffer.isBuffer(snapshot.checkpointBytes) || !metadataBytes(checkpoint).equals(snapshot.checkpointBytes) || snapshot.name !== (historical ? epochName(checkpoint) : consumerGenerationName(checkpoint))) throw new Error("Generation predecessor checkpoint authority is not exact.");
 	const records = snapshot.epochRecords;
 	if (!(records instanceof Map) || records.size > GENERATION_EPOCH_MAX_ENTRIES) throw new Error("Generation epoch entry bound is invalid.");
-	let totalBytes = snapshot.checkpointBytes.length * 2;
+	let totalBytes = snapshot.checkpointBytes.length * (historical ? 1 : 2);
 	for (const bytes of records.values()) {
 		if (!Buffer.isBuffer(bytes) || bytes.length < 1 || bytes.length > options.metadataMaxBytes) throw new Error("Generation epoch metadata byte bound is invalid.");
-		totalBytes += bytes.length * 2;
+		totalBytes += bytes.length * (historical ? 1 : 2);
 		if (totalBytes > options.maxJournalBytes) throw new Error("Generation epoch exceeds its byte bound.");
 	}
 	const contents = new Map();
 	const indexes = new Map();
+	const undigested = new Map();
 	const heartbeats = new Map();
 	const heartbeatRecords = [];
 	const terminals = new Map();
@@ -3828,7 +3830,14 @@ function generationEpochAuthority(snapshot, options) {
 		let match;
 		if ((match = claimPattern.exec(name))) {
 			if (value.generation !== Number(match[1]) || generationName(value.generation) !== match[1] || digest(bytes) !== match[2]) throw new Error("Generation claim name is not exact.");
-			if (value.type === "rotation") {
+			if (historical) {
+				validateClaim(value, { checkpoint, checkpointDigest: digest(snapshot.checkpointBytes), epochDirectory: snapshot.name }, options.stateMaxBytes);
+				if (value.type === "rotation") {
+					const context = { checkpoint, checkpointDigest: digest(snapshot.checkpointBytes), epochDirectory: snapshot.name };
+					const tip = { tipDigest: value.intent.tipSha256, tipBytes: validateCheckpoint(value.intent.checkpoint, options.stateMaxBytes).anchorBytes };
+					if (!bytes.equals(metadataBytes(rotationClaimFor(context, value.generation, tip)))) throw new Error("Historical rotation content is not exact.");
+				}
+			} else if (value.type === "rotation") {
 				const successor = validateGenerationCheckpoint(value.intent?.checkpoint, options.stateMaxBytes);
 				const expected = consumerGenerationRotationClaim(checkpoint, value.generation, {
 					tipDigest: successor.checkpoint.anchorDigest, tipBytes: successor.anchorBytes, previousGenerationIdentity: successor.checkpoint.previousGenerationIdentity, retirementAuthoritySha256: successor.checkpoint.retirementAuthoritySha256,
@@ -3836,6 +3845,11 @@ function generationEpochAuthority(snapshot, options) {
 				if (!bytes.equals(metadataBytes(expected))) throw new Error("Generation rotation intent is not exact.");
 			} else validateClaim(value, null, options.stateMaxBytes);
 			contents.set(match[2], value);
+		} else if (historical && (match = undigestedClaimPattern.exec(name))) {
+			validateClaim(value, { checkpoint, checkpointDigest: digest(snapshot.checkpointBytes), epochDirectory: snapshot.name }, options.stateMaxBytes);
+			if (value.generation !== Number(match[1]) || generationName(value.generation) !== match[1]) throw new Error("Historical claim name is not exact.");
+			undigested.set(value.generation, value);
+			contents.set(digest(bytes), value);
 		} else if ((match = claimIndexPattern.exec(name))) {
 			validateClaimIndex(value, Number(match[1]));
 			if (generationName(value.generation) !== match[1]) throw new Error("Generation claim CAS name is malformed.");
@@ -3844,7 +3858,7 @@ function generationEpochAuthority(snapshot, options) {
 			heartbeatRecords.push([`${Number(match[1])}:${match[2]}`, value]);
 			const key = `${Number(match[1])}:${match[2]}`;
 			if (!heartbeats.has(key) || heartbeats.get(key).refreshedAtMs < value.refreshedAtMs) heartbeats.set(key, value);
-		} else if ((match = generationHeartbeatPattern.exec(name))) {
+		} else if (!historical && (match = generationHeartbeatPattern.exec(name))) {
 			heartbeatRecords.push([`${Number(match[1])}:${match[2]}`, value]);
 			if (value.refreshedAtMs !== Number(match[3]) || value.generation !== Number(match[1]) || value.token !== match[2]) throw new Error("Generation immutable heartbeat name is not exact.");
 			const key = `${Number(match[1])}:${match[2]}`;
@@ -3859,6 +3873,10 @@ function generationEpochAuthority(snapshot, options) {
 	}
 	const claims = [];
 	const byKey = new Map();
+	for (const [slot, claim] of undigested) {
+		if (indexes.has(slot)) throw new Error("Historical epoch has competing indexed and undigested claims.");
+		indexes.set(slot, claimIndexFor(claim));
+	}
 	for (const [slot, index] of [...indexes].sort(([a], [b]) => a - b)) {
 		const claim = contents.get(index.claimSha256);
 		if (!claim || claim.generation !== slot || slot !== claims.length + 1) throw new Error("Generation rotation authority has a missing claim CAS or noncontiguous slot.");
@@ -3866,7 +3884,7 @@ function generationEpochAuthority(snapshot, options) {
 		byKey.set(`${claim.generation}:${claim.token}`, claim);
 	}
 	for (const claim of contents.values()) {
-		if (claim.generation > claims.length + 1) throw new Error("Generation epoch contains a future unindexed claim.");
+		if (!historical && claim.generation > claims.length + 1) throw new Error("Generation epoch contains a future unindexed claim.");
 	}
 	for (const [key, value] of heartbeatRecords) {
 		const claim = byKey.get(key);
@@ -3884,7 +3902,7 @@ function generationEpochAuthority(snapshot, options) {
 		validateApplied(value, claim, terminals.get(key));
 	}
 	let tipDigest = checkpoint.anchorDigest;
-	let tipBytes = validateGenerationCheckpoint(checkpoint, options.stateMaxBytes).anchorBytes;
+	let tipBytes = historical ? validateCheckpoint(checkpoint, options.stateMaxBytes).anchorBytes : validateGenerationCheckpoint(checkpoint, options.stateMaxBytes).anchorBytes;
 	const decided = new Map();
 	let depth = 0;
 	for (const claim of claims) {
@@ -4981,4 +4999,17 @@ export async function withConsumerGenerationLock(root, authority, action, rawOpt
 		}
 		throw error;
 	}
+}
+
+const migrationApi = createConsumerMigrationApi({
+ validateLegacyClaim, validateLegacyHeartbeat, validateLegacyTerminal, validateLegacyApplied,
+ validateLegacyRetirementMarker, legacyRetirementMarkerFor, validateGenerationTransaction,
+ authorityDigest, validateCheckpoint, checkpointName, epochName, genesisCheckpoint,
+ migrationCheckpoint, deterministicUuid, generationEpochAuthority, rotationClaimFor,
+});
+
+// Read-only historical inventory; public migration stays on v2 until the blocker
+// and installation contract has passed the protected-client matrix.
+export async function inspectConsumerMigrationSource(statePath, rawOptions = {}) {
+ return migrationApi.inspect(statePath, rawOptions);
 }
