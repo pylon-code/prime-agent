@@ -1,3 +1,4 @@
+import "./pylon-generation.test.mjs";
 import "./pylon-bounded-file.test.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";

@@ -10,6 +10,22 @@ import {
 	readBoundedRegularFile,
 } from "./pylon-bounded-file.mjs";
 
+import {
+	consumerGenerationGenesisCheckpoint,
+	consumerGenerationName,
+	consumerGenerationRotationClaim,
+	consumerGenerationSuccessorCheckpoint,
+	generationRecordMaxBytes,
+	GENERATION_EPOCH_MAX_ENTRIES,
+	GENERATION_JOURNAL_MAX_BYTES,
+	GENERATION_RECEIPT_MAX_ENTRIES,
+	GENERATION_ROOT_MAX_ENTRIES,
+	GENERATION_STATE_MAX_BYTES,
+	validateGenerationCheckpoint,
+} from "./pylon-generation-format.mjs";
+
+export { consumerGenerationGenesisCheckpoint, consumerGenerationName, consumerGenerationRotationClaim, consumerGenerationSuccessorCheckpoint };
+
 class ConsumerEpochAdvancedError extends Error {
 	constructor() {
 		super("Consumer high-water journal epoch changed and fenced a paused writer.");
@@ -267,7 +283,7 @@ function validateRotationIntent(value, context, stateMaxBytes) {
 	return value;
 }
 
-function validateTerminal(value, claim, stateMaxBytes) {
+function validateTerminal(value, claim, stateMaxBytes, validatePayload = validateTransaction) {
 	const common = ["schemaVersion", "generation", "token", "outcome"];
 	if (
 		claim.type !== "normal" || !value || value.schemaVersion !== LOCK_SCHEMA_VERSION || value.generation !== claim.generation ||
@@ -284,7 +300,7 @@ function validateTerminal(value, claim, stateMaxBytes) {
 	let expectedBase = value.transactions[0]?.baseDigest;
 	if (!/^[0-9a-f]{64}$/.test(expectedBase ?? "")) throw new Error("Consumer high-water lock commit marker is malformed.");
 	for (const transaction of value.transactions) {
-		validateTransaction(transaction, expectedBase, stateMaxBytes);
+		validatePayload(transaction, expectedBase, stateMaxBytes);
 		expectedBase = transaction.candidateDigest;
 	}
 	return value;
@@ -3753,4 +3769,364 @@ export async function withConsumerStateLock(statePath, action, rawOptions = {}) 
 export async function rotateConsumerStateJournal(statePath, rawOptions = {}) {
 	if (typeof statePath !== "string" || !statePath) throw new Error("A consumer-local state path is required for journal rotation.");
 	return runRotation(statePath, rawOptions);
+}
+
+// V3 primitives remain separate from the public v2 preparation/rotation entrypoints.
+const generationBuilders = new WeakMap();
+const generationReceiptPattern = /^receipt-([0-9a-f]{64})\.json$/;
+const generationReceiptTemporaryPattern = new RegExp(`^\\.receipt-p([1-9][0-9]*)-w(${uuidSource})-t([0-9a-f]{64})\\.tmp$`);
+function generationOptions(raw = {}) {
+	const options = {
+		stateMaxBytes: GENERATION_STATE_MAX_BYTES,
+		maxJournalBytes: GENERATION_JOURNAL_MAX_BYTES,
+		currentUid: process.getuid(), lstatEntry: lstat, openFile: open, readDirectory: readdir,
+		makeDirectory: mkdir, linkFile: link, renameFile: rename, ...raw,
+	};
+	options.metadataMaxBytes = generationRecordMaxBytes(options.stateMaxBytes);
+	if (!Number.isSafeInteger(options.maxJournalBytes) || options.maxJournalBytes < 1 || options.maxJournalBytes > GENERATION_JOURNAL_MAX_BYTES ||
+		!Number.isSafeInteger(options.currentUid) || options.currentUid < 0) throw new Error("Generation byte bound or uid is invalid.");
+	return options;
+}
+function generationCanonical(bytes, maxBytes) {
+	if (!Buffer.isBuffer(bytes) || bytes.length < 1 || bytes.length > maxBytes) throw new Error("Generation metadata exceeds its byte bound.");
+	const value = JSON.parse(bytes);
+	if (!metadataBytes(value).equals(bytes)) throw new Error("Generation metadata is not canonical.");
+	return value;
+}
+function validateGenerationTransaction(value, expectedBaseDigest, stateMaxBytes) {
+	if (!exactKeys(value, ["schemaVersion", "baseDigest", "candidateDigest", "candidateBase64"]) || value.schemaVersion !== 1 ||
+		value.baseDigest !== expectedBaseDigest || !/^[0-9a-f]{64}$/.test(value.candidateDigest ?? "") ||
+		typeof value.candidateBase64 !== "string" || value.candidateBase64.length > 4 * Math.ceil(stateMaxBytes / 3)) throw new Error("Generation transaction is malformed or exceeds its byte bound.");
+	const candidateBytes = Buffer.from(value.candidateBase64, "base64");
+	if (candidateBytes.length < 1 || candidateBytes.length > stateMaxBytes || candidateBytes.toString("base64") !== value.candidateBase64 ||
+		digest(candidateBytes) !== value.candidateDigest || value.candidateDigest === value.baseDigest) throw new Error("Generation transaction payload is malformed.");
+	return { value, candidateBytes };
+}
+function generationEpochAuthority(snapshot, options) {
+	const checkpoint = validateGenerationCheckpoint(snapshot.checkpoint, options.stateMaxBytes).checkpoint;
+	if (!Buffer.isBuffer(snapshot.checkpointBytes) || !metadataBytes(checkpoint).equals(snapshot.checkpointBytes) || snapshot.name !== consumerGenerationName(checkpoint)) throw new Error("Generation predecessor checkpoint authority is not exact.");
+	const records = snapshot.epochRecords;
+	if (!(records instanceof Map) || records.size > GENERATION_EPOCH_MAX_ENTRIES) throw new Error("Generation epoch entry bound is invalid.");
+	let totalBytes = snapshot.checkpointBytes.length * 2;
+	for (const bytes of records.values()) {
+		if (!Buffer.isBuffer(bytes) || bytes.length < 1 || bytes.length > options.metadataMaxBytes) throw new Error("Generation epoch metadata byte bound is invalid.");
+		totalBytes += bytes.length * 2;
+		if (totalBytes > options.maxJournalBytes) throw new Error("Generation epoch exceeds its byte bound.");
+	}
+	const contents = new Map();
+	const indexes = new Map();
+	const heartbeats = new Map();
+	const terminals = new Map();
+	const applied = new Map();
+	const transitions = new Map();
+	for (const [name, bytes] of records) {
+		const value = generationCanonical(bytes, options.metadataMaxBytes);
+		let match;
+		if ((match = claimPattern.exec(name))) {
+			if (value.generation !== Number(match[1]) || generationName(value.generation) !== match[1] || digest(bytes) !== match[2]) throw new Error("Generation claim name is not exact.");
+			if (value.type === "rotation") {
+				const successor = validateGenerationCheckpoint(value.intent?.checkpoint, options.stateMaxBytes);
+				const expected = consumerGenerationRotationClaim(checkpoint, value.generation, {
+					tipDigest: successor.checkpoint.anchorDigest, tipBytes: successor.anchorBytes,
+				}, options.stateMaxBytes);
+				if (!bytes.equals(metadataBytes(expected))) throw new Error("Generation rotation intent is not exact.");
+			} else validateClaim(value, null, options.stateMaxBytes);
+			contents.set(match[2], value);
+		} else if ((match = claimIndexPattern.exec(name))) {
+			validateClaimIndex(value, Number(match[1]));
+			if (generationName(value.generation) !== match[1]) throw new Error("Generation claim CAS name is malformed.");
+			indexes.set(value.generation, value);
+		} else if ((match = heartbeatPattern.exec(name))) heartbeats.set(`${Number(match[1])}:${match[2]}`, value);
+		else if ((match = terminalPattern.exec(name))) terminals.set(`${Number(match[1])}:${match[2]}`, value);
+		else if ((match = appliedPattern.exec(name))) applied.set(`${Number(match[1])}:${match[2]}`, value);
+		else if ((match = transitionPattern.exec(name))) {
+			validateGenerationTransaction(value, match[1], options.stateMaxBytes);
+			transitions.set(match[1], value);
+		} else throw new Error("Generation epoch contains an unexpected entry.");
+	}
+	const claims = [];
+	const byKey = new Map();
+	for (const [slot, index] of [...indexes].sort(([a], [b]) => a - b)) {
+		const claim = contents.get(index.claimSha256);
+		if (!claim || claim.generation !== slot || slot !== claims.length + 1) throw new Error("Generation rotation authority has a missing claim CAS or noncontiguous slot.");
+		claims.push(claim);
+		byKey.set(`${claim.generation}:${claim.token}`, claim);
+	}
+	for (const claim of contents.values()) {
+		if (claim.generation > claims.length + 1) throw new Error("Generation epoch contains a future unindexed claim.");
+	}
+	for (const [key, value] of heartbeats) {
+		const claim = byKey.get(key);
+		if (!claim) throw new Error("Generation epoch contains an orphan heartbeat.");
+		validateHeartbeat(value, claim);
+	}
+	for (const [key, value] of terminals) {
+		const claim = byKey.get(key);
+		if (!claim) throw new Error("Generation epoch contains an orphan terminal.");
+		validateTerminal(value, claim, options.stateMaxBytes, validateGenerationTransaction);
+	}
+	for (const [key, value] of applied) {
+		const claim = byKey.get(key);
+		if (!claim) throw new Error("Generation epoch contains an orphan applied marker.");
+		validateApplied(value, claim, terminals.get(key));
+	}
+	let tipDigest = checkpoint.anchorDigest;
+	let tipBytes = validateGenerationCheckpoint(checkpoint, options.stateMaxBytes).anchorBytes;
+	const decided = new Map();
+	let depth = 0;
+	for (const claim of claims) {
+		const key = `${claim.generation}:${claim.token}`;
+		const terminal = terminals.get(key);
+		if (claim !== claims.at(-1) && (claim.type === "rotation" || !terminal || (terminal.outcome === "commit" && !applied.has(key)))) throw new Error("Generation epoch crossed an unresolved earlier slot.");
+		if (terminal?.outcome !== "commit") continue;
+		for (const transaction of terminal.transactions) {
+			if (transaction.baseDigest !== tipDigest || decided.has(tipDigest) || ++depth > MAX_TRANSACTION_DEPTH) throw new Error("Generation commit decisions do not form one bounded exact chain.");
+			decided.set(tipDigest, transaction);
+			tipDigest = transaction.candidateDigest;
+		}
+	}
+	let actualDigest = checkpoint.anchorDigest;
+	const visited = new Set();
+	while (transitions.has(actualDigest)) {
+		const actual = transitions.get(actualDigest);
+		if (visited.has(actualDigest) || !decided.has(actualDigest) || !metadataBytes(actual).equals(metadataBytes(decided.get(actualDigest)))) throw new Error("Generation transition lacks its exact commit decision.");
+		visited.add(actualDigest);
+		tipBytes = validateGenerationTransaction(actual, actualDigest, options.stateMaxBytes).candidateBytes;
+		actualDigest = actual.candidateDigest;
+	}
+	if (visited.size !== transitions.size) throw new Error("Generation epoch has an unreachable transition.");
+	for (const key of applied.keys()) {
+		for (const transaction of terminals.get(key).transactions) {
+			if (!transitions.has(transaction.baseDigest) || !metadataBytes(transitions.get(transaction.baseDigest)).equals(metadataBytes(transaction))) throw new Error("Generation applied marker lacks its exact transition.");
+		}
+	}
+	return { claims, terminals, applied, tip: { tipDigest: actualDigest, tipBytes }, decidedTipDigest: tipDigest };
+}
+
+// The caller must read/revalidate the predecessor from its pinned directory immediately
+// before a handoff. Snapshots are evidence inputs, never a permission to reuse stale authority.
+export function assertConsumerGenerationSuccessor(predecessor, name, bytes, rawOptions = {}) {
+	const options = generationOptions(rawOptions);
+	const scan = generationEpochAuthority(predecessor, options);
+	const latest = scan.claims.at(-1);
+	if (latest?.type !== "rotation" || scan.decidedTipDigest !== scan.tip.tipDigest) throw new Error("Generation successor lacks exact latest rotation authority.");
+	const expected = consumerGenerationRotationClaim(predecessor.checkpoint, latest.generation, scan.tip, options.stateMaxBytes);
+	if (!metadataBytes(latest).equals(metadataBytes(expected)) || name !== consumerGenerationName(expected.intent.checkpoint) || !Buffer.isBuffer(bytes) || !bytes.equals(metadataBytes(expected.intent.checkpoint))) throw new Error("Generation successor differs from its exact latest rotation authority and immutable tip.");
+	return expected.intent.checkpoint;
+}
+function expectedConsumerGeneration(authority, options) {
+	if (exactKeys(authority, ["genesis"])) return consumerGenerationGenesisCheckpoint(authority.genesis, options.stateMaxBytes);
+	if (!exactKeys(authority, ["predecessor"])) throw new Error("Generation construction requires exact genesis or predecessor authority.");
+	const scan = generationEpochAuthority(authority.predecessor, options);
+	const candidate = scan.claims.at(-1)?.intent?.checkpoint;
+	if (!candidate) throw new Error("Generation successor lacks latest rotation authority.");
+	return assertConsumerGenerationSuccessor(authority.predecessor, consumerGenerationName(candidate), metadataBytes(candidate), options);
+}
+function generationSameInode(a, b) { return a.dev === b.dev && a.ino === b.ino; }
+function generationEntryStat(stat, type, options) {
+	if (stat.isSymbolicLink?.() || (type === "directory" ? !stat.isDirectory() : !stat.isFile()) || stat.uid !== options.currentUid || (stat.mode & 0o7777) !== (type === "directory" ? 0o700 : 0o600)) throw new Error("Generation entry has unsafe type, owner or exact permissions.");
+	return stat;
+}
+async function generationDirectory(path, options, sync = false) {
+	const before = generationEntryStat(await options.lstatEntry(path), "directory", options);
+	await options.hooks?.afterInitialPathStat?.({ path, stat: before });
+	const handle = await options.openFile(path, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0));
+	try {
+		const opened = generationEntryStat(await handle.stat(), "directory", options);
+		if (!generationSameInode(before, opened)) throw new Error("Generation directory identity changed.");
+		if (sync) await handle.sync();
+		const final = generationEntryStat(await options.lstatEntry(path), "directory", options);
+		if (!generationSameInode(opened, final)) throw new Error("Generation directory identity changed.");
+		return Object.freeze({ dev: opened.dev, ino: opened.ino });
+	} finally { await handle.close(); }
+}
+async function generationBoundary(options, phase, operation, path) {
+	await options.hooks?.generationBoundary?.({ phase, operation, path });
+}
+async function generationSync(path, options) {
+	await generationBoundary(options, "before", "sync", path);
+	await generationDirectory(path, options, true);
+	await generationBoundary(options, "after", "sync", path);
+}
+async function generationNames(path, limit, options) {
+	const names = await options.readDirectory(path);
+	if (!Array.isArray(names) || names.length > limit || new Set(names).size !== names.length || names.some((name) => typeof name !== "string" || basename(name) !== name || [".", ".."].includes(name))) throw new Error("Generation directory exceeds its entry bound or closed namespace.");
+	return names;
+}
+async function generationRootPreflight(root, options) {
+	const rootNames = await generationNames(root, GENERATION_ROOT_MAX_ENTRIES, options);
+	const finalPattern = /^generation-[0-9]{16}-[0-9a-f]{64}$/;
+	const hiddenPattern = new RegExp(`^\\.building-${uuidSource}$`);
+	const retiredPattern = /^\.((retired)|(deleting))-generation-[0-9]{16}-[0-9a-f]{64}$/;
+	if (rootNames.filter((name) => finalPattern.test(name)).length > 2 || rootNames.some((name) => !finalPattern.test(name) && !hiddenPattern.test(name) && !retiredPattern.test(name))) throw new Error("Generation root contains an unexpected entry or competing finals.");
+	let totalBytes = 0;
+	const charge = async (path) => {
+		const stat = generationEntryStat(await options.lstatEntry(path), "file", options);
+		if (stat.size < 1 || stat.size > options.metadataMaxBytes) throw new Error("Generation root metadata exceeds its byte bound.");
+		totalBytes += stat.size;
+		if (totalBytes > options.maxJournalBytes) throw new Error("Generation root exceeds its aggregate byte bound.");
+	};
+	for (const name of rootNames) {
+		const path = join(root, name);
+		generationEntryStat(await options.lstatEntry(path), "directory", options);
+		const entries = await generationNames(path, 3, options);
+		if (entries.some((entry) => !["checkpoint.json", "epoch", "receipts"].includes(entry))) throw new Error("Generation root contains an unexpected nested entry.");
+		for (const entry of entries) {
+			if (entry === "checkpoint.json") { await charge(join(path, entry)); continue; }
+			const directory = join(path, entry);
+			generationEntryStat(await options.lstatEntry(directory), "directory", options);
+			const names = await generationNames(directory, entry === "epoch" ? GENERATION_EPOCH_MAX_ENTRIES : GENERATION_RECEIPT_MAX_ENTRIES, options);
+			for (const child of names) await charge(join(directory, child));
+		}
+	}
+	return totalBytes;
+}
+async function readGenerationSnapshot(path, checkpoint, options, expectedIdentity = null, requireEmpty = false) {
+	const root = dirname(path);
+	await generationRootPreflight(root, options);
+	const names = await generationNames(path, 3, options);
+	if (names.slice().sort().join() !== "checkpoint.json,epoch,receipts") throw new Error("Generation has an incomplete or unexpected closed namespace.");
+	const epochNames = await generationNames(join(path, "epoch"), GENERATION_EPOCH_MAX_ENTRIES, options);
+	const receiptNames = await generationNames(join(path, "receipts"), GENERATION_RECEIPT_MAX_ENTRIES, options);
+	if (requireEmpty && (epochNames.length !== 0 || receiptNames.length !== 1)) throw new Error("Generation publication requires an exactly empty epoch and checkpoint-only receipts.");
+	// Stat and charge every name, including both hardlinks, before opening nested metadata.
+	const canonical = new Map();
+	const byInode = new Map();
+	const receiptEntries = [];
+	let totalBytes = 0;
+	for (const name of ["checkpoint.json", ...epochNames.map((name) => `epoch/${name}`)]) {
+		const stat = generationEntryStat(await options.lstatEntry(join(path, name)), "file", options);
+		if (stat.size < 1 || stat.size > options.metadataMaxBytes) throw new Error("Generation metadata exceeds its byte bound.");
+		totalBytes += stat.size;
+		if (totalBytes > options.maxJournalBytes) throw new Error("Generation exceeds its aggregate byte bound.");
+		const key = `${stat.dev}:${stat.ino}`;
+		if (byInode.has(key)) throw new Error("Generation canonical entries alias the same inode.");
+		const entry = { name, stat, receipts: [] };
+		canonical.set(name, entry); byInode.set(key, entry);
+	}
+	for (const name of receiptNames) {
+		const fixed = generationReceiptPattern.exec(name);
+		const temporary = generationReceiptTemporaryPattern.exec(name);
+		if (!fixed && !temporary) throw new Error("Generation receipt name is malformed.");
+		const stat = generationEntryStat(await options.lstatEntry(join(path, "receipts", name)), "file", options);
+		if (stat.size < 1 || stat.size > options.metadataMaxBytes) throw new Error("Generation receipt exceeds its byte bound.");
+		totalBytes += stat.size;
+		if (totalBytes > options.maxJournalBytes) throw new Error("Generation exceeds its aggregate byte bound.");
+		const target = byInode.get(`${stat.dev}:${stat.ino}`);
+		if (!target || (fixed?.[1] ?? temporary?.[3]) !== digest(Buffer.from(target.name)) || stat.size !== target.stat.size) throw new Error("Generation receipt lacks its exact canonical inode and target.");
+		target.receipts.push({ name, stat, temporary: !!temporary });
+		receiptEntries.push({ name, stat, target: target.name, temporary: !!temporary });
+	}
+	for (const entry of canonical.values()) {
+		if (entry.receipts.length !== 1 || entry.stat.nlink !== 2 || entry.receipts[0].stat.nlink !== 2 || (requireEmpty && entry.receipts[0].temporary)) throw new Error("Generation canonical metadata lacks its exact durable receipt inode.");
+	}
+	await generationDirectory(root, options);
+	const identity = await generationDirectory(path, options);
+	if (expectedIdentity !== null && !generationSameInode(identity, expectedIdentity)) throw new Error("Generation directory inode differs from the observed builder identity.");
+	const epochIdentity = await generationDirectory(join(path, "epoch"), options);
+	const receiptsIdentity = await generationDirectory(join(path, "receipts"), options);
+	const epochRecords = new Map();
+	let checkpointBytes;
+	for (const entry of canonical.values()) {
+		const bytes = await readBoundedRegularFile(join(path, entry.name), {
+			maxBytes: options.metadataMaxBytes, openFile: options.openFile, lstatEntry: options.lstatEntry,
+			hooks: { ...options.hooks?.metadataRead, afterInitialPathStat: async (observation) => {
+				if (!sameRetiredLinkStat(observation.stat, entry.stat)) throw new Error("Generation metadata changed after allocation preflight.");
+				await options.hooks?.metadataRead?.afterInitialPathStat?.(observation);
+			} },
+			validateHandle: async (_handle, stat) => generationEntryStat(stat, "file", options),
+		});
+		if (bytes === null) throw new Error("Generation required metadata disappeared.");
+		if (entry.name === "checkpoint.json") checkpointBytes = bytes;
+		else epochRecords.set(entry.name.slice(6), bytes);
+	}
+	if (!checkpointBytes.equals(metadataBytes(checkpoint))) throw new Error("Generation checkpoint differs from exact expected authority.");
+	const snapshot = { path, name: consumerGenerationName(checkpoint), checkpoint, checkpointBytes, epochRecords, identity, totalBytes, receiptEntries };
+	generationEpochAuthority(snapshot, options);
+	for (const entry of receiptEntries) {
+		if (!sameRetiredLinkStat(entry.stat, await options.lstatEntry(join(path, "receipts", entry.name)))) throw new Error("Generation receipt inode or stat changed.");
+	}
+	for (const [directory, observed, expectedNames, limit] of [[path, identity, names, 3], [join(path, "epoch"), epochIdentity, epochNames, GENERATION_EPOCH_MAX_ENTRIES], [join(path, "receipts"), receiptsIdentity, receiptNames, GENERATION_RECEIPT_MAX_ENTRIES]]) {
+		if (!generationSameInode(observed, await generationDirectory(directory, options)) || (await generationNames(directory, limit, options)).sort().join() !== expectedNames.slice().sort().join()) throw new Error("Generation namespace changed during validation.");
+	}
+	return snapshot;
+}
+export async function readConsumerGeneration(path, authority, rawOptions = {}) {
+	const options = generationOptions(rawOptions);
+	const checkpoint = expectedConsumerGeneration(authority, options);
+	if (basename(path) !== consumerGenerationName(checkpoint)) throw new Error("Generation final name differs from its exact authority.");
+	return readGenerationSnapshot(path, checkpoint, options);
+}
+async function publishGenerationCheckpoint(path, checkpoint, options) {
+	const receipts = join(path, "receipts");
+	const target = join(path, "checkpoint.json");
+	const targetHash = digest(Buffer.from("checkpoint.json"));
+	const temporary = join(receipts, `.receipt-p${process.pid}-w${randomUUID()}-t${targetHash}.tmp`);
+	const fixed = join(receipts, `receipt-${targetHash}.json`);
+	const handle = await options.openFile(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0), 0o600);
+	try {
+		await handle.writeFile(metadataBytes(checkpoint));
+		await generationBoundary(options, "before", "file-sync", temporary);
+		await handle.sync();
+		await generationBoundary(options, "after", "file-sync", temporary);
+	} finally { await handle.close(); }
+	await generationSync(receipts, options);
+	await generationBoundary(options, "before", "link", target);
+	await options.linkFile(temporary, target);
+	await generationBoundary(options, "after", "link", target);
+	await generationSync(path, options);
+	await generationBoundary(options, "before", "rename", fixed);
+	await options.renameFile(temporary, fixed);
+	await generationBoundary(options, "after", "rename", fixed);
+	await generationSync(receipts, options);
+}
+export async function buildConsumerGeneration(root, authority, rawOptions = {}) {
+	const options = generationOptions(rawOptions);
+	const checkpoint = expectedConsumerGeneration(authority, options);
+	if (2 * metadataBytes(checkpoint).length > options.maxJournalBytes) throw new Error("Generation checkpoint and receipt exceed aggregate byte bound.");
+	await generationNames(root, GENERATION_ROOT_MAX_ENTRIES - 1, options);
+	const rootBytes = await generationRootPreflight(root, options);
+	if (rootBytes + 2 * metadataBytes(checkpoint).length > options.maxJournalBytes) throw new Error("Generation build exceeds the root aggregate byte bound.");
+	const rootIdentity = await generationDirectory(root, options);
+	const path = join(root, `.building-${randomUUID()}`);
+	await options.makeDirectory(path, { mode: 0o700 });
+	const identity = await generationDirectory(path, options);
+	await options.makeDirectory(join(path, "epoch"), { mode: 0o700 });
+	await options.makeDirectory(join(path, "receipts"), { mode: 0o700 });
+	await generationSync(join(path, "epoch"), options);
+	await generationSync(join(path, "receipts"), options);
+	await publishGenerationCheckpoint(path, checkpoint, options);
+	await generationSync(join(path, "epoch"), options);
+	await generationSync(path, options);
+	await generationSync(root, options);
+	await readGenerationSnapshot(path, checkpoint, options, identity, true);
+	const builder = Object.freeze({ path, identity });
+	generationBuilders.set(builder, { path, identity, rootIdentity, checkpoint });
+	return builder;
+}
+export async function publishConsumerGeneration(builder, rawOptions = {}) {
+	const evidence = generationBuilders.get(builder);
+	if (!evidence) throw new Error("Generation publication requires an observed builder identity.");
+	const options = generationOptions(rawOptions);
+	const { path: source, identity, checkpoint, rootIdentity } = evidence;
+	const root = dirname(source);
+	const destination = join(root, consumerGenerationName(checkpoint));
+	await readGenerationSnapshot(source, checkpoint, options, identity, true);
+	if (!generationSameInode(rootIdentity, await generationDirectory(root, options))) throw new Error("Generation root inode changed before publication.");
+	const observation = { source, destination, identity };
+	await options.hooks?.beforeGenerationRename?.(observation);
+	await generationBoundary(options, "before", "rename", destination);
+	try {
+		await options.renameFile(source, destination);
+	} catch (error) {
+		if (options.renameFile !== rename || error?.code !== "ENOENT") throw error;
+		// Only native source loss can join this rename; a byte-identical winner is not ours.
+		await readGenerationSnapshot(destination, checkpoint, options, identity, true);
+	}
+	await generationBoundary(options, "after", "rename", destination);
+	await options.hooks?.afterGenerationRename?.(observation);
+	const result = await readGenerationSnapshot(destination, checkpoint, options, identity, true);
+	if (!generationSameInode(rootIdentity, await generationDirectory(root, options))) throw new Error("Generation root inode changed after publication.");
+	await generationSync(root, options);
+	return result;
 }
