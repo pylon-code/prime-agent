@@ -640,8 +640,19 @@ export type AgentConnectionSessionEvent = AgentConnectionSessionEventBody & {
 };
 
 export type AgentConnectionEvent =
-	| { type: "session_event"; event: AgentConnectionSessionEvent; attribution?: PromptEventAttribution }
-	| { type: "prompt_lifecycle"; lifecycle: PromptLifecycleSnapshot }
+	| {
+			type: "session_event";
+			event: AgentConnectionSessionEvent;
+			attribution?: PromptEventAttribution;
+			/** Cursor of this accepted event, absent on transports without event cursors. */
+			meta?: { cursor: AgentConnectionEventCursor };
+	  }
+	| {
+			type: "prompt_lifecycle";
+			lifecycle: PromptLifecycleSnapshot;
+			/** Cursor of this accepted event, not a later connection snapshot. */
+			meta?: { cursor: AgentConnectionEventCursor };
+	  }
 	| { type: "correlated_prompt_protocol_violation" }
 	| { type: "side_question_event"; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_replaced"; state: AgentConnectionState; messages: AgentMessage[] }
