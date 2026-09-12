@@ -3504,7 +3504,18 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.observeRlmChildUpdate(message.event.child);
 			}
 			this.latestSnapshotIsFresh = false;
-			await this.emit({ type: "session_event", event: message.event, attribution: message.attribution });
+			await this.emit({
+				type: "session_event",
+				event: message.event,
+				attribution: message.attribution,
+				...(message.meta?.cursor
+					? {
+							meta: {
+								cursor: { generation: message.meta.cursor.generation, sequence: message.meta.cursor.sequence },
+							},
+						}
+					: {}),
+			});
 			return;
 		}
 		if (message.type === "prompt_lifecycle") {
@@ -3535,7 +3546,17 @@ export class DaemonAgentConnection implements AgentConnection {
 			} else {
 				this.observeDaemonEventSequence(message);
 			}
-			await this.emit({ type: "prompt_lifecycle", lifecycle: message.lifecycle });
+			await this.emit({
+				type: "prompt_lifecycle",
+				lifecycle: message.lifecycle,
+				...(message.meta?.cursor
+					? {
+							meta: {
+								cursor: { generation: message.meta.cursor.generation, sequence: message.meta.cursor.sequence },
+							},
+						}
+					: {}),
+			});
 			return;
 		}
 		if (message.type === "session_resynced") {

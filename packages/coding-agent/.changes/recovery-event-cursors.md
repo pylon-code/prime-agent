@@ -1,0 +1,1 @@
+- Fixed SDK conversation recovery losing progress after completed turns.

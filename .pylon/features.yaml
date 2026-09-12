@@ -377,8 +377,10 @@ decisions:
       - https://github.com/pylon-code/prime-agent/issues/27
     upstream_refs:
       - https://github.com/PrimeIntellect-ai/prime-agent/tree/c718bf3c30fd8da206ed551837cbb54f7ad15948
+      - https://github.com/PrimeIntellect-ai/prime-agent/tree/46c60b7500923be9e77022cb85c731241f35e2ac
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2044
     fork_change: recoverable-owned-session-adoption-v1
-    upstream_support: Prime upstream does not expose capability-gated same-supervisor adoption of an existing caller-owned worker with private rotating authority, prepare/commit proof, authoritative snapshot fencing, ordered event reconciliation, and in-place MCP ownership transfer.
+    upstream_support: Prime upstream does not expose capability-gated same-supervisor adoption of an existing caller-owned worker with private rotating authority, prepare/commit proof, authoritative snapshot fencing, ordered event reconciliation, and in-place MCP ownership transfer. Current upstream SDK session events also discard daemon event cursors; retain exact per-event cursor forwarding through the existing validated SDK dispatch so consumers can durably record accepted transcript progress.
     revisit_when:
       - Prime upstream exposes an equivalent frozen public SDK token, detached-daemon capability, non-enumerating failure contract, same-generation rotating authority, staged proof, and explicit durability confirmation.
       - Pylon can remove the fork token without weakening caller-owned worker continuity, event ordering, credential privacy, or owner isolation.
