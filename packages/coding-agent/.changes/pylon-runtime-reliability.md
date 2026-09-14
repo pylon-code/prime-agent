@@ -1,0 +1,2 @@
+- Fixed a kernel pipe write error (write EPIPE) crashing the whole session worker: pipe errors are now recorded as kernel diagnostics while the pending write rejects cleanly.
+- Fixed a session worker wedging at 100% CPU: waiting for a session to go idle while queued input was blocked by a running bash command, compaction, or retry spun in microtasks without ever yielding to IO, freezing every session in the worker and starving daemon IPC.
