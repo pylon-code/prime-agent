@@ -417,3 +417,20 @@ decisions:
     revisit_when:
       - Prime ships a repository-neutral immutable release and promotion primitive that preserves Pylon's exact source, workflow, attestation, stable-history, and withdrawal policy without upstream credentials or channel names.
       - Pylon adopts another verifiable distribution transport that fully supersedes GitHub immutable Releases.
+
+  runtime-reliability-september-followup:
+    area: runtime-reliability
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/69
+      - https://github.com/pylon-code/pylon/issues/114
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/commit/90ca4a457e0fef0bd925215d4c973abd6264f067
+      - https://github.com/PrimeIntellect-ai/prime-agent/commit/8eaa00c37385c6b25fed9d46584b50ffc2e87f9c
+      - https://github.com/PrimeIntellect-ai/prime-agent/commit/7d1913969d33fa5a31366321e3f5db0070dcf2bf
+    fork_change: selective-kernel-idle-codex-reliability
+    upstream_support: Absorb kernel pipe errors, park blocked idle waiters, and retry stale Codex continuation IDs once before output; retain Pylon lifecycle, cancellation, scoped identity, recovery cursors and ownership without wire changes.
+    revisit_when:
+      - The next complete upstream integration includes these commits; reconcile the selective patches without duplicating behavior.
