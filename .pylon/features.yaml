@@ -434,3 +434,18 @@ decisions:
     upstream_support: Absorb kernel pipe errors, park blocked idle waiters, and retry stale Codex continuation IDs once before output; retain Pylon lifecycle, cancellation, scoped identity, recovery cursors and ownership without wire changes.
     revisit_when:
       - The next complete upstream integration includes these commits; reconcile the selective patches without duplicating behavior.
+
+  opencode-maintenance-routing:
+    area: provider-identity
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/65
+      - https://github.com/pylon-code/prime-agent/issues/23
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/commit/66658d2cf73153340f23133fbc16eafac31423e8
+    fork_change: maintenance-session-routing-with-scoped-payload-hooks
+    upstream_support: Pass the owning session to provider completion options for maintenance routing while retaining Pylon scoped payload hooks and independent summary request identities.
+    revisit_when:
+      - Upstream provides both owning-session routing and scoped auxiliary payload identity without replacing the fork hooks.
