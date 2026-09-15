@@ -434,3 +434,18 @@ decisions:
     upstream_support: Absorb kernel pipe errors, park blocked idle waiters, and retry stale Codex continuation IDs once before output; retain Pylon lifecycle, cancellation, scoped identity, recovery cursors and ownership without wire changes.
     revisit_when:
       - The next complete upstream integration includes these commits; reconcile the selective patches without duplicating behavior.
+
+  custom-message-persistence-identity:
+    area: runtime-reliability
+    state: candidate
+    owner: pylon-fork
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/76
+      - https://github.com/pylon-code/pylon/issues/552
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/tree/f5859162c
+    fork_change: preserve-custom-message-timestamps
+    upstream_support: Current upstream allocates a second timestamp when persisting custom messages, so reloading or compacting changes live transcript identities. Preserve the original message timestamp at every AgentSession persistence boundary.
+    revisit_when:
+      - Upstream preserves exact custom-message identities across live emission, persistence and reconstruction.

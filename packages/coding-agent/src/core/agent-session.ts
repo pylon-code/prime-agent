@@ -2518,6 +2518,7 @@ export class AgentSession {
 			message.content,
 			message.display,
 			message.details,
+			message.timestamp,
 		);
 		this._emit({ type: "message_start", message });
 		this._emit({ type: "message_end", message });
@@ -4175,6 +4176,7 @@ export class AgentSession {
 					event.message.content,
 					event.message.display,
 					event.message.details,
+					event.message.timestamp,
 				);
 			} else if (
 				event.message.role === "user" ||
@@ -7076,6 +7078,7 @@ export class AgentSession {
 			message.content,
 			message.display,
 			message.details,
+			message.timestamp,
 		);
 		this.agent.state.messages.push(message);
 		this._emit({ type: "message_start", message });
@@ -7161,6 +7164,7 @@ export class AgentSession {
 				message.content,
 				message.display,
 				message.details,
+				appMessage.timestamp,
 			);
 			this._emit({ type: "message_start", message: appMessage });
 			this._emit({ type: "message_end", message: appMessage });
@@ -8292,7 +8296,13 @@ export class AgentSession {
 		} else {
 			messages.push(message);
 		}
-		this.sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, undefined);
+		this.sessionManager.appendCustomMessageEntry(
+			message.customType,
+			message.content,
+			message.display,
+			undefined,
+			message.timestamp,
+		);
 		this._emit({ type: "message_start", message });
 		this._emit({ type: "message_end", message });
 	}
@@ -9087,6 +9097,7 @@ export class AgentSession {
 				message.content,
 				message.display,
 				message.details,
+				message.timestamp,
 			);
 		} catch {
 			// Unpersisted session: context-only injection.
@@ -9379,6 +9390,7 @@ export class AgentSession {
 				message.content,
 				message.display,
 				message.details,
+				message.timestamp,
 			);
 		} catch {
 			// Not in the session file, so context rebuilds would drop the outcome.
@@ -9688,6 +9700,7 @@ export class AgentSession {
 				outcomeMessage.content,
 				outcomeMessage.display,
 				outcomeMessage.details,
+				outcomeMessage.timestamp,
 			);
 		} catch (error) {
 			const persistenceError = error instanceof Error ? error.message : String(error);

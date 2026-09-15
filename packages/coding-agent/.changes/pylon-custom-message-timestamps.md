@@ -1,0 +1,1 @@
+- Fixed custom message timestamps changing when sessions are compacted or reloaded.
