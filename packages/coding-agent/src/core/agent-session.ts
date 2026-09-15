@@ -250,6 +250,7 @@ import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.j
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createAsyncBashCompletionHostHandler,
+	createAsyncBashConsumedHostHandler,
 	createDefaultRlmSubagentSessionName,
 	createRlmCreateSessionHostHandler,
 	createRlmDeleteSubagentHostHandler,
@@ -5451,6 +5452,40 @@ export class AgentSession {
 		for (const id of ids) this._durableRlmTerminalNoticeActionIds.delete(id);
 	}
 
+	/**
+	 * The kernel read the command's result before the notice reached the model, so
+	 * the notice has nothing left to report: drop it while it is still queued.
+	 * Delivered notices are no longer clearable, which makes this a no-op.
+	 */
+	private _withdrawAsyncBashCompletionNotice(details: { pid: number; command: string; completionId: string }): void {
+		// A read withdraws only its own handle, even after PID/command reuse.
+		const notice = this._actionStore
+			.clearableActions()
+			.find((action) => this._isAsyncBashCompletionActionFor(action, details));
+		if (!notice) return;
+		this._cancelSessionActions(
+			(action) => action === notice,
+			new Error("Background command completion notice withdrawn: the kernel read the result first."),
+		);
+		this._emitQueueUpdate();
+	}
+
+	private _isAsyncBashCompletionActionFor(
+		action: QueuedSessionAction,
+		details: { pid: number; command: string; completionId: string },
+	): boolean {
+		if (action.payload.kind !== "turn") return false;
+		const message = primaryDeliveryRecord(action).message;
+		if (message.role !== "custom" || message.customType !== ASYNC_BASH_COMPLETION_CUSTOM_TYPE) return false;
+		// Retain PID/command checks alongside the per-handle identity.
+		const completion = message.details as AsyncBashCompletionDetails | undefined;
+		return (
+			completion?.completionId === details.completionId &&
+			completion.pid === details.pid &&
+			completion.command === details.command
+		);
+	}
+
 	private async _promptInjectedMessage(
 		text: string,
 		message: CustomMessage,
@@ -10358,6 +10393,9 @@ export class AgentSession {
 						}
 					}
 				}
+			}),
+			"bash.consumed": createAsyncBashConsumedHostHandler((details) => {
+				this._withdrawAsyncBashCompletionNotice(details);
 			}),
 			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),

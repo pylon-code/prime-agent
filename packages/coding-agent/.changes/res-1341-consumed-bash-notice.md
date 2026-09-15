@@ -1,0 +1,1 @@
+- Fixed redundant background-command completion turns after a live cell reads the result, preserving unread notices and matching withdrawals to the exact command handle.

@@ -119,7 +119,10 @@ def wait_for_host_request(repl: ReplProcess, events: list[dict]) -> dict:
 
 
 def reply_ok(repl: ReplProcess, request: dict) -> None:
-    repl.send({"type": "host_reply", "id": request["id"], "data": {"status": "ok", "result": {}}})
+    result = {}
+    if request["data"].get("type") == "bash.completed":
+        result = {"completionId": request["data"]["completionId"]}
+    repl.send({"type": "host_reply", "id": request["id"], "data": {"status": "ok", "result": result}})
 
 
 class ReplTest(unittest.TestCase):
@@ -747,6 +750,7 @@ class ReplTest(unittest.TestCase):
             request["data"],
             {
                 "type": "bash.completed",
+                "completionId": request["data"]["completionId"],
                 "pid": pid,
                 "command": "sleep 0.05; printf detached",
                 "exitCode": 0,
@@ -755,6 +759,103 @@ class ReplTest(unittest.TestCase):
         reply_ok(self.repl, request)
         inspected = self.repl.execute("bash-inspect", "handle.poll().output")
         self.assertIn("detached", one(inspected, "result")["text"])
+
+    def test_result_read_after_notice_requests_one_withdrawal(self):
+        reads = (
+            ("poll", "handle.poll().output"),
+            ("await", "(await handle).output"),
+        )
+        for label, read_code in reads:
+            with self.subTest(label=label):
+                command = f"sleep 0.05; printf withdrawn-{label}"
+                started = self.repl.execute(
+                    f"withdraw-{label}",
+                    f"from rlm import bash\nhandle = bash({command!r})\nhandle.pid",
+                )
+                pid = int(one(started, "result")["text"])
+                notice = wait_for_host_request(self.repl, started)
+                self.assertEqual(notice["data"]["type"], "bash.completed")
+                reply_ok(self.repl, notice)
+                read = self.repl.execute(f"withdraw-{label}-read", read_code)
+                self.assertIn(f"withdrawn-{label}", one(read, "result")["text"])
+                request = wait_for_host_request(self.repl, read)
+                self.assertEqual(
+                    request["data"], {"type": "bash.consumed", "completionId": notice["data"]["completionId"], "pid": pid, "command": command}
+                )
+                # Old host: error reply is absorbed and the withdrawal never repeats.
+                self.repl.send(
+                    {"type": "host_reply", "id": request["id"], "data": {"status": "error", "error": "unknown"}}
+                )
+                if label == "poll":
+                    again = self.repl.execute("withdraw-again", "handle.output()\nhandle.tail(1)")
+                    self.assertIsNone(one(again, "host_request"))
+
+    def test_detached_read_during_another_cell_preserves_notice(self):
+        started = self.repl.execute(
+            "watcher-notice", "from rlm import bash\nhandle = bash('printf watcher')\nhandle.pid"
+        )
+        notice = wait_for_host_request(self.repl, started)
+        reply_ok(self.repl, notice)
+        watched = self.repl.execute(
+            "watcher-cell",
+            "import asyncio\nfinished = asyncio.Event()\n"
+            "async def watch():\n    handle.output()\n    finished.set()\n"
+            "watcher = asyncio.create_task(watch())\nawait finished.wait()",
+        )
+        self.assertIsNone(one(watched, "host_request"))
+        read = self.repl.execute("watcher-direct-read", "handle.output()")
+        request = wait_for_host_request(self.repl, read)
+        self.assertEqual(request["data"]["type"], "bash.consumed")
+        self.assertEqual(request["data"]["completionId"], notice["data"]["completionId"])
+        reply_ok(self.repl, request)
+
+    def test_old_host_does_not_enable_identity_based_withdrawal(self):
+        started = self.repl.execute(
+            "legacy-notice", "from rlm import bash\nhandle = bash('printf legacy')\nhandle.pid"
+        )
+        notice = wait_for_host_request(self.repl, started)
+        self.assertRegex(notice["data"]["completionId"], r"^[a-f0-9]{32}$")
+        self.repl.send({"type": "host_reply", "id": notice["id"], "data": {"status": "ok", "result": {}}})
+        read = self.repl.execute("legacy-read", "handle.output()")
+        self.assertIn("legacy", one(read, "result")["text"])
+        barrier = self.repl.execute("legacy-barrier", "import asyncio\nawait asyncio.sleep(0)")
+        self.assertIsNone(one(read + barrier, "host_request"))
+
+    def test_detached_read_between_turns_keeps_bash_completion(self):
+        # A watcher reading the handle with no cell running reaches nobody: the
+        # notice is the only wake-up an idle session gets, so it must survive.
+        code = "\n".join(
+            [
+                "from rlm import bash",
+                "import asyncio",
+                "handle = bash('sleep 0.2; printf detached-read')",
+                "async def watch():",
+                "    await handle._wait()",
+                "    globals()['seen'] = handle.output()",
+                "asyncio.create_task(watch())",
+                "handle.pid",
+            ]
+        )
+        started = self.repl.execute("detached-read", code)
+        pid = int(one(started, "result")["text"])
+        request = wait_for_host_request(self.repl, started)
+        self.assertEqual(request["data"]["type"], "bash.completed")
+        self.assertEqual(request["data"]["pid"], pid)
+        reply_ok(self.repl, request)
+        probe = self.repl.execute("detached-read-probe", "await asyncio.sleep(0.05)\nseen")
+        self.assertIsNone(one(probe, "host_request"))
+        self.assertEqual(one(probe, "result")["text"], "'detached-read'")
+
+    def test_result_read_in_creating_cell_suppresses_bash_completion(self):
+        events = self.repl.execute(
+            "read-in-cell",
+            "from rlm import bash\nimport asyncio\nhandle = bash('printf read-in-cell')\n"
+            "await asyncio.wait_for(handle._wait(), 5)\nhandle.output()",
+        )
+        self.assertEqual(one(events, "result")["text"], "'read-in-cell'")
+        probe = self.repl.execute("read-in-cell-probe", "await asyncio.sleep(0.05)")
+        self.assertIsNone(one(events, "host_request"))
+        self.assertIsNone(one(probe, "host_request"))
 
     def test_wrapper_awaits_in_creating_cell_suppress_bash_completion(self):
         def task_group(label: str, await_expression: str) -> str:
@@ -840,7 +941,6 @@ class ReplTest(unittest.TestCase):
                 "consumer = asyncio.create_task(consume())\n"
                 "await asyncio.sleep(0.05)"
             ),
-            "later-cell": "iterator = asyncio.as_completed([handle])",
         }
         for label, snippet in snippets.items():
             with self.subTest(label=label):
@@ -849,11 +949,9 @@ class ReplTest(unittest.TestCase):
                     f"as-completed-{label}",
                     f"from rlm import bash\nimport asyncio\nhandle = bash({command!r})\n{snippet}",
                 )
-                if label == "later-cell":
-                    events += self.repl.execute(
-                        "as-completed-later-await",
-                        "for completed in iterator:\n    await completed",
-                    )
+                notice = wait_for_host_request(self.repl, events)
+                if notice not in events:
+                    events.append(notice)
                 events += self.repl.execute(
                     f"as-completed-{label}-probe", "await asyncio.sleep(0.05)"
                 )
