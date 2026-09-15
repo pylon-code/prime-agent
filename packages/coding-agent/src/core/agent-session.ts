@@ -8527,6 +8527,7 @@ export class AgentSession {
 					summaryCall,
 					providerRetryPolicy(this.settingsManager),
 					this.createScopedProviderHooks("compaction").onPayload,
+					this.sessionId,
 				));
 			}
 
@@ -9051,6 +9052,7 @@ export class AgentSession {
 			this.thinkingLevel,
 			providerRetryPolicy(this.settingsManager),
 			this.createScopedProviderHooks("auto-refine-review").onPayload,
+			this.sessionId,
 		);
 	}
 
@@ -9355,6 +9357,7 @@ export class AgentSession {
 			signal,
 			this.thinkingLevel,
 			this.createScopedProviderHooks("refine").onPayload,
+			this.sessionId,
 		);
 		if (this._disposed || signal.aborted) {
 			throw new Error("Refinement cancelled because the session was disposed.");
@@ -12899,6 +12902,7 @@ export class AgentSession {
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
 					onPayload: this.createScopedProviderHooks("branch-summary").onPayload,
+					sessionId: this.sessionId,
 					retry: providerRetryPolicy(this.settingsManager),
 				});
 				if (result.aborted) {

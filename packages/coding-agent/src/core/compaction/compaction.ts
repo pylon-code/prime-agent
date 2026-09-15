@@ -538,6 +538,7 @@ export async function generateSummary(
 	thinkingLevel?: ThinkingLevel,
 	retry?: ProviderRetryPolicy,
 	onPayload?: ProviderPayloadHook,
+	sessionId?: string,
 ): Promise<SummarySlice> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
@@ -561,8 +562,8 @@ export async function generateSummary(
 
 	const completionOptions =
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, onPayload, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers, onPayload };
+			? { maxTokens, signal, apiKey, headers, onPayload, sessionId, reasoning: thinkingLevel }
+			: { maxTokens, signal, apiKey, headers, onPayload, sessionId };
 
 	const response = await completeWithProviderRetry(
 		() =>
@@ -713,6 +714,7 @@ export async function compact(
 	summaryCall: SummaryCallRunner = (call) => call(headers),
 	retry?: ProviderRetryPolicy,
 	onPayload?: ProviderPayloadHook,
+	sessionId?: string,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -744,6 +746,7 @@ export async function compact(
 							thinkingLevel,
 							retry,
 							onPayload,
+							sessionId,
 						),
 					)
 				: Promise.resolve<SummarySlice>({ summary: "No prior history." }),
@@ -758,6 +761,7 @@ export async function compact(
 					thinkingLevel,
 					retry,
 					onPayload,
+					sessionId,
 				),
 			),
 		]);
@@ -777,6 +781,7 @@ export async function compact(
 				thinkingLevel,
 				retry,
 				onPayload,
+				sessionId,
 			),
 		);
 		slices.push(result);
@@ -817,6 +822,7 @@ async function generateTurnPrefixSummary(
 	thinkingLevel?: ThinkingLevel,
 	retry?: ProviderRetryPolicy,
 	onPayload?: ProviderPayloadHook,
+	sessionId?: string,
 ): Promise<SummarySlice> {
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 	const llmMessages = convertToLlm(messages);
@@ -836,8 +842,8 @@ async function generateTurnPrefixSummary(
 				model,
 				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 				model.reasoning && thinkingLevel && thinkingLevel !== "off"
-					? { maxTokens, signal, apiKey, headers, onPayload, reasoning: thinkingLevel }
-					: { maxTokens, signal, apiKey, headers, onPayload },
+					? { maxTokens, signal, apiKey, headers, onPayload, sessionId, reasoning: thinkingLevel }
+					: { maxTokens, signal, apiKey, headers, onPayload, sessionId },
 			),
 		{ policy: retry, signal },
 	);

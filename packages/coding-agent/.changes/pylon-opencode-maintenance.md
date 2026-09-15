@@ -1,0 +1,1 @@
+- Fixed OpenCode maintenance requests missing their owning session while preserving scoped provider hooks.
