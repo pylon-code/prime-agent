@@ -435,6 +435,23 @@ decisions:
     revisit_when:
       - The next complete upstream integration includes these commits; reconcile the selective patches without duplicating behavior.
 
+  compiled-installer-boundary:
+    area: distribution
+    state: shipped
+    owner: pylon-fork
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/67
+      - https://github.com/pylon-code/pylon/issues/557
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2140
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2165
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2166
+    fork_change: retain-immutable-sdk-distribution
+    upstream_support: Compiled CLI archives and npm migration do not provide an importable Node SDK or Pylon signed immutable selection. Retain recipe 2, disabled stock self-update for distribution packages, and Pylon-owned maintenance.
+    revisit_when:
+      - Compiled distribution can preserve the public SDK, owned daemon contract, signed immutable source selection and Pylon maintenance ownership together.
+
   opencode-maintenance-routing:
     area: provider-identity
     state: candidate
