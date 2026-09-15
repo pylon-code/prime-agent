@@ -434,3 +434,18 @@ decisions:
     upstream_support: Absorb kernel pipe errors, park blocked idle waiters, and retry stale Codex continuation IDs once before output; retain Pylon lifecycle, cancellation, scoped identity, recovery cursors and ownership without wire changes.
     revisit_when:
       - The next complete upstream integration includes these commits; reconcile the selective patches without duplicating behavior.
+
+  agent-authentication-isolation:
+    area: authentication
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/66
+      - https://github.com/pylon-code/pylon/issues/557
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/commit/df6c709a06d85805cebb1c2a1001e144754cab9e
+    fork_change: agent-owned-prime-authentication-and-team-state
+    upstream_support: Isolate normal Agent credentials, team selection and endpoints from CLI profile changes; import only validated production CLI credentials during explicit login.
+    revisit_when:
+      - Prime changes credential storage, endpoint overrides or explicit CLI import semantics.
