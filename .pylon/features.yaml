@@ -434,3 +434,17 @@ decisions:
     upstream_support: Absorb kernel pipe errors, park blocked idle waiters, and retry stale Codex continuation IDs once before output; retain Pylon lifecycle, cancellation, scoped identity, recovery cursors and ownership without wire changes.
     revisit_when:
       - The next complete upstream integration includes these commits; reconcile the selective patches without duplicating behavior.
+
+  grok-subscription-authentication:
+    area: provider-authentication
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/68
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2252
+    fork_change: grok-subscription-with-owned-provider-routing
+    upstream_support: Adopt device-code authentication and auth-specific Responses routing while retaining Pylon scoped provider hooks, recovery cursors and the three-tab configuration menu.
+    revisit_when:
+      - The complete upstream integration includes equivalent subscription routing and preserves Pylon ownership contracts.
