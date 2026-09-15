@@ -67,12 +67,21 @@ export type RlmRunHandler = (request: RlmRunRequest) => Promise<Record<string, u
 type RlmCreateSessionHandler = (request: RlmCreateSessionRequest) => Promise<RlmCreateSessionResult>;
 
 interface AsyncBashCompletionRequest {
+	completionId?: string;
 	pid: number;
 	command: string;
 	exitCode: number;
 }
 
 type AsyncBashCompletionHandler = (request: AsyncBashCompletionRequest) => void | Promise<void>;
+
+interface AsyncBashConsumedRequest {
+	completionId: string;
+	pid: number;
+	command: string;
+}
+
+type AsyncBashConsumedHandler = (request: AsyncBashConsumedRequest) => void | Promise<void>;
 export type RlmListSubagentsHandler = () => RlmListSubagentsResult | Promise<RlmListSubagentsResult>;
 export type RlmDeleteSubagentHandler = (target: string) => Promise<RlmDeleteSubagentResult>;
 export type RlmFindModelsHandler = (query: string, limit: number) => RlmFindModelsResult | Promise<RlmFindModelsResult>;
@@ -214,10 +223,19 @@ export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHand
 	};
 }
 
+function parseBashCompletionId(value: unknown): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || !/^[a-f0-9]{32}$/.test(value)) {
+		throw new Error("bash completionId must be a 32-character lowercase hex identity");
+	}
+	return value;
+}
+
 /** Adapt detached kernel bash completions into a validated host notification. */
 export function createAsyncBashCompletionHostHandler(handler: AsyncBashCompletionHandler): HostRequestHandler {
 	return async (payload) => {
 		const { pid, command, exitCode } = payload;
+		const completionId = parseBashCompletionId(payload.completionId);
 		if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
 			throw new Error("bash.completed pid must be a positive integer");
 		}
@@ -227,7 +245,25 @@ export function createAsyncBashCompletionHostHandler(handler: AsyncBashCompletio
 		if (typeof exitCode !== "number" || !Number.isInteger(exitCode)) {
 			throw new Error("bash.completed exitCode must be an integer");
 		}
-		await handler({ pid, command, exitCode });
+		await handler({ pid, command, exitCode, ...(completionId ? { completionId } : {}) });
+		return completionId ? { completionId } : {};
+	};
+}
+
+/** The kernel read a finished command's result, so its completion notice is stale. */
+export function createAsyncBashConsumedHostHandler(handler: AsyncBashConsumedHandler): HostRequestHandler {
+	return async (payload) => {
+		const { pid, command } = payload;
+		if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+			throw new Error("bash.consumed pid must be a positive integer");
+		}
+		if (typeof command !== "string" || !command) {
+			throw new Error("bash.consumed command must be a non-empty string");
+		}
+		const completionId = parseBashCompletionId(payload.completionId);
+		// Legacy runtimes cannot identify which retained handle was read.
+		if (!completionId) return {};
+		await handler({ pid, command, completionId });
 		return {};
 	};
 }
