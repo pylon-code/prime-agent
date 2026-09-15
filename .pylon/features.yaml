@@ -435,6 +435,53 @@ decisions:
     revisit_when:
       - The next complete upstream integration includes these commits; reconcile the selective patches without duplicating behavior.
 
+  compiled-installer-boundary:
+    area: distribution
+    state: shipped
+    owner: pylon-fork
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/67
+      - https://github.com/pylon-code/pylon/issues/557
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2140
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2165
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2166
+    fork_change: retain-immutable-sdk-distribution
+    upstream_support: Compiled CLI archives and npm migration do not provide an importable Node SDK or Pylon signed immutable selection. Retain recipe 2, disabled stock self-update for distribution packages, and Pylon-owned maintenance.
+    revisit_when:
+      - Compiled distribution can preserve the public SDK, owned daemon contract, signed immutable source selection and Pylon maintenance ownership together.
+
+  opencode-maintenance-routing:
+    area: provider-identity
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/65
+      - https://github.com/pylon-code/prime-agent/issues/23
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/commit/66658d2cf73153340f23133fbc16eafac31423e8
+    fork_change: maintenance-session-routing-with-scoped-payload-hooks
+    upstream_support: Pass the owning session to provider completion options for maintenance routing while retaining Pylon scoped payload hooks and independent summary request identities.
+    revisit_when:
+      - Upstream provides both owning-session routing and scoped auxiliary payload identity without replacing the fork hooks.
+
+  background-command-consumption:
+    area: runtime-reliability
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/64
+      - https://github.com/pylon-code/pylon/issues/552
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/commit/ecd60e3cd4313643dede3cb2fcf13b4e2e9a2a75
+    fork_change: acknowledged-per-handle-background-notice-withdrawal
+    upstream_support: Withdraw a pending completion after a result reaches a live cell; add per-handle identity and host acknowledgment to preserve unread notices under PID reuse and mixed runtime versions.
+    revisit_when:
+      - Upstream provides exact handle identity and reader ownership for background completion withdrawal.
+
   agent-authentication-isolation:
     area: authentication
     state: candidate
