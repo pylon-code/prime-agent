@@ -434,3 +434,18 @@ decisions:
     upstream_support: Absorb kernel pipe errors, park blocked idle waiters, and retry stale Codex continuation IDs once before output; retain Pylon lifecycle, cancellation, scoped identity, recovery cursors and ownership without wire changes.
     revisit_when:
       - The next complete upstream integration includes these commits; reconcile the selective patches without duplicating behavior.
+
+  background-command-consumption:
+    area: runtime-reliability
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/64
+      - https://github.com/pylon-code/pylon/issues/552
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/commit/ecd60e3cd4313643dede3cb2fcf13b4e2e9a2a75
+    fork_change: acknowledged-per-handle-background-notice-withdrawal
+    upstream_support: Withdraw a pending completion after a result reaches a live cell; add per-handle identity and host acknowledgment to preserve unread notices under PID reuse and mixed runtime versions.
+    revisit_when:
+      - Upstream provides exact handle identity and reader ownership for background completion withdrawal.
