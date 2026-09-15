@@ -1998,7 +1998,11 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		messageTimestamp?: number,
 	): string {
+		if (messageTimestamp !== undefined && !Number.isSafeInteger(messageTimestamp)) {
+			throw new Error("Custom message timestamp must be an integer millisecond value");
+		}
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
 			customType,
@@ -2007,7 +2011,7 @@ export class SessionManager {
 			details,
 			id: generateId(this.byId),
 			parentId: this.leafId,
-			timestamp: new Date().toISOString(),
+			timestamp: new Date(messageTimestamp ?? Date.now()).toISOString(),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -2022,8 +2026,11 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		messageTimestamp?: number,
 	): string {
-		return this._appendEntryWithRollback(() => this.appendCustomMessageEntry(customType, content, display, details));
+		return this._appendEntryWithRollback(() =>
+			this.appendCustomMessageEntry(customType, content, display, details, messageTimestamp),
+		);
 	}
 
 	private _appendEntryWithRollback(append: () => string): string {
