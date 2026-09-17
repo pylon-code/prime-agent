@@ -2,17 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
-import atexit
 import functools
 import json
 import os
-import secrets
-import selectors
-import shutil
 import signal
 import socket
-import struct
 import subprocess
 import sys
 import threading
@@ -21,16 +15,17 @@ import uuid
 from collections import deque
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, cast
 
 from . import _winjob
 
-_IS_POSIX = os.name == "posix"
+# Boot-lean imports: asyncio, secrets, shutil, datetime, selectors, struct,
+# fcntl/termios, and atexit load on first use below so `import rlm` (and with
+# it the kernel's pre-ready startup path) stays small. asyncio is bound onto
+# this module's globals by BashHandle.__init__ before any code path here can
+# touch it; every other user imports inside the function that needs it.
 
-if _IS_POSIX:
-    import fcntl
-    import termios
+_IS_POSIX = os.name == "posix"
 
 _HEAD_CAP = 512 * 1024
 _TAIL_CAP = 3 * 512 * 1024
@@ -237,6 +232,12 @@ class BashHandle:
     """
 
     def __init__(self, command: str) -> None:
+        # Every asyncio use in this module runs on a handle path (bash() is the
+        # only constructor), so bind the module global here, before
+        # _schedule_background_completion_notice or any await can run.
+        global asyncio
+        import asyncio
+
         self.command = command
         completion_context = _current_cell_completion_context()
         self._creating_cell_finished = completion_context[0] if completion_context else None
@@ -255,6 +256,8 @@ class BashHandle:
         self._result: BashResult | None = None
         self._callbacks: list[Callable[[], None]] = []
         self._reap_callback: Callable[[], None] | None = None
+        import secrets
+
         self._completion_id = secrets.token_hex(16)
         self._result_consumed = False
         self._consumed_notice: Callable[[], None] | None = None
@@ -273,6 +276,8 @@ class BashHandle:
         self._completion_marker: bytes | None = None
         status_write = -1
         if _IS_POSIX:
+            import secrets
+
             # Full-duplex status channel: the child end rides in as stdin (fd 0)
             # and the script remaps it to _STATUS_FD before swapping in /dev/null
             # (dash rejects multi-digit fds in redirections at parse time). The
@@ -423,6 +428,8 @@ class BashHandle:
             _signal_group(self._pid, signal.SIGKILL)
 
     def _pump(self) -> None:
+        import selectors
+
         stdout = self._proc.stdout
         assert stdout is not None
         if not _IS_POSIX:
@@ -570,11 +577,26 @@ class BashHandle:
             return True  # group already gone
         except PermissionError:
             pass
-        return _signal_group(self._pid, signal.SIGKILL)
+        delivered = _signal_group(self._pid, signal.SIGKILL)
+        if not delivered and sys.platform == "darwin":
+            # On macOS, signalling a dying group whose leader is a zombie can transiently
+            # raise PermissionError before transitioning to ProcessLookupError.
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                time.sleep(0.02)
+                try:
+                    os.killpg(self._pid, 0)
+                except ProcessLookupError:
+                    return True
+                except OSError:
+                    pass
+        return delivered
 
     def _read_status(self) -> int | None:
         if self._status_read < 0:
             return None
+        import selectors
+
         try:
             # DefaultSelector (kqueue/epoll) instead of select(): select() rejects
             # fds >= FD_SETSIZE (1024) even when the process fd limit is higher.
@@ -621,6 +643,9 @@ class BashHandle:
         # quiescence heuristic (best-effort parity).
         if not _IS_POSIX or self._eof.is_set():
             return False
+        import fcntl
+        import struct
+        import termios
         stdout = self._proc.stdout
         if stdout is None:
             return False
@@ -686,6 +711,7 @@ class BashHandle:
         except RuntimeError:
             return
         from . import repl
+        import secrets
 
         activity = {"id": secrets.token_hex(16), "pid": self._pid, "active": True}
         # Publish synchronously before bash() returns and the creating cell can end.
@@ -976,6 +1002,8 @@ def bash(command: str) -> BashHandle:
 
 
 def _shell() -> str:
+    import shutil
+
     # Read per call so env changes made in the REPL apply to later commands.
     override = os.environ.get("PRIME_AGENT_BASH_SHELL")
     if override:
@@ -1002,6 +1030,8 @@ def _with_prefix(command: str) -> str:
 
 
 def _fence_printf() -> str:
+    import shutil
+
     # `\command -p printf` defeats alias expansion but not a user-defined shell
     # function named `command`, which would swallow both fence frames and leave
     # the await hanging until the shell dies (wedged behind background jobs). A
@@ -1121,6 +1151,8 @@ def _record_journal(pid: int, active: bool) -> bool:
     # Returns False only when the journal is configured but enrollment failed;
     # active-record callers must then fail closed. Active records always carry
     # a processStartId so host reaping stays identity-verified.
+    from datetime import datetime, timezone
+
     path = os.environ.get("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL")
     owner = os.environ.get("PRIME_AGENT_KERNEL_OWNER_PID")
     if not path or not owner:
@@ -1188,6 +1220,8 @@ def _kill_live_handles() -> None:
 
 def _install_shutdown_hook() -> None:
     global _hook_installed
+    import atexit
+
     with _hook_lock:
         if _hook_installed:
             return
