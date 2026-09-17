@@ -71,15 +71,27 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 }
 /** Maximum characters for a tool result in serialized summaries. */
 const TOOL_RESULT_MAX_CHARS = 2000;
+/**
+ * Characters kept from the end of a truncated tool result. Tool output is
+ * tail-heavy: exit errors, stack traces, and log tails appear at the end.
+ */
+const TOOL_RESULT_TAIL_CHARS = 500;
 
 /**
  * Truncate text to a maximum character length for summarization.
- * Keeps the beginning and appends a truncation marker.
+ * Keeps the beginning and the end within the same total budget, marking
+ * the elided middle.
  */
 function truncateForSummary(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
-	const truncatedChars = text.length - maxChars;
-	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+	// The marker's digit counts are largest when the elided and kept sizes hit
+	// the text and budget maxima, so reserve space for that worst case to keep
+	// the result within maxChars.
+	const markerMaxLength =
+		`[... ${text.length} characters truncated; first ${maxChars} and last ${TOOL_RESULT_TAIL_CHARS} kept ...]`.length;
+	const headChars = maxChars - TOOL_RESULT_TAIL_CHARS - markerMaxLength - 4;
+	const elided = text.length - headChars - TOOL_RESULT_TAIL_CHARS;
+	return `${text.slice(0, headChars)}\n\n[... ${elided} characters truncated; first ${headChars} and last ${TOOL_RESULT_TAIL_CHARS} kept ...]\n\n${text.slice(text.length - TOOL_RESULT_TAIL_CHARS)}`;
 }
 
 /**
@@ -89,9 +101,19 @@ function truncateForSummary(text: string, maxChars: number): string {
  *
  * Tool results are truncated to keep the summarization request within
  * reasonable token budgets. Full content is not needed for summarization.
+ *
+ * Tool calls are serialized with a sequential `#N` prefix and results repeat
+ * the matching index, so repeated calls of the same tool pair unambiguously.
  */
 export function serializeConversation(messages: Message[]): string {
 	const parts: string[] = [];
+	// Tool calls are serialized with a 1-based sequential index and results
+	// repeat the index of their call (matched by toolCallId), so repeated
+	// calls of the same tool pair unambiguously in the summarizer input.
+	// The short index stands in for the raw provider toolCallId, which can
+	// exceed 450 characters on some providers.
+	const toolCallIndices = new Map<string, number>();
+	let toolCallIndex = 0;
 
 	for (const msg of messages) {
 		if (msg.role === "user") {
@@ -118,7 +140,9 @@ export function serializeConversation(messages: Message[]): string {
 					const argsStr = Object.entries(args)
 						.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
 						.join(", ");
-					toolCalls.push(`${block.name}(${argsStr})`);
+					toolCallIndex += 1;
+					toolCallIndices.set(block.id, toolCallIndex);
+					toolCalls.push(`#${toolCallIndex} ${block.name}(${argsStr})`);
 				}
 			}
 
@@ -137,7 +161,19 @@ export function serializeConversation(messages: Message[]): string {
 				.map((c) => c.text)
 				.join("");
 			if (content) {
-				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
+				// Label the tool name, error status, and the index of the
+				// paired call so the summarizer can match each result to
+				// its `#N`-prefixed entry in the [Assistant tool calls]
+				// lines even when the same tool is called repeatedly in
+				// one turn. Results whose call is not part of the input
+				// (extension callers may pass partial message lists)
+				// fall back to the name-only label.
+				const callIndex = toolCallIndices.get(msg.toolCallId);
+				const indexSuffix = callIndex === undefined ? "" : ` #${callIndex}`;
+				const label = msg.isError
+					? `[Tool result (${msg.toolName}, error)${indexSuffix}]`
+					: `[Tool result (${msg.toolName})${indexSuffix}]`;
+				parts.push(`${label}: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
 			}
 		}
 	}

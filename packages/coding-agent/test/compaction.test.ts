@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, ToolCall, Usage } from "@earendil-works/pi-ai";
 import { getModel } from "@earendil-works/pi-ai";
 import { readFileSync } from "fs";
 import { join } from "path";
@@ -16,6 +16,7 @@ import {
 	prepareCompaction,
 	shouldCompact,
 } from "../src/core/compaction/index.js";
+import { serializeConversation } from "../src/core/compaction/utils.js";
 import {
 	buildSessionContext,
 	type CompactionEntry,
@@ -54,10 +55,10 @@ function createUserMessage(text: string): AgentMessage {
 	return { role: "user", content: text, timestamp: Date.now() };
 }
 
-function createAssistantMessage(text: string, usage?: Usage): AssistantMessage {
+function createAssistantMessage(content: AssistantMessage["content"] | string, usage?: Usage): AssistantMessage {
 	return {
 		role: "assistant",
-		content: [{ type: "text", text }],
+		content: typeof content === "string" ? [{ type: "text", text: content }] : content,
 		usage: usage || createMockUsage(100, 50),
 		stopReason: "stop",
 		timestamp: Date.now(),
@@ -628,4 +629,71 @@ describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("LLM summarization", () => {
 		console.log("Original messages:", loaded.messages.length);
 		console.log("After compaction:", reloaded.messages.length);
 	}, 60000);
+});
+
+function toolResult(text: string, toolName = "ipython", isError = false, toolCallId = "tc1"): Message {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName,
+		content: [{ type: "text", text }],
+		isError,
+		timestamp: Date.now(),
+	};
+}
+
+function toolCall(id: string, name: string, args: Record<string, unknown>): ToolCall {
+	return { type: "toolCall", id, name, arguments: args };
+}
+
+describe("serializeConversation", () => {
+	it("truncates long tool results keeping head and tail within the summary budget", () => {
+		const head = "A".repeat(1431);
+		const tail = "T".repeat(500);
+		const result = serializeConversation([toolResult(head + "B".repeat(3069) + tail)]);
+
+		expect(result).toContain("[Tool result (ipython)]:");
+		expect(result).toContain(head);
+		expect(result).toContain(tail);
+		expect(result).toContain("[... 3069 characters truncated; first 1431 and last 500 kept ...]");
+		expect(result).not.toContain("B".repeat(10));
+		expect(result.length).toBeLessThanOrEqual("[Tool result (ipython)]: ".length + 2000);
+	});
+
+	it.each([
+		["labels short success results with the tool name", "bash", false, "[Tool result (bash)]"],
+		["labels short error results as failed", "edit", true, "[Tool result (edit, error)]"],
+	])("%s", (_label, toolName, isError, label) => {
+		const shortContent = "x".repeat(1500);
+		expect(serializeConversation([toolResult(shortContent, toolName, isError)])).toBe(`${label}: ${shortContent}`);
+	});
+
+	it.each([
+		[
+			"pairs repeated same-name tool calls with their results by index",
+			[toolCall("c1", "ipython", { code: "a" }), toolCall("c2", "ipython", { code: "b" })],
+			[toolResult("first output", "ipython", false, "c1"), toolResult("second output", "ipython", true, "c2")],
+			'[Assistant tool calls]: #1 ipython(code="a"); #2 ipython(code="b")\n\n' +
+				"[Tool result (ipython) #1]: first output\n\n" +
+				"[Tool result (ipython, error) #2]: second output",
+		],
+		[
+			"falls back to the name-only label when the result's call was not serialized",
+			[toolCall("c1", "bash", { command: "ls" })],
+			[toolResult("orphan output", "ipython", false, "tc-orphan")],
+			'[Assistant tool calls]: #1 bash(command="ls")\n\n[Tool result (ipython)]: orphan output',
+		],
+	])("%s", (_label, calls, results, expected) => {
+		expect(serializeConversation([createAssistantMessage(calls), ...results])).toBe(expected);
+	});
+
+	it("does not truncate user or assistant messages", () => {
+		const longText = "y".repeat(5000);
+		const result = serializeConversation([
+			{ role: "user", content: [{ type: "text", text: longText }], timestamp: Date.now() },
+			createAssistantMessage(longText),
+		]);
+		expect(result).not.toContain("truncated");
+		expect(result).toContain(longText);
+	});
 });
