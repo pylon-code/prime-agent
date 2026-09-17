@@ -127,7 +127,7 @@ describe("ReplKernelManager startup", () => {
 				"",
 			].join("\n"),
 		);
-		const stderrLogPath = join(tempDir, "kernel-stderr.log");
+		const stderrLogPath = join(tempDir, "artifacts", "kernel-stderr.log");
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const manager = new ReplKernelManager({ python, cwd: tempDir, stderrLogPath });
 
@@ -135,6 +135,27 @@ describe("ReplKernelManager startup", () => {
 			// Well under the 30s ready timeout: teardown must not wait for the
 			// grandchild (destroying the pipe kills it with SIGPIPE).
 			await expect(manager.execute("print(1)")).rejects.toThrow(/Kernel exited before ready/);
+			expect(statSync(stderrLogPath).mode & 0o777).toBe(0o600);
+			expect(statSync(join(tempDir, "artifacts")).mode & 0o777).toBe(0o700);
+		} finally {
+			errorSpy.mockRestore();
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	}, 15000);
+
+	it("tightens a rotated kernel stderr log that was world-readable", async () => {
+		const stderrLogPath = join(tempDir, "kernel-stderr.log");
+		writeFileSync(stderrLogPath, Buffer.alloc(5 * 1024 * 1024 + 1), { mode: 0o644 });
+		const python = join(tempDir, "python");
+		writeExecutable(python, ["#!/bin/sh", "exit 42", ""].join("\n"));
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const manager = new ReplKernelManager({ python, cwd: tempDir, stderrLogPath });
+
+		try {
+			await expect(manager.execute("print(1)")).rejects.toThrow(/Kernel exited before ready/);
+			// The rotated file holds the historical exception payloads.
+			expect(statSync(`${stderrLogPath}.old`).mode & 0o777).toBe(0o600);
+			expect(statSync(stderrLogPath).mode & 0o777).toBe(0o600);
 		} finally {
 			errorSpy.mockRestore();
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
