@@ -87,7 +87,13 @@ import {
 } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
-import { DaemonSessionRecoveringError, deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
+import {
+	DaemonSessionRecoveringError,
+	deserializeDaemonError,
+	serializeDaemonError,
+	UPDATE_RESTART_PREPARING_ERROR_INFO,
+	UPDATE_RESTART_PREPARING_MESSAGE,
+} from "./daemon-errors.js";
 import {
 	cloneCallerOwnedSessionLaunchEnv,
 	collectDaemonClientEnv,
@@ -104,6 +110,7 @@ import {
 	type DaemonClientCapability,
 	type DaemonClosingReason,
 	type DaemonCommand,
+	type DaemonErrorInfo,
 	type DaemonOutbound,
 	type DaemonOwnedSessionCleanupResult,
 	type DaemonPeerTransportTicket,
@@ -440,12 +447,17 @@ function isRecoverableOwnedCommandType(command: string): boolean {
 	return RECOVERABLE_OWNED_COMMAND_TYPES.has(command);
 }
 
-function recoverableOwnedCommandFailure(id: string | undefined, command: string, error: unknown): DaemonResponse {
+function recoverableOwnedCommandFailure(
+	id: string | undefined,
+	command: string,
+	error: unknown,
+	errorInfo?: DaemonErrorInfo,
+): DaemonResponse {
 	return isRecoverableOwnedCommandType(command)
 		? failure(id, command, OWNED_SESSION_ADOPTION_UNAVAILABLE, {
 				code: "owned_session_adoption_unavailable",
 			})
-		: failure(id, command, error, serializeDaemonError(error));
+		: failure(id, command, error, errorInfo ?? serializeDaemonError(error));
 }
 
 function salvageRecoverableOwnedCommand(line: string): { id?: string; command: string } | undefined {
@@ -2451,7 +2463,12 @@ export class DaemonSupervisor {
 		if (command.type === "cancel_prompt_admission" && this.updateRestartPhase !== undefined) {
 			this.write(
 				client,
-				recoverableOwnedCommandFailure(command.id, command.type, "Daemon is preparing an update restart"),
+				recoverableOwnedCommandFailure(
+					command.id,
+					command.type,
+					UPDATE_RESTART_PREPARING_MESSAGE,
+					UPDATE_RESTART_PREPARING_ERROR_INFO,
+				),
 			);
 			return;
 		}
@@ -2603,7 +2620,12 @@ export class DaemonSupervisor {
 			correlatedOrder?.release();
 			this.write(
 				client,
-				recoverableOwnedCommandFailure(command.id, command.type, "Daemon is preparing an update restart"),
+				recoverableOwnedCommandFailure(
+					command.id,
+					command.type,
+					UPDATE_RESTART_PREPARING_MESSAGE,
+					UPDATE_RESTART_PREPARING_ERROR_INFO,
+				),
 			);
 			return;
 		}

@@ -1352,7 +1352,8 @@ export type DaemonErrorInfo =
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId }
 	| { code: "owned_session_owner_mismatch" }
 	| { code: "owned_session_adoption_unavailable" }
-	| { code: "session_recovering"; activeSessionId: string };
+	| { code: "session_recovering"; activeSessionId: string }
+	| { code: "update_restarting" };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 export type DaemonClosingReason = "shutdown" | "update";
