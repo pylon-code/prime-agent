@@ -378,3 +378,14 @@ Follow-up: Task10 builds/packs the exact merged tree into a private prefix and r
 - Add an optional original timestamp to both custom append methods and pass it from every AgentSession custom-message write: delivered/queued messages, direct messages, session commands, Python state, harness digests, refinement and compaction outcomes. Calls that originate durable markers without a live message retain their existing current-time default. Invalid or lossy timestamps fail before publication.
 - No daemon command, event, response shape, protocol/schema revision, artifact recipe or capability changes. Historical files are not rewritten. An older custom record whose live and persisted timestamps already disagree remains unproved; Pylon must not relax history matching to accept it. New managed bytes are required for the correction.
 - Validation: 165 focused tests pass across the timestamp regression, session persistence/rollback, compaction and input queue. The regression deliberately advances the clock at the persistence boundary and verifies the exact live, pre-compaction tree, current context and reopened session messages. `npm run check` and required hosted checks accompany the PR.
+
+## 2026-09-18: legacy caller-owned settlement observation
+
+Decision: hybridize the existing descriptor-last cleanup invariant with a public,
+read-only local SDK observation. Upstream #1908 requests PID-based lease sweeping;
+it does not cover a host-private acquired receipt lacking a recovery handle and
+old socket identity. Existing public replacement-client cleanup remains unchanged.
+The SDK token gates the new local API; daemon wire shapes and stock behavior do
+not change. Validation: focused malformed/private/path/registration cases and a real
+isolated supervisor/owned-worker test prove registered before cleanup and settled
+after exact owned cleanup and supervisor exit. Pylon delivery tracked in [pylon#557](https://github.com/pylon-code/pylon/issues/557).

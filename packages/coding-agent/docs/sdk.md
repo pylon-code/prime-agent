@@ -93,6 +93,26 @@ The contract proof contains only the feature/status, protocol identity, schema r
 
 Use `disposeOwnedSession({ timeoutMs })` when cleanup must be observable. Concurrent calls join one operation, and `timeoutMs` is one strict total deadline for reconnection, authoritative queries, completion, side-question aborts, and unsupported-peer finalization. Its fixed statuses are `completed`, `already_completed`, `replacement_settled`, `owner_mismatch`, `uncertain`, `transport_failure`, and `unsupported`; `uncertain` also reports whether the last authoritative state was `active` or `stopping`. `replacement_settled` means an authenticated supervisor with a different generation answered the read-only cleanup query with `settled` for the connection's previously proved opaque route. Cleanup never sends completion on a replacement or pending route without a current internal attach proof. Each strict cleanup request is transport-bound and is never replayed after reconnect. Public attachment proof remains absent throughout disposal. Results never return raw errors or environment identity. `dispose()` remains the legacy best-effort `Promise<void>` API.
 
+### Observing settlement after a host restart
+
+A local POSIX host retaining a prior `caller_owned_session_environment_cleanup_v1`
+attachment proof may use the frozen SDK feature `owned_session_settlement_observation_v1`
+and public `observeOwnedSessionSettlement({ agentDir, activeSessionId, contractProof })`.
+Pass the exact canonical agent home and root route saved with that proof. This read-only
+operation scans Prime's durable registration namespaces, including prior temporary socket
+locations, without creating a daemon, claiming ownership, sending completion, or signaling
+processes. It returns only the feature token and `settled`, `registered`, or `unavailable`.
+
+Only `settled` permits retirement of that exact legacy host receipt. A capable supervisor
+persists registration before releasing its worker startup gate, retains it during recovery,
+and removes it last after joining cleanup. This observation relies on that prior contract;
+it is not a general orphan-process detector or authority for stock/descriptorless work,
+copied state, or a different agent home. Missing, changing, malformed, oversized, aliased,
+or nonprivate registries return `unavailable`. Existing registrations return `registered`
+even if their socket and PID are gone. Retain quarantine in either case. Native Windows
+is unsupported. Hosts must compare and remove their exact receipt atomically and must
+continue using recovery-handle adoption for recoverable sessions.
+
 ### Recoverable caller-owned daemon sessions
 
 Native detached-daemon hosts can opt into same-supervisor recovery with `recoverable_owned_session_adoption_v1`. The complete pre-create gate requires schema revision 30, the frozen package-root SDK tokens `recoverable_owned_session_adoption_v1` and `caller_owned_session_environment_cleanup_v1`, and connected hello offers for `daemon_recoverable_owned_session_adoption_v1`, `caller_owned_session_environment_cleanup_v1`, and `authoritative_owned_session_cleanup_v1`. If any proof is absent, select ACP before creating a native worker. This is a POSIX detached-daemon contract; it does not provide resident promotion, cross-host recovery, or recovery after supervisor process replacement.

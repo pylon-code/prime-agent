@@ -319,6 +319,11 @@ export {
 	type RecoverableOwnedSessionCreateOptions,
 	type RecoverableOwnedSessionCreation,
 } from "./modes/agent-connection/recoverable-owned-session.js";
+export {
+	OWNED_SESSION_SETTLEMENT_OBSERVATION_FEATURE,
+	type OwnedSessionSettlementObservation,
+	observeOwnedSessionSettlement,
+} from "./modes/daemon/owned-session-settlement.js";
 // Run modes for programmatic SDK usage
 export {
 	ClientPromptStashStore,
