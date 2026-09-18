@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -49,7 +50,7 @@ async function fixture() {
 	return { agentDir, registry, scope, observe, descriptor };
 }
 
-describe("previously proved caller-owned root settlement", () => {
+describe.runIf(process.platform !== "win32")("previously proved caller-owned root settlement", () => {
 	it("proves absent registration across old socket scopes without mutating another worker", async () => {
 		const f = await fixture();
 		await f.descriptor("another-root");
@@ -107,6 +108,18 @@ describe("previously proved caller-owned root settlement", () => {
 		await chmod(f.registry, 0o700);
 		await f.descriptor("another-root");
 		await chmod(join(f.scope, "worker.json"), 0o644);
+		expect((await f.observe()).status).toBe("unavailable");
+	});
+	it("rejects a FIFO registration without blocking on open", async () => {
+		const f = await fixture();
+		execFileSync("mkfifo", [join(f.scope, "worker.json")]);
+		expect((await f.observe()).status).toBe("unavailable");
+	});
+	it("rejects a registration attributed to a different socket namespace", async () => {
+		const f = await fixture();
+		await writeFile(join(f.scope, "worker.json"), JSON.stringify(registration("another-root", "/different.sock")), {
+			mode: 0o600,
+		});
 		expect((await f.observe()).status).toBe("unavailable");
 	});
 	it("rejects an unproved attachment", async () => {

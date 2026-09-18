@@ -62,6 +62,12 @@ export async function observeOwnedSessionSettlement(input: {
 		proof?.feature !== CALLER_OWNED_SESSION_ENVIRONMENT_CLEANUP_FEATURE ||
 		proof.status !== "attached" ||
 		proof.daemon?.protocolName !== "prime-agent.daemon" ||
+		!Number.isSafeInteger(proof.daemon.protocolVersion) ||
+		proof.daemon.protocolVersion < 7 ||
+		!Number.isSafeInteger(proof.daemon.schemaRevision) ||
+		proof.daemon.schemaRevision < 0 ||
+		!Number.isSafeInteger(proof.daemon.transportGeneration) ||
+		proof.daemon.transportGeneration < 0 ||
 		!proof.daemon.supervisorGeneration
 	)
 		return result("unavailable");
@@ -91,7 +97,10 @@ export async function observeOwnedSessionSettlement(input: {
 			for (const name of names) {
 				if (!name.endsWith(".json")) continue;
 				if (++inspectedFiles > 16384 || Date.now() >= deadline) return result("unavailable");
-				const file = await open(join(directory, name), constants.O_RDONLY | constants.O_NOFOLLOW);
+				const file = await open(
+					join(directory, name),
+					constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+				);
 				try {
 					const before = await file.stat();
 					inspectedBytes += before.size;
@@ -112,7 +121,11 @@ export async function observeOwnedSessionSettlement(input: {
 						})(),
 					);
 					const after = await file.stat();
+					const linked = await lstat(join(directory, name));
 					if (
+						linked.isSymbolicLink() ||
+						linked.dev !== before.dev ||
+						linked.ino !== before.ino ||
 						before.size !== after.size ||
 						before.mtimeMs !== after.mtimeMs ||
 						!validRegistration(descriptor, scope)
@@ -127,6 +140,7 @@ export async function observeOwnedSessionSettlement(input: {
 			if (
 				after.dev !== identity.dev ||
 				after.ino !== identity.ino ||
+				after.mtimeMs !== identity.mtimeMs ||
 				JSON.stringify((await readdir(directory)).sort()) !== JSON.stringify(names)
 			)
 				return result("unavailable");
@@ -135,10 +149,11 @@ export async function observeOwnedSessionSettlement(input: {
 		if (
 			after.dev !== rootIdentity.dev ||
 			after.ino !== rootIdentity.ino ||
+			after.mtimeMs !== rootIdentity.mtimeMs ||
 			JSON.stringify((await readdir(root)).sort()) !== JSON.stringify(scopes)
 		)
 			return result("unavailable");
-		return result("settled");
+		return result(Date.now() >= deadline ? "unavailable" : "settled");
 	} catch {
 		return result("unavailable");
 	}
