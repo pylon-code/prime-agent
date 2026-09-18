@@ -19,6 +19,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultArtifacts = join(root, ".npm", "pylon-release", "artifacts");
 const MAX_DIAGNOSTICS = 64 * 1024;
 export const PYLON_RELEASE_EXPECTED_SDK_FEATURES = Object.freeze([
+	"owned_session_settlement_observation_v1",
 	"bounded_daemon_ingress_v1",
 	"negotiated_daemon_session_capabilities_v1",
 	"caller_owned_session_environment_cleanup_v1",
@@ -330,6 +331,7 @@ if (${JSON.stringify(standalone)}) {
 const expected = ${JSON.stringify(PYLON_RELEASE_EXPECTED_SDK_FEATURES)};
 if (!Object.isFrozen(sdk.PRIME_AGENT_SDK_FEATURES)) throw new Error("SDK feature tokens are not frozen.");
 if (JSON.stringify([...sdk.PRIME_AGENT_SDK_FEATURES]) !== JSON.stringify(expected)) throw new Error("Unexpected SDK feature tokens.");
+if (typeof sdk.observeOwnedSessionSettlement !== "function") throw new Error("Missing public settlement observer.");
 if (typeof sdk.DaemonClient !== "function" || typeof sdk.DaemonAgentConnection !== "function") throw new Error("Missing daemon SDK constructors.");
 console.log(JSON.stringify({ features: [...sdk.PRIME_AGENT_SDK_FEATURES] }));
 `,
@@ -353,7 +355,7 @@ async function smokePosixDaemon({ tempRoot, probesDir, cliEntry, fixture, expect
 	const probePath = join(probesDir, "daemon-probe.mjs");
 	writeFileSync(
 		probePath,
-		`${staticSdkImport()}import { writeFileSync } from "node:fs";
+		`${staticSdkImport()}import { writeFileSync, realpathSync } from "node:fs";
 const [socketPath, projectDir, agentDir, sessionDir, workerReceiptPath, expectedBuildId] = process.argv.slice(2);
 const expected = ${JSON.stringify(PYLON_RELEASE_EXPECTED_SDK_FEATURES)};
 if (!Object.isFrozen(sdk.PRIME_AGENT_SDK_FEATURES) || JSON.stringify([...sdk.PRIME_AGENT_SDK_FEATURES]) !== JSON.stringify(expected)) throw new Error("Unexpected SDK feature contract.");
@@ -383,6 +385,7 @@ async function connectEventually() {
 let client;
 let connection;
 let activeSessionId;
+let ownedProof;
 let receipt = {};
 let failure;
 try {
@@ -442,11 +445,13 @@ try {
     snapshotTimeoutMs: 10_000
   }), 20_000, "Daemon attach");
   if (!connection.supportsNegotiatedCapability("correlated_prompt_lifecycle_v1")) throw new Error("Post-attach negotiated capability was not proved.");
-  const ownedProof = connection.getOwnedSessionContractProof();
+  ownedProof = connection.getOwnedSessionContractProof();
   if (ownedProof?.feature !== "caller_owned_session_environment_cleanup_v1" || ownedProof.status !== "attached") {
     throw new Error("Post-attach caller-owned environment contract was not proved.");
   }
-  receipt = { negotiated: true, ownedContract: true, activeSessionId, runtimeBuildId: client.hello.runtime.buildId };
+  const registered = await sdk.observeOwnedSessionSettlement({ agentDir: realpathSync(agentDir), activeSessionId, contractProof: ownedProof });
+  if (registered.status !== "registered") throw new Error("Live owned worker was not durably registered.");
+  receipt = { negotiated: true, ownedContract: true, activeSessionId, ownedProof, runtimeBuildId: client.hello.runtime.buildId };
 } catch (error) {
   failure = error;
 } finally {
@@ -552,6 +557,17 @@ console.log(JSON.stringify({ connected }));
 		if (daemon.exitCode !== 0 || daemonOutput.overflow || daemonOutput.error) {
 			throw new Error(`Installed daemon exited unexpectedly.\n${daemonOutput.stderr || daemonOutput.stdout}`);
 		}
+		// Join the captured supervisor before requiring a stable durable-registry observation.
+		const settlementProbe = join(probesDir, "settlement-probe.mjs");
+		writeFileSync(settlementProbe, `${staticSdkImport()}import { realpathSync } from "node:fs";
+const receipt = ${JSON.stringify(receipt)};
+const result = await sdk.observeOwnedSessionSettlement({ agentDir: realpathSync(${JSON.stringify(fixture.agentDir)}), activeSessionId: receipt.activeSessionId, contractProof: receipt.ownedProof });
+if (result.status !== "settled") throw new Error("Owned worker settlement was not observed after supervisor exit: " + result.status);
+`);
+		const settlement = await collectChild(spawn(process.execPath, [settlementProbe], {
+			cwd: probesDir, env: fixture.env, stdio: ["ignore", "pipe", "pipe"], shell: false,
+		}), 15_000);
+		if (settlement.status !== 0) throw new Error(`Installed settlement observation failed.\n${settlement.stderr || settlement.stdout}`);
 	} catch (error) {
 		failure = error;
 	} finally {

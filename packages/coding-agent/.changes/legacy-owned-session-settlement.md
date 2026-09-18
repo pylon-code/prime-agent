@@ -1,0 +1,1 @@
+- Added read-only settlement observation for a local host retaining a proved caller-owned session receipt after restart.

@@ -215,17 +215,19 @@ decisions:
     owner: shared
     decision: hybridize
     pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/557
       - https://github.com/pylon-code/prime-agent/issues/11
       - https://github.com/pylon-code/prime-agent/pull/14
       - https://github.com/pylon-code/pylon/issues/114
       - https://github.com/rynfar/comet/issues/5
     upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/issues/1908
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1756
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1858
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1864
       - https://github.com/PrimeIntellect-ai/prime-agent/pull/1882
-    fork_change: negotiated-authoritative-owned-session-cleanup-v1
-    upstream_support: Prime through a903d4b6768f has recovery-aware reuse, owner-checked opens, bounded daemon-close bash draining, per-command abort ownership, client-owned sessions, and best-effort owner cleanup, but another host process cannot prove exact worker-generation and durable-descriptor absence after the owner connection disappears.
+    fork_change: negotiated-authoritative-owned-session-cleanup-v1-and-local-settlement-observation
+    upstream_support: Reviewed again 2026-09-18; upstream issue 1908 concerns PID-based session lease cleanup, not a public read-only settlement proof for prior caller-owned roots across socket namespaces. Prime through a903d4b6768f has recovery-aware reuse, owner-checked opens, bounded daemon-close bash draining, per-command abort ownership, client-owned sessions, and best-effort owner cleanup, but another host process cannot prove exact worker-generation and durable-descriptor absence after the owner connection disappears.
     revisit_when:
       - Prime upstream exposes an equivalent privacy-safe, capability-negotiated cleanup proof with durable descriptor-last retries.
       - Comet and Pylon can remove the fork capability without weakening crash cleanup or stock-Prime fallback behavior.

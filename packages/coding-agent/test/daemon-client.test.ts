@@ -212,6 +212,7 @@ describe("DaemonClient", () => {
 	it("exports the bounded-ingress SDK proof and validates finite byte limits", () => {
 		const rootOptions: RootDaemonClientOptions = { maxInboundFrameBytes: 1 };
 		const rootFeatures: RootPrimeAgentSdkFeature[] = [
+			"owned_session_settlement_observation_v1",
 			"bounded_daemon_ingress_v1",
 			"negotiated_daemon_session_capabilities_v1",
 			"caller_owned_session_environment_cleanup_v1",
