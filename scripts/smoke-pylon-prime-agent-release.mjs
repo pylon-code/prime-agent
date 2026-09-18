@@ -451,7 +451,7 @@ try {
   }
   const registered = await sdk.observeOwnedSessionSettlement({ agentDir: realpathSync(agentDir), activeSessionId, contractProof: ownedProof });
   if (registered.status !== "registered") throw new Error("Live owned worker was not durably registered.");
-  receipt = { negotiated: true, ownedContract: true, activeSessionId, runtimeBuildId: client.hello.runtime.buildId };
+  receipt = { negotiated: true, ownedContract: true, activeSessionId, ownedProof, runtimeBuildId: client.hello.runtime.buildId };
 } catch (error) {
   failure = error;
 } finally {
@@ -466,10 +466,6 @@ try {
         throw new Error("Owned session disposal was not authoritatively completed: " + ownedCleanup.status);
       }
       receipt.ownedCleanup = ownedCleanup.status;
-      if (ownedProof) {
-        const settled = await sdk.observeOwnedSessionSettlement({ agentDir: realpathSync(agentDir), activeSessionId, contractProof: ownedProof });
-        if (settled.status !== "settled") throw new Error("Owned worker settlement was not observed after cleanup.");
-      }
     } else if (client && activeSessionId) {
       const complete = await client.request({ type: "complete_owned_session", activeSessionId }, 10_000);
       if (!complete.success) throw new Error(complete.error);
@@ -561,6 +557,17 @@ console.log(JSON.stringify({ connected }));
 		if (daemon.exitCode !== 0 || daemonOutput.overflow || daemonOutput.error) {
 			throw new Error(`Installed daemon exited unexpectedly.\n${daemonOutput.stderr || daemonOutput.stdout}`);
 		}
+		// Join the captured supervisor before requiring a stable durable-registry observation.
+		const settlementProbe = join(probesDir, "settlement-probe.mjs");
+		writeFileSync(settlementProbe, `${staticSdkImport()}import { realpathSync } from "node:fs";
+const receipt = ${JSON.stringify(receipt)};
+const result = await sdk.observeOwnedSessionSettlement({ agentDir: realpathSync(${JSON.stringify(fixture.agentDir)}), activeSessionId: receipt.activeSessionId, contractProof: receipt.ownedProof });
+if (result.status !== "settled") throw new Error("Owned worker settlement was not observed after supervisor exit: " + result.status);
+`);
+		const settlement = await collectChild(spawn(process.execPath, [settlementProbe], {
+			cwd: probesDir, env: fixture.env, stdio: ["ignore", "pipe", "pipe"], shell: false,
+		}), 15_000);
+		if (settlement.status !== 0) throw new Error(`Installed settlement observation failed.\n${settlement.stderr || settlement.stdout}`);
 	} catch (error) {
 		failure = error;
 	} finally {

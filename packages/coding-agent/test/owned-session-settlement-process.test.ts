@@ -98,7 +98,7 @@ it.runIf(process.platform !== "win32")(
 			const input = { agentDir, activeSessionId: summary.activeSessionId, contractProof };
 			expect((await observeOwnedSessionSettlement(input)).status).toBe("registered");
 			expect((await connection.disposeOwnedSession({ timeoutMs: 30_000 })).status).toBe("completed");
-			expect((await observeOwnedSessionSettlement(input)).status).toBe("settled");
+			// The live supervisor can still update registry metadata; join its exit before the stable scan.
 			const observer = new DaemonClient(socket);
 			await observer.connect(10_000);
 			try {
