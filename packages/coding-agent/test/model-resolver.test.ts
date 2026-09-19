@@ -274,7 +274,6 @@ describe("resolveCliModel", () => {
 			cliModel: "zai/glm-5",
 			modelRegistry: registry,
 		});
-
 		expect(result.error).toBeUndefined();
 		expect(result.model?.provider).toBe("zai");
 		expect(result.model?.id).toBe("glm-5");

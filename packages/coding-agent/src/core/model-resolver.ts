@@ -158,6 +158,16 @@ function buildFallbackModel(provider: string, modelId: string, availableModels: 
 	const providerModels = availableModels.filter((m) => m.provider === provider);
 	if (providerModels.length === 0) return undefined;
 
+	// Daemon-created sessions (rlm.create_session) re-resolve their model from
+	// provider/id strings in a registry that has not refreshed the team-authorized
+	// private catalog, so unknown private ids reach this fallback. They must
+	// inherit a private-route template: public-route limits and thinking-level
+	// maps do not describe private routes.
+	if (isPrivatePrimeInferenceModel({ provider, id: modelId })) {
+		const privateTemplate = providerModels.find((m) => isPrivatePrimeInferenceModel(m));
+		if (!privateTemplate) return undefined;
+		return { ...privateTemplate, id: modelId, name: modelId };
+	}
 	const defaultId = defaultModelPerProvider[provider as KnownProvider];
 	const baseModel = defaultId
 		? (providerModels.find((m) => m.id === defaultId) ?? providerModels[0])
