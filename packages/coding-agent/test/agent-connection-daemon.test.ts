@@ -84,6 +84,8 @@ class FakeDaemonClient {
 	rlmChildrenGate: Promise<void> | undefined;
 	abortBashUnknownCommand = false;
 	abortAndClearQueueUnknownCommand = false;
+	abortAndSendQueuedUnknownCommand = false;
+	abortAndSendQueuedUpdateRestart = false;
 	inputPauseAcquireGate: Promise<void> | undefined;
 	cronAddGate: Promise<void> | undefined;
 	promptGate: Promise<void> | undefined;
@@ -378,6 +380,26 @@ class FakeDaemonClient {
 					success: true,
 					data: { steering: ["cleared"], followUp: [] },
 				};
+			case "abort":
+				return { type: "response", command: command.type, success: true };
+			case "abort_and_send_queued":
+				if (this.abortAndSendQueuedUnknownCommand) {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Unknown daemon command: abort_and_send_queued",
+					};
+				}
+				if (this.abortAndSendQueuedUpdateRestart) {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Daemon is preparing an update restart",
+					};
+				}
+				return { type: "response", command: command.type, success: true };
 			case "abort_and_clear_queue":
 				if (this.abortAndClearQueueUnknownCommand) {
 					return {
@@ -9390,5 +9412,25 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.getCloseListenerCount()).toBe(0);
 		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach", "attach", "detach"]);
 		expect(fakeClient.closeCount).toBe(1);
+	});
+
+	it("sends abort_and_send_queued only behind the advertised daemon capability", async () => {
+		const send = (client: FakeDaemonClient) =>
+			new DaemonAgentConnection(asDaemonClient(client), "active-1").abortAndSendQueued();
+		const capable = new FakeDaemonClient();
+		capable.serverCapabilities.add("abort_and_send_queued_v1");
+		await expect(send(capable)).resolves.toBeUndefined();
+		expect(capable.requests).toEqual([{ type: "abort_and_send_queued", activeSessionId: "active-1" }]);
+		const older = new FakeDaemonClient();
+		await expect(send(older)).resolves.toBeUndefined();
+		expect(older.requests).toEqual([{ type: "abort", activeSessionId: "active-1" }]);
+		const stale = Object.assign(new FakeDaemonClient(), { abortAndSendQueuedUnknownCommand: true });
+		stale.serverCapabilities.add("abort_and_send_queued_v1");
+		await expect(send(stale)).resolves.toBeUndefined();
+		expect(stale.requests.map(({ type }) => type)).toEqual(["abort_and_send_queued", "abort"]);
+		const restarting = Object.assign(new FakeDaemonClient(), { abortAndSendQueuedUpdateRestart: true });
+		restarting.serverCapabilities.add("abort_and_send_queued_v1");
+		await expect(send(restarting)).resolves.toBeUndefined();
+		expect(restarting.requests.map(({ type }) => type)).toEqual(["abort_and_send_queued", "abort"]);
 	});
 });

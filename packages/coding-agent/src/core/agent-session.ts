@@ -1275,6 +1275,9 @@ export class AgentSession {
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
 	private readonly _actionStore = new ActionStore<QueuedSessionAction>();
+	// One-shot "all" steering batch armed by abortAndSendQueued: read on selection, never
+	// consumed on read, and disarmed once the armed actions leave the steering queue.
+	private _forcedAllSteeringActionIds: ReadonlySet<string> | undefined;
 	private readonly _promptLifecycles = new PromptLifecycleStore();
 	private readonly _pendingCorrelatedPromptAdmissions = new Map<string, AbortController>();
 	private readonly _promptEventContext = new AsyncLocalStorage<string>();
@@ -6613,7 +6616,13 @@ export class AgentSession {
 					return;
 				}
 
-				const mode = first.delivery === "next_turn_boundary" ? this.steeringMode : this.followUpMode;
+				const forcedAllSteeringActionIds = this._forcedAllSteeringBatch(first);
+				const mode =
+					forcedAllSteeringActionIds !== undefined
+						? "all"
+						: first.delivery === "next_turn_boundary"
+							? this.steeringMode
+							: this.followUpMode;
 				const actions: QueuedSessionAction[] = [first];
 				while (!preselected && mode === "all" && first.promptCorrelationId === undefined) {
 					const next = this._actionStore.queuedActions(first.delivery)[0];
@@ -6621,6 +6630,7 @@ export class AgentSession {
 						!next ||
 						next.promptCorrelationId !== undefined ||
 						next.payload.kind !== "turn" ||
+						(forcedAllSteeringActionIds !== undefined && !forcedAllSteeringActionIds.has(next.id)) ||
 						!turnExecutionPoliciesEqual(first.payload.executionPolicy, next.payload.executionPolicy)
 					) {
 						break;
@@ -7250,6 +7260,7 @@ export class AgentSession {
 	}
 
 	clearQueue(): { steering: string[]; followUp: string[] } {
+		this._forcedAllSteeringActionIds = undefined;
 		const clearable = this._actionStore
 			.clearableActions()
 			.filter((action) => action.payload.kind === "session_command" || action.payload.queueVisible);
@@ -7982,7 +7993,53 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Abort the active run and deliver every queued user steering message in one new turn.
+	 * Abort-only when the visible steering queue is empty or the scheduler must stay
+	 * suspended; an update-restart suspension is left untouched. steeringMode is never changed.
+	 */
+	abortAndSendQueued(): boolean {
+		// requestAbort would clear the restart flag, letting later admissions resume
+		// work during the restart window; abortForUpdateRestart already aborted the run.
+		if (this._sessionInputSuspendedForUpdateRestart) {
+			return false;
+		}
+		const queuedSteering = visibleSessionActionProjection(
+			this._actionStore.queuedActions("next_turn_boundary"),
+		).filter(
+			(action) =>
+				action.payload.kind === "turn" &&
+				!action.payload.acceptedAgentMessage &&
+				action.promptCorrelationId === undefined &&
+				primaryDeliveryRecord(action).message.role === "user",
+		);
+		const canResume =
+			!this._disposed &&
+			!this._disposing &&
+			this._sessionInputAdmissionPauses.size === 0 &&
+			this._queuedWorkPauses.size === 0;
+		if (queuedSteering.length === 0 || !canResume) {
+			this.requestAbort();
+			return false;
+		}
+		this._forcedAllSteeringActionIds = new Set(queuedSteering.map((action) => action.id));
+		this.requestAbort();
+		this.resumeQueuedWork();
+		return true;
+	}
+
+	private _forcedAllSteeringBatch(first: QueuedSessionAction): ReadonlySet<string> | undefined {
+		const armed = this._forcedAllSteeringActionIds;
+		if (armed === undefined) return undefined;
+		if (first.delivery === "next_turn_boundary" && armed.has(first.id)) return armed;
+		if (!this._actionStore.queuedActions("next_turn_boundary").some((action) => armed.has(action.id))) {
+			this._forcedAllSteeringActionIds = undefined;
+		}
+		return undefined;
+	}
+
 	abortForUpdateRestart(): void {
+		this._forcedAllSteeringActionIds = undefined;
 		this._failDeferredPromptLifecycles();
 		// Cancel scheduled pumps and suspend new ones: queued inputs must survive
 		// into the restart manifest instead of starting a turn during teardown.

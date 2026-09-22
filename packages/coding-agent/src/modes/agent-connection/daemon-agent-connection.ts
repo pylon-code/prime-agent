@@ -44,7 +44,7 @@ import {
 	type DaemonTransportClient,
 	getDaemonSocketCloseReason,
 } from "../daemon/daemon-client.js";
-import { deserializeDaemonError } from "../daemon/daemon-errors.js";
+import { deserializeDaemonError, UPDATE_RESTART_PREPARING_MESSAGE } from "../daemon/daemon-errors.js";
 import {
 	cloneCallerOwnedSessionLaunchEnv,
 	collectDaemonClientEnv,
@@ -2276,6 +2276,25 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	async abort(): Promise<void> {
 		await this.requestOk({ type: "abort", activeSessionId: this.activeSessionId });
+	}
+
+	async abortAndSendQueued(): Promise<void> {
+		if (!this.client.supportsServerCapability("abort_and_send_queued_v1")) {
+			await this.abort();
+			return;
+		}
+		try {
+			await this.requestOk({ type: "abort_and_send_queued", activeSessionId: this.activeSessionId });
+		} catch (error) {
+			if (
+				isUnknownDaemonCommandError(error, "abort_and_send_queued") ||
+				(error instanceof Error && error.message.includes(UPDATE_RESTART_PREPARING_MESSAGE))
+			) {
+				await this.abort();
+				return;
+			}
+			throw error;
+		}
 	}
 
 	async cancelRlmChild(childId: string): Promise<boolean> {
