@@ -793,6 +793,10 @@ class ReplTest(unittest.TestCase):
                 reply_ok(self.repl, notice)
                 read = self.repl.execute(f"withdraw-{label}-read", read_code)
                 self.assertIn(f"withdrawn-{label}", one(read, "result")["text"])
+                # The withdrawal must ship ahead of the reading cell's done, or the
+                # notice is delivered as a stale turn-boundary notice instead.
+                kinds = [event.get("event") for event in read]
+                self.assertLess(kinds.index("host_request"), kinds.index("done"))
                 request = wait_for_host_request(self.repl, read)
                 self.assertEqual(
                     request["data"], {"type": "bash.consumed", "completionId": notice["data"]["completionId"], "pid": pid, "command": command}
