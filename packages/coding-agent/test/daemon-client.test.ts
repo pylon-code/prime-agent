@@ -9,6 +9,7 @@ import type {
 import * as publicSdk from "../src/index.js";
 import {
 	DaemonClient,
+	type DaemonHello,
 	DaemonInboundFrameTooLargeError,
 	DEFAULT_DAEMON_CLIENT_MAX_INBOUND_FRAME_BYTES,
 	getDaemonSocketCloseReason,
@@ -1572,4 +1573,3 @@ describe("daemon heartbeat catalog", () => {
 		expect(client.request).toHaveBeenCalledWith({ type: "heartbeats_list" });
 	});
 });
-
