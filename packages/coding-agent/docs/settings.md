@@ -1,120 +1,47 @@
 # Settings
 
-Prime Agent uses JSON settings files with project settings overriding global settings.
+Prime Agent stores its settings in `settings.json`. By default this file is at:
+- macOS/Linux: `~/.prime-agent/settings.json`
+- Windows: `%USERPROFILE%\.prime-agent\settings.json`
 
-| Location | Scope |
-|----------|-------|
-| `~/.prime/agent/settings.json` | Global (all projects) |
-| `.prime/agent/settings.json` | Project (current directory) |
+You can also specify a project-level settings file in your project root:
+`.prime-agent/settings.json`
 
-Edit directly or use `/settings` for common options.
+Project settings override global settings, except for lists and objects which are merged.
 
-## All Settings
+## Configuration Options
 
-### Model & Thinking
+### Models & Thinking
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `defaultProvider` | string | - | Default provider (e.g., `"anthropic"`, `"openai"`) |
-| `defaultModel` | string | - | Default model ID |
-| `defaultThinkingLevel` | string | `"xhigh"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
-| `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
-| `thinkingBudgets` | object | - | Custom token budgets per thinking level |
-
-#### thinkingBudgets
+| `defaultProvider` | string | none | Default AI provider to use |
+| `defaultModel` | string | none | Default model ID |
+| `defaultThinkingLevel` | string | `"low"` | Default thinking level: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` |
+| `defaultServiceTier` | string | none | Default service tier for providers that support it (e.g. Anthropic's `"auto"` or `"priority"`) |
+| `thinkingBudgets` | object | none | Custom token budgets for thinking levels: `minimal`, `low`, `medium`, `high`, `xhigh` |
+| `enabledModels` | string[] | none | Whitelist of model patterns for cycling/selection |
 
 ```json
 {
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-3-7-sonnet-20250219",
+  "defaultThinkingLevel": "low",
   "thinkingBudgets": {
-    "minimal": 1024,
     "low": 4096,
-    "medium": 10240,
-    "high": 32768
+    "medium": 8192
   }
 }
 ```
 
-### UI & Display
+### Context & Compaction
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `theme` | string | `"dark"` | Theme name (`"dark"`, `"light"`, or custom) |
-| `quietStartup` | boolean | `false` | Hide startup header |
-| `collapseChangelog` | boolean | `false` | Show condensed changelog after updates |
-| `treeFilterMode` | string | `"user-only"` | Default filter for `/tree`: `"default"`, `"no-tools"`, `"user-only"`, `"labeled-only"`, `"all"` |
-| `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
-| `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
-| `showHardwareCursor` | boolean | `false` | Show terminal cursor |
-
-### Update Checks
-
-Stable builds fetch the release manifest at `https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/latest.json`. Beta builds fetch `beta.json` and continue following beta updates. Override the base URL with `PRIME_AGENT_DOWNLOAD_BASE_URL`.
-
-Set `PI_SKIP_VERSION_CHECK=1` to disable the Prime Agent version update check. Use `--offline` or `PI_OFFLINE=1` to disable startup network operations, including update checks and package update checks.
-
-The stable `latest.json` and beta `beta.json` manifests use the same JSON shape:
-
-```json
-{
-  "version": "0.73.1",
-  "package": "prime-agent",
-  "tarball": "releases/v0.73.1/prime-agent-0.73.1.tgz"
-}
-```
-
-`version` is required. `package` is optional and may also be named `packageName`; it defaults to the current package name. `tarball` is optional; when present, Prime Agent installs that tarball instead of the package name. Relative tarball paths resolve against `PRIME_AGENT_DOWNLOAD_BASE_URL`.
-
-### Pseudonymous usage analytics
-
-Prime Agent sends pseudonymous, aggregate usage and performance events to Prime Intellect. These events include version and operating-system category, onboarding outcome and duration, execution mode (`interactive`, `print`, `json`, `rpc`, or `acp`), run outcomes, TTFT and latency, prompt and turn counts, token usage, tool success counts, retries, and compactions.
-
-Prime Agent does not send prompts, responses, thinking, tool arguments or results, command text, filenames, paths, repository information, environment variables, credentials, raw error messages, hostnames, usernames, emails, or hardware identifiers. A random installation ID is stored as `telemetry.json` in the configured agent directory (normally `~/.prime/agent/`).
-
-Telemetry can be disabled globally or for an individual project. Project settings can only further restrict telemetry: they cannot re-enable a global opt-out or suppress the global one-time disclosure.
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `telemetry.enabled` | boolean | `true` | Send pseudonymous aggregate usage and performance events |
-
-Disable analytics with any of:
-
-```json
-{
-  "telemetry": {
-    "enabled": false
-  }
-}
-```
-
-```bash
-PRIME_AGENT_TELEMETRY=0 prime-agent
-DO_NOT_TRACK=1 prime-agent
-prime-agent --offline
-```
-
-`PRIME_AGENT_TELEMETRY_ENDPOINT` overrides the ingestion endpoint for development and self-hosted deployments.
-
-### Warnings
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `warnings.anthropicExtraUsage` | boolean | `true` | Show a warning when Anthropic subscription auth may use paid extra usage |
-
-```json
-{
-  "warnings": {
-    "anthropicExtraUsage": false
-  }
-}
-```
-
-### Compaction
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `compaction.enabled` | boolean | `true` | Enable auto-compaction |
-| `compaction.reserveTokens` | number | `16384` | Tokens reserved for LLM response |
-| `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
+| `compaction.enabled` | boolean | `true` | Enable automatic context compaction |
+| `compaction.reserveTokens` | number | `16384` | Tokens reserved for output and tool use |
+| `compaction.keepRecentTokens` | number | `20000` | Tokens of recent messages to preserve during compaction |
+| `compaction.customInstructions` | string | none | Additional instructions for the summarizer |
 
 ```json
 {
@@ -126,14 +53,37 @@ prime-agent --offline
 }
 ```
 
-### Branch Summary
+### Auto Refinement
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `branchSummary.reserveTokens` | number | `16384` | Tokens reserved for branch summarization |
-| `branchSummary.skipPrompt` | boolean | `false` | Skip "Summarize branch?" prompt on `/tree` navigation (defaults to no summary) |
+| `autoRefine.enabled` | boolean | `false` | Enable automatic prompt refinement |
+| `autoRefine.minIntervalMs` | number | `60000` | Minimum interval between automated refinement checks (1 minute) |
+| `autoRefine.cooldownMs` | number | `1200000` | Cooldown period after refinement triggers (20 minutes) |
 
-### Retry
+```json
+{
+  "autoRefine": {
+    "enabled": true,
+    "minIntervalMs": 60000,
+    "cooldownMs": 1200000
+  }
+}
+```
+
+### Subagents (RLM)
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `rlmMaxDepth` | number | `2` | Maximum nesting depth for subagents (0 = disabled, max = 5) |
+
+```json
+{
+  "rlmMaxDepth": 2
+}
+```
+
+### Auto Retry
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
@@ -145,6 +95,62 @@ prime-agent --offline
 
 When a provider requests a retry delay longer than `retry.provider.maxRetryDelayMs` (e.g. a usage-limit reset hours away), auto-retry stops immediately with an informative error instead of waiting. Set to `0` to disable the cap.
 
+### Wait-for-usage and provider recovery
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `retry.provider.waitForUsage.enabled` | boolean | `true` | Bounded wait-for-recovery loop for quota exhaustion and provider unavailability |
+| `retry.provider.waitForUsage.baseDelayMs` | number | `1000` | First ping delay (doubles per ping) |
+| `retry.provider.waitForUsage.maxDelayMs` | number | `300000` | Per-ping ceiling (5m) |
+| `retry.provider.waitForUsage.maxAttempts` | number | `30` | Abort bound: maximum recovery pings |
+| `retry.provider.waitForUsage.maxWaitMs` | number | `900000` | Abort bound: maximum total wait (15m) |
+| `retry.provider.waitForUsage.pauseUntilReset` | boolean | `true` | Park quota-blocked sessions until the provider-reported reset instead of dying mid-task |
+| `retry.provider.waitForUsage.maxPauseMs` | number | `86400000` | Abort bound: maximum single park (24h; clamped to 7d) |
+| `retry.provider.waitForUsage.maxParks` | number | `8` | Abort bound: maximum parks per quota episode |
+| `providerBackupModel` | string | none | Backup model ("provider/model-id" or bare id) used while the primary is quota-blocked or unavailable |
+
+The wait loop runs under the `retry.enabled` master switch: with retries
+disabled, no waits run either.
+
+When a request fails with quota/subscription exhaustion (429s, usage limits), the
+session waits for usage to come back: it pings the provider with exponential
+backoff and jitter (1s doubling to a 5m ceiling) and resumes automatically when
+the provider recovers. If the provider reports a reset time (Retry-After header
+or "Try again in ~90 min" style text), the resume is scheduled exactly then
+instead of pinging. Quick retries still run first for transient errors (5xx,
+overload, network, and 404 routing blips); the wait loop takes over when they
+are exhausted. Every wait shows attempts and the next check countdown in the
+status line, and both abort bounds (`maxAttempts`, `maxWaitMs`) are hard stops:
+waits never hang. When a reported reset time exceeds `maxWaitMs`, the wait gives
+up immediately with an informative error instead of pinging pointlessly — raise
+`maxWaitMs` to wait out long subscription windows.
+
+When `pauseUntilReset` is on (the default) and such a reset is reported — e.g.
+the ChatGPT-plan "Try again in ~7272 min" 429 — the session does not die
+mid-task: it parks. The turn ends cleanly with a "parked until ..." status, the
+park/resume transitions are recorded in the session log, and one durable
+one-shot scheduled job (visible via `/cron`) wakes the session at the reset
+time — or sooner when `maxPauseMs` caps the park. While parked the session
+itself makes no model calls. The wake delivers an
+in-context marker telling the model the pause happened and to continue the
+interrupted task; that turn's single model call probes the quota. If the quota
+is back, the task resumes with its context. If not, the session re-parks with
+the newly reported reset, bounded by `maxPauseMs` per park and `maxParks` per
+quota episode; when the budget is spent, it aborts exactly like the bounded
+wait it replaced. Parks apply at the session level (subagents included), only
+for quota failures with a provider-reported reset, and only when no backup
+model took over; a `maxPauseMs` above 7 days is clamped. Set
+`pauseUntilReset: false` to keep the pre-park behavior of failing immediately.
+
+`providerBackupModel` routes failed turns to a user-defined backup model
+instead of waiting while the primary is quota-blocked or unavailable. It is
+disabled by default: with no setting, behavior is unchanged and requests never
+silently switch models. When set, the retry status line shows an explicit
+"retrying on backup model X" indicator, the switch is recorded in the session
+log, and the session returns to the primary model automatically (the next turn
+probes the primary again). If the backup reference cannot be resolved to an
+available, authenticated model, the bounded wait runs instead.
+
 ```json
 {
   "retry": {
@@ -153,9 +159,20 @@ When a provider requests a retry delay longer than `retry.provider.maxRetryDelay
     "baseDelayMs": 2000,
     "provider": {
       "timeoutMs": 3600000,
-      "maxRetryDelayMs": 60000
+      "maxRetryDelayMs": 60000,
+      "waitForUsage": {
+        "enabled": true,
+        "baseDelayMs": 1000,
+        "maxDelayMs": 300000,
+        "maxAttempts": 30,
+        "maxWaitMs": 900000,
+        "pauseUntilReset": true,
+        "maxPauseMs": 86400000,
+        "maxParks": 8
+      }
     }
-  }
+  },
+  "providerBackupModel": "anthropic/claude-opus-4-7"
 }
 ```
 
@@ -186,151 +203,44 @@ When a provider requests a retry delay longer than `retry.provider.maxRetryDelay
 
 ```json
 {
-  "npmCommand": ["mise", "exec", "node@20", "--", "npm"]
+  "shellPath": "/bin/zsh",
+  "shellCommandPrefix": "shopt -s expand_aliases",
+  "npmCommand": ["pnpm"]
 }
 ```
 
-`npmCommand` is used for all npm package-manager operations, including installs, uninstalls, and dependency installs inside git packages. Use argv-style entries exactly as the process should be launched. When `npmCommand` is configured, git package dependency installs use plain `install` to avoid npm-specific flags in wrappers or alternate package managers.
-
-Normally the package manager's global modules location is queried using `root -g`. As a special case, if the first element of `npmCommand` is `"bun"`, the modules location will instead be queried with `pm bin -g`.
-
-### Daemon
+### UI & Themes
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `idleEvictionMinutes` | number or `"off"` | `90` | Idle threshold in minutes for whole-tree worker eviction and individual idle-child passivation; `"off"` disables both. |
+| `theme` | string | `"dark"` | Color theme name |
+| `themes` | string[] | none | Paths to custom theme files/directories |
+| `editorPaddingX` | number | `0` | Horizontal padding for input editor |
+| `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown |
+| `showHardwareCursor` | boolean | `false` | Show hardware terminal cursor |
+| `quietStartup` | boolean | `false` | Suppress startup banner |
 
-`idleEvictionMinutes` is a global daemon policy and is read only from `~/.prime/agent/settings.json`. Set it to a positive number to configure the idle threshold.
-
-### Sessions
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `sessionDir` | string | - | Directory where session files are stored. Accepts absolute or relative paths, plus `~`. |
-
-```json
-{ "sessionDir": ".prime/agent/sessions" }
-```
-
-When multiple sources specify a session directory, precedence is `--session-dir`, `PRIME_AGENT_SESSION_DIR`, the legacy `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `sessionDir` in `settings.json`.
-
-### Model Cycling
+### Skills & Prompts
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `enabledModels` | string[] | - | Model patterns for Ctrl+P cycling (same format as `--models` CLI flag) |
-
-```json
-{
-  "enabledModels": ["claude-*", "gpt-4o", "gemini-2*"]
-}
-```
-
-### Markdown
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `markdown.codeBlockIndent` | string | `"  "` | Indentation for code blocks |
-
-### Resources
-
-These settings define where to load extensions, skills, prompts, and themes from.
-
-Paths in `~/.prime/agent/settings.json` resolve relative to `~/.prime/agent`. Paths in `.prime/agent/settings.json` resolve relative to `.prime/agent`. Absolute paths and `~` are supported.
-
-| Setting | Type | Default | Description |
-|---------|------|---------|-------------|
-| `packages` | array | `[]` | npm/git packages to load resources from |
-| `extensions` | string[] | `[]` | Local extension file paths or directories |
-| `skills` | string[] | `[]` | Local skill file paths or directories |
-| `prompts` | string[] | `[]` | Local prompt template paths or directories |
-| `themes` | string[] | `[]` | Local theme file paths or directories |
+| `skills` | string[] | none | Paths to skill files/directories |
 | `enableSkillCommands` | boolean | `true` | Register skills as `/skill:name` commands |
-| `enableBuiltinSkills` | boolean | `true` | Load built-in skills shipped with prime-agent |
-| `bundledSkills.websearch` | boolean | `true` | Load the built-in `websearch` skill |
+| `bundledSkills` | object | none | Configure bundled skills |
+| `enableBuiltinSkills` | boolean | `true` | Enable built-in skills |
+| `prompts` | string[] | none | Paths to prompt template files/directories |
 
-Arrays support glob patterns and exclusions. Use `!pattern` to exclude. Use `+path` to force-include an exact path and `-path` to force-exclude an exact path.
+### Extensions & MCP
 
-Disable the built-in `websearch` skill while keeping normal skill discovery enabled:
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `extensions` | string[] | none | Paths to extension files/directories |
+| `packages` | object[] | none | NPM/git package sources |
+| `mcpServers` | object | none | MCP server configurations (see [MCP documentation](mcp.md)) |
 
-```json
-{
-  "bundledSkills": {
-    "websearch": false
-  }
-}
-```
+### Session Management
 
-#### packages
-
-String form loads all resources from a package:
-
-```json
-{
-  "packages": ["pi-skills", "@org/my-extension"]
-}
-```
-
-Object form filters which resources to load:
-
-```json
-{
-  "packages": [
-    {
-      "source": "pi-skills",
-      "skills": ["brave-search", "transcribe"],
-      "extensions": []
-    }
-  ]
-}
-```
-
-See [packages.md](packages.md) for package management details.
-
-## Example
-
-```json
-{
-  "defaultProvider": "anthropic",
-  "defaultModel": "claude-sonnet-4-20250514",
-  "defaultThinkingLevel": "xhigh",
-  "theme": "dark",
-  "compaction": {
-    "enabled": true,
-    "reserveTokens": 16384,
-    "keepRecentTokens": 20000
-  },
-  "retry": {
-    "enabled": true,
-    "maxRetries": 3
-  },
-  "enabledModels": ["claude-*", "gpt-4o"],
-  "warnings": {
-    "anthropicExtraUsage": true
-  },
-  "packages": ["pi-skills"]
-}
-```
-
-## Project Overrides
-
-Project settings (`.prime/agent/settings.json`) override global settings. Nested objects are merged:
-
-```json
-// ~/.prime/agent/settings.json (global)
-{
-  "theme": "dark",
-  "compaction": { "enabled": true, "reserveTokens": 16384 }
-}
-
-// .prime/agent/settings.json (project)
-{
-  "compaction": { "reserveTokens": 8192 }
-}
-
-// Result
-{
-  "theme": "dark",
-  "compaction": { "enabled": true, "reserveTokens": 8192 }
-}
-```
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `sessionDir` | string | none | Custom directory for session storage |
+| `idleEvictionMinutes` | number | `90` | Minutes of inactivity before evicting a session from memory (0 or `"off"` disables) |
