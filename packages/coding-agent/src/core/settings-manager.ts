@@ -5,6 +5,7 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
+import { MAX_PROVIDER_PAUSE_MS, type ProviderWaitPolicy } from "./provider-retry.js";
 
 const RECENT_MODELS_LIMIT = 20;
 export const DEFAULT_IDLE_EVICTION_MINUTES = 90;
@@ -28,9 +29,21 @@ export interface AutoRefineSettings {
 	cooldownMs?: number; // default: 20 minutes
 }
 
+export interface ProviderWaitSettings {
+	enabled?: boolean; // default: true - bounded wait for quota/unavailability recovery
+	baseDelayMs?: number; // default: 1000 (first ping delay)
+	maxDelayMs?: number; // default: 300000 (per-ping ceiling, 5m)
+	maxAttempts?: number; // default: 30 (abort bound: max pings)
+	maxWaitMs?: number; // default: 900000 (abort bound: max total wait, 15m)
+	pauseUntilReset?: boolean; // default: true - park quota-blocked sessions until the provider-reported reset
+	maxPauseMs?: number; // default: 86400000 (abort bound: max single park, 24h; clamped to 7d)
+	maxParks?: number; // default: 8 (abort bound: max parks per quota episode)
+}
+
 export interface ProviderRetrySettings {
 	timeoutMs?: number; // SDK/provider request timeout in milliseconds
 	maxRetryDelayMs?: number; // default: 60000 (max server-requested retry delay before failing; 0 disables the cap)
+	waitForUsage?: ProviderWaitSettings;
 }
 
 export interface RetrySettings {
@@ -148,6 +161,7 @@ export interface Settings {
 	telemetry?: TelemetrySettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
+	providerBackupModel?: string;
 	hideThinkingBlock?: boolean;
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows)
 	quietStartup?: boolean;
@@ -956,6 +970,32 @@ export class SettingsManager {
 			timeoutMs: this.settings.retry?.provider?.timeoutMs,
 			maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000,
 		};
+	}
+
+	getProviderWaitSettings(): ProviderWaitPolicy {
+		const wait = this.settings.retry?.provider?.waitForUsage;
+		const bound = (value: number | undefined, fallback: number): number =>
+			typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : fallback;
+		return {
+			enabled: wait?.enabled ?? true,
+			baseDelayMs: bound(wait?.baseDelayMs, 1000),
+			maxDelayMs: bound(wait?.maxDelayMs, 300_000),
+			maxAttempts: bound(wait?.maxAttempts, 30),
+			maxWaitMs: bound(wait?.maxWaitMs, 900_000),
+			pauseUntilReset: wait?.pauseUntilReset ?? true,
+			// Very large parks are clamped to MAX_PROVIDER_PAUSE_MS instead of
+			// silently waiting weeks for a stale reset.
+			maxPauseMs: Math.min(bound(wait?.maxPauseMs, 86_400_000), MAX_PROVIDER_PAUSE_MS),
+			maxParks: bound(wait?.maxParks, 8),
+		};
+	}
+
+	getProviderBackupModel(): string | undefined {
+		// Parsed settings are only cast to Settings; a non-string JSON value
+		// (e.g. 123) must behave as unset, never throw into the retry path.
+		const reference = this.settings.providerBackupModel;
+		if (typeof reference !== "string") return undefined;
+		return reference.trim() ? reference.trim() : undefined;
 	}
 
 	getHideThinkingBlock(): boolean {
