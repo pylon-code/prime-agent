@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	type AgentSessionMessageController,
 	createAgentSessionMessage,
+	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 } from "../src/core/agent-messages.js";
 import { AgentSession, type RlmChildAgentSnapshot } from "../src/core/agent-session.js";
@@ -566,6 +567,28 @@ describe("AgentSession rlm recursion", () => {
 		);
 		releaseChild();
 		await runPromise;
+	});
+
+	it("holds a spawn name reservation until admission settles, then frees it", async () => {
+		const releaseAdmission = deferred<void>();
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					await releaseAdmission.promise;
+					throw new Error("kernel startup failed");
+				},
+				deleteRlmSubagentRuntime: async () => {},
+			},
+		});
+		const internals = root as unknown as InspectableRlmSession & { _pendingRlmSubagentSessionNames: Set<string> };
+		const unavailable = formatAgentSessionNameUnavailable("slow-worker", root.rlmDepth + 1);
+		const spawned = await root.runRlmChild("slow admitting child", { name: "slow-worker" });
+		expect(internals._pendingRlmSubagentSessionNames.has("slow-worker")).toBe(true);
+		await expect(root.runRlmChild("racing spawn", { name: "slow-worker" })).rejects.toThrow(unavailable);
+		releaseAdmission.resolve();
+		await internals._activeRlmChildRuns.get(spawned.rlm_child_id)!.settlement!.promise;
+		expect(internals._pendingRlmSubagentSessionNames.has("slow-worker")).toBe(false);
+		await expect(root.runRlmChild("respawn while retained", { name: "slow-worker" })).rejects.toThrow(unavailable);
 	});
 
 	it("makes an externally restored retained child listable and deletable", async () => {

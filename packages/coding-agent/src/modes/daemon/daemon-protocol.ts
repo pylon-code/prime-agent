@@ -92,7 +92,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 33 preserves optional worker replay metadata on runtime snapshots under event_sequence.
 export const DAEMON_SCHEMA_REVISION = 33;
 export const DAEMON_RUNTIME_SNAPSHOT_REPLAY_MIN_SCHEMA_REVISION = 33;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-33-5924c5b19b8b";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-33-df7072089924";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1352,7 +1352,8 @@ export type DaemonErrorInfo =
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId }
 	| { code: "owned_session_owner_mismatch" }
 	| { code: "owned_session_adoption_unavailable" }
-	| { code: "session_recovering"; activeSessionId: string };
+	| { code: "session_recovering"; activeSessionId: string }
+	| { code: "update_restarting" };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 export type DaemonClosingReason = "shutdown" | "update";

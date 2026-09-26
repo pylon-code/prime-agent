@@ -18,10 +18,10 @@ describe("serializeConversation", () => {
 
 		const result = serializeConversation(messages);
 
-		expect(result).toContain("[Tool result]:");
-		expect(result).toContain("[... 3000 more characters truncated]");
+		expect(result).toContain("[Tool result (ipython)]:");
+		expect(result).toContain("truncated");
 		expect(result).not.toContain("x".repeat(3000));
-		expect(result).toContain("x".repeat(2000));
+		expect(result).toContain("x".repeat(1000));
 	});
 
 	it("should not truncate short tool results", () => {
@@ -39,7 +39,7 @@ describe("serializeConversation", () => {
 
 		const result = serializeConversation(messages);
 
-		expect(result).toBe(`[Tool result]: ${shortContent}`);
+		expect(result).toBe(`[Tool result (ipython)]: ${shortContent}`);
 		expect(result).not.toContain("truncated");
 	});
 

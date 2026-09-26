@@ -252,7 +252,9 @@ function emptyHarnessState(): HarnessState {
 }
 
 function slug(raw: string, fallback: string): string {
-	const normalized = raw
+	// A malformed value (for example a non-string title) cannot be normalized; resolve
+	// to the fallback so apply-time validation can still reject the edit by id.
+	const normalized = (typeof raw === "string" ? raw : fallback)
 		.trim()
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "_")
@@ -441,6 +443,42 @@ export function mergeRefinementHistory(
 	return [...byId.values()];
 }
 
+/** Why a persisted harness entry cannot be rendered safely: the field whose
+ * stored type violates the entry contract (write paths reject these shapes).
+ * Render paths skip such entries with a diagnostic instead of throwing, so one
+ * corrupt entry (from an older build or a hand-edited store) can never break
+ * session creation by crashing the harness digest. */
+export function harnessEntryMalformation(entry: HarnessEntry): string | undefined {
+	if (typeof entry.content !== "string") return "content not a string";
+	if (typeof entry.title !== "string") return "title not a string";
+	return undefined;
+}
+
+/** Same contract for refinement events: the digest renders id, trigger, changes,
+ * and outcome with string operations, so a non-string id or trigger, non-array
+ * changes, non-string change elements, or non-string outcome must be skipped
+ * with a diagnostic rather than crash the digest or render junk. */
+export function harnessRefinementMalformation(event: HarnessRefinementEvent): string | undefined {
+	if (typeof event !== "object" || event === null) return "event not an object";
+	if (typeof event.id !== "string") return "id not a string";
+	if (typeof event.trigger !== "string") return "trigger not a string";
+	if (!Array.isArray(event.changes)) return "changes not an array";
+	if (!event.changes.every((change) => typeof change === "string")) return "changes contain a non-string";
+	if (event.outcome !== undefined && typeof event.outcome !== "string") return "outcome not a string";
+	return undefined;
+}
+
+/** Bounded label for a skipped malformed refinement event. Non-object elements
+ * and invalid ids are labeled by type, never by value: a corrupt store element
+ * must not inject arbitrary unbounded text into every session's prompt digest. */
+function malformedRefinementEventLabel(event: HarnessRefinementEvent): string {
+	if (event === null) return "null";
+	if (typeof event === "undefined") return "undefined";
+	if (typeof event !== "object") return `a ${typeof event}`;
+	if (Array.isArray(event)) return "an array";
+	return typeof event.id === "string" ? event.id : `a ${typeof event.id} id`;
+}
+
 function compactText(text: string, maxLength: number): string {
 	const normalized = text.replace(/\s+/g, " ").trim();
 	if (normalized.length <= maxLength) {
@@ -456,11 +494,12 @@ export function formatRefinementNoticeBody(result: RefinementResult): string {
 		if (!edit.applied) continue;
 		const entry = edit.after ?? edit.before;
 		const scope = entry?.scope ?? result.scope ?? "local";
+		const malformation = entry ? harnessEntryMalformation(entry) : undefined;
 		lines.push(
-			`- ${edit.action} ${edit.kind} [${scope}:${edit.id}] ${entry?.title ?? edit.id}: ${compactText(
-				entry?.content ?? "",
+			`- ${edit.action} ${edit.kind} [${scope}:${edit.id}] ${malformation ? edit.id : (entry?.title ?? edit.id)}: ${compactText(
+				malformation ? "" : (entry?.content ?? ""),
 				DEFAULT_OVERVIEW_CONTENT_LIMIT,
-			)}`,
+			)}${malformation ? ` (skipped malformed entry: ${malformation})` : ""}`,
 		);
 	}
 	return lines.join("\n");
@@ -519,6 +558,11 @@ export function formatHarnessStateForPrompt(
 			lines.push(`${kind}: ${entries.length}`);
 		}
 		for (const entry of entries.slice(0, maxEntriesPerKind)) {
+			const malformation = harnessEntryMalformation(entry);
+			if (malformation) {
+				lines.push(`harness: skipped malformed entry ${entry.id} (${malformation})`);
+				continue;
+			}
 			const argumentsText =
 				entry.kind === "skill" && Object.keys(entry.arguments).length > 0
 					? ` args=${compactText(JSON.stringify(entry.arguments), maxContentLength)}`
@@ -547,6 +591,13 @@ export function formatHarnessStateForPrompt(
 
 	lines.push(`recent refinements: ${state.refinements.length}`);
 	for (const event of state.refinements.slice(-maxRefinements)) {
+		const malformation = harnessRefinementMalformation(event);
+		if (malformation) {
+			lines.push(
+				`harness: skipped malformed refinement event ${malformedRefinementEventLabel(event)} (${malformation})`,
+			);
+			continue;
+		}
 		const changes = event.changes.length > 0 ? event.changes.join(", ") : "no applied edits";
 		const outcome = event.outcome ? `; outcome: ${compactText(event.outcome, maxContentLength)}` : "";
 		lines.push(`- [${event.id}] ${compactText(event.trigger, maxContentLength)}: ${changes}${outcome}`);
@@ -565,6 +616,11 @@ function overviewForPrompt(state: HarnessState): string {
 		const entries = Object.values(state.entries[kind]);
 		lines.push(`${kind}: ${entries.length}`);
 		for (const entry of entries.slice(0, 40)) {
+			const malformation = harnessEntryMalformation(entry);
+			if (malformation) {
+				lines.push(`- harness: skipped malformed entry ${entry.id} (${malformation})`);
+				continue;
+			}
 			const content = entry.content.replace(/\s+/g, " ").slice(0, 240);
 			const argumentsText =
 				entry.kind === "skill" && Object.keys(entry.arguments).length > 0
@@ -725,6 +781,27 @@ function validateEdit(edit: RefinementEdit, computedId?: string): string | undef
 	}
 	if (edit.action !== "delete" && (!edit.title || !edit.content)) {
 		return `${edit.action} requires title and content`;
+	}
+	if (edit.id !== undefined && (typeof edit.id !== "string" || edit.id.length === 0)) {
+		return `${edit.action} requires id to be a non-empty string when provided`;
+	}
+	if (edit.path !== undefined && (typeof edit.path !== "string" || edit.path.length === 0)) {
+		return `${edit.action} requires path to be a non-empty string when provided`;
+	}
+	if (
+		edit.action !== "delete" &&
+		(typeof edit.title !== "string" || typeof edit.content !== "string" || !edit.title || !edit.content)
+	) {
+		return `${edit.action} requires title and content to be non-empty strings`;
+	}
+	if (edit.reference !== undefined && objectRecord(edit.reference) === undefined) {
+		return `${edit.action} requires reference to be an object when provided`;
+	}
+	if (edit.arguments !== undefined && objectRecord(edit.arguments) === undefined) {
+		return `${edit.action} requires arguments to be an object when provided`;
+	}
+	if (edit.metadata !== undefined && objectRecord(edit.metadata) === undefined) {
+		return `${edit.action} requires metadata to be an object when provided`;
 	}
 	if (edit.action !== "delete" && edit.kind === "skill" && edit.arguments === undefined) {
 		return `${edit.action} skill requires arguments`;

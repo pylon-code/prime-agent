@@ -2212,6 +2212,19 @@ describe("Harness digest at cold boundaries", () => {
 		expect(harness.session.messages[0]).toMatchObject({ role: "custom", customType: HARNESS_DIGEST_CUSTOM_TYPE });
 	});
 
+	function isolatedAgentDir(prefix: string): string {
+		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		const agentDir = join(tmpdir(), `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(agentDir, { recursive: true });
+		tempDirs.push(agentDir);
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = agentDir;
+		onTestFinished(() => {
+			if (previousAgentDir === undefined) delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			else process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+		});
+		return agentDir;
+	}
+
 	it("treats tree navigation as a cold boundary with digest dedupe", async () => {
 		// Empty global store: digest content must reflect only the local test entry.
 		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
@@ -2260,6 +2273,40 @@ describe("Harness digest at cold boundaries", () => {
 		expect(digests).toHaveLength(2);
 		expect(harness.session.messages.at(-1)).toBe(digests.at(-1));
 		expect(getMessageText(digests.at(-1))).toContain("[local:nav_test_memory] Nav test memory");
+	});
+
+	it("delivers a diagnostic digest instead of crashing on a malformed global entry", async () => {
+		// Regression for the fleet-wide incident: one entry with list content in
+		// the global store bricked all child spawn creation via the digest crash.
+		const agentDir = isolatedAgentDir("pi-digest-malformed");
+		mkdirSync(join(agentDir, "harness"), { recursive: true });
+		writeFileSync(
+			join(agentDir, "harness", "harness_state.json"),
+			'{"schema":1,"entries":{"prompt":{},"skill":{},"subagent":{},"memory":{"broken_memory":{"id":"broken_memory","kind":"memory","title":"Breaking memory","content":["one string"],"path":"arc","scope":"global","version":1},"valid_memory":{"id":"valid_memory","kind":"memory","title":"Valid memory","content":"Worktree workflow notes.","path":"general","scope":"global","version":1}}},"refinements":[{"id":"refine_bad","trigger":["not a string"],"changes":[],"evidence":"","outcome":""},null,"RAWLEAK-5f1e",{"id":null,"trigger":"t","changes":["update memory:m"]},{"id":"bad_changes","trigger":"t","changes":[7]}]}',
+		);
+
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("hi")]);
+		await harness.session.prompt("hello");
+
+		const digests = digestMessages(harness);
+		expect(digests).toHaveLength(1);
+		const digest = getMessageText(digests[0]);
+		expect(digest).toContain("harness: skipped malformed entry broken_memory (content not a string)");
+		expect(digest).toContain("harness: skipped malformed refinement event refine_bad (trigger not a string)");
+		expect(digest).toContain("harness: skipped malformed refinement event null (event not an object)");
+		// Non-object elements are labeled by type only: the raw value must not leak.
+		expect(digest).toContain("harness: skipped malformed refinement event a string (event not an object)");
+		expect(digest).not.toContain("RAWLEAK-5f1e");
+		// Non-string ids and non-string change elements are skipped by type label, not rendered.
+		expect(digest).toContain("harness: skipped malformed refinement event a object id (id not a string)");
+		expect(digest).toContain(
+			"harness: skipped malformed refinement event bad_changes (changes contain a non-string)",
+		);
+		expect(digest).toContain("[global:valid_memory]");
+		// The malformed content itself must never leak into the digest.
+		expect(digest).not.toContain("one string");
 	});
 
 	it("prefers the newest digest by timestamp over a retained pre-compaction digest", async () => {

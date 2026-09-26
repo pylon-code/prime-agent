@@ -2255,7 +2255,10 @@ export class AgentSession {
 				const restorable = payload.records
 					.filter(
 						(record): record is DeliveryRecord & { message: CustomMessage } =>
-							(record.role === "next_turn" || (payload.acceptedAgentMessage && record.role === "prefix")) &&
+							// Prefix records are parked next-turn context the action captured
+							// on admission; a cancelled turn hands them back, like the
+							// admission-rejection and dispatch-failure paths already do.
+							(record.role === "next_turn" || record.role === "prefix") &&
 							record.message.role === "custom" &&
 							record.message.customType !== HARNESS_DIGEST_CUSTOM_TYPE &&
 							!record.durable,
@@ -8517,7 +8520,9 @@ export class AgentSession {
 				const result = (await this._extensionRunner.emit({
 					type: "session_before_compact",
 					preparation,
-					branchEntries: pathEntries,
+					// slice: getBranch() returns the live leaf-branch cache, which appends
+					// extend in place, so the awaited handler gets a snapshot.
+					branchEntries: pathEntries.slice(),
 					customInstructions,
 					signal,
 				})) as SessionBeforeCompactResult | undefined;
@@ -11693,24 +11698,36 @@ export class AgentSession {
 			}
 			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
 		}
+		// The name stays reserved until the spawn admission settles: the
+		// detached runtime task releases it at admission completion (success
+		// or failure), and every pre-admission failure path releases it here.
+		const releaseReservedSessionName = () => {
+			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
+		};
 		let modelSelection: RlmSubagentModelSelection;
+		let childSessionDir: string;
 		try {
 			if (requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(requestedSessionName, true);
+			// An unpinned spawn model resolves against the persisted subagent
+			// default; an unavailable default fails the spawn instead of silently
+			// inheriting the parent model.
 			modelSelection = await this._resolveRlmSubagentModel(requestedModel);
-		} finally {
-			if (requestedSessionName) this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
-		}
-		if (requestedThinkingLevel !== undefined) {
-			const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
-			if (!supported.includes(requestedThinkingLevel)) {
-				throw new Error(
-					`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
-				);
+			if (requestedThinkingLevel !== undefined) {
+				const supported = getSupportedThinkingLevels(modelSelection.model) as ThinkingLevel[];
+				if (!supported.includes(requestedThinkingLevel)) {
+					throw new Error(
+						`Requested thinking level "${requestedThinkingLevel}" is not supported by model "${modelSelection.model.provider}/${modelSelection.model.id}"; supported levels: ${supported.join(", ")}`,
+					);
+				}
 			}
+			if (this._disposed || this._disposing) {
+				throw new Error("Cannot spawn a subagent after its parent was disposed");
+			}
+			childSessionDir = this._createChildRlmSessionDir();
+		} catch (error) {
+			releaseReservedSessionName();
+			throw error;
 		}
-		if (this._disposed || this._disposing) throw new Error("Cannot spawn a subagent after its parent was disposed");
-
-		const childSessionDir = this._createChildRlmSessionDir();
 		const childNodeId = basename(childSessionDir);
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
@@ -11883,7 +11900,14 @@ export class AgentSession {
 		void (async () => {
 			let childRuntime: RlmSubagentRuntime | undefined;
 			try {
-				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
+				try {
+					childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
+				} finally {
+					// Admission settled: in daemon mode the spawn edge is now
+					// durable, so the name transfers from the pending reservation
+					// to the admitted run. A failed admission frees the name.
+					releaseReservedSessionName();
+				}
 				const child = childRuntime.session;
 				if (run.status === "cancelled") throw new Error(run.error ?? "RLM child cancelled");
 				if (child.sessionName !== sessionName) child.setSessionName(sessionName);

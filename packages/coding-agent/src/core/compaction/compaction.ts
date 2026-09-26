@@ -27,6 +27,7 @@ import {
 	formatFileOperations,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
+	stripFileListBlocks,
 } from "./utils.js";
 /** Details stored in CompactionEntry.details for file tracking */
 export interface CompactionDetails {
@@ -525,6 +526,9 @@ export function buildSummarizationPrompt(customInstructions?: string, previousSu
  * `onPayload` carries the owning session's provider identity so the call is
  * not anonymous at the provider; it is expected to be scoped, because the
  * summarization prompt is not the session's own conversation.
+ * If recentStateAnchor is provided (newest retained assistant text), the
+ * prompt marks it as the current state so the summary cannot lag behind the
+ * kept tail.
  */
 export async function generateSummary(
 	currentMessages: AgentMessage[],
@@ -539,6 +543,7 @@ export async function generateSummary(
 	retry?: ProviderRetryPolicy,
 	onPayload?: ProviderPayloadHook,
 	sessionId?: string,
+	recentStateAnchor?: string,
 ): Promise<SummarySlice> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
@@ -549,6 +554,9 @@ export async function generateSummary(
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
 		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+	}
+	if (recentStateAnchor) {
+		promptText += `<recent-state-anchor>\nNewest assistant message that stays retained below the summary. The conversation to summarize is older than this anchor; the retained messages below are authoritative, so treat this anchor, not the conversation above, as the current state.\n\n${recentStateAnchor}\n</recent-state-anchor>\n\n`;
 	}
 	promptText += basePrompt;
 
@@ -596,8 +604,10 @@ export interface CompactionPreparation {
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
-	/** Summary from previous compaction, for iterative update */
+	/** Summary from previous compaction, for iterative update (file-list blocks stripped) */
 	previousSummary?: string;
+	/** Newest retained assistant text; anchors the summary to kept-tail state */
+	recentStateAnchor?: string;
 	/** File operations extracted from messagesToSummarize */
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
@@ -624,7 +634,10 @@ export function prepareCompaction(
 	let boundaryStart = 0;
 	if (prevCompactionIndex >= 0) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
-		previousSummary = prevCompaction.summary;
+		// File-list blocks never reach the update prompt: they are re-appended
+		// mechanically below and compound when the model re-summarizes them.
+		const strippedSummary = stripFileListBlocks(prevCompaction.summary);
+		previousSummary = strippedSummary.length > 0 ? strippedSummary : undefined;
 		const firstKeptEntryIndex = pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId);
 		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
 	}
@@ -653,6 +666,11 @@ export function prepareCompaction(
 		}
 	}
 
+	// Recency anchor: the summarizer sees only messages before the cut, so its
+	// summary would describe pre-tail state. The newest retained assistant
+	// text is the state the next turn actually sees; pass it to the summarizer.
+	const recentStateAnchor = extractRecentStateAnchor(pathEntries, cutPoint.firstKeptEntryIndex, pathEntries.length);
+
 	// Avoid a compaction that would summarize no history.
 	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0 && !previousSummary) {
 		return undefined;
@@ -672,9 +690,38 @@ export function prepareCompaction(
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,
+		recentStateAnchor,
 		fileOps,
 		settings,
 	};
+}
+
+/**
+ * Maximum characters kept from the retained tail for the recency anchor.
+ * The end of a message holds the newest state, so long text keeps its tail.
+ */
+const RECENT_STATE_ANCHOR_MAX_CHARS = 2000;
+
+/**
+ * Extract the newest retained assistant text (the recency anchor) from the
+ * kept tail [keptStart, keptEnd). Returns undefined when the tail has no
+ * assistant text; long text is tail-truncated to the anchor budget.
+ */
+function extractRecentStateAnchor(entries: SessionEntry[], keptStart: number, keptEnd: number): string | undefined {
+	for (let i = keptEnd - 1; i >= keptStart; i--) {
+		const msg = getMessageFromEntryForCompaction(entries[i]);
+		if (!msg || msg.role !== "assistant" || !("content" in msg) || !Array.isArray(msg.content)) continue;
+		const text = msg.content
+			.filter((block): block is { type: "text"; text: string } => block.type === "text")
+			.map((block) => block.text)
+			.join("\n")
+			.trim();
+		if (!text) continue;
+		return text.length > RECENT_STATE_ANCHOR_MAX_CHARS
+			? text.slice(text.length - RECENT_STATE_ANCHOR_MAX_CHARS)
+			: text;
+	}
+	return undefined;
 }
 const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
 
@@ -723,6 +770,7 @@ export async function compact(
 		isSplitTurn,
 		tokensBefore,
 		previousSummary,
+		recentStateAnchor,
 		fileOps,
 		settings,
 	} = preparation;
@@ -747,6 +795,7 @@ export async function compact(
 							retry,
 							onPayload,
 							sessionId,
+							recentStateAnchor,
 						),
 					)
 				: Promise.resolve<SummarySlice>({ summary: "No prior history." }),
@@ -782,6 +831,7 @@ export async function compact(
 				retry,
 				onPayload,
 				sessionId,
+				recentStateAnchor,
 			),
 		);
 		slices.push(result);

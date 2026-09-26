@@ -171,16 +171,12 @@ describe("Prime Inference models", () => {
 		});
 		const glm51 = getModel("prime-inference", "z-ai/glm-5.1");
 		expect(glm51.reasoning).toBe(true);
-		expect(glm51.compat).toMatchObject({
-			supportsReasoningEffort: false,
-			thinkingFormat: "zai",
-		});
+		expect(glm51.compat?.supportsReasoningEffort).toBe(false);
+		expect(glm51.compat?.thinkingFormat).toBeUndefined();
 		const glm52 = getModel("prime-inference", "z-ai/glm-5.2");
 		expect(glm52.reasoning).toBe(true);
-		expect(glm52.compat).toMatchObject({
-			supportsReasoningEffort: false,
-			thinkingFormat: "zai",
-		});
+		expect(glm52.compat?.supportsReasoningEffort).toBe(false);
+		expect(glm52.compat?.thinkingFormat).toBeUndefined();
 		expect(getModel("prime-inference", "qwen/qwen3-coder-next").reasoning).toBe(false);
 		expect(getModel("prime-inference", "x-ai/grok-4.20").reasoning).toBe(true);
 		expect(getModel("prime-inference", "minimax/minimax-m3").reasoning).toBe(true);

@@ -177,6 +177,59 @@ describe("#2068 shell message steering", () => {
 		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
 	});
 
+	it("re-parks pending next-turn messages when an async-bash notice is withdrawn", async () => {
+		const started = createDeferred<void>();
+		const release = createDeferred<void>();
+		let providerSawParkedContext = false;
+		const tool: AgentTool = {
+			name: "wait",
+			label: "Wait",
+			description: "Hold the current tool until released",
+			parameters: Type.Object({}),
+			execute: async () => {
+				started.resolve();
+				await release.promise;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [tool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Finished the original work."),
+			(context) => {
+				providerSawParkedContext = context.messages.some((message) => getMessageText(message) === "carry this");
+				return fauxAssistantMessage("Follow-up turn complete.");
+			},
+		]);
+		const original = harness.session.prompt("Continue working.");
+		try {
+			await started.promise;
+			await harness.session.sendCustomMessage(
+				{ customType: "next-turn", content: "carry this", display: true, details: {} },
+				{ deliverAs: "nextTurn" },
+			);
+			await completeShell(harness);
+			const [notice] = harness.session.getSessionActionRecoverySnapshot().actions;
+			const prefixes =
+				notice?.payload.kind === "turn" ? notice.payload.records.filter((record) => record.role === "prefix") : [];
+			expect(prefixes.map((record) => getMessageText(record.message))).toEqual(["carry this"]);
+			expect(harness.session.getSteeringMessages()).toHaveLength(1);
+			await readShellResult(harness);
+			expect(harness.session.getSteeringMessages()).toEqual([]);
+			expect(harness.session.getPendingNextTurnMessageSnapshots().map(getMessageText)).toEqual(["carry this"]);
+		} finally {
+			release.resolve();
+			await original;
+		}
+		await harness.session.waitForIdle();
+		expect(shellMessages(harness)).toEqual([]);
+		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
+		await harness.session.prompt("next turn");
+		await harness.session.waitForIdle();
+		expect(providerSawParkedContext).toBe(true);
+	});
+
 	it("renders shell-specific queue and transcript labels without generic delivery prefixes", () => {
 		const message = createAsyncBashCompletionMessage(completion);
 		const preview = `${ASYNC_BASH_COMPLETION_PREVIEW_LABEL}: pid 42, exit 0`;

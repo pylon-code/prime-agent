@@ -527,3 +527,192 @@ decisions:
     upstream_support: Current upstream allocates a second timestamp when persisting custom messages, so reloading or compacting changes live transcript identities. Preserve the original message timestamp at every AgentSession persistence boundary.
     revisit_when:
       - Upstream preserves exact custom-message identities across live emission, persistence and reconstruction.
+
+  kernel-stderr-stream-errors:
+    area: kernel
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/1
+      - https://github.com/pylon-code/pylon/issues/114
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2383
+    fork_change: absorb-kernel-child-stderr-stream-errors
+    upstream_support: Absorb child stderr stream errors to prevent worker crashes on broken pipe or process death without altering process ownership.
+    revisit_when:
+      - Upstream redesigns kernel stdio streams.
+
+  repl-bounded-frames:
+    area: kernel
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/1
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2423
+    fork_change: bound-repl-protocol-frame-sizes
+    upstream_support: Bound REPL message sizes to prevent memory exhaustion and protocol desync.
+    revisit_when:
+      - Kernel REPL migrates to chunked framing.
+
+  owner-only-kernel-stderr-log:
+    area: kernel-security
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/1
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2425
+    fork_change: owner-only-kernel-stderr-log-permissions
+    upstream_support: Set mode 0o600 on kernel stderr log files.
+    revisit_when:
+      - Kernel logging subsystem is replaced.
+
+  heartbeats-list-bounded-live-state:
+    area: daemon-health
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/1
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2378
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2342
+    fork_change: heartbeats-list-from-live-state-with-deadline
+    upstream_support: Read active heartbeats from in-memory state with 10s deadline without queueing behind busy worker turns; must not fabricate liveness for quarantined sessions.
+    revisit_when:
+      - Heartbeat storage moves out-of-process.
+
+  session-open-restart-wait:
+    area: daemon-lifecycle
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/1
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2391
+    fork_change: session-open-wait-during-daemon-restart
+    upstream_support: Let session opens wait through daemon update restart instead of failing immediately; re-verifies daemon hello and supervisor generation on connect.
+    revisit_when:
+      - Daemon lifecycle management changes.
+
+  spawn-name-reservation-admission:
+    area: session-lifecycle
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/1
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2396
+    fork_change: hold-spawn-name-reservations-until-admission
+    upstream_support: Hold spawn name reservations until admission is durable, respecting caller-owned admission proofs and reconnect handles.
+    revisit_when:
+      - Session admission protocol is redesigned.
+
+  async-bash-notice-turn-boundary:
+    area: runtime-reliability
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/64
+      - https://github.com/pylon-code/prime-agent/issues/1
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2372
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2386
+    fork_change: async-bash-notice-re-parking-with-handle-withdrawal
+    upstream_support: Hybridize turn-boundary notice fixes with fork #72 per-handle withdrawal and single terminal settlement.
+    revisit_when:
+      - Upstream introduces handle-bound async command receipts.
+
+  compaction-tool-identity-and-anchoring:
+    area: context-compaction
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/1
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2424
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2385
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2463
+    fork_change: compaction-tool-identity-anchoring-and-validation
+    upstream_support: Preserve tool identity in summarizer input, anchor summaries to kept tail, validate refinement writes, and preserve custom message timestamps without altering cursor order.
+    revisit_when:
+      - Compaction architecture or prompt format changes.
+
+  codex-stale-chain-recovery:
+    area: provider-codex
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/1
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2374
+    fork_change: codex-stale-chain-recovery-after-metadata
+    upstream_support: Recover stale Codex chains after metadata while preserving connection binding.
+    revisit_when:
+      - Codex completion API changes.
+
+  prime-inference-glm-no-thinking:
+    area: provider-glm
+    state: candidate
+    owner: upstream
+    decision: adopt
+    pylon_refs:
+      - https://github.com/pylon-code/prime-agent/issues/1
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2459
+    fork_change: prime-inference-glm-disable-thinking
+    upstream_support: Stop sending enable_thinking to Prime Inference GLM models.
+    revisit_when:
+      - GLM adds reasoning support.
+
+  abort-and-send-queued:
+    area: session-input
+    state: candidate
+    owner: shared
+    decision: hybridize
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2426
+    fork_change: capability-gated-abort-and-send-queued-schema34
+    upstream_support: Renumber schema revision above fork 33 to 34 and gate behind abort_and_send_queued_v1 capability.
+    revisit_when:
+      - Upstream negotiates queued aborts via capability.
+
+  quota-park-and-auto-resume:
+    area: provider-quota
+    state: deferred
+    owner: shared
+    decision: redesign
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2375
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2280
+    fork_change: none
+    upstream_support: Quota waiting and auto-resume daemon behavior. Pending maintainer decision.
+    revisit_when:
+      - Maintainer guides quota park and auto-resume projection.
+
+  mcp-service-catalog-oauth:
+    area: mcp-ownership
+    state: deferred
+    owner: shared
+    decision: retain
+    pylon_refs:
+      - https://github.com/pylon-code/pylon/issues/114
+    upstream_refs:
+      - https://github.com/PrimeIntellect-ai/prime-agent/pull/2330
+    fork_change: none
+    upstream_support: Daemon MCP service catalog and OAuth engine. Retaining Pylon MCP ownership pending maintainer decision.
+    revisit_when:
+      - Maintainer guidance on MCP service catalog.
