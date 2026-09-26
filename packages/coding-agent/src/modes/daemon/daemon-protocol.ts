@@ -90,9 +90,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 31 is reserved for the separate nonpersistent-worker candidate (#54).
 // Revision 32 integrates upstream roster/peer transport, usage/model metadata and session_recovering.
 // Revision 33 preserves optional worker replay metadata on runtime snapshots under event_sequence.
-export const DAEMON_SCHEMA_REVISION = 33;
+// Revision 34 adds capability-gated abort_and_send_queued_v1 (#2426).
+export const DAEMON_SCHEMA_REVISION = 34;
 export const DAEMON_RUNTIME_SNAPSHOT_REPLAY_MIN_SCHEMA_REVISION = 33;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-33-df7072089924";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-34-24a1b6f17411";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -154,7 +155,8 @@ export type DaemonServerCapability =
 	| "snapshot_generation_nonce_v1"
 	| "authoritative_owned_session_cleanup_v1"
 	| "daemon_recoverable_owned_session_adoption_v1"
-	| "direct_peer_transport";
+	| "direct_peer_transport"
+	| "abort_and_send_queued_v1";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -205,6 +207,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_pause",
 	"acp_mcp_servers",
 	"snapshot_generation_nonce_v1",
+	"abort_and_send_queued_v1",
 ];
 
 /** Supervisor-only offers. Private session workers must not advertise these commands. */
@@ -791,6 +794,7 @@ export type DaemonCommand =
 	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_clear"; activeSessionId: string }
 	| { id?: string; type: "abort"; activeSessionId: string }
+	| { id?: string; type: "abort_and_send_queued"; activeSessionId: string }
 	| {
 			id?: string;
 			type: "start_side_question";
@@ -1071,6 +1075,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
 	agent_messages_clear: LEGACY_DAEMON_COMMAND,
 	abort: LEGACY_DAEMON_COMMAND,
+	abort_and_send_queued: { minProtocol: 7, minSchemaRevision: 34, capability: "abort_and_send_queued_v1" },
 	start_side_question: LEGACY_DAEMON_COMMAND,
 	abort_side_question: LEGACY_DAEMON_COMMAND,
 	execute_bash: LEGACY_DAEMON_COMMAND,
@@ -1197,6 +1202,7 @@ export const DAEMON_COMMAND_PLANE = {
 	agent_messages_resume: "control",
 	agent_messages_clear: "control",
 	abort: "session",
+	abort_and_send_queued: "session",
 	start_side_question: "session",
 	abort_side_question: "session",
 	execute_bash: "session",

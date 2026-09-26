@@ -388,6 +388,15 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("model_catalog");
 	});
 
+	it("capability- and schema-gates abort_and_send_queued at schema 34", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.abort_and_send_queued).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 34,
+			capability: "abort_and_send_queued_v1",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("abort_and_send_queued_v1");
+	});
+
 	it("capability- and schema-gates queued message mutation at its introducing revision", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.mutate_queued_message).toEqual({
 			minProtocol: 7,
@@ -403,7 +412,7 @@ describe("daemon protocol helpers", () => {
 	});
 
 	it("capability- and schema-gates fresh snapshot generation nonces", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(33);
+		expect(DAEMON_SCHEMA_REVISION).toBe(34);
 		expect(DAEMON_SNAPSHOT_GENERATION_NONCE_MIN_SCHEMA_REVISION).toBe(28);
 		expect(
 			getDaemonCommandCompatibilities({

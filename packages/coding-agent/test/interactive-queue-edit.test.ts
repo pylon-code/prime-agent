@@ -78,6 +78,7 @@ function createHarness(queue: { steering: string[]; followUp: string[] }, mutate
 		agentConnection: {
 			mutateQueuedMessage: vi.fn(async () => mutateResult),
 			abort: vi.fn(async () => {}),
+			abortAndSendQueued: vi.fn(async () => {}),
 		},
 		sessionEventGeneration: 0,
 		sessionEventQueue: Promise.resolve(),
@@ -597,8 +598,9 @@ describe("interactive queued-message editing", () => {
 });
 
 describe("interactive interrupt preserves the queue", () => {
-	it("aborts without clearing or restoring queued messages", () => {
+	it("interrupts streaming by aborting and sending the queued messages without clearing the queue or the draft", () => {
 		const abort = vi.fn(async () => {});
+		const abortAndSendQueued = vi.fn(async () => {});
 		const harness = {
 			traceUploadAllAbortController: undefined,
 			sideQuestionEvent: undefined,
@@ -606,12 +608,13 @@ describe("interactive interrupt preserves the queue", () => {
 			isAgentCompacting: () => false,
 			isBashRunning: () => false,
 			isAgentStreaming: () => true,
-			agentConnection: { abort },
+			agentConnection: { abort, abortAndSendQueued },
 			showError: vi.fn(),
 			editor: { getText: () => "", setText: vi.fn() },
 		};
 		(proto.interruptOrClearInput as (this: unknown) => void).call(harness);
-		expect(abort).toHaveBeenCalledOnce();
+		expect(abortAndSendQueued).toHaveBeenCalledOnce();
+		expect(abort).not.toHaveBeenCalled();
 		expect(harness.editor.setText).not.toHaveBeenCalled();
 	});
 });
