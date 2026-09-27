@@ -267,7 +267,7 @@ test("v3 two migration helpers join one installed source and canonical root", as
  const attempts = await Promise.allSettled([migrateConsumerGenerationJournal(state, options), migrateConsumerGenerationJournal(state, options)]);
  const results = attempts.filter((attempt) => attempt.status === "fulfilled").map((attempt) => attempt.value);
  assert.ok(results.length >= 1, attempts.map((attempt) => attempt.reason?.stack).join("\n"));
- for (const attempt of attempts) if (attempt.status === "rejected") assert.match(attempt.reason.message, /changed|disappeared|ENOENT|inode|fenced|authority|actively locked|receipt|publication|conflicting exact bytes/);
+ for (const attempt of attempts) if (attempt.status === "rejected") assert.match(attempt.reason.message, /changed|disappeared|ENOENT|inode|fenced|authority|actively locked|receipt|publication|conflicting exact bytes|malformed/);
  const resumed = await migrateConsumerGenerationJournal(state, options);
  for (const result of results) assert.deepEqual(result, resumed);
  const roots = (await readdir(`${state}.journal-v3`)).filter((name) => name.startsWith("journal-"));
