@@ -286,6 +286,7 @@ export class DaemonClient {
 					this.connectingSocket = undefined;
 				}
 				this.clearSocketReference(socket);
+				socket.on("error", () => {});
 				socket.destroy();
 				reject(error);
 			};
@@ -865,4 +866,46 @@ function isDaemonSavedSessionAgentStatus(value: unknown): boolean {
 			candidate.taskState === "needs_input" ||
 			candidate.taskState === "completed")
 	);
+}
+
+/**
+ * onFailure drops the callers socket reference, so a failed connect never leaves the client
+ * holding a socket it never connected.
+ */
+export function awaitSocketConnect(
+	socket: Socket,
+	timeoutMs: number,
+	handlers: {
+		onFailure: () => void;
+		timeoutError: () => Error;
+		connectError: (error: Error) => Error;
+	},
+): Promise<void> {
+	return new Promise<void>((resolve, reject) => {
+		const timeout = setTimeout(() => {
+			cleanup();
+			handlers.onFailure();
+			socket.on("error", () => {});
+			socket.destroy();
+			reject(handlers.timeoutError());
+		}, timeoutMs);
+		const cleanup = () => {
+			clearTimeout(timeout);
+			socket.off("connect", onConnect);
+			socket.off("error", onError);
+		};
+		const onConnect = () => {
+			cleanup();
+			resolve();
+		};
+		const onError = (error: Error) => {
+			cleanup();
+			handlers.onFailure();
+			socket.on("error", () => {});
+			socket.destroy();
+			reject(handlers.connectError(error));
+		};
+		socket.once("connect", onConnect);
+		socket.once("error", onError);
+	});
 }

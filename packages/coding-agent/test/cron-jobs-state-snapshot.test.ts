@@ -1,5 +1,5 @@
 import type * as FsModule from "node:fs";
-import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -173,9 +173,10 @@ describe("AgentCronJobStore state snapshots", () => {
 		const bytes = readFileSync(storePath, "utf-8");
 		readCounts.clear();
 
-		rmSync(storePath);
-		writeFileSync(storePath, bytes);
-		utimesSync(storePath, pinned, pinned);
+		const replacementPath = `${storePath}.replacement`;
+		writeFileSync(replacementPath, bytes);
+		utimesSync(replacementPath, pinned, pinned);
+		renameSync(replacementPath, storePath);
 
 		expect(store.list()).toHaveLength(1);
 		expect(jobsReads(storePath)).toBe(1);

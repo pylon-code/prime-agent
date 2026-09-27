@@ -427,3 +427,28 @@ after exact owned cleanup and supervisor exit. Pylon delivery tracked in [pylon#
 | TUI / CLI UI / CI: #2446, #2447, #2430, #2466, #2340, #2331, #2328, #2324, #2325, #2301, #2302, #2306, #2449, #2376, #2456, #2323 | Terminal UI interactions, upstream CI/benchmarks, install docs | **Skip** | Prime-specific TUI screens, terminal commands, and upstream internal CI are not consumed by Pylon web/desktop/mobile clients. No daemon protocol or SDK impact. Revisit if features move to daemon protocol. |
 | #2458 (`2e9ab77b8`) | Reconnect attached windows when daemon restarts | **Skip / Retain** | TUI client window reconnect is skipped because Pylon manages its own reconnection; supervisor update-restart phase closing reason is retained/deferred with supervisor lifecycle audit. |
 | Distribution: #2366, #2370, #2369, #2368, #2361, #2344, #2319 | Native binaries, updater manifests, musl packages | **Retain** | Retain Pylon recipe 2 deterministic SDK archives per fork #75 decision. Revisit if upstream provides importable Node SDK in binary archives. |
+
+## 2026-09-26 — post-v0.9.5 through v0.9.6 upstream review (18a56bf35..cd1f215cf)
+
+- Review range: upstream commits `18a56bf3557063c0cd0be12f99f0bcce2a46da32..cd1f215cfc6604470c1f6d3f2ecbfca3006497f3` (45 commits, including release v0.9.6 `e260085dd` and post-release TUI commits `80c51e460`, `cd1f215cf`).
+- Merge-base and complete integration checkpoint remain frozen at v0.9.4 `1eee2938b4eeb7a4d72e17035adda669a89b63de`.
+- Adversarial triage completed across all 45 candidate commits.
+
+### Dispositions and Revisit Triggers
+
+| PR / Commit | Subject / Area | Disposition | Notes & Revisit Triggers |
+| --- | --- | --- | --- |
+| #2508 (`a0660bb5f`) | Worker client socket release on failed connect | **Adopt (Hardened)** | Releases stale socket references on connect timeout or rejection. Hardened in fork to attach trailing error sink before socket destruction to avoid unhandled Node exception crashes. |
+| #2474 (`cc55bb11a`) | Provider retry backoff jitter (\+/-25%) | **Adopt** | De-synchronizes concurrent retry storms while strictly flooring delays at server-mandated `Retry-After` headers. |
+| #2500 (`0e3c90022`) | Kernel error text cap and host_request size bounds | **Adopt** | Caps kernel execution error text to 1MB and rejects oversized host_request payloads to prevent memory exhaustion and IPC deadlocks. |
+| #2499 (`5062b1b31`) | Python skills key matching `(importName, packagePath)` | **Adopt** | Prevents spurious skill venv re-synchronization when skills share import namespaces across distinct packages. |
+| #2491 (`fb8d7411e`) | Proxy stream truncation detection & serviceTier forwarding | **Adopt** | Propagates premature proxy stream EOF as terminal stream errors and preserves OpenAI `serviceTier` parameter across proxy boundaries. |
+| #2533, #2555, #2560 (`1e2cc2278`, `b11fd5e2d`, `346a463da`) | Claude Opus 5.5 adaptive thinking | **Adopt** | Configures always-on adaptive thinking and test fixture surfaces for Claude Opus 5.5. |
+| #2645 (`703cc4547`) | Claude Code client version bump (2.1.281) & ban risk notice | **Adopt** | Claims client version 2.1.281 for Anthropic subscription OAuth requests to pass backend model gating, accompanied by user-facing ban-risk warning. |
+| #2507 (`36b912fea`) | Remote catalog fetch from `prime-agent-catalog` | **Hold / Audit** | Introduces runtime network dependency for model metadata. Held pending evaluation of offline cache fallbacks and deterministic air-gapped guarantees. |
+| #2475 (`561401b27`) | Truncate cell source to 2KB on `host_request` | **Hold / Audit** | May break downstream provenance reconstruction and context hash verification when cells exceed 2KB. Held for Pylon trace analysis. |
+| #2382 (`d73349d50`) | Raw `child.kill("SIGKILL")` on worker bridge EPIPE | **Reject** | Violates Pylon syscall safety invariant; raw signals to unverified PIDs risk killing recycled processes during rapid worker crashes. Must rely on supervised process exit receipts. |
+| #2471 (`8ee46be35`), #2478 (`02e5babb4`) | Live mutation of CPython `__closure__` and `__globals__` | **Reject** | Unsafe runtime bytecode/closure mutation in REPL state restore risks memory leaks and CPython interpreter `SIGSEGV` crashes. |
+| #2388 (`1c1ad1e48`) | Synchronous session name reclamation on delete receipt | **Reject** | Deleting session name before child process unwinding completes creates race conditions with pending detached worker handles. |
+| #2334, #2465 | Human priority queue reordering & continuation holds | **Fenced** | Fenced per Issue #727 empirical findings. Pylon daemon adapter enforces FIFO cursor monotonicity; reordering causes frame drop and transcript desync. |
+| TUI / Internal CI (23 commits) | Terminal UI styling, upstream release benchmarks, packaging | **Skip** | Prime-specific TUI screens, terminal commands, and internal CI workflows not consumed by Pylon web/desktop/mobile hosts. |
