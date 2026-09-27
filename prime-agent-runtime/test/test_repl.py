@@ -844,7 +844,7 @@ class ReplTest(unittest.TestCase):
         self.assertIsNone(one(self.repl.execute("early-read", "handle.poll().output"), "host_request"))
         reply_ok(self.repl, notice)
         withdrawal = wait_for_host_request(self.repl, [])["data"]
-        self.assertEqual(withdrawal, {"type": "bash.consumed", "pid": notice["data"]["pid"], "command": "printf early"})
+        self.assertEqual(withdrawal, {"type": "bash.consumed", "completionId": notice["data"]["completionId"], "pid": notice["data"]["pid"], "command": "printf early"})
 
     def test_detached_read_during_another_cell_preserves_notice(self):
         started = self.repl.execute(
